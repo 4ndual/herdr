@@ -93,6 +93,14 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Native goal dashboard model (feat/native-dashes): holds the goal tree,
+    /// proposals, history, and time-gate state. Refreshed/polled from the tick
+    /// loop and drawn into `state.view.goal_dash_area`.
+    pub(crate) goal_dash: goal_dash_core::App,
+    /// Native usage dashboard interaction state (expand/collapse/scroll/hover +
+    /// last frame's hit-rects) and the latest resolved snapshot.
+    pub(crate) usage_view: usage_dash_core::UsageView,
+    pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -492,6 +500,8 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                usage_dash_area: Rect::default(),
+                goal_dash_area: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -518,6 +528,7 @@ impl App {
             sidebar_width_source,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            goal_panel_visible: false,
             sidebar_section_split,
             agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
@@ -609,6 +620,9 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
+            goal_dash: goal_dash_core::App::new(None),
+            usage_view: usage_dash_core::UsageView::default(),
+            usage_snapshot: None,
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -897,6 +911,17 @@ impl App {
                         &self.state,
                         &self.terminal_runtimes,
                         frame,
+                    );
+                    // feat/native-dashes: paint the usage strip + goal panel on
+                    // top of the freshly-rendered panes area. Rects come from
+                    // compute_view; empty rects are skipped inside dash::draw.
+                    crate::dash::draw(
+                        frame,
+                        self.state.view.usage_dash_area,
+                        self.state.view.goal_dash_area,
+                        &mut self.goal_dash,
+                        &mut self.usage_view,
+                        self.usage_snapshot.as_ref(),
                     );
                 })?;
                 if kitty_graphics_enabled {

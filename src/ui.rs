@@ -91,7 +91,14 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
+const COLLAPSED_WIDTH: u16 = 4;
+
+// feat/native-dashes: fixed reserve for the bottom usage strip and the bounds of
+// the toggleable right goal panel. P4 will derive the strip height from usage
+// content height rather than reserving a fixed band.
+const USAGE_STRIP_HEIGHT: u16 = 7;
+const GOAL_PANEL_MIN_WIDTH: u16 = 36;
+const GOAL_PANEL_MAX_WIDTH: u16 = 56; // num + space + dot + separator
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -199,6 +206,30 @@ fn compute_view_internal(
         (Rect::default(), main_area)
     };
 
+    // feat/native-dashes: carve the persistent bottom usage strip and the
+    // toggleable right goal panel out of the terminal area before panes are laid
+    // out, so panes never overlap them. Both collapse to an empty Rect when there
+    // isn't room (or the goal panel is toggled off). P4 will derive the strip
+    // height from usage content instead of the fixed reserve used here.
+    let (terminal_area, usage_dash_area) = if terminal_area.height > USAGE_STRIP_HEIGHT + 3 {
+        let [panes, strip] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(USAGE_STRIP_HEIGHT)])
+                .areas(terminal_area);
+        (panes, strip)
+    } else {
+        (terminal_area, Rect::default())
+    };
+    let (terminal_area, goal_dash_area) = if app.goal_panel_visible
+        && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
+    {
+        let panel_w = (terminal_area.width / 3).clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH);
+        let [panes, panel] = Layout::horizontal([Constraint::Min(24), Constraint::Length(panel_w)])
+            .areas(terminal_area);
+        (panes, panel)
+    } else {
+        (terminal_area, Rect::default())
+    };
+
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
         let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
@@ -282,6 +313,8 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        usage_dash_area,
+        goal_dash_area,
     };
 }
 
@@ -351,6 +384,8 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        usage_dash_area: Rect::default(),
+        goal_dash_area: Rect::default(),
     };
 }
 

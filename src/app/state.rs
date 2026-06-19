@@ -742,6 +742,11 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    /// Native dashboard regions (feat/native-dashes), computed in `compute_view`.
+    /// The bottom usage strip is always present; the right goal panel is
+    /// `Rect::default()` (empty) when the panel is toggled off.
+    pub usage_dash_area: Rect,
+    pub goal_dash_area: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1338,6 +1343,9 @@ pub struct AppState {
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
+    /// Whether the native right-side goal panel is shown (feat/native-dashes).
+    /// Pure data; the renderer reads it and `compute_view` sizes the panel.
+    pub goal_panel_visible: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_scope: AgentPanelScope,
@@ -1662,6 +1670,8 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                usage_dash_area: Rect::default(),
+                goal_dash_area: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -1688,6 +1698,7 @@ impl AppState {
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            goal_panel_visible: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,

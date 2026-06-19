@@ -7,6 +7,8 @@
 //! routes the cores' [`dash_common::Effect`]s back onto herdr machinery.
 
 use dash_common::{AgentKind, FocusInput};
+use ratatui::layout::Rect;
+use ratatui::Frame;
 
 use crate::agent_resume::AgentSessionRefKind;
 use crate::app::AppState;
@@ -73,6 +75,28 @@ pub fn focus_input(state: &AppState) -> FocusInput {
         // Set true only when a herdr dashboard region itself holds focus; wired
         // when input routing lands (P3.6). Until then a pane is always focused.
         is_self_focus: false,
+    }
+}
+
+/// Draw the native dashboard regions for this frame, called from the app's
+/// render closure after the main UI is painted (so they sit on top of the panes
+/// area, never under them). Each region is skipped when its rect is empty
+/// (`compute_view` collapses the usage strip when there's no room and the goal
+/// panel when it's toggled off). Both cores record their hit-rects back onto the
+/// passed-in view/model so a later `handle` resolves clicks against this frame.
+pub fn draw(
+    frame: &mut Frame,
+    usage_area: Rect,
+    goal_area: Rect,
+    goal: &mut goal_dash_core::App,
+    usage_view: &mut usage_dash_core::UsageView,
+    usage_snapshot: Option<&usage_dash_core::UsageSnapshot>,
+) {
+    if usage_area.width > 0 && usage_area.height > 0 {
+        usage_dash_core::render(frame, usage_area, usage_snapshot, usage_view);
+    }
+    if goal_area.width > 0 && goal_area.height > 0 {
+        goal_dash_core::draw(frame, goal_area, goal);
     }
 }
 

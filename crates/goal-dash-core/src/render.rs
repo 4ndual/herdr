@@ -26,12 +26,12 @@ fn dim_rule(width: u16) -> Paragraph<'static> {
     )))
 }
 
-pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
+pub fn draw(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     match app.view {
-        View::History => draw_history(f, app),
-        View::Proposals => draw_proposals(f, app),
-        View::PromptLog => draw_prompt_log(f, app),
-        View::Tree => draw_tree(f, app),
+        View::History => draw_history(f, area, app),
+        View::Proposals => draw_proposals(f, area, app),
+        View::PromptLog => draw_prompt_log(f, area, app),
+        View::Tree => draw_tree(f, area, app),
     }
     // Hover tooltip overlay (Tree view): when the cursor sits over a registered truncated region
     // (MAIN goal row, paraphrase footer), pop the full text in a floating box.
@@ -43,7 +43,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &mut App) {
                 .find(|(r, _)| cy == r.y && cx >= r.x && cx < r.x + r.width)
                 .map(|(r, t)| (*r, t.clone()))
             {
-                render_tooltip(f, f.area(), r, &text);
+                render_tooltip(f, area, r, &text);
             }
         }
     }
@@ -541,8 +541,7 @@ fn plans_section_lines(app: &App, width: usize) -> Vec<(Line<'static>, PlanClick
     out
 }
 
-fn draw_tree(f: &mut ratatui::Frame, app: &mut App) {
-    let area = f.area();
+fn draw_tree(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Paraphrase footer ("the last message" — the latest prompt's meaning): ONE truncated line; a
     // hover tooltip reveals the full text. (Capped to ≤240 chars when written.)
     let para_full = format!("💬 {}", app.paraphrase);
@@ -861,8 +860,7 @@ fn draw_tree(f: &mut ratatui::Frame, app: &mut App) {
 /// always WRAPPED, never truncated at the pane edge) is the non-collapsible part; the reason folds
 /// under a ▸/▾ caret. `↑↓` pick, `⏎` expand/collapse, `y` accept, `x` dismiss. Long content scrolls so
 /// the selected proposal stays visible.
-fn draw_proposals(f: &mut ratatui::Frame, app: &mut App) {
-    let area = f.area();
+fn draw_proposals(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1012,8 +1010,7 @@ fn draw_proposals(f: &mut ratatui::Frame, app: &mut App) {
 }
 
 /// The Prompt-Log view — the per-prompt paraphrase trail, newest first.
-fn draw_prompt_log(f: &mut ratatui::Frame, app: &mut App) {
-    let area = f.area();
+fn draw_prompt_log(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1200,8 +1197,7 @@ fn history_entry_lines(
     lines
 }
 
-fn draw_history(f: &mut ratatui::Frame, app: &mut App) {
-    let area = f.area();
+fn draw_history(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let rows = Layout::vertical([
         Constraint::Length(1), // title
         Constraint::Length(1), // divider
