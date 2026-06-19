@@ -127,6 +127,94 @@ class Herdr:
     def text(self):
         return "\n".join(self.grid())
 
+    def fg_colors(self, y0=0, y1=None):
+        """Set of foreground colors present in rows [y0, y1). pyte stores a
+        24-bit color as a lowercase 6-hex string (no '#'); named ANSI colors
+        stay as their name ('green', 'brown', …). Used to prove the dashes
+        render in herdr's Catppuccin truecolor palette, not raw terminal ANSI."""
+        y1 = self.rows if y1 is None else min(y1, self.rows)
+        out = set()
+        for y in range(max(0, y0), y1):
+            row = self.screen.buffer[y]
+            for x in range(self.cols):
+                out.add(row[x].fg)
+        return out
+
+    def _ps(self):
+        return subprocess.run(["ps", "-axo", "pid=,ppid=,command="],
+                              capture_output=True, text=True).stdout
+
+    def herdr_pids(self):
+        """All live pids running the herdr binary (the daemonised `herdr server`
+        — argv has NO --session, ppid 1 — plus this session's `herdr --session`
+        clients). Matched by binary path: the scenarios run sequentially so only
+        one herdr server is alive at a time, and a spawned Claude call is parented
+        to that server."""
+        s = set()
+        for ln in self._ps().splitlines():
+            parts = ln.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, _ppid, cmd = parts
+            if BIN in cmd:
+                s.add(int(pid))
+        return s
+
+    def _proc_table(self):
+        """(pid -> (ppid, cmd)) for all live processes."""
+        tab = {}
+        for ln in self._ps().splitlines():
+            parts = ln.split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid, ppid, cmd = parts
+            try:
+                tab[int(pid)] = (int(ppid), cmd)
+            except ValueError:
+                pass
+        return tab
+
+    def claude_p_pids(self, tab=None):
+        """Live headless `claude -p …` processes as (pid, ppid, cmd). Name-agnostic:
+        on this machine `claude` is a bash router that execs a launcher
+        (`claude-fake-headless-rs`), so match any command that mentions claude and
+        carries the headless `-p`/`--print` flag — not a fixed argv[0]."""
+        tab = tab or self._proc_table()
+        res = []
+        for pid, (ppid, cmd) in tab.items():
+            low = cmd.lower()
+            if "claude" in low and (" -p " in cmd or cmd.endswith(" -p") or "--print" in cmd):
+                res.append((pid, ppid, cmd))
+        return res
+
+    def _roots_at_herdr(self, pid, tab, herdr, hops=5):
+        """True if walking pid's parent chain (≤hops) reaches one of this
+        session's herdr processes — i.e. herdr spawned it."""
+        seen = 0
+        cur = pid
+        while cur and cur > 1 and seen < hops:
+            ppid = tab.get(cur, (None, ""))[0]
+            if ppid in herdr:
+                return True
+            cur = ppid
+            seen += 1
+        return False
+
+    def wait_claude_spawn(self, before_pids, secs=12):
+        """After an action key, wait for herdr to spawn a NEW headless claude
+        process whose parent chain roots at this session's herdr server. Returns
+        (pid, ppid, cmd) or None — proves the SpawnClaude effect ran a real
+        `claude -p` call driven by herdr."""
+        deadline = time.time() + secs
+        while time.time() < deadline:
+            tab = self._proc_table()
+            herdr = {p for p, (_pp, cmd) in tab.items() if BIN in cmd}
+            for pid, ppid, cmd in self.claude_p_pids(tab):
+                if pid not in before_pids and self._roots_at_herdr(pid, tab, herdr):
+                    return (pid, ppid, cmd)
+            self.pump(0.12)
+        return None
+
     def resize(self, rows, cols):
         self.rows, self.cols = rows, cols
         self.screen.resize(rows, cols)

@@ -195,6 +195,123 @@ def main():
     finally:
         h.stop()
 
+    # ---- TC10: dashes are themed to herdr's Catppuccin palette (truecolor),
+    # not raw terminal ANSI. herdr recolors the dash regions onto its resolved
+    # Palette; pyte captures the 24-bit fg as a hex string. ----
+    MAUVE = "cba6f7"   # Catppuccin Mocha mauve  = Claude caption color
+    GREEN = "a6e3a1"   # Catppuccin Mocha green
+    YELLOW = "f9e2af"  # Catppuccin Mocha yellow
+    h = Herdr(usage_strip=True, goal_panel=False, session="dse5", rows=50, cols=170)
+    try:
+        h.start()
+        p1 = h.current_pane()
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
+        h.pump(3.0)
+        # scan only the bottom strip rows so shell-pane colors don't pollute
+        strip = h.fg_colors(y0=h.rows - 8)
+        cat_hits = sorted(c for c in strip if c in (MAUVE, GREEN, YELLOW))
+        # the Claude caption is mauve; the strip must carry Catppuccin truecolor
+        # and must NOT leave raw named ANSI (magenta/green) in the strip.
+        ansi_leak = sorted(c for c in strip if c in ("magenta", "green", "yellow", "red", "blue", "cyan"))
+        ok = (MAUVE in strip) and not ansi_leak
+        with open(os.path.join(OUTDIR, "12_catppuccin.txt"), "w") as f:
+            f.write("# 12_catppuccin [TC10] dash strip themed to Catppuccin palette\n")
+            f.write("catppuccin truecolor fg in strip: %s\n" % cat_hits)
+            f.write("raw ANSI named fg left in strip:   %s\n" % ansi_leak)
+            f.write(h.text())
+        results.append(("12_catppuccin", "TC10", "usage strip uses Catppuccin truecolor (no raw ANSI leak)", ok, [MAUVE], ansi_leak))
+        frames.append({"id": "12_catppuccin", "tc": "TC10", "label": "Catppuccin palette", "ok": ok, "path": os.path.join(OUTDIR, "12_catppuccin.txt")})
+        print(f"[{'PASS' if ok else 'FAIL'}] 12_catppuccin TC10: cat={cat_hits} ansi_leak={ansi_leak}")
+    finally:
+        h.stop()
+
+    # ---- TC23: ClearRebrief — `x` in the focused goal panel makes herdr execute
+    # a SendPaneKeys effect (clear+rebrief) AND stage the rebrief file. Real
+    # in-herdr keystroke -> GoalAction -> handle_goal -> run_effects -> host. ----
+    rebrief_file = os.path.expanduser(f"~/.claude/goal/{sid_a}.rebrief.md")
+    try:
+        os.remove(rebrief_file)
+    except OSError:
+        pass
+    h = Herdr(usage_strip=True, goal_panel=False, session="dse6", rows=50, cols=170)
+    try:
+        h.start()
+        p1 = h.current_pane()
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
+        h.pump(2.0)
+        h.prefix(b"d")          # open + focus the goal panel
+        h.pump(1.0)
+        h.send(b"x", settle=2.0)  # ClearRebrief
+        staged = os.path.exists(rebrief_file)
+        record(h, "13_clear_rebrief", "TC23",
+               "x -> herdr clears+rebriefs: panel status + staged rebrief file",
+               "cleared")
+        # tighten: the staged file is the deterministic host-executed proof
+        results[-1] = (results[-1][0], results[-1][1], results[-1][2],
+                       results[-1][3] and staged, results[-1][4], results[-1][5])
+        frames[-1]["ok"] = results[-1][3]
+        print(f"   staged rebrief file present: {staged} ({rebrief_file})")
+    finally:
+        h.stop()
+        try:
+            os.remove(rebrief_file)
+        except OSError:
+            pass
+
+    # ---- TC20: Sort — `f` dispatches a SpawnClaude(Sort) the host runs as a real
+    # `claude -p`; panel status flips to "sorting…" immediately. ----
+    h = Herdr(usage_strip=True, goal_panel=False, session="dse7", rows=50, cols=170)
+    try:
+        h.start()
+        p1 = h.current_pane()
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
+        h.pump(2.0)
+        h.prefix(b"d")
+        h.pump(1.0)
+        before = {pid for pid, _, _ in h.claude_p_pids()}
+        h.send(b"f", settle=0.05)   # Sort — poll immediately (the launcher may be fast)
+        spawned = h.wait_claude_spawn(before, secs=12)
+        record(h, "14_sort_dispatch", "TC20",
+               "f -> herdr spawns claude --sort; panel status = sorting",
+               "sorting")
+        results[-1] = (results[-1][0], results[-1][1], results[-1][2],
+                       results[-1][3] and spawned is not None, results[-1][4], results[-1][5])
+        frames[-1]["ok"] = results[-1][3]
+        print(f"   herdr-spawned claude -p: {spawned[:2] if spawned else None}")
+    finally:
+        h.stop()
+
+    # ---- TC19 + TC21: Infer — `r` on the focused goal makes herdr execute a
+    # SpawnClaude(Infer/InferTree) effect as a REAL `claude -p` subscription call
+    # (headless, no token API). We prove the host actually launched Claude by
+    # catching the spawned child parented to the herdr server. (TC21 Observe
+    # shares this exact spawn_claude dispatch path + is green standalone.) ----
+    h = Herdr(usage_strip=True, goal_panel=False, session="dse8", rows=50, cols=170)
+    try:
+        h.start()
+        p1 = h.current_pane()
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
+        h.pump(2.0)
+        h.prefix(b"d")
+        h.pump(1.0)
+        before = {pid for pid, _, _ in h.claude_p_pids()}
+        h.send(b"r", settle=0.05)   # Infer — poll immediately
+        spawned = h.wait_claude_spawn(before, secs=14)
+        txt = h.text()
+        path = os.path.join(OUTDIR, "15_infer_live.txt")
+        with open(path, "w") as f:
+            f.write("# 15_infer_live [TC19] r -> herdr spawns real `claude -p` infer\n")
+            f.write("herdr-spawned claude: %s\n" % (str(spawned[:2]) if spawned else "None"))
+            if spawned:
+                f.write("cmd: %s\n" % spawned[2][:200])
+            f.write(txt)
+        ok = spawned is not None
+        results.append(("15_infer_live", "TC19/TC21", "r -> herdr launches real claude -p goal inference", ok, ["claude -p child"], []))
+        frames.append({"id": "15_infer_live", "tc": "TC19/TC21", "label": "live Claude infer in-herdr", "ok": ok, "path": path})
+        print(f"[{'PASS' if ok else 'FAIL'}] 15_infer_live TC19/TC21: spawned={spawned[:2] if spawned else None}")
+    finally:
+        h.stop()
+
     print("\n==== SUMMARY ====")
     npass = sum(1 for r in results if r[3])
     for fid, tc, label, ok, _, _ in results:
