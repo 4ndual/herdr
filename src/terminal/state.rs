@@ -580,7 +580,7 @@ impl TerminalState {
             })
     }
 
-    fn current_session_identity_for_persistence(
+    pub(crate) fn current_session_identity_for_persistence(
         &self,
     ) -> Option<(
         String,

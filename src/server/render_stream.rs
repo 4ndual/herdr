@@ -9,6 +9,19 @@ use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
 use crate::terminal::TerminalRuntimeRegistry;
 
+/// feat/native-dashes: the runtime-side dashboard state the server render path
+/// needs to paint the native usage strip + goal panel. It lives on [`App`], not
+/// [`AppState`], so the server (which renders from `AppState`) must be handed it
+/// explicitly. `None` means "don't paint the dashes" (used by the test-only
+/// `render_virtual` wrapper, which has no `App`).
+///
+/// [`App`]: crate::app::App
+pub(crate) struct DashRender<'a> {
+    pub goal: &'a mut goal_dash_core::App,
+    pub usage_view: &'a mut usage_dash_core::UsageView,
+    pub usage_snapshot: Option<&'a usage_dash_core::UsageSnapshot>,
+}
+
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
@@ -280,6 +293,7 @@ pub(crate) fn render_virtual(
         area,
         resize_panes,
         crate::kitty_graphics::HostCellSize::default(),
+        None,
     )
 }
 
@@ -289,6 +303,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+    dash: Option<DashRender<'_>>,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let pre_compute_suppresses_focused_terminal_cursor =
         focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
@@ -306,6 +321,20 @@ pub(crate) fn render_virtual_with_runtime_registry(
     terminal
         .draw(|frame| {
             crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            // feat/native-dashes: paint the usage strip + goal panel on top of
+            // the panes, using rects carved by compute_view. Mirrors the
+            // direct-mode draw in `App` so the dashes appear for server-rendered
+            // (thin-client) sessions, which are the common deployment.
+            if let Some(dash) = dash {
+                crate::dash::draw(
+                    frame,
+                    app_state.view.usage_dash_area,
+                    app_state.view.goal_dash_area,
+                    dash.goal,
+                    dash.usage_view,
+                    dash.usage_snapshot,
+                );
+            }
         })
         .expect("render to TestBackend should never fail");
 

@@ -3045,6 +3045,7 @@ impl HeadlessServer {
                 area,
                 resize_panes,
                 crate::kitty_graphics::HostCellSize::default(),
+                None,
             );
             crate::render_prof::duration_since("full_render.render_virtual", render_started);
             self.app.full_redraw_pending = false;
@@ -3072,6 +3073,11 @@ impl HeadlessServer {
                                 area,
                                 is_foreground,
                                 cell_size,
+                                Some(crate::server::render_stream::DashRender {
+                                    goal: &mut self.app.goal_dash,
+                                    usage_view: &mut self.app.usage_view,
+                                    usage_snapshot: self.app.usage_snapshot.as_ref(),
+                                }),
                             )
                         } else {
                             crate::server::render_stream::render_virtual_with_runtime_registry(
@@ -3080,6 +3086,11 @@ impl HeadlessServer {
                                 area,
                                 is_foreground,
                                 crate::kitty_graphics::HostCellSize::default(),
+                                Some(crate::server::render_stream::DashRender {
+                                    goal: &mut self.app.goal_dash,
+                                    usage_view: &mut self.app.usage_view,
+                                    usage_snapshot: self.app.usage_snapshot.as_ref(),
+                                }),
                             )
                         };
                     crate::render_prof::duration_since(
@@ -3448,6 +3459,23 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
+
+        // feat/native-dashes: the server renders (clients only blit), so the
+        // dashboard cores must be refreshed here too — not just in the
+        // non-headless `App::handle_scheduled_tasks` loop used by direct mode.
+        // Gated on an actually-rendering client plus a live dashboard so a
+        // clientless or idle, agent-less server does zero per-second dash work
+        // (TC13). The 250ms client-accept poll already wakes this loop, so no
+        // extra deadline is needed for the ~1 Hz tick to fire.
+        if self.has_app_client()
+            && self.app.dashboards_need_tick()
+            && now >= self.app.next_dash_tick
+        {
+            crate::dash::tick(&mut self.app);
+            self.app.next_dash_tick = now + app::DASH_TICK_INTERVAL;
+            changed = true;
+        }
+
         self.app.sync_headless_animation_timer(now);
         changed
     }
