@@ -5,7 +5,16 @@
 //! `refresh(FocusInput) -> GoalSnapshot`, `draw(f, area, &snap, &view)`,
 //! and `handle(key, &mut model) -> Vec<Effect>` (G-F1–G-F16).
 //!
-//! Kept as a compiling placeholder so the workspace builds during Phase 1.
+//! Phase 2 carves the goal-widget core into the modules below. `refresh`,
+//! `handle`, and `draw` remain the Phase-3 host contract and are wired as the
+//! herdr fork gains its goal panel.
+
+pub mod model;
+pub mod store;
+pub mod timegate;
+
+pub use model::{GoalDoc, GoalState, Links, Par, Proposal, St, Sub, Tree};
+pub use store::GoalStore;
 
 use dash_common::{Effect, FocusInput};
 
