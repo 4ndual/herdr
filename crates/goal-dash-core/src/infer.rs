@@ -14,12 +14,10 @@ use serde::Deserialize;
 
 use crate::context::{claude_md_goal, recent_activity, user_prompts};
 use crate::model::{
-    clip_inline, has_real, norm, normalize_parent, now_stamp, GoalDoc, GoalState, Proposal,
-    PromptEntry, Sub, MAX_INLINE, SUB_STATES,
+    clip_inline, has_real, norm, normalize_parent, now_stamp, GoalDoc, GoalState, PromptEntry,
+    Proposal, Sub, MAX_INLINE, SUB_STATES,
 };
-use crate::store::{
-    most_recent_session, move_goal_store, session_cwd, session_jsonl, GoalStore,
-};
+use crate::store::{most_recent_session, move_goal_store, session_cwd, session_jsonl, GoalStore};
 use crate::timegate::{
     candidate_projects, expand_tilde, fill_estimate, plan_inventory_block, project_goal_file,
     project_root,
@@ -113,9 +111,18 @@ fn infer_goal(context: &str) -> Option<String> {
     );
     let out = claude_infer(&prompt, Duration::from_secs(90))?;
     for ln in out.lines() {
-        let ln = ln.trim().trim_start_matches(['-', '*', '•', ' ']).trim().trim_matches('"').trim();
-        if ln.is_empty() { continue; }
-        if looks_like_refusal(ln) { return None; }  // empty-activity refusal, not a goal
+        let ln = ln
+            .trim()
+            .trim_start_matches(['-', '*', '•', ' '])
+            .trim()
+            .trim_matches('"')
+            .trim();
+        if ln.is_empty() {
+            continue;
+        }
+        if looks_like_refusal(ln) {
+            return None;
+        } // empty-activity refusal, not a goal
         return Some(ln.chars().take(MAX_INLINE).collect());
     }
     None
@@ -145,7 +152,9 @@ pub fn run_infer(sid: Option<String>) -> i32 {
     if let Some(cwd) = session_cwd(&target_sid) {
         if let Some(root) = project_root(&cwd) {
             if let Some(g) = claude_md_goal(&root) {
-                context.push_str(&format!("=== PROJECT CLAUDE.md \"## Goal\" (authoritative north-star) ===\n{g}\n\n"));
+                context.push_str(&format!(
+                    "=== PROJECT CLAUDE.md \"## Goal\" (authoritative north-star) ===\n{g}\n\n"
+                ));
                 has_signal = true;
             }
         }
@@ -172,7 +181,16 @@ pub fn run_infer(sid: Option<String>) -> i32 {
     let mut doc = store.load();
     match infer_goal(&context) {
         Some(g) => {
-            doc.main = GoalState { text: g.clone(), source: "agent".into(), approved: false, state: String::new(), updated_at: now_stamp(), set_at: now_stamp(), reason: None, ..Default::default() };
+            doc.main = GoalState {
+                text: g.clone(),
+                source: "agent".into(),
+                approved: false,
+                state: String::new(),
+                updated_at: now_stamp(),
+                set_at: now_stamp(),
+                reason: None,
+                ..Default::default()
+            };
             fill_estimate(&mut doc.main, &store.root());
             let _ = store.save(&doc);
             store.append_history("main", &doc.main);
@@ -181,7 +199,16 @@ pub fn run_infer(sid: Option<String>) -> i32 {
         }
         None => {
             // Honest placeholder; not logged to history (keeps the log free of noise).
-            doc.main = GoalState { text: "(could not infer a goal — press e to set one)".into(), source: "agent".into(), approved: false, state: String::new(), updated_at: now_stamp(), set_at: now_stamp(), reason: None, ..Default::default() };
+            doc.main = GoalState {
+                text: "(could not infer a goal — press e to set one)".into(),
+                source: "agent".into(),
+                approved: false,
+                state: String::new(),
+                updated_at: now_stamp(),
+                set_at: now_stamp(),
+                reason: None,
+                ..Default::default()
+            };
             let _ = store.save(&doc);
             eprintln!("infer: no goal inferred");
             1
@@ -211,19 +238,40 @@ fn infer_tree(activity: &str) -> Option<(String, Vec<String>)> {
 fn parse_infer_tree_json(out: &str) -> Option<(String, Vec<String>)> {
     let start = out.find('{')?;
     let end = out.rfind('}')?;
-    if end < start { return None; }
+    if end < start {
+        return None;
+    }
     let json = &out[start..=end];
     #[derive(Deserialize)]
-    struct Parsed { #[serde(default)] current: String, #[serde(default)] subgoals: Vec<String> }
+    struct Parsed {
+        #[serde(default)]
+        current: String,
+        #[serde(default)]
+        subgoals: Vec<String>,
+    }
     let p: Parsed = serde_json::from_str(json).ok()?;
-    let current: String = p.current.trim().trim_matches('"').chars().take(MAX_INLINE).collect();
-    let current = if looks_like_refusal(&current) { String::new() } else { current };
-    let subs: Vec<String> = p.subgoals.into_iter()
+    let current: String = p
+        .current
+        .trim()
+        .trim_matches('"')
+        .chars()
+        .take(MAX_INLINE)
+        .collect();
+    let current = if looks_like_refusal(&current) {
+        String::new()
+    } else {
+        current
+    };
+    let subs: Vec<String> = p
+        .subgoals
+        .into_iter()
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty() && !looks_like_refusal(s))
         .map(|s| s.chars().take(MAX_INLINE).collect())
         .collect();
-    if current.is_empty() && subs.is_empty() { return None; }
+    if current.is_empty() && subs.is_empty() {
+        return None;
+    }
     Some((current, subs))
 }
 
@@ -231,7 +279,9 @@ fn parse_infer_tree_json(out: &str) -> Option<(String, Vec<String>)> {
 /// set `current` only if empty/agent-unapproved; add only agent subgoals whose text is new (dedup),
 /// never touching user-added, approved, or discarded subs.
 pub fn run_infer_tree(sid: &str) -> i32 {
-    let activity = session_jsonl(sid).map(|p| recent_activity(&p, 18)).unwrap_or_default();
+    let activity = session_jsonl(sid)
+        .map(|p| recent_activity(&p, 18))
+        .unwrap_or_default();
     let Some((current, subs)) = infer_tree(&activity) else {
         eprintln!("infer-tree: nothing inferred");
         return 1;
@@ -240,27 +290,58 @@ pub fn run_infer_tree(sid: &str) -> i32 {
     let mut doc = store.load();
     // current: only fill if there is no user/approved current goal yet.
     let mut changed_current = false;
-    if !current.is_empty() && (!has_real(&doc.current.text) || (doc.current.source == "agent" && !doc.current.approved)) {
-        doc.current = GoalState { text: current.clone(), source: "agent".into(), approved: false, state: String::new(), updated_at: now_stamp(), set_at: now_stamp(), reason: None, ..Default::default() };
+    if !current.is_empty()
+        && (!has_real(&doc.current.text)
+            || (doc.current.source == "agent" && !doc.current.approved))
+    {
+        doc.current = GoalState {
+            text: current.clone(),
+            source: "agent".into(),
+            approved: false,
+            state: String::new(),
+            updated_at: now_stamp(),
+            set_at: now_stamp(),
+            reason: None,
+            ..Default::default()
+        };
         fill_estimate(&mut doc.current, &store.root());
         changed_current = true;
     }
     // subs: add new agent suggestions, deduped by normalized text against ALL existing subs.
-    let mut seen: std::collections::HashSet<String> = doc.subs.iter().map(|s| norm(&s.text)).collect();
+    let mut seen: std::collections::HashSet<String> =
+        doc.subs.iter().map(|s| norm(&s.text)).collect();
     let mut new_subs: Vec<Sub> = Vec::new();
     for s in subs {
         let n = norm(&s);
-        if n.is_empty() || seen.contains(&n) { continue; }
+        if n.is_empty() || seen.contains(&n) {
+            continue;
+        }
         seen.insert(n);
         let id = doc.next_id;
         doc.next_id += 1;
-        new_subs.push(Sub { id, text: s.clone(), source: "agent".into(), approved: false, state: "active".into(), parent: "current".into(), created_at: now_stamp(), updated_at: now_stamp(), pinned: false });
+        new_subs.push(Sub {
+            id,
+            text: s.clone(),
+            source: "agent".into(),
+            approved: false,
+            state: "active".into(),
+            parent: "current".into(),
+            created_at: now_stamp(),
+            updated_at: now_stamp(),
+            pinned: false,
+        });
     }
     let added = new_subs.len();
-    for sub in &new_subs { doc.subs.push(sub.clone()); }
+    for sub in &new_subs {
+        doc.subs.push(sub.clone());
+    }
     let _ = store.save(&doc);
-    if changed_current { store.append_history("current", &doc.current); }
-    for sub in &new_subs { store.append_history(&format!("sub-{}", sub.id), &sub.snapshot()); }
+    if changed_current {
+        store.append_history("current", &doc.current);
+    }
+    for sub in &new_subs {
+        store.append_history(&format!("sub-{}", sub.id), &sub.snapshot());
+    }
     println!("current set; +{added} subgoals");
     0
 }
@@ -282,19 +363,28 @@ fn claude_observe(prompt: String, timeout: Duration) -> Option<String> {
         .spawn()
         .ok()?;
     if let Some(mut si) = child.stdin.take() {
-        std::thread::spawn(move || { use std::io::Write; let _ = si.write_all(prompt.as_bytes()); });
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = si.write_all(prompt.as_bytes());
+        });
     }
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !status.success() { return None; }
+                if !status.success() {
+                    return None;
+                }
                 let mut out = String::new();
                 child.stdout.take()?.read_to_string(&mut out).ok()?;
                 return Some(out);
             }
             Ok(None) => {
-                if start.elapsed() > timeout { let _ = child.kill(); let _ = child.wait(); return None; }
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(_) => return None,
@@ -306,17 +396,28 @@ fn claude_observe(prompt: String, timeout: Duration) -> Option<String> {
 /// results, truncated), and return that rendering plus the new total non-empty-line count (the cursor).
 pub fn transcript_delta(path: &Path, since: usize) -> (String, usize) {
     use serde_json::Value;
-    let Ok(content) = fs::read_to_string(path) else { return (String::new(), since) };
+    let Ok(content) = fs::read_to_string(path) else {
+        return (String::new(), since);
+    };
     let mut idx = 0usize;
     let mut out: Vec<String> = Vec::new();
     for raw in content.lines() {
         let raw = raw.trim();
-        if raw.is_empty() { continue; }
-        let cur = idx; idx += 1;
-        if cur < since { continue; }
-        let Ok(e) = serde_json::from_str::<Value>(raw) else { continue };
+        if raw.is_empty() {
+            continue;
+        }
+        let cur = idx;
+        idx += 1;
+        if cur < since {
+            continue;
+        }
+        let Ok(e) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
         let role = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "user" && role != "assistant" { continue; }
+        if role != "user" && role != "assistant" {
+            continue;
+        }
         let content = e.get("message").and_then(|m| m.get("content"));
         let mut text = String::new();
         match content {
@@ -325,15 +426,32 @@ pub fn transcript_delta(path: &Path, since: usize) -> (String, usize) {
                 let mut parts: Vec<String> = Vec::new();
                 for b in blocks {
                     match b.get("type").and_then(|t| t.as_str()) {
-                        Some("text") => if let Some(t) = b.get("text").and_then(|t| t.as_str()) { parts.push(t.to_string()); },
-                        Some("tool_use") => if let Some(n) = b.get("name").and_then(|t| t.as_str()) { parts.push(format!("[tool:{n}]")); },
+                        Some("text") => {
+                            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                parts.push(t.to_string());
+                            }
+                        }
+                        Some("tool_use") => {
+                            if let Some(n) = b.get("name").and_then(|t| t.as_str()) {
+                                parts.push(format!("[tool:{n}]"));
+                            }
+                        }
                         Some("tool_result") => {
                             let s = match b.get("content") {
                                 Some(Value::String(s)) => s.clone(),
-                                Some(Value::Array(a)) => a.iter().filter_map(|x| x.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join(" "),
+                                Some(Value::Array(a)) => a
+                                    .iter()
+                                    .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
                                 _ => String::new(),
                             };
-                            if !s.is_empty() { parts.push(format!("[result: {}]", s.chars().take(200).collect::<String>())); }
+                            if !s.is_empty() {
+                                parts.push(format!(
+                                    "[result: {}]",
+                                    s.chars().take(200).collect::<String>()
+                                ));
+                            }
                         }
                         _ => {}
                     }
@@ -353,26 +471,43 @@ pub fn transcript_delta(path: &Path, since: usize) -> (String, usize) {
 
 /// Count of non-empty transcript lines (the observer's cursor unit).
 pub fn transcript_line_count(path: &Path) -> usize {
-    fs::read_to_string(path).map(|c| c.lines().filter(|l| !l.trim().is_empty()).count()).unwrap_or(0)
+    fs::read_to_string(path)
+        .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// True if a genuine USER PROMPT (text, not a tool-result echo) appears at/after line index `since`.
 pub fn has_new_user_prompt(path: &Path, since: usize) -> bool {
     use serde_json::Value;
-    let Ok(content) = fs::read_to_string(path) else { return false };
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
     let mut idx = 0usize;
     for raw in content.lines() {
         let raw = raw.trim();
-        if raw.is_empty() { continue; }
-        let cur = idx; idx += 1;
-        if cur < since { continue; }
-        let Ok(e) = serde_json::from_str::<Value>(raw) else { continue };
-        if e.get("type").and_then(|v| v.as_str()) != Some("user") { continue; }
+        if raw.is_empty() {
+            continue;
+        }
+        let cur = idx;
+        idx += 1;
+        if cur < since {
+            continue;
+        }
+        let Ok(e) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        if e.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
         match e.get("message").and_then(|m| m.get("content")) {
             Some(Value::String(s)) if !s.trim().is_empty() => return true,
             Some(Value::Array(blocks)) => {
-                if blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && b.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.trim().is_empty())) {
+                if blocks.iter().any(|b| {
+                    b.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && b.get("text")
+                            .and_then(|t| t.as_str())
+                            .is_some_and(|t| !t.trim().is_empty())
+                }) {
                     return true;
                 }
             }
@@ -383,43 +518,75 @@ pub fn has_new_user_prompt(path: &Path, since: usize) -> bool {
 }
 
 #[derive(Deserialize, Default)]
-struct TextReason { #[serde(default)] text: String, #[serde(default)] reason: String }
-#[derive(Deserialize, Default)]
-struct CurrentOp { #[serde(default)] action: String, #[serde(default)] text: String, #[serde(default)] reason: String }
-#[derive(Deserialize, Default)]
-struct SubOp {
-    #[serde(default)] op: String,
-    #[serde(default)] id: Option<u64>,
-    #[serde(default)] text: Option<String>,
-    #[serde(default)] state: Option<String>,
-    #[serde(default)] parent: Option<String>,
-    #[serde(default)] reason: String,
+struct TextReason {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    reason: String,
 }
 #[derive(Deserialize, Default)]
-struct ConstraintSuggestion { #[serde(default)] entity: String, #[serde(default)] text: String, #[serde(default)] reason: String }
+struct CurrentOp {
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    reason: String,
+}
+#[derive(Deserialize, Default)]
+struct SubOp {
+    #[serde(default)]
+    op: String,
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+#[derive(Deserialize, Default)]
+struct ConstraintSuggestion {
+    #[serde(default)]
+    entity: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    reason: String,
+}
 #[derive(Deserialize, Default)]
 struct ObserverDecision {
-    #[serde(default)] paraphrase: String,
-    #[serde(default)] main_suggestion: Option<TextReason>,
-    #[serde(default)] current: Option<CurrentOp>,
-    #[serde(default)] subs: Vec<SubOp>,
-    #[serde(default)] constraints: Vec<ConstraintSuggestion>,
+    #[serde(default)]
+    paraphrase: String,
+    #[serde(default)]
+    main_suggestion: Option<TextReason>,
+    #[serde(default)]
+    current: Option<CurrentOp>,
+    #[serde(default)]
+    subs: Vec<SubOp>,
+    #[serde(default)]
+    constraints: Vec<ConstraintSuggestion>,
 }
 
 /// Pull the JSON object out of the model's output (tolerates ``` fences / prose) and parse it.
 fn parse_observer(out: &str) -> Option<ObserverDecision> {
     let start = out.find('{')?;
     let end = out.rfind('}')?;
-    if end < start { return None; }
+    if end < start {
+        return None;
+    }
     serde_json::from_str(&out[start..=end]).ok()
 }
 
 /// The sorter agent's decision: which existing folder a session's goal docs belong to.
 #[derive(Clone, Debug, PartialEq)]
 struct SortDecision {
-    project_dir: String,        // an absolute path copied verbatim from the candidate folders
-    project_key: String,        // short stable key to index the project's plans by (THREAD project)
-    plan_basenames: Vec<String>,// plan files the agent thinks belong here (advisory; never moved)
+    project_dir: String, // an absolute path copied verbatim from the candidate folders
+    project_key: String, // short stable key to index the project's plans by (THREAD project)
+    plan_basenames: Vec<String>, // plan files the agent thinks belong here (advisory; never moved)
     reason: String,
 }
 
@@ -427,37 +594,86 @@ struct SortDecision {
 /// ("NO MATCH" carries no braces, so it falls out here). `project_dir` is required and non-empty; the
 /// rest default. Pure — invents nothing. Returns `None` on a refusal or unparseable / dir-less output.
 fn parse_sort(out: &str) -> Option<SortDecision> {
-    if looks_like_refusal(out) { return None; }
+    if looks_like_refusal(out) {
+        return None;
+    }
     let start = out.find('{')?;
     let end = out.rfind('}')?;
-    if end < start { return None; }
+    if end < start {
+        return None;
+    }
     let v: serde_json::Value = serde_json::from_str(&out[start..=end]).ok()?;
-    let project_dir = v.get("project_dir").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    if project_dir.is_empty() { return None; }
-    let project_key = v.get("project_key").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let plan_basenames = v.get("plan_basenames").and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.to_string()).collect())
+    let project_dir = v
+        .get("project_dir")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if project_dir.is_empty() {
+        return None;
+    }
+    let project_key = v
+        .get("project_key")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let plan_basenames = v
+        .get("plan_basenames")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
         .unwrap_or_default();
-    let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    Some(SortDecision { project_dir, project_key, plan_basenames, reason })
+    let reason = v
+        .get("reason")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Some(SortDecision {
+        project_dir,
+        project_key,
+        plan_basenames,
+        reason,
+    })
 }
 
 /// A picked folder is valid ONLY if it exists AND is one of the candidates we offered (no fabricated /
 /// off-list folder, no path traversal to somewhere we never proposed). Compares by canonical path when
 /// possible so `~`-expanded / symlinked forms still match. Pure.
 fn validate_pick(dir: &Path, candidates: &[PathBuf]) -> bool {
-    if !dir.is_dir() { return false; }
+    if !dir.is_dir() {
+        return false;
+    }
     let canon = std::fs::canonicalize(dir).ok();
-    candidates.iter().any(|c| c == dir || (canon.is_some() && std::fs::canonicalize(c).ok() == canon))
+    candidates
+        .iter()
+        .any(|c| c == dir || (canon.is_some() && std::fs::canonicalize(c).ok() == canon))
 }
 
 /// Compact JSON view of the tree handed to the observer (ownership made explicit).
 fn goal_context_json(doc: &GoalDoc) -> String {
-    let owner = |source: &str, approved: bool, pinned: bool| if pinned || source == "user" || approved { "user" } else { "agent" };
-    let subs: Vec<serde_json::Value> = doc.subs.iter().map(|s| serde_json::json!({
-        "id": s.id, "text": s.text, "state": s.state, "parent": s.parent,
-        "owner": owner(&s.source, s.approved, s.pinned)
-    })).collect();
+    let owner = |source: &str, approved: bool, pinned: bool| {
+        if pinned || source == "user" || approved {
+            "user"
+        } else {
+            "agent"
+        }
+    };
+    let subs: Vec<serde_json::Value> = doc
+        .subs
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id, "text": s.text, "state": s.state, "parent": s.parent,
+                "owner": owner(&s.source, s.approved, s.pinned)
+            })
+        })
+        .collect();
     serde_json::json!({
         "main":    { "text": doc.main.text,    "owner": owner(&doc.main.source, doc.main.approved, false) },
         "current": { "text": doc.current.text, "owner": owner(&doc.current.source, doc.current.approved, false) },
@@ -468,9 +684,22 @@ fn goal_context_json(doc: &GoalDoc) -> String {
 /// Queue a proposal (MAIN change, or a CURRENT change the user owns). Skips dismissed/duplicate ideas.
 fn propose(doc: &mut GoalDoc, kind: &str, text: &str, reason: &str) -> bool {
     let n = norm(text);
-    if n.is_empty() || doc.dismissed.iter().any(|d| *d == n) { return false; }
-    if doc.proposals.iter().any(|p| p.kind == kind && norm(&p.text) == n) { return false; }
-    doc.proposals.push(Proposal { kind: kind.into(), text: clip_inline(text), reason: clip_inline(reason), ts: now_stamp() });
+    if n.is_empty() || doc.dismissed.iter().any(|d| *d == n) {
+        return false;
+    }
+    if doc
+        .proposals
+        .iter()
+        .any(|p| p.kind == kind && norm(&p.text) == n)
+    {
+        return false;
+    }
+    doc.proposals.push(Proposal {
+        kind: kind.into(),
+        text: clip_inline(text),
+        reason: clip_inline(reason),
+        ts: now_stamp(),
+    });
     true
 }
 
@@ -485,17 +714,36 @@ fn apply_observer(doc: &mut GoalDoc, store: &GoalStore, d: ObserverDecision) -> 
     // ---- CURRENT: auto iff agent-owned, else downgrade to a suggestion ----
     if let Some(c) = d.current {
         let text: String = c.text.trim().chars().take(MAX_INLINE).collect();
-        let wants = matches!(c.action.as_str(), "replace" | "suggest") && has_real(&text) && !looks_like_refusal(&text) && norm(&text) != norm(&doc.current.text);
+        let wants = matches!(c.action.as_str(), "replace" | "suggest")
+            && has_real(&text)
+            && !looks_like_refusal(&text)
+            && norm(&text) != norm(&doc.current.text);
         if wants {
             let user_owns = doc.current.source == "user" || doc.current.approved;
             if user_owns {
-                if propose(doc, "current", &text, &c.reason) { actions.push("current?"); if reason_acc.is_empty() { reason_acc = c.reason.clone(); } }
+                if propose(doc, "current", &text, &c.reason) {
+                    actions.push("current?");
+                    if reason_acc.is_empty() {
+                        reason_acc = c.reason.clone();
+                    }
+                }
             } else {
-                doc.current = GoalState { text, source: "agent".into(), approved: false, state: String::new(), updated_at: now_stamp(), set_at: now_stamp(), reason: Some(c.reason.clone()), ..Default::default() };
+                doc.current = GoalState {
+                    text,
+                    source: "agent".into(),
+                    approved: false,
+                    state: String::new(),
+                    updated_at: now_stamp(),
+                    set_at: now_stamp(),
+                    reason: Some(c.reason.clone()),
+                    ..Default::default()
+                };
                 fill_estimate(&mut doc.current, &store.root());
                 hist.push(("current".into(), doc.current.clone()));
                 actions.push("current");
-                if reason_acc.is_empty() { reason_acc = c.reason.clone(); }
+                if reason_acc.is_empty() {
+                    reason_acc = c.reason.clone();
+                }
             }
         }
     }
@@ -503,40 +751,98 @@ fn apply_observer(doc: &mut GoalDoc, store: &GoalStore, d: ObserverDecision) -> 
     // ---- MAIN: never auto — always a suggestion ----
     if let Some(m) = d.main_suggestion {
         let text: String = clip_inline(m.text.trim());
-        if has_real(&text) && !looks_like_refusal(&text) && norm(&text) != norm(&doc.main.text)
-            && propose(doc, "main", &text, &m.reason) { actions.push("main?"); if reason_acc.is_empty() { reason_acc = m.reason.clone(); } }
+        if has_real(&text)
+            && !looks_like_refusal(&text)
+            && norm(&text) != norm(&doc.main.text)
+            && propose(doc, "main", &text, &m.reason)
+        {
+            actions.push("main?");
+            if reason_acc.is_empty() {
+                reason_acc = m.reason.clone();
+            }
+        }
     }
 
     // ---- SUBS: agent-managed; user-pinned subs are off-limits ----
     for op in d.subs {
         match op.op.as_str() {
             "add" => {
-                let text: String = op.text.unwrap_or_default().trim().chars().take(MAX_INLINE).collect();
+                let text: String = op
+                    .text
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(MAX_INLINE)
+                    .collect();
                 let n = norm(&text);
-                if n.is_empty() || looks_like_refusal(&text) || doc.subs.iter().any(|s| norm(&s.text) == n) { continue; }
+                if n.is_empty()
+                    || looks_like_refusal(&text)
+                    || doc.subs.iter().any(|s| norm(&s.text) == n)
+                {
+                    continue;
+                }
                 let parent = normalize_parent(op.parent.as_deref().unwrap_or("current"));
-                let id = doc.next_id; doc.next_id += 1;
-                let sub = Sub { id, text, source: "agent".into(), approved: false, state: "active".into(), parent, created_at: now_stamp(), updated_at: now_stamp(), pinned: false };
-                let mut snap = sub.snapshot(); snap.reason = Some(op.reason.clone());
+                let id = doc.next_id;
+                doc.next_id += 1;
+                let sub = Sub {
+                    id,
+                    text,
+                    source: "agent".into(),
+                    approved: false,
+                    state: "active".into(),
+                    parent,
+                    created_at: now_stamp(),
+                    updated_at: now_stamp(),
+                    pinned: false,
+                };
+                let mut snap = sub.snapshot();
+                snap.reason = Some(op.reason.clone());
                 hist.push((format!("sub-{id}"), snap));
                 doc.subs.push(sub);
                 actions.push("sub+");
             }
             "update" | "state" | "discard" | "reparent" => {
                 let Some(id) = op.id else { continue };
-                let Some(sub) = doc.subs.iter_mut().find(|s| s.id == id) else { continue };
-                if sub.pinned || sub.source == "user" || sub.approved { continue; } // your override sticks
+                let Some(sub) = doc.subs.iter_mut().find(|s| s.id == id) else {
+                    continue;
+                };
+                if sub.pinned || sub.source == "user" || sub.approved {
+                    continue;
+                } // your override sticks
                 let mut touched = false;
                 match op.op.as_str() {
-                    "discard" => { sub.state = "discarded".into(); touched = true; }
-                    "state" => if let Some(st) = op.state.as_deref() { if SUB_STATES.contains(&st) { sub.state = st.into(); touched = true; } },
-                    "reparent" => if let Some(p) = op.parent.as_deref() { sub.parent = normalize_parent(p); touched = true; },
-                    "update" => if let Some(t) = op.text.as_deref() { if has_real(t) && !looks_like_refusal(t) { sub.text = t.trim().chars().take(MAX_INLINE).collect(); touched = true; } },
+                    "discard" => {
+                        sub.state = "discarded".into();
+                        touched = true;
+                    }
+                    "state" => {
+                        if let Some(st) = op.state.as_deref() {
+                            if SUB_STATES.contains(&st) {
+                                sub.state = st.into();
+                                touched = true;
+                            }
+                        }
+                    }
+                    "reparent" => {
+                        if let Some(p) = op.parent.as_deref() {
+                            sub.parent = normalize_parent(p);
+                            touched = true;
+                        }
+                    }
+                    "update" => {
+                        if let Some(t) = op.text.as_deref() {
+                            if has_real(t) && !looks_like_refusal(t) {
+                                sub.text = t.trim().chars().take(MAX_INLINE).collect();
+                                touched = true;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 if touched {
                     sub.updated_at = now_stamp();
-                    let mut snap = sub.snapshot(); snap.reason = Some(op.reason.clone());
+                    let mut snap = sub.snapshot();
+                    snap.reason = Some(op.reason.clone());
                     hist.push((format!("sub-{id}"), snap));
                     actions.push("sub~");
                 }
@@ -547,24 +853,53 @@ fn apply_observer(doc: &mut GoalDoc, store: &GoalStore, d: ObserverDecision) -> 
 
     // ---- CONSTRAINTS: agent only ever SUGGESTS (as a proposal); user must accept. Never auto-added.
     for cs in d.constraints {
-        let entity = if cs.entity == "main" { "main" } else { "current" };
+        let entity = if cs.entity == "main" {
+            "main"
+        } else {
+            "current"
+        };
         let text: String = cs.text.trim().chars().take(MAX_INLINE).collect();
-        if !has_real(&text) { continue; }
+        if !has_real(&text) {
+            continue;
+        }
         let n = norm(&text);
-        if doc.constraints.iter().any(|c| c.entity == entity && norm(&c.text) == n) { continue; } // already a bound
-        if propose(doc, &format!("constraint:{entity}"), &text, &cs.reason) { actions.push("constraint?"); }
+        if doc
+            .constraints
+            .iter()
+            .any(|c| c.entity == entity && norm(&c.text) == n)
+        {
+            continue;
+        } // already a bound
+        if propose(doc, &format!("constraint:{entity}"), &text, &cs.reason) {
+            actions.push("constraint?");
+        }
     }
 
-    for (entity, snap) in &hist { store.append_history(entity, snap); }
-    let action = if actions.is_empty() { "noop".to_string() } else { actions.join(",") };
-    PromptEntry { ts: now_stamp(), paraphrase: d.paraphrase.trim().chars().take(240).collect(), action, reason: reason_acc.chars().take(200).collect() }
+    for (entity, snap) in &hist {
+        store.append_history(entity, snap);
+    }
+    let action = if actions.is_empty() {
+        "noop".to_string()
+    } else {
+        actions.join(",")
+    };
+    PromptEntry {
+        ts: now_stamp(),
+        paraphrase: d.paraphrase.trim().chars().take(240).collect(),
+        action,
+        reason: reason_acc.chars().take(200).collect(),
+    }
 }
 
 /// Build the full observer prompt (instructions + ownership rules + tree + prompt-log + new activity).
 fn build_observer_prompt(doc: &GoalDoc, log_tail: &[PromptEntry], delta: &str) -> String {
     let mut log = String::new();
-    for e in log_tail { log.push_str(&format!("- ({}) {} [{}]\n", e.ts, e.paraphrase, e.action)); }
-    if log.is_empty() { log.push_str("(none yet)\n"); }
+    for e in log_tail {
+        log.push_str(&format!("- ({}) {} [{}]\n", e.ts, e.paraphrase, e.action));
+    }
+    if log.is_empty() {
+        log.push_str("(none yet)\n");
+    }
     format!(
         "You are the GOAL OBSERVER for a developer's coding session. You silently maintain a goal tree:\n\
          MAIN = the long-running north-star goal; CURRENT = the goal being worked on right now; SUBS =\n\
@@ -610,14 +945,20 @@ fn build_observer_prompt(doc: &GoalDoc, log_tail: &[PromptEntry], delta: &str) -
 
 /// `goal-widget --observe <sid>`: process new turns since the cursor, update the tree, log the prompt.
 pub fn run_observe(sid: &str) -> i32 {
-    let Some(path) = session_jsonl(sid) else { eprintln!("observe: no transcript for {sid}"); return 1; };
+    let Some(path) = session_jsonl(sid) else {
+        eprintln!("observe: no transcript for {sid}");
+        return 1;
+    };
     let store = GoalStore::resolve(sid);
     let mut doc = store.load();
     let since = doc.last_turn as usize;
     let (delta, total) = transcript_delta(&path, since);
     if total <= since || delta.trim().is_empty() {
         // nothing new to interpret — advance cursor so we don't rescan, write nothing.
-        if total != since { doc.last_turn = total as u64; let _ = store.save(&doc); }
+        if total != since {
+            doc.last_turn = total as u64;
+            let _ = store.save(&doc);
+        }
         return 0;
     }
     let log = store.read_prompt_log();
@@ -646,10 +987,26 @@ pub fn run_observe(sid: &str) -> i32 {
 /// Build the SORTER prompt: from the goals + recent prompts, pick which EXISTING candidate folder these
 /// docs belong to. Folders + plans are given verbatim so the agent copies a real path (never invents one).
 fn build_sort_prompt(doc: &GoalDoc, prompts: &str, candidates: &[PathBuf], plans: &str) -> String {
-    let cand = candidates.iter().map(|p| format!("- {}", p.display())).collect::<Vec<_>>().join("\n");
-    let main = if has_real(&doc.main.text) { doc.main.text.as_str() } else { "—" };
-    let current = if has_real(&doc.current.text) { doc.current.text.as_str() } else { "—" };
-    let prompts = if prompts.trim().is_empty() { "—" } else { prompts };
+    let cand = candidates
+        .iter()
+        .map(|p| format!("- {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let main = if has_real(&doc.main.text) {
+        doc.main.text.as_str()
+    } else {
+        "—"
+    };
+    let current = if has_real(&doc.current.text) {
+        doc.current.text.as_str()
+    } else {
+        "—"
+    };
+    let prompts = if prompts.trim().is_empty() {
+        "—"
+    } else {
+        prompts
+    };
     format!(
         "You are a documentation SORTER for an unorganized developer workspace. Given a session's goals\n\
          and recent requests, decide which EXISTING project folder these goal documents belong to. Pick\n\
@@ -675,17 +1032,28 @@ pub fn run_sort(sid: &str) -> i32 {
     let mut doc = store.load();
     let cwd = session_cwd(sid);
     let candidates = candidate_projects(cwd.as_deref());
-    if candidates.is_empty() { eprintln!("sort: no candidate project folders under ~/Projects"); return 1; }
-    let prompts = session_jsonl(sid).map(|p| user_prompts(&p, 8)).unwrap_or_default();
+    if candidates.is_empty() {
+        eprintln!("sort: no candidate project folders under ~/Projects");
+        return 1;
+    }
+    let prompts = session_jsonl(sid)
+        .map(|p| user_prompts(&p, 8))
+        .unwrap_or_default();
     let prompt = build_sort_prompt(&doc, &prompts, &candidates, &plan_inventory_block());
     let Some(out) = claude_observe(prompt, Duration::from_secs(180)) else {
         eprintln!("sort: agent produced no output");
         return 1;
     };
-    let Some(dec) = parse_sort(&out) else { eprintln!("sort: no confident match (refusal / unparseable)"); return 1; };
+    let Some(dec) = parse_sort(&out) else {
+        eprintln!("sort: no confident match (refusal / unparseable)");
+        return 1;
+    };
     let dir = expand_tilde(&dec.project_dir);
     if !validate_pick(&dir, &candidates) {
-        eprintln!("sort: '{}' is not an existing candidate folder — nothing moved", dir.display());
+        eprintln!(
+            "sort: '{}' is not an existing candidate folder — nothing moved",
+            dir.display()
+        );
         return 1;
     }
     let dest = project_goal_file(&dir);
@@ -695,15 +1063,22 @@ pub fn run_sort(sid: &str) -> i32 {
         println!("sort: already sorted in {}", dir.display());
         return 0;
     }
-    if key_changes { doc.project_key = new_key.to_string(); }
+    if key_changes {
+        doc.project_key = new_key.to_string();
+    }
     // persist the key on the current store first (covers the already-in-folder, key-only case)
     let _ = store.save(&doc);
     match move_goal_store(&store, &doc, &dir) {
-        Ok(_) => { println!("sort: moved to {} (key={})", dir.display(), doc.project_key); 0 }
-        Err(e) => { eprintln!("sort: move failed: {e}"); 1 }
+        Ok(_) => {
+            println!("sort: moved to {} (key={})", dir.display(), doc.project_key);
+            0
+        }
+        Err(e) => {
+            eprintln!("sort: move failed: {e}");
+            1
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -744,7 +1119,10 @@ mod tests {
     fn parse_infer_tree_json_drops_refusal_text() {
         // A refusal disguised as JSON yields no usable goal.
         let out = r#"{"current":"Provide activity data to analyze","subgoals":["No recent activity provided after '--- activity ---' line","Please share the developer's session activity"]}"#;
-        assert!(parse_infer_tree_json(out).is_none(), "refusal JSON must be rejected");
+        assert!(
+            parse_infer_tree_json(out).is_none(),
+            "refusal JSON must be rejected"
+        );
         // A real reply still parses, and any stray refusal sub is filtered out.
         let out2 = r#"{"current":"Wire up the plans section","subgoals":["Add list_project_plans","Please provide activity"]}"#;
         let (cur, subs) = parse_infer_tree_json(out2).unwrap();

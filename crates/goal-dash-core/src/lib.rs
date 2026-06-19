@@ -12,6 +12,8 @@
 pub mod context;
 pub mod infer;
 pub mod model;
+pub mod render;
+pub mod state;
 pub mod store;
 pub mod timegate;
 pub mod view;

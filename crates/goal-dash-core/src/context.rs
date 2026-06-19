@@ -6,15 +6,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn recent_activity(path: &PathBuf, max_msgs: usize) -> String {
-    let Ok(content) = fs::read_to_string(path) else { return String::new() };
+pub fn recent_activity(path: &PathBuf, max_msgs: usize) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
     let mut lines: Vec<String> = Vec::new();
     for raw in content.lines() {
         let raw = raw.trim();
         if raw.is_empty() {
             continue;
         }
-        let Ok(e) = serde_json::from_str::<serde_json::Value>(raw) else { continue };
+        let Ok(e) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
         let role = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if role != "user" && role != "assistant" {
             continue;
@@ -45,44 +49,63 @@ fn recent_activity(path: &PathBuf, max_msgs: usize) -> String {
 
 /// The project's stated goal: the `## Goal` section of `<root>/CLAUDE.md` (the user's own convention),
 /// captured until the next `## ` heading. Best single source of the north-star MAIN goal.
-fn claude_md_goal(root: &Path) -> Option<String> {
+pub fn claude_md_goal(root: &Path) -> Option<String> {
     let content = fs::read_to_string(root.join("CLAUDE.md")).ok()?;
     let mut out = String::new();
     let mut in_goal = false;
     for line in content.lines() {
         let t = line.trim_start();
         if t.starts_with("## ") {
-            if in_goal { break; }                       // end of the Goal section
+            if in_goal {
+                break;
+            } // end of the Goal section
             in_goal = t[3..].trim().to_lowercase().starts_with("goal");
             continue;
         }
-        if in_goal { out.push_str(line); out.push('\n'); }
+        if in_goal {
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     let out = out.trim();
-    if out.is_empty() { None } else { Some(out.chars().take(1500).collect()) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.chars().take(1500).collect())
+    }
 }
 
 /// The developer's own prompts (the "sum of what they asked for"), oldest→newest, skipping
 /// tool-result echoes and meta lines. This is the throughline the north-star MAIN goal should track.
-fn user_prompts(path: &Path, max_msgs: usize) -> String {
-    let Ok(content) = fs::read_to_string(path) else { return String::new() };
+pub fn user_prompts(path: &Path, max_msgs: usize) -> String {
+    let Ok(content) = fs::read_to_string(path) else {
+        return String::new();
+    };
     let mut prompts: Vec<String> = Vec::new();
     for raw in content.lines() {
-        let Ok(e) = serde_json::from_str::<serde_json::Value>(raw.trim()) else { continue };
-        if e.get("type").and_then(|v| v.as_str()) != Some("user") { continue }
+        let Ok(e) = serde_json::from_str::<serde_json::Value>(raw.trim()) else {
+            continue;
+        };
+        if e.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
         let c = e.get("message").and_then(|m| m.get("content"));
         let text = match c {
             Some(serde_json::Value::String(s)) => s.clone(),
             // array form: keep only genuine text blocks (skip tool_result / images)
-            Some(serde_json::Value::Array(blocks)) => blocks.iter()
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
                 .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>().join(" "),
+                .collect::<Vec<_>>()
+                .join(" "),
             _ => String::new(),
         };
         let text = text.trim().replace('\n', " ");
         // skip command/hook noise and empty/tool-only turns
-        if text.is_empty() || text.starts_with("<") || text.starts_with("Caveat:") { continue }
+        if text.is_empty() || text.starts_with("<") || text.starts_with("Caveat:") {
+            continue;
+        }
         prompts.push(format!("- {}", text.chars().take(200).collect::<String>()));
     }
     let start = prompts.len().saturating_sub(max_msgs);
@@ -93,11 +116,34 @@ fn user_prompts(path: &Path, max_msgs: usize) -> String {
 /// hands in the goals (already in memory) and the recent-prompts block (from `user_prompts`), plus the
 /// resolved transcript path and session cwd for the reconstruction scaffold. A missing goal renders as
 /// a dash — never a fabricated line. Scaffold wording mirrors `~/.claude/hooks/compact-context/briefing.md`.
-fn compose_rebrief(main: Option<&str>, current: &str, prompts: &str, transcript: &Path, cwd: &Path) -> String {
+pub fn compose_rebrief(
+    main: Option<&str>,
+    current: &str,
+    prompts: &str,
+    transcript: &Path,
+    cwd: &Path,
+) -> String {
     let dash = "—";
-    let main = main.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(dash);
-    let current = { let c = current.trim(); if c.is_empty() { dash } else { c } };
-    let prompts = { let p = prompts.trim(); if p.is_empty() { dash } else { p } };
+    let main = main
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(dash);
+    let current = {
+        let c = current.trim();
+        if c.is_empty() {
+            dash
+        } else {
+            c
+        }
+    };
+    let prompts = {
+        let p = prompts.trim();
+        if p.is_empty() {
+            dash
+        } else {
+            p
+        }
+    };
     let tp = transcript.display();
     let cwd = cwd.display();
     format!(
@@ -137,7 +183,7 @@ If something looks wrong, NEVER default-assume it was a past mistake — grep th
 /// The single-line prompt sent after `/clear` that points Claude at the staged briefing file. MUST be
 /// one line — `cmux send` turns every newline into Enter, so any newline here would submit early and
 /// shred the rest. The full multi-line briefing lives in the file at `path`; Claude reads it.
-fn rebrief_read_prompt(path: &str) -> String {
+pub fn rebrief_read_prompt(path: &str) -> String {
     format!(
         "Carry-forward briefing after a TRUE /clear (NOT a compaction). Read {path} in full now and \
          reconstruct working state from it before doing anything else."
@@ -153,12 +199,22 @@ fn rebrief_read_prompt(path: &str) -> String {
 /// rather than the brief itself: `cmux send` (and `paste-buffer`) convert every newline to Enter, so a
 /// multi-line payload submits per-line and is shredded in transit (proven against a real surface). A
 /// single-line prompt has no newline to break on; Claude reads the staged brief in full.
-fn clear_rebrief_cmds(surface: &str, brief_path: &str) -> Vec<Vec<String>> {
+pub fn clear_rebrief_cmds(surface: &str, brief_path: &str) -> Vec<Vec<String>> {
     let s = surface.to_string();
     let prompt = rebrief_read_prompt(brief_path);
     vec![
-        vec!["send".into(), "--surface".into(), s.clone(), "/clear".into()],
-        vec!["send-key".into(), "--surface".into(), s.clone(), "Enter".into()],
+        vec![
+            "send".into(),
+            "--surface".into(),
+            s.clone(),
+            "/clear".into(),
+        ],
+        vec![
+            "send-key".into(),
+            "--surface".into(),
+            s.clone(),
+            "Enter".into(),
+        ],
         vec!["send".into(), "--surface".into(), s.clone(), prompt],
         vec!["send-key".into(), "--surface".into(), s, "Enter".into()],
     ]
@@ -190,7 +246,6 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-
     #[test]
     fn compose_rebrief_includes_goals_prompts_and_scaffold() {
         // TC1: build the recent-prompts block from a REAL transcript (also proves "no plus prompt":
@@ -213,14 +268,29 @@ mod tests {
         std::fs::write(&tp, lines.join("\n") + "\n").unwrap();
         let prompts = user_prompts(&tp, 5);
         let cwd = PathBuf::from("/Users/andual/Projects/goal-widget");
-        let out = compose_rebrief(Some("Ship the goal dash"), "Add clear+rebrief button", &prompts, &tp, &cwd);
+        let out = compose_rebrief(
+            Some("Ship the goal dash"),
+            "Add clear+rebrief button",
+            &prompts,
+            &tp,
+            &cwd,
+        );
 
         assert!(out.contains("Ship the goal dash"), "main goal missing");
-        assert!(out.contains("Add clear+rebrief button"), "current goal missing");
+        assert!(
+            out.contains("Add clear+rebrief button"),
+            "current goal missing"
+        );
         // exactly the last 5 genuine prompts, oldest of the five first; the injected/Caveat/tool lines gone.
         assert!(out.contains("- prompt two") && out.contains("- prompt six"));
-        assert!(!out.contains("first real prompt"), "should keep only last 5");
-        assert!(!out.contains("injected") && !out.contains("Caveat:"), "plus/injected prompts leaked");
+        assert!(
+            !out.contains("first real prompt"),
+            "should keep only last 5"
+        );
+        assert!(
+            !out.contains("injected") && !out.contains("Caveat:"),
+            "plus/injected prompts leaked"
+        );
         // scaffold lines (literal).
         assert!(out.contains(&format!("grep -a '<keyword>' {} | tail -30", tp.display())));
         assert!(out.contains("ls -t ~/.claude/plans/*.md | head -3"));
@@ -240,7 +310,13 @@ mod tests {
         assert!(out.contains("## Current goal\n—"));
         assert!(out.contains("## Recent prompts (oldest first)\n—"));
         // an all-whitespace goal also degrades to a dash.
-        let out2 = compose_rebrief(Some("   "), "  ", "  ", Path::new("/tmp/t.jsonl"), Path::new("/tmp"));
+        let out2 = compose_rebrief(
+            Some("   "),
+            "  ",
+            "  ",
+            Path::new("/tmp/t.jsonl"),
+            Path::new("/tmp"),
+        );
         assert!(out2.contains("## Overall goal\n—") && out2.contains("## Current goal\n—"));
     }
 
@@ -253,15 +329,26 @@ mod tests {
         let cmds = clear_rebrief_cmds("surface:42", path);
         assert_eq!(cmds.len(), 4);
         assert_eq!(cmds[0], vec!["send", "--surface", "surface:42", "/clear"]);
-        assert_eq!(cmds[1], vec!["send-key", "--surface", "surface:42", "Enter"]);
+        assert_eq!(
+            cmds[1],
+            vec!["send-key", "--surface", "surface:42", "Enter"]
+        );
         assert_eq!(cmds[2][0..3], ["send", "--surface", "surface:42"]);
-        assert_eq!(cmds[3], vec!["send-key", "--surface", "surface:42", "Enter"]);
+        assert_eq!(
+            cmds[3],
+            vec!["send-key", "--surface", "surface:42", "Enter"]
+        );
         // /clear is its own payload — the read prompt never rides along with it.
         assert!(!cmds[0].iter().any(|a| a.contains(".rebrief.md")));
         // The read prompt references the staged file and is STRICTLY single-line (no newline to shred).
         let prompt = &cmds[2][3];
-        assert!(prompt.contains(path), "prompt must point at the staged brief file");
-        assert!(!prompt.contains('\n') && !prompt.contains('\r'), "read prompt must be single-line");
+        assert!(
+            prompt.contains(path),
+            "prompt must point at the staged brief file"
+        );
+        assert!(
+            !prompt.contains('\n') && !prompt.contains('\r'),
+            "read prompt must be single-line"
+        );
     }
-
 }

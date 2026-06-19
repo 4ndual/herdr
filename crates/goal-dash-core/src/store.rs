@@ -78,19 +78,33 @@ pub struct GoalStore {
 }
 impl Default for GoalStore {
     fn default() -> Self {
-        GoalStore { id: String::new(), path: global_goal_path("none") }
+        GoalStore {
+            id: String::new(),
+            path: global_goal_path("none"),
+        }
     }
 }
 impl GoalStore {
     /// The goal's project root = the goal file's parent dir.
     pub fn root(&self) -> PathBuf {
-        self.path.parent().map(|p| p.to_path_buf()).unwrap_or_else(state_dir)
+        self.path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(state_dir)
     }
     /// History dir is a sibling of the goal file: `<stem>.history/`.
     pub fn history_dir(&self) -> PathBuf {
-        let name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or(GOAL_FILE);
+        let name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(GOAL_FILE);
         let stem = name.strip_suffix(".json").unwrap_or(name);
-        let parent = self.path.parent().map(|p| p.to_path_buf()).unwrap_or_else(state_dir);
+        let parent = self
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(state_dir);
         parent.join(format!("{stem}.history"))
     }
     pub fn history_file(&self, entity: &str) -> PathBuf {
@@ -99,9 +113,17 @@ impl GoalStore {
 
     /// Prompt-log is a sibling of the goal file: `<stem>.prompts.jsonl`.
     pub fn prompt_log_path(&self) -> PathBuf {
-        let name = self.path.file_name().and_then(|n| n.to_str()).unwrap_or(GOAL_FILE);
+        let name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(GOAL_FILE);
         let stem = name.strip_suffix(".json").unwrap_or(name);
-        let parent = self.path.parent().map(|p| p.to_path_buf()).unwrap_or_else(state_dir);
+        let parent = self
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(state_dir);
         parent.join(format!("{stem}.prompts.jsonl"))
     }
     pub fn read_prompt_log(&self) -> Vec<PromptEntry> {
@@ -119,8 +141,10 @@ impl GoalStore {
         }
         if let Ok(line) = serde_json::to_string(e) {
             use std::io::Write;
-            if let Ok(mut f) =
-                fs::OpenOptions::new().create(true).append(true).open(self.prompt_log_path())
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.prompt_log_path())
             {
                 let _ = writeln!(f, "{line}");
             }
@@ -181,8 +205,10 @@ impl GoalStore {
         }
         if let Ok(line) = serde_json::to_string(st) {
             use std::io::Write;
-            if let Ok(mut f) =
-                fs::OpenOptions::new().create(true).append(true).open(self.history_file(entity))
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.history_file(entity))
             {
                 let _ = writeln!(f, "{line}");
             }
@@ -194,8 +220,11 @@ impl GoalStore {
         let mut links = read_links();
         // 1. existing link
         if let Some(gid) = links.sessions.get(sid).cloned() {
-            let path =
-                links.goals.get(&gid).map(PathBuf::from).unwrap_or_else(|| global_goal_path(&gid));
+            let path = links
+                .goals
+                .get(&gid)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| global_goal_path(&gid));
             if path.exists() {
                 return GoalStore { id: gid, path };
             }
@@ -204,16 +233,25 @@ impl GoalStore {
         if let Some(cwd) = session_cwd(sid) {
             let pf = project_goal_file(&cwd);
             if let Some(doc) = read_goal_file(&pf) {
-                let gid = if doc.goal_id.is_empty() { sid.to_string() } else { doc.goal_id };
+                let gid = if doc.goal_id.is_empty() {
+                    sid.to_string()
+                } else {
+                    doc.goal_id
+                };
                 links.sessions.insert(sid.to_string(), gid.clone());
-                links.goals.insert(gid.clone(), pf.to_string_lossy().into_owned());
+                links
+                    .goals
+                    .insert(gid.clone(), pf.to_string_lossy().into_owned());
                 write_links(&links);
                 return GoalStore { id: gid, path: pf };
             }
         }
         // 3. migrate legacy split files (<sid>.json / <sid>.tree.json), non-destructive
         if state_path_for(sid).exists() || tree_path_for(sid).exists() {
-            let store = GoalStore { id: sid.to_string(), path: global_goal_path(sid) };
+            let store = GoalStore {
+                id: sid.to_string(),
+                path: global_goal_path(sid),
+            };
             if !store.path.exists() {
                 migrate_legacy(sid, &store);
             }
@@ -226,21 +264,35 @@ impl GoalStore {
             if let Some(root) = project_root(&cwd) {
                 let pf = project_goal_file(&root);
                 if let Some(doc) = read_goal_file(&pf) {
-                    let gid = if doc.goal_id.is_empty() { sid.to_string() } else { doc.goal_id };
+                    let gid = if doc.goal_id.is_empty() {
+                        sid.to_string()
+                    } else {
+                        doc.goal_id
+                    };
                     links.sessions.insert(sid.to_string(), gid.clone());
-                    links.goals.insert(gid.clone(), pf.to_string_lossy().into_owned());
+                    links
+                        .goals
+                        .insert(gid.clone(), pf.to_string_lossy().into_owned());
                     write_links(&links);
                     return GoalStore { id: gid, path: pf };
                 }
-                let store = GoalStore { id: sid.to_string(), path: pf };
+                let store = GoalStore {
+                    id: sid.to_string(),
+                    path: pf,
+                };
                 links.sessions.insert(sid.to_string(), sid.to_string());
-                links.goals.insert(sid.to_string(), store.path.to_string_lossy().into_owned());
+                links
+                    .goals
+                    .insert(sid.to_string(), store.path.to_string_lossy().into_owned());
                 write_links(&links);
                 return store;
             }
         }
         // 4b. fall back to a new global goal (cwd has no project root)
-        let store = GoalStore { id: sid.to_string(), path: global_goal_path(sid) };
+        let store = GoalStore {
+            id: sid.to_string(),
+            path: global_goal_path(sid),
+        };
         links.sessions.insert(sid.to_string(), sid.to_string());
         write_links(&links);
         store
@@ -263,8 +315,14 @@ fn migrate_legacy(sid: &str, store: &GoalStore) {
     let _ = store.save(&doc);
     let hd = store.history_dir();
     let _ = fs::create_dir_all(&hd);
-    copy_file(&state_dir().join(format!("{sid}.history.jsonl")), &hd.join("main.jsonl"));
-    copy_file(&state_dir().join(format!("{sid}.current.history.jsonl")), &hd.join("current.jsonl"));
+    copy_file(
+        &state_dir().join(format!("{sid}.history.jsonl")),
+        &hd.join("main.jsonl"),
+    );
+    copy_file(
+        &state_dir().join(format!("{sid}.current.history.jsonl")),
+        &hd.join("current.jsonl"),
+    );
     if let Ok(rd) = fs::read_dir(state_dir()) {
         let prefix = format!("{sid}.sub-");
         for e in rd.flatten() {
@@ -284,9 +342,16 @@ fn copy_file(from: &Path, to: &Path) {
 }
 
 /// Move a goal store's files into `dest_root` and repoint the global link. Returns the new store.
-pub fn move_goal_store(old: &GoalStore, doc: &GoalDoc, dest_root: &Path) -> std::io::Result<GoalStore> {
+pub fn move_goal_store(
+    old: &GoalStore,
+    doc: &GoalDoc,
+    dest_root: &Path,
+) -> std::io::Result<GoalStore> {
     let dest = project_goal_file(dest_root);
-    let new = GoalStore { id: old.id.clone(), path: dest.clone() };
+    let new = GoalStore {
+        id: old.id.clone(),
+        path: dest.clone(),
+    };
     if dest == old.path {
         return Ok(new);
     }
@@ -314,7 +379,9 @@ pub fn move_goal_store(old: &GoalStore, doc: &GoalDoc, dest_root: &Path) -> std:
     }
     let _ = fs::remove_file(&old.path);
     let mut links = read_links();
-    links.goals.insert(old.id.clone(), dest.to_string_lossy().into_owned());
+    links
+        .goals
+        .insert(old.id.clone(), dest.to_string_lossy().into_owned());
     write_links(&links);
     Ok(new)
 }
@@ -399,7 +466,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gw_store_{}_{}", std::process::id(), tag));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
-        GoalStore { id: "abc-123".into(), path: dir.join(GOAL_FILE) }
+        GoalStore {
+            id: "abc-123".into(),
+            path: dir.join(GOAL_FILE),
+        }
     }
 
     fn set_mtime(p: &Path, t: SystemTime) {
@@ -464,7 +534,10 @@ mod tests {
     #[test]
     fn store_history_is_separate_and_dedups() {
         let store = tmp_store("hist");
-        assert_eq!(store.history_dir(), store.path.parent().unwrap().join(".goal.history"));
+        assert_eq!(
+            store.history_dir(),
+            store.path.parent().unwrap().join(".goal.history")
+        );
         let a = GoalState {
             text: "v1".into(),
             source: "user".into(),
@@ -488,14 +561,20 @@ mod tests {
         assert_eq!(log[1].text, "v2");
         store.save(&store.load()).unwrap();
         let raw = fs::read_to_string(&store.path).unwrap();
-        assert!(!raw.contains("v1"), "history must not be embedded in the goal file");
+        assert!(
+            !raw.contains("v1"),
+            "history must not be embedded in the goal file"
+        );
         fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 
     #[test]
     fn project_key_round_trips_and_legacy_loads_clean() {
         let store = tmp_store("pk_rt");
-        let mut doc = GoalDoc { goal_id: "g".into(), ..GoalDoc::default() };
+        let mut doc = GoalDoc {
+            goal_id: "g".into(),
+            ..GoalDoc::default()
+        };
         doc.project_key = "laser-tag".into();
         store.save(&doc).unwrap();
         let raw = fs::read_to_string(&store.path).unwrap();
@@ -510,9 +589,22 @@ mod tests {
     fn constraints_round_trip_in_goal_file() {
         use crate::model::GoalConstraint;
         let store = tmp_store("cons_rt");
-        let mut doc = GoalDoc { goal_id: "g".into(), ..GoalDoc::default() };
-        doc.constraints.push(GoalConstraint { entity: "main".into(), text: "no new deps".into(), source: "user".into(), ts: "t".into() });
-        doc.constraints.push(GoalConstraint { entity: "current".into(), text: "merge-commit only".into(), source: "user".into(), ts: "t".into() });
+        let mut doc = GoalDoc {
+            goal_id: "g".into(),
+            ..GoalDoc::default()
+        };
+        doc.constraints.push(GoalConstraint {
+            entity: "main".into(),
+            text: "no new deps".into(),
+            source: "user".into(),
+            ts: "t".into(),
+        });
+        doc.constraints.push(GoalConstraint {
+            entity: "current".into(),
+            text: "merge-commit only".into(),
+            source: "user".into(),
+            ts: "t".into(),
+        });
         store.save(&doc).unwrap();
         let back = store.load();
         assert_eq!(back.constraints.len(), 2);
@@ -525,8 +617,16 @@ mod tests {
     fn doc_carries_observer_fields_round_trip() {
         use crate::model::Proposal;
         let store = tmp_store("obs");
-        let mut doc = GoalDoc { goal_id: "g".into(), ..GoalDoc::default() };
-        doc.proposals.push(Proposal { kind: "main".into(), text: "new north star".into(), reason: "scope shift".into(), ts: "t".into() });
+        let mut doc = GoalDoc {
+            goal_id: "g".into(),
+            ..GoalDoc::default()
+        };
+        doc.proposals.push(Proposal {
+            kind: "main".into(),
+            text: "new north star".into(),
+            reason: "scope shift".into(),
+            ts: "t".into(),
+        });
         doc.dismissed.push(norm("an old idea"));
         doc.paraphrase = "do the thing".into();
         doc.last_turn = 7;
@@ -543,9 +643,22 @@ mod tests {
     #[test]
     fn prompt_log_round_trips_beside_goal_file() {
         let store = tmp_store("plog");
-        assert!(store.prompt_log_path().to_string_lossy().ends_with(".goal.prompts.jsonl"));
-        store.append_prompt_log(&PromptEntry { ts: "t1".into(), paraphrase: "first".into(), action: "noop".into(), reason: String::new() });
-        store.append_prompt_log(&PromptEntry { ts: "t2".into(), paraphrase: "second".into(), action: "current".into(), reason: "shift".into() });
+        assert!(store
+            .prompt_log_path()
+            .to_string_lossy()
+            .ends_with(".goal.prompts.jsonl"));
+        store.append_prompt_log(&PromptEntry {
+            ts: "t1".into(),
+            paraphrase: "first".into(),
+            action: "noop".into(),
+            reason: String::new(),
+        });
+        store.append_prompt_log(&PromptEntry {
+            ts: "t2".into(),
+            paraphrase: "second".into(),
+            action: "current".into(),
+            reason: "shift".into(),
+        });
         let log = store.read_prompt_log();
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].paraphrase, "first");
@@ -567,7 +680,10 @@ mod tests {
         let pi_path = pi.join(format!("{pi_sid}.jsonl"));
         fs::write(&pi_path, "{}\n").unwrap();
         let roots = vec![dir.join("claude/projects"), dir.join("pi/agent/sessions")];
-        assert_eq!(session_jsonl_in(&roots, pi_sid).as_deref(), Some(pi_path.as_path()));
+        assert_eq!(
+            session_jsonl_in(&roots, pi_sid).as_deref(),
+            Some(pi_path.as_path())
+        );
         assert_eq!(
             session_jsonl_in(&roots, claude_sid).as_deref(),
             Some(claude.join(format!("{claude_sid}.jsonl")).as_path())
@@ -591,7 +707,10 @@ mod tests {
         set_mtime(&claude_path, now - Duration::from_secs(60));
         set_mtime(&pi_path, now);
         let roots = vec![dir.join("claude/projects"), dir.join("pi/agent/sessions")];
-        assert_eq!(most_recent_session_in(&roots).as_deref(), Some(pi_path.as_path()));
+        assert_eq!(
+            most_recent_session_in(&roots).as_deref(),
+            Some(pi_path.as_path())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -607,14 +726,33 @@ mod tests {
 
         let src_dir = home.join(".claude/goal");
         fs::create_dir_all(&src_dir).unwrap();
-        let old = GoalStore { id: "gid-1".into(), path: src_dir.join("gid-1.goal.json") };
-        let mut doc = GoalDoc { goal_id: "gid-1".into(), schema: 1, ..GoalDoc::default() };
-        doc.main = GoalState { text: "ship sorter".into(), ..Default::default() };
+        let old = GoalStore {
+            id: "gid-1".into(),
+            path: src_dir.join("gid-1.goal.json"),
+        };
+        let mut doc = GoalDoc {
+            goal_id: "gid-1".into(),
+            schema: 1,
+            ..GoalDoc::default()
+        };
+        doc.main = GoalState {
+            text: "ship sorter".into(),
+            ..Default::default()
+        };
         doc.project_key = "goal-widget".into();
         old.save(&doc).unwrap();
-        old.append_prompt_log(&PromptEntry { ts: "t".into(), paraphrase: "p".into(), action: "keep".into(), reason: String::new() });
+        old.append_prompt_log(&PromptEntry {
+            ts: "t".into(),
+            paraphrase: "p".into(),
+            action: "keep".into(),
+            reason: String::new(),
+        });
         old.append_history("main", &doc.main);
-        assert!(old.path.exists() && old.prompt_log_path().exists() && old.history_file("main").exists());
+        assert!(
+            old.path.exists()
+                && old.prompt_log_path().exists()
+                && old.history_file("main").exists()
+        );
 
         let dest = home.join("Projects/goal-widget");
         fs::create_dir_all(&dest).unwrap();
@@ -627,8 +765,15 @@ mod tests {
         assert!(!old.path.exists(), "old goal file removed (true move)");
         assert!(!old.prompt_log_path().exists(), "old prompt-log gone");
         let links = read_links();
-        assert_eq!(links.goals.get("gid-1").map(String::as_str), Some(new.path.to_string_lossy().as_ref()));
-        assert_eq!(new.load().project_key, "goal-widget", "projectKey survives the move");
+        assert_eq!(
+            links.goals.get("gid-1").map(String::as_str),
+            Some(new.path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            new.load().project_key,
+            "goal-widget",
+            "projectKey survives the move"
+        );
 
         match prev {
             Some(h) => std::env::set_var("HOME", h),

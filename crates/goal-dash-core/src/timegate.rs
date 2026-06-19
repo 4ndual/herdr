@@ -26,11 +26,16 @@ pub fn project_goal_file(dir: &Path) -> PathBuf {
 /// `.goal.json`. `$HOME` and `~/.claude` are never project roots.
 pub fn project_root(dir: &Path) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let skip: Vec<PathBuf> = home.iter().flat_map(|h| [h.clone(), h.join(".claude")]).collect();
+    let skip: Vec<PathBuf> = home
+        .iter()
+        .flat_map(|h| [h.clone(), h.join(".claude")])
+        .collect();
     let mut cur = Some(dir);
     while let Some(d) = cur {
         if !skip.iter().any(|s| s == d)
-            && (d.join(".git").exists() || d.join("CLAUDE.md").exists() || d.join(GOAL_FILE).exists())
+            && (d.join(".git").exists()
+                || d.join("CLAUDE.md").exists()
+                || d.join(GOAL_FILE).exists())
         {
             return Some(d.to_path_buf());
         }
@@ -43,7 +48,9 @@ pub fn global_goal_path(goal_id: &str) -> PathBuf {
 }
 
 pub fn plans_dir() -> PathBuf {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
     home.join(".claude").join("plans")
 }
 
@@ -225,10 +232,18 @@ pub fn list_project_plans_in(dir: &Path, key: &str) -> Vec<PlanMeta> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        if parse_thread_project(&content).map(|x| norm_proj(&x)).as_deref() != Some(key) {
+        if parse_thread_project(&content)
+            .map(|x| norm_proj(&x))
+            .as_deref()
+            != Some(key)
+        {
             continue;
         }
-        let basename = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let basename = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
         let title = plan_title(&content, &basename);
         let p50 = parse_timegate(&content).map(|(p50, _)| p50);
         let mtime_ms = entry
@@ -238,7 +253,13 @@ pub fn list_project_plans_in(dir: &Path, key: &str) -> Vec<PlanMeta> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        out.push(PlanMeta { path: p, basename, title, p50, mtime_ms });
+        out.push(PlanMeta {
+            path: p,
+            basename,
+            title,
+            p50,
+            mtime_ms,
+        });
     }
     out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
     out
@@ -281,7 +302,11 @@ pub fn plan_inventory_block_in(dir: &Path, cap: usize) -> String {
             let Ok(content) = fs::read_to_string(&p) else {
                 continue;
             };
-            let base = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            let base = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
             let proj = parse_thread_project(&content).unwrap_or_else(|| "—".into());
             let title = plan_title(&content, &base);
             rows.push(format!("- {base} · {proj} · {title}"));
@@ -449,10 +474,18 @@ mod tests {
         dir
     }
 
-    fn write_plan(dir: &Path, name: &str, project: &str, title: &str, gate: Option<(u32, u32)>) -> PathBuf {
+    fn write_plan(
+        dir: &Path,
+        name: &str,
+        project: &str,
+        title: &str,
+        gate: Option<(u32, u32)>,
+    ) -> PathBuf {
         let mut s = format!("<!-- THREAD: {project} — t | feature -->\n\n# {title}\n\nbody\n");
         if let Some((p50, p90)) = gate {
-            s.push_str(&format!("<!-- TIME-GATE: v=1 round=1 status=calibrated p50={p50} p90={p90} -->\n"));
+            s.push_str(&format!(
+                "<!-- TIME-GATE: v=1 round=1 status=calibrated p50={p50} p90={p90} -->\n"
+            ));
         }
         let path = dir.join(name);
         fs::write(&path, s).unwrap();
@@ -473,7 +506,10 @@ mod tests {
         let later = dir_mtime + Duration::from_secs(120);
         set_mtime(&a, later);
         let wm1 = plans_watermark_in(&dir).expect("dir exists");
-        assert!(wm1 > wm0, "watermark must advance on in-place edit (wm0={wm0:?} wm1={wm1:?})");
+        assert!(
+            wm1 > wm0,
+            "watermark must advance on in-place edit (wm0={wm0:?} wm1={wm1:?})"
+        );
         assert_eq!(wm1, later, "watermark tracks the newest plan file's mtime");
         fs::remove_dir_all(&dir).ok();
     }
@@ -481,7 +517,10 @@ mod tests {
     #[test]
     fn project_match_key_prefers_explicit_then_folder() {
         let root = Path::new("/x/Some_Project");
-        assert_eq!(project_match_key(root, "Laser Tag").as_deref(), Some("laser-tag"));
+        assert_eq!(
+            project_match_key(root, "Laser Tag").as_deref(),
+            Some("laser-tag")
+        );
         assert_eq!(project_match_key(root, "").as_deref(), Some("some-project"));
     }
 
@@ -489,7 +528,10 @@ mod tests {
     fn plans_scope_key_explicit_key_wins_even_for_global_or_worktree() {
         let global = state_dir();
         assert_eq!(plans_scope_key(&global, ""), None);
-        assert_eq!(plans_scope_key(&global, "CleoBot").as_deref(), Some("cleobot"));
+        assert_eq!(
+            plans_scope_key(&global, "CleoBot").as_deref(),
+            Some("cleobot")
+        );
         let wt = Path::new("/private/tmp/CleoBot-code-1a2b");
         assert_eq!(plans_scope_key(wt, "cleobot").as_deref(), Some("cleobot"));
         let proj = Path::new("/Users/x/Projects/goal-widget");
@@ -517,7 +559,11 @@ mod tests {
     fn list_project_plans_tolerates_missing_timegate_and_titles_fall_back() {
         let dir = tmp_plans_dir("notrailer");
         let p = dir.join("no-title.md");
-        fs::write(&p, "<!-- THREAD: GOAL-WIDGET — t | feature -->\n\njust body, no H1\n").unwrap();
+        fs::write(
+            &p,
+            "<!-- THREAD: GOAL-WIDGET — t | feature -->\n\njust body, no H1\n",
+        )
+        .unwrap();
         let plans = list_project_plans_in(&dir, "goal-widget");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].p50, None);
@@ -553,7 +599,9 @@ mod tests {
         assert!(got.contains(&proj.join("alpha")));
         assert!(got.contains(&proj.join("beta")));
         assert!(got.contains(&extra));
-        assert!(!got.iter().any(|p| p.file_name().and_then(|n| n.to_str()) == Some("notadir.txt")));
+        assert!(!got
+            .iter()
+            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("notadir.txt")));
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -563,9 +611,19 @@ mod tests {
         write_plan(&dir, "one.md", "GOAL-WIDGET", "Sort button", Some((1, 2)));
         write_plan(&dir, "two.md", "LASER-TAG", "Gate E", None);
         let block = plan_inventory_block_in(&dir, 80);
-        assert!(block.contains("one.md · GOAL-WIDGET · Sort button"), "got: {block}");
-        assert!(block.contains("two.md · LASER-TAG · Gate E"), "got: {block}");
-        assert_eq!(plan_inventory_block_in(&dir, 1).lines().count(), 1, "cap respected");
+        assert!(
+            block.contains("one.md · GOAL-WIDGET · Sort button"),
+            "got: {block}"
+        );
+        assert!(
+            block.contains("two.md · LASER-TAG · Gate E"),
+            "got: {block}"
+        );
+        assert_eq!(
+            plan_inventory_block_in(&dir, 1).lines().count(),
+            1,
+            "cap respected"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -583,7 +641,10 @@ mod tests {
     #[test]
     fn global_goal_path_names_file_by_id() {
         let p = global_goal_path("abc-123");
-        assert_eq!(p.file_name().and_then(|n| n.to_str()), Some("abc-123.goal.json"));
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("abc-123.goal.json")
+        );
     }
 
     #[test]
@@ -595,12 +656,29 @@ mod tests {
     #[test]
     fn fill_estimate_never_fabricates_and_respects_pin() {
         let root = std::env::temp_dir().join(format!("gw_noplan_{}", std::process::id()));
-        let mut st = GoalState { set_at: now_stamp(), ..Default::default() };
+        let mut st = GoalState {
+            set_at: now_stamp(),
+            ..Default::default()
+        };
         fill_estimate(&mut st, &root);
         assert_eq!(st.est_minutes, None);
         assert!(st.deadline.is_empty());
-        let mut pinned = GoalState { set_at: now_stamp(), time_pinned: true, est_minutes: Some(5), ..Default::default() };
+        let mut pinned = GoalState {
+            set_at: now_stamp(),
+            time_pinned: true,
+            est_minutes: Some(5),
+            ..Default::default()
+        };
         fill_estimate(&mut pinned, &root);
         assert_eq!(pinned.est_minutes, Some(5));
+    }
+}
+
+/// `2026-06-15T14:23:01-0500` -> `06-15 14:23` (ASCII slice, defensive on length).
+pub fn short_time(iso: &str) -> String {
+    if iso.len() >= 16 && iso.is_char_boundary(5) && iso.is_char_boundary(16) {
+        format!("{} {}", &iso[5..10], &iso[11..16])
+    } else {
+        iso.to_string()
     }
 }

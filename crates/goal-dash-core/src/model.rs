@@ -27,7 +27,11 @@ pub struct GoalState {
     #[serde(rename = "setAt", default, skip_serializing_if = "String::is_empty")]
     pub set_at: String,
     /// Estimated minutes to reach this goal — sourced from the time-gate plan's p50 (or a user override).
-    #[serde(rename = "estMinutes", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "estMinutes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub est_minutes: Option<u32>,
     /// Deadline (RFC3339) the goal should be reached by — set_at + the plan's p90 (or a user override).
     #[serde(rename = "deadline", default, skip_serializing_if = "String::is_empty")]
@@ -42,7 +46,9 @@ fn is_false(b: &bool) -> bool {
 }
 
 pub fn now_stamp() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%z")
+        .to_string()
 }
 
 #[allow(dead_code)] // referenced by #[cfg(test)] units below
@@ -115,7 +121,11 @@ pub fn one_u64() -> u64 {
 
 /// Normalize goal text for dedup (case/space-insensitive).
 pub fn norm(s: &str) -> String {
-    s.trim().to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+    s.trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ----------------------- portable goal store doc ---------------------------
@@ -157,7 +167,11 @@ pub struct GoalDoc {
     #[serde(default)]
     pub constraints: Vec<GoalConstraint>,
     /// Optional stable project identifier for plans scoping.
-    #[serde(rename = "projectKey", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "projectKey",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub project_key: String,
 }
 impl Default for GoalDoc {
@@ -356,8 +370,14 @@ mod tests {
         l.goals.insert("goal-9".into(), "/p/.goal.json".into());
         let json = serde_json::to_string(&l).unwrap();
         let back: Links = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.sessions.get("sid-1").map(String::as_str), Some("goal-9"));
-        assert_eq!(back.goals.get("goal-9").map(String::as_str), Some("/p/.goal.json"));
+        assert_eq!(
+            back.sessions.get("sid-1").map(String::as_str),
+            Some("goal-9")
+        );
+        assert_eq!(
+            back.goals.get("goal-9").map(String::as_str),
+            Some("/p/.goal.json")
+        );
         let empty: Links = serde_json::from_str("{}").unwrap();
         assert!(empty.sessions.is_empty() && empty.goals.is_empty());
     }

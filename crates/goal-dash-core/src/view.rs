@@ -35,7 +35,11 @@ pub const SESSION: [(Act, &str, &str); 3] = [
         " ⌖ Sort ",
         "auto-sort — let the agent reorganize the goal tree",
     ),
-    (Act::AddSub, " ＋ Sub ", "add a subgoal under the current goal"),
+    (
+        Act::AddSub,
+        " ＋ Sub ",
+        "add a subgoal under the current goal",
+    ),
 ];
 
 /// A contextual chip rendered under the selected node: its action, icon glyph, and hover tooltip.
