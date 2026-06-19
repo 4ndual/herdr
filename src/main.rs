@@ -51,6 +51,7 @@ mod checksum;
 mod cli;
 mod client;
 mod config;
+mod dash;
 mod detect;
 mod events;
 mod ghostty;

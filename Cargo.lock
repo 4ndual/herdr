@@ -605,6 +605,8 @@ dependencies = [
  "bytes",
  "crossterm",
  "ctrlc",
+ "dash-common",
+ "goal-dash-core",
  "interprocess",
  "libc",
  "png",
@@ -619,6 +621,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "usage-dash-core",
  "windows-sys",
 ]
 
