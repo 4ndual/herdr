@@ -175,6 +175,7 @@ close_pane = "prefix+x"
 zoom = "prefix+z"
 resize_mode = "prefix+r"
 toggle_sidebar = "prefix+b"
+toggle_goal_panel = "prefix+d"
 ```
 
 Optional actions are unset by default. Bind them with `prefix+` for prefix-mode behavior, or with an explicit modified chord when you intentionally want a direct shortcut:
@@ -289,6 +290,8 @@ prompt_new_tab_name = true
 show_agent_labels_on_pane_borders = false
 agent_panel_scope = "all"
 accent = "cyan"
+usage_strip = true
+goal_panel = false
 ```
 
 `sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
@@ -296,6 +299,8 @@ accent = "cyan"
 `mobile_width_threshold` controls the terminal width at or below which Herdr uses the mobile single-column layout. The default is 64 columns; increase it for foldables, tablets, or wide phone terminals.
 
 `agent_panel_scope` can be `all` or `current`. Use `current` if you only want the agent panel to show agents in the active workspace.
+
+`usage_strip` toggles the persistent native usage strip along the bottom of the terminal area; it follows the focused pane's agent and session. Set it to `false` to hide the strip and give panes the full height. `goal_panel` controls whether the native right-side goal panel opens on startup; it can always be toggled at runtime with `<prefix> g`.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
 

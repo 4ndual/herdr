@@ -112,7 +112,10 @@ pub fn fold_stats(mut acc: StatsAcc, text: &str) -> StatsAcc {
             Err(_) => continue,
         };
         let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(iso_to_epoch);
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(iso_to_epoch);
 
         // session span
         if let Some(t) = ts {
@@ -158,7 +161,11 @@ pub fn fold_stats(mut acc: StatsAcc, text: &str) -> StatsAcc {
                         acc.ctx_tokens = ctx; // latest wins
                     }
                 }
-                if let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                if let Some(content) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
                     for item in content {
                         if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             acc.tool_calls += 1;
@@ -252,20 +259,18 @@ pub fn session_stats(key: &str, path: &Path) -> Option<SessionStats> {
         acc = StatsAcc::default();
     }
 
-    if len > acc.byte_offset {
-        if file.seek(SeekFrom::Start(acc.byte_offset)).is_ok() {
-            let mut buf = String::new();
-            if file.read_to_string(&mut buf).is_ok() {
-                // Only fold up to the last complete line; leave a trailing
-                // partial line for the next tick (advance offset to the last \n).
-                let consumed = match buf.rfind('\n') {
-                    Some(i) => i + 1,
-                    None => 0,
-                };
-                if consumed > 0 {
-                    acc = fold_stats(acc, &buf[..consumed]);
-                    acc.byte_offset += consumed as u64;
-                }
+    if len > acc.byte_offset && file.seek(SeekFrom::Start(acc.byte_offset)).is_ok() {
+        let mut buf = String::new();
+        if file.read_to_string(&mut buf).is_ok() {
+            // Only fold up to the last complete line; leave a trailing
+            // partial line for the next tick (advance offset to the last \n).
+            let consumed = match buf.rfind('\n') {
+                Some(i) => i + 1,
+                None => 0,
+            };
+            if consumed > 0 {
+                acc = fold_stats(acc, &buf[..consumed]);
+                acc.byte_offset += consumed as u64;
             }
         }
     }
@@ -287,7 +292,10 @@ mod tests {
     fn iso_parses_utc_variants() {
         // 2021-01-01T00:00:00Z = 1609459200
         assert_eq!(iso_to_epoch("2021-01-01T00:00:00Z"), Some(1609459200));
-        assert_eq!(iso_to_epoch("2021-01-01T00:00:00.123456+00:00"), Some(1609459200));
+        assert_eq!(
+            iso_to_epoch("2021-01-01T00:00:00.123456+00:00"),
+            Some(1609459200)
+        );
         assert_eq!(iso_to_epoch("2026-06-17T13:11:38.554Z"), Some(1781701898));
         assert_eq!(iso_to_epoch("garbage"), None);
     }
@@ -315,7 +323,7 @@ mod tests {
         let s = finalize(&fold_stats(StatsAcc::default(), &t));
         assert_eq!(s.out_tokens, 350);
         assert_eq!(s.ctx_tokens, 2 + 149701 + 4352); // latest assistant
-        // cache% = read/(read+creation) = (38000+149701)/(38000+149701+2000+4352)
+                                                     // cache% = read/(read+creation) = (38000+149701)/(38000+149701+2000+4352)
         let expected = (38000.0 + 149701.0) / (38000.0 + 149701.0 + 2000.0 + 4352.0) * 100.0;
         assert!((s.cache_pct.unwrap() - expected).abs() < 0.01);
     }
@@ -358,7 +366,10 @@ mod tests {
              {{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":1}}}}}}\n\
              {{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":1}}}}}}\n\
              {{\"type\":\"user\",{},\"message\":{{\"content\":\"next\"}}}}",
-            ts("2026-06-17T13:00:00Z"), ts("2026-06-17T13:00:30Z"), ts("2026-06-17T13:00:40Z"), ts("2026-06-17T13:02:20Z")
+            ts("2026-06-17T13:00:00Z"),
+            ts("2026-06-17T13:00:30Z"),
+            ts("2026-06-17T13:00:40Z"),
+            ts("2026-06-17T13:02:20Z")
         );
         let s = finalize(&fold_stats(StatsAcc::default(), &t));
         assert_eq!(s.busy_secs, 40); // 30 + 10
@@ -368,8 +379,14 @@ mod tests {
 
     #[test]
     fn incremental_fold_equals_full_pass() {
-        let l1 = format!("{{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":100}}}}}}\n", ts("2026-06-17T13:00:00Z"));
-        let l2 = format!("{{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":200}}}}}}\n", ts("2026-06-17T13:00:05Z"));
+        let l1 = format!(
+            "{{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":100}}}}}}\n",
+            ts("2026-06-17T13:00:00Z")
+        );
+        let l2 = format!(
+            "{{\"type\":\"assistant\",{},\"message\":{{\"usage\":{{\"output_tokens\":200}}}}}}\n",
+            ts("2026-06-17T13:00:05Z")
+        );
         let full = finalize(&fold_stats(StatsAcc::default(), &format!("{l1}{l2}")));
         let part = fold_stats(StatsAcc::default(), &l1);
         let two = finalize(&fold_stats(part, &l2));

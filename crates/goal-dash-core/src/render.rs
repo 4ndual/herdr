@@ -126,7 +126,7 @@ fn truncate_display(text: &str, width: usize) -> (String, bool) {
 /// just below `anchor` (or above when there's no room below), clamped on-screen. Cheap — ratatui
 /// diffs identical frames, so re-rendering on every hover move is near-free.
 fn render_tooltip(f: &mut ratatui::Frame, area: Rect, anchor: Rect, text: &str) {
-    let maxw = (area.width.saturating_sub(2)).min(56).max(10) as usize;
+    let maxw = (area.width.saturating_sub(2)).clamp(10, 56) as usize;
     let lines = wrap_display(text, maxw, maxw);
     let w = (lines
         .iter()
@@ -654,9 +654,7 @@ fn draw_tree(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 ci = Some((row, specs));
             }
         }
-        if matches!(*n, Node::Main | Node::Current) {
-            b.push(Line::from(""));
-        } else if ci.is_some() {
+        if matches!(*n, Node::Main | Node::Current) || ci.is_some() {
             b.push(Line::from(""));
         }
         blocks.push(b);

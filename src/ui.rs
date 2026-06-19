@@ -109,6 +109,22 @@ pub(super) fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize / 8) % SPINNERS.len()]
 }
 
+/// feat/native-dashes: anchor area for desktop herdr toasts that keeps them clear
+/// of the native dashboards. The bottom usage strip sits along the window bottom
+/// and the goal panel along the right edge; a bottom/right-anchored toast drawn
+/// against the full window would overlap them and (since `dash::route_mouse`
+/// resolves the usage strip and goal panel before the toast) have its clicks
+/// swallowed by the strip. Shrinking the anchor by those rects moves the toast
+/// just above the strip and left of the panel so render and hit-area agree.
+fn toast_desktop_anchor_area(area: Rect, usage_dash_area: Rect, goal_dash_area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(goal_dash_area.width),
+        area.height.saturating_sub(usage_dash_area.height),
+    )
+}
+
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -211,14 +227,15 @@ fn compute_view_internal(
     // out, so panes never overlap them. Both collapse to an empty Rect when there
     // isn't room (or the goal panel is toggled off). P4 will derive the strip
     // height from usage content instead of the fixed reserve used here.
-    let (terminal_area, usage_dash_area) = if terminal_area.height > USAGE_STRIP_HEIGHT + 3 {
-        let [panes, strip] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(USAGE_STRIP_HEIGHT)])
-                .areas(terminal_area);
-        (panes, strip)
-    } else {
-        (terminal_area, Rect::default())
-    };
+    let (terminal_area, usage_dash_area) =
+        if app.usage_strip_enabled && terminal_area.height > USAGE_STRIP_HEIGHT + 3 {
+            let [panes, strip] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(USAGE_STRIP_HEIGHT)])
+                    .areas(terminal_area);
+            (panes, strip)
+        } else {
+            (terminal_area, Rect::default())
+        };
     let (terminal_area, goal_dash_area) = if app.goal_panel_visible
         && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
     {
@@ -285,12 +302,13 @@ fn compute_view_internal(
         );
     }
 
+    let toast_anchor_area = toast_desktop_anchor_area(area, usage_dash_area, goal_dash_area);
     let toast_hit_area = app
         .toast
         .as_ref()
         .map(|toast| {
             toast_notification_rect(
-                area,
+                toast_anchor_area,
                 toast,
                 app.config_diagnostic.is_some(),
                 toast.position.unwrap_or(app.toast_config.herdr.position),
@@ -468,16 +486,23 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 &app.palette,
             );
         } else {
+            // feat/native-dashes: keep the toast clear of the native usage strip
+            // and goal panel so render matches the hit-area set in compute_view.
+            let toast_anchor_area = toast_desktop_anchor_area(
+                frame.area(),
+                app.view.usage_dash_area,
+                app.view.goal_dash_area,
+            );
             render_toast_notification(
                 frame,
-                frame.area(),
+                toast_anchor_area,
                 toast,
                 has_config_diagnostic,
                 toast.position.unwrap_or(app.toast_config.herdr.position),
                 &app.palette,
             );
             toast_rect = Some(toast_notification_rect(
-                frame.area(),
+                toast_anchor_area,
                 toast,
                 has_config_diagnostic,
                 toast.position.unwrap_or(app.toast_config.herdr.position),

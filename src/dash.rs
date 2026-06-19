@@ -91,7 +91,7 @@ pub fn tick(app: &mut App) {
     let focus = focus_input(&app.state);
 
     match usage_dash_core::refresh(focus.clone()) {
-        RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(snap),
+        RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(*snap),
         RefreshOutcome::Clear => app.usage_snapshot = None,
         RefreshOutcome::KeepPrevious => {}
     }

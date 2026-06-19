@@ -166,8 +166,7 @@ impl GoalStore {
             fs::create_dir_all(parent)?;
         }
         let tmp = self.path.with_extension("json.tmp");
-        let serialized = serde_json::to_string_pretty(doc)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let serialized = serde_json::to_string_pretty(doc).map_err(std::io::Error::other)?;
         fs::write(&tmp, serialized)?;
         fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -426,7 +425,7 @@ pub fn most_recent_session_in(roots: &[PathBuf]) -> Option<PathBuf> {
     let mut best: Option<(SystemTime, PathBuf)> = None;
     for_each_jsonl_in(roots, |path, entry| {
         if let Ok(m) = entry.metadata().and_then(|md| md.modified()) {
-            if best.as_ref().map_or(true, |(bt, _)| m > *bt) {
+            if best.as_ref().is_none_or(|(bt, _)| m > *bt) {
                 best = Some((m, path.clone()));
             }
         }

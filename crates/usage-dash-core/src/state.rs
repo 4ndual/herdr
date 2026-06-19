@@ -53,11 +53,15 @@ fn summarize(text: &str) -> String {
 /// so the dash shows *what* is being asked, not the opening sentence).
 fn last_question(text: &str) -> Option<String> {
     for line in text.lines().rev() {
-        let l = line.trim().trim_end_matches(|c: char| c == '*' || c == '_' || c == '`' || c == ')');
+        let l = line.trim().trim_end_matches(['*', '_', '`', ')']);
         if l.is_empty() {
             continue;
         }
-        return if l.ends_with('?') { Some(l.to_string()) } else { None };
+        return if l.ends_with('?') {
+            Some(l.to_string())
+        } else {
+            None
+        };
     }
     None
 }
@@ -103,7 +107,11 @@ fn assistant_text(v: &Value) -> Option<String> {
 /// Names of `tool_use` blocks in an assistant `message.content[]`.
 fn assistant_tool_uses(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+    if let Some(content) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
         for item in content {
             if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                 if let Some(n) = item.get("name").and_then(|n| n.as_str()) {
@@ -123,7 +131,10 @@ fn is_tool_result_user(v: &Value) -> bool {
     v.get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
-        .map(|arr| arr.iter().any(|it| it.get("type").and_then(|t| t.as_str()) == Some("tool_result")))
+        .map(|arr| {
+            arr.iter()
+                .any(|it| it.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        })
         .unwrap_or(false)
 }
 
@@ -164,7 +175,11 @@ fn is_error_record(v: &Value) -> bool {
     }
     // tool_result user with is_error: true
     if t == "user" {
-        if let Some(arr) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+        if let Some(arr) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
             if arr.iter().any(|it| {
                 it.get("type").and_then(|x| x.as_str()) == Some("tool_result")
                     && it.get("is_error").and_then(|b| b.as_bool()) == Some(true)
@@ -221,20 +236,29 @@ pub fn infer_claude(transcript: &str, age: u64) -> (ThreadState, Option<String>)
     // 2) Degraded — errors at/after the last assistant turn (not yet recovered).
     let errs = recs[la_idx..].iter().filter(|v| is_error_record(v)).count();
     if errs >= 2 || is_error_record(la) {
-        return (ThreadState::Degraded, Some(format!("{} API error(s)/retries", errs.max(1))));
+        return (
+            ThreadState::Degraded,
+            Some(format!("{} API error(s)/retries", errs.max(1))),
+        );
     }
 
     // 3) Working — a tool is dispatched, or a tool just returned and the agent
     //    is generating the next step.
     if pending_tool {
-        return (ThreadState::Working, Some(format!("Running {}", tool_names.last().unwrap())));
+        return (
+            ThreadState::Working,
+            Some(format!("Running {}", tool_names.last().unwrap())),
+        );
     }
     if result_after {
         return (ThreadState::Working, Some("processing".into()));
     }
 
     // 4) Clean turn end → Waiting (fresh) or Done (parked).
-    let stop = la.get("message").and_then(|m| m.get("stop_reason")).and_then(|s| s.as_str());
+    let stop = la
+        .get("message")
+        .and_then(|m| m.get("stop_reason"))
+        .and_then(|s| s.as_str());
     if stop == Some("tool_use") {
         // Ended on a tool_use that already has its result handled above; here it
         // has none and isn't recent enough to be a live tool → ambiguous.
@@ -260,12 +284,18 @@ pub fn infer_codex(content: &str, age: u64) -> (ThreadState, Option<String>) {
     for (i, v) in recs.iter().enumerate() {
         let t = rec_type(v);
         let payload = v.get("payload");
-        let ptype = payload.and_then(|p| p.get("type")).and_then(|x| x.as_str()).unwrap_or("");
+        let ptype = payload
+            .and_then(|p| p.get("type"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if ptype == "token_count" || t == "token_count" {
             continue;
         }
         if t == "event_msg" || t == "response_item" {
-            if let Some(ph) = payload.and_then(|p| p.get("phase")).and_then(|x| x.as_str()) {
+            if let Some(ph) = payload
+                .and_then(|p| p.get("phase"))
+                .and_then(|x| x.as_str())
+            {
                 last_phase = Some(ph.to_string());
                 last_msg = payload
                     .and_then(|p| p.get("message").or_else(|| p.get("text")))
@@ -286,7 +316,9 @@ pub fn infer_codex(content: &str, age: u64) -> (ThreadState, Option<String>) {
     match last_phase.as_deref() {
         Some("final_answer") => finished_state(last_msg.as_deref(), age),
         Some(_) => {
-            let note = last_msg.map(|m| summarize(&m)).unwrap_or_else(|| "working".into());
+            let note = last_msg
+                .map(|m| summarize(&m))
+                .unwrap_or_else(|| "working".into());
             (ThreadState::Working, Some(note))
         }
         None => (ThreadState::Unknown, None),
@@ -336,8 +368,14 @@ pub fn infer_pi(content: &str, age: u64) -> (ThreadState, Option<String>) {
         .iter()
         .filter(|v| {
             rec_type(v) == "message"
-                && v.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("toolResult")
-                && v.get("message").and_then(|m| m.get("isError")).and_then(|b| b.as_bool()) == Some(true)
+                && v.get("message")
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str())
+                    == Some("toolResult")
+                && v.get("message")
+                    .and_then(|m| m.get("isError"))
+                    .and_then(|b| b.as_bool())
+                    == Some(true)
         })
         .count();
     if err >= 2 {
@@ -349,8 +387,14 @@ pub fn infer_pi(content: &str, age: u64) -> (ThreadState, Option<String>) {
         None => return (ThreadState::Unknown, None),
     };
     let msg = last.get("message");
-    let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("");
-    let stop = msg.and_then(|m| m.get("stopReason")).and_then(|s| s.as_str()).unwrap_or("");
+    let role = msg
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    let stop = msg
+        .and_then(|m| m.get("stopReason"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
 
     match (role, stop) {
         ("assistant", "stop") => finished_state(pi_text(last).as_deref(), age),
@@ -456,7 +500,10 @@ mod tests {
         let t = r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Everything you asked for is done and tested.\n\nWant me to wire up the daily budget?"}]}}"#;
         let (s, note) = infer_claude(t, 30);
         assert_eq!(s, ThreadState::Waiting);
-        assert_eq!(note.as_deref(), Some("Want me to wire up the daily budget?"));
+        assert_eq!(
+            note.as_deref(),
+            Some("Want me to wire up the daily budget?")
+        );
     }
 
     // S3c — AwaitingReview: work delivered, fresh, NO question → user's move to review.

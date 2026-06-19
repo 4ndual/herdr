@@ -35,7 +35,14 @@ fn newest_jsonl_in(dir: &std::path::Path) -> Option<PathBuf> {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
-        .map(|e| (e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), e.path()))
+        .map(|e| {
+            (
+                e.metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+                e.path(),
+            )
+        })
         .filter(|(_, p)| p.extension().map(|x| x == "jsonl").unwrap_or(false))
         .collect();
     files.sort_by(|a, b| b.0.cmp(&a.0));
@@ -49,7 +56,10 @@ pub fn newest_session() -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for d in std::fs::read_dir(&root).ok()?.flatten() {
         if let Some((mt, p)) = newest_jsonl_in(&d.path()).and_then(|p| {
-            std::fs::metadata(&p).ok().and_then(|m| m.modified().ok()).map(|t| (t, p))
+            std::fs::metadata(&p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| (t, p))
         }) {
             if best.as_ref().map(|(bt, _)| mt > *bt).unwrap_or(true) {
                 best = Some((mt, p));
@@ -128,7 +138,8 @@ pub fn snapshot_for_cwd(cwd: &str) -> Option<UsageSnapshot> {
     // mirror Codex's rate limits (shared OpenAI plan); prefer the freshest
     // live app-server reading for THIS session's model bucket, falling back to
     // the default bucket / newest rollout.
-    if let Some((primary, secondary, plan)) = codex::fresh_rate_limits_for_model(s.model.as_deref()) {
+    if let Some((primary, secondary, plan)) = codex::fresh_rate_limits_for_model(s.model.as_deref())
+    {
         s.five_hour = primary;
         s.five_hour.shared = true;
         s.weekly = secondary;

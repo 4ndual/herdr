@@ -684,7 +684,7 @@ fn goal_context_json(doc: &GoalDoc) -> String {
 /// Queue a proposal (MAIN change, or a CURRENT change the user owns). Skips dismissed/duplicate ideas.
 fn propose(doc: &mut GoalDoc, kind: &str, text: &str, reason: &str) -> bool {
     let n = norm(text);
-    if n.is_empty() || doc.dismissed.iter().any(|d| *d == n) {
+    if n.is_empty() || doc.dismissed.contains(&n) {
         return false;
     }
     if doc

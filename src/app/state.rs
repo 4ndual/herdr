@@ -1343,6 +1343,10 @@ pub struct AppState {
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
+    /// Whether the persistent native usage strip is enabled (feat/native-dashes).
+    /// Honors `[ui] usage_strip` at startup; `compute_view` skips carving the
+    /// strip rect when false, so panes reclaim the full height.
+    pub usage_strip_enabled: bool,
     /// Whether the native right-side goal panel is shown (feat/native-dashes).
     /// Pure data; the renderer reads it and `compute_view` sizes the panel.
     pub goal_panel_visible: bool,
@@ -1701,6 +1705,7 @@ impl AppState {
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            usage_strip_enabled: true,
             goal_panel_visible: false,
             goal_panel_focused: false,
             sidebar_section_split: 0.5,

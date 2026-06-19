@@ -18,15 +18,9 @@ fn budget_dir() -> PathBuf {
 
 /// Pure fold: given the stored `(date, weekly_pct)` baseline, today's date, and
 /// the current weekly_pct, return `(delta_pct, new_baseline)`.
-pub fn fold(
-    stored: Option<(String, f32)>,
-    today: &str,
-    current: f32,
-) -> (f32, (String, f32)) {
+pub fn fold(stored: Option<(String, f32)>, today: &str, current: f32) -> (f32, (String, f32)) {
     match stored {
-        Some((date, base)) if date == today && current >= base => {
-            (current - base, (date, base))
-        }
+        Some((date, base)) if date == today && current >= base => (current - base, (date, base)),
         // new day, missing baseline, or a weekly reset → re-baseline to current
         _ => (0.0, (today.to_string(), current)),
     }

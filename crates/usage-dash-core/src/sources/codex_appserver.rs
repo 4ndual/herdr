@@ -49,7 +49,9 @@ pub fn fresh_rate_limits() -> Option<(Window, Window, Option<String>)> {
 /// Fresh rate limits for the bucket metering `model`, falling back to the
 /// default top-level bucket when no per-model bucket self-describes that model.
 /// `None` when the app-server is unavailable AND no cache exists.
-pub fn fresh_rate_limits_for_model(model: Option<&str>) -> Option<(Window, Window, Option<String>)> {
+pub fn fresh_rate_limits_for_model(
+    model: Option<&str>,
+) -> Option<(Window, Window, Option<String>)> {
     let raw = cached_or_fetch()?;
     parse_for_model(&raw, model)
 }
@@ -217,7 +219,10 @@ fn win(v: Option<&serde_json::Value>) -> Window {
     };
     Window {
         // app-server reports usedPercent as an integer; accept float too.
-        used_pct: v.get("usedPercent").and_then(|x| x.as_f64()).map(|f| f as f32),
+        used_pct: v
+            .get("usedPercent")
+            .and_then(|x| x.as_f64())
+            .map(|f| f as f32),
         resets_at: v.get("resetsAt").and_then(|x| x.as_i64()),
         shared: false,
     }
@@ -246,7 +251,8 @@ mod tests {
 
     #[test]
     fn float_used_percent_also_accepted() {
-        let raw = r#"{"rateLimits":{"primary":{"usedPercent":12.5},"secondary":{"usedPercent":0}}}"#;
+        let raw =
+            r#"{"rateLimits":{"primary":{"usedPercent":12.5},"secondary":{"usedPercent":0}}}"#;
         let (p, s, _) = parse(raw).unwrap();
         assert_eq!(p.used_pct, Some(12.5));
         assert_eq!(s.used_pct, Some(0.0));

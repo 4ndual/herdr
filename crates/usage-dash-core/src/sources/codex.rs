@@ -32,7 +32,10 @@ fn rollouts_by_mtime(root: &Path) -> Vec<PathBuf> {
                         let p = e.path();
                         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
                         if name.starts_with("rollout-") && name.ends_with(".jsonl") {
-                            let mt = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                            let mt = e
+                                .metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::UNIX_EPOCH);
                             out.push((mt, p));
                         }
                     }
@@ -97,10 +100,16 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
         };
         let top_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let payload = v.get("payload");
-        let payload_type = payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()).unwrap_or("");
+        let payload_type = payload
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
 
         if top_type == "turn_context" {
-            if let Some(m) = payload.and_then(|p| p.get("model")).and_then(|x| x.as_str()) {
+            if let Some(m) = payload
+                .and_then(|p| p.get("model"))
+                .and_then(|x| x.as_str())
+            {
                 out.model = Some(m.to_string());
             }
         }
@@ -109,7 +118,10 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
                 Some(p) => p,
                 None => continue,
             };
-            if let Some(w) = p.pointer("/info/model_context_window").and_then(|x| x.as_u64()) {
+            if let Some(w) = p
+                .pointer("/info/model_context_window")
+                .and_then(|x| x.as_u64())
+            {
                 out.ctx_window = Some(w);
             }
             if let Some(t) = p
@@ -136,7 +148,10 @@ fn rl_window(v: Option<&serde_json::Value>) -> Window {
         None => return Window::default(),
     };
     Window {
-        used_pct: v.get("used_percent").and_then(|x| x.as_f64()).map(|f| f as f32),
+        used_pct: v
+            .get("used_percent")
+            .and_then(|x| x.as_f64())
+            .map(|f| f as f32),
         resets_at: v.get("resets_at").and_then(|x| x.as_i64()),
         shared: false,
     }

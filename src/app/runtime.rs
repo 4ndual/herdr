@@ -292,8 +292,9 @@ impl App {
 
         // feat/native-dashes: refresh the dashboard cores from disk + run the
         // goal observer on a flat poll, then repaint so the strip/panel reflect
-        // the focused pane.
-        if now >= self.next_dash_tick {
+        // the focused pane. Skipped entirely when no dashboard is showing live
+        // data so an idle, agent-less herdr does no per-second work (TC13).
+        if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::dash::tick(self);
             self.next_dash_tick = now + DASH_TICK_INTERVAL;
             changed = true;
@@ -521,6 +522,15 @@ impl App {
             .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
     }
 
+    /// feat/native-dashes: whether a foreground dashboard is showing live data that
+    /// a ~1 Hz tick would update — a focused agent (the usage strip) or the open
+    /// goal panel. When false, the dash tick is neither scheduled nor executed, so
+    /// an idle, agent-less herdr does no per-second work (TC13).
+    pub(crate) fn dashboards_need_tick(&self) -> bool {
+        self.state.goal_panel_visible
+            || crate::dash::focus_input(&self.state).agent != dash_common::AgentKind::None
+    }
+
     pub(crate) fn next_loop_deadline(&self, now: Instant, needs_render: bool) -> Option<Instant> {
         self.next_loop_deadline_with_resize_poll(now, needs_render, true, true)
     }
@@ -566,7 +576,10 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
-            Some(self.next_dash_tick),
+            // feat/native-dashes: only wake ~1 Hz for the dashboard refresh in a
+            // foreground render context where a dashboard shows live data. Headless
+            // clients and idle, agent-less layouts stay idle (TC13).
+            (include_resize_poll && self.dashboards_need_tick()).then_some(self.next_dash_tick),
             render_deadline,
         ]
         .into_iter()

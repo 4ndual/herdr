@@ -29,7 +29,12 @@ fn cache_path() -> PathBuf {
 /// OAuth access token from the macOS keychain entry Claude Code maintains.
 fn oauth_token() -> Option<String> {
     let out = Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -109,7 +114,10 @@ fn win(v: Option<&serde_json::Value>) -> Window {
         None => return Window::default(),
     };
     Window {
-        used_pct: v.get("utilization").and_then(|x| x.as_f64()).map(|f| f as f32),
+        used_pct: v
+            .get("utilization")
+            .and_then(|x| x.as_f64())
+            .map(|f| f as f32),
         resets_at: v
             .get("resets_at")
             .and_then(|x| x.as_str())

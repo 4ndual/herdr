@@ -82,8 +82,9 @@ impl UsageView {
 /// unresolved focus) keeps the previous snapshot rather than blanking the panel.
 #[derive(Debug, Clone)]
 pub enum RefreshOutcome {
-    /// Replace the stored snapshot with this one.
-    Replace(UsageSnapshot),
+    /// Replace the stored snapshot with this one. Boxed because `UsageSnapshot`
+    /// is far larger than the other (unit) variants.
+    Replace(Box<UsageSnapshot>),
     /// Keep the previously-stored snapshot (sticky: self-focus / unresolved).
     KeepPrevious,
     /// No focused agent session — clear the panel to the empty state.
@@ -111,21 +112,21 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
         AgentKind::None => RefreshOutcome::Clear,
         AgentKind::Claude => match focus.session_id.as_deref() {
             Some(sid) if !sid.is_empty() => match sources::claude::snapshot_for_sid(sid) {
-                Some(s) => RefreshOutcome::Replace(s),
+                Some(s) => RefreshOutcome::Replace(Box::new(s)),
                 None => RefreshOutcome::KeepPrevious,
             },
             _ => RefreshOutcome::KeepPrevious,
         },
         AgentKind::Codex => match focus.cwd.as_deref() {
             Some(cwd) => match sources::codex::snapshot_for_cwd(&cwd.to_string_lossy()) {
-                Some(s) => RefreshOutcome::Replace(s),
+                Some(s) => RefreshOutcome::Replace(Box::new(s)),
                 None => RefreshOutcome::KeepPrevious,
             },
             None => RefreshOutcome::KeepPrevious,
         },
         AgentKind::Pi => match focus.cwd.as_deref() {
             Some(cwd) => match sources::pi::snapshot_for_cwd(&cwd.to_string_lossy()) {
-                Some(s) => RefreshOutcome::Replace(s),
+                Some(s) => RefreshOutcome::Replace(Box::new(s)),
                 None => RefreshOutcome::KeepPrevious,
             },
             None => RefreshOutcome::KeepPrevious,
@@ -287,7 +288,12 @@ mod tests {
     #[test]
     fn expand_toggles_with_state_hit() {
         let mut v = UsageView::new();
-        v.hits.state = Some(Rect { x: 0, y: 0, width: 10, height: 1 });
+        v.hits.state = Some(Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        });
         assert!(handle(Action::ToggleExpand, &mut v));
         assert!(v.expanded);
     }
@@ -295,7 +301,12 @@ mod tests {
     #[test]
     fn click_on_stats_hit_toggles_stats() {
         let mut v = UsageView::new();
-        v.hits.stats = Some(Rect { x: 2, y: 3, width: 5, height: 1 });
+        v.hits.stats = Some(Rect {
+            x: 2,
+            y: 3,
+            width: 5,
+            height: 1,
+        });
         assert!(handle(Action::Click(3, 3), &mut v));
         assert!(!v.stats_shown);
         // a click outside any hit does nothing

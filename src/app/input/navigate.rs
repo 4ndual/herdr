@@ -50,15 +50,6 @@ impl App {
             return;
         }
 
-        // feat/native-dashes: <prefix> g toggles the goal panel and moves
-        // keyboard focus to it (or releases focus when hiding it).
-        if key.code == KeyCode::Char('g') && key.modifiers.is_empty() {
-            self.state.goal_panel_visible = !self.state.goal_panel_visible;
-            self.state.goal_panel_focused = self.state.goal_panel_visible;
-            leave_command_mode(&mut self.state);
-            return;
-        }
-
         if let Some(action) = action_for_key(&self.state, raw_key, BindingDispatch::Prefix) {
             if action == NavigateAction::EditScrollback {
                 let previous_mode = self.state.mode;
@@ -612,6 +603,7 @@ pub(crate) enum NavigateAction {
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
+    ToggleGoalPanel,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -719,6 +711,7 @@ fn action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_goal_panel, NavigateAction::ToggleGoalPanel),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -925,6 +918,13 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::EnterResizeMode => state.mode = Mode::Resize,
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
+            leave_navigate_mode(state);
+        }
+        NavigateAction::ToggleGoalPanel => {
+            // feat/native-dashes: show/hide the right goal panel and move keyboard
+            // focus to it while open (released when hidden).
+            state.goal_panel_visible = !state.goal_panel_visible;
+            state.goal_panel_focused = state.goal_panel_visible;
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {

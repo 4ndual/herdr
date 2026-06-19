@@ -131,7 +131,7 @@ pub fn timegate_estimate(root: &Path) -> Option<(u32, u32)> {
             Some(t) => t,
             None => continue,
         };
-        if best.as_ref().map_or(true, |(bt, _)| mtime > *bt) {
+        if best.as_ref().is_none_or(|(bt, _)| mtime > *bt) {
             best = Some((mtime, est));
         }
     }

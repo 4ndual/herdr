@@ -358,7 +358,7 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 /// and clamped within `area`. Placed below the anchor row when there's room,
 /// else above.
 fn render_tooltip(f: &mut Frame, area: Rect, anchor: Rect, text: &str) {
-    let maxw = (area.width.saturating_sub(2)).min(56).max(10) as usize;
+    let maxw = (area.width.saturating_sub(2)).clamp(10, 56) as usize;
     let lines = word_wrap(text, maxw);
     let w = (lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2)
         .min(area.width.max(3));
@@ -698,8 +698,7 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
             ));
         }
         if snap.stats.is_some() {
-            let mut agedesc =
-                "age — session lifetime (first activity → last activity)".to_string();
+            let mut agedesc = "age — session lifetime (first activity → last activity)".to_string();
             if snap.is_stale() {
                 agedesc.push_str("; idle — minutes since the source last updated (stale)");
             }

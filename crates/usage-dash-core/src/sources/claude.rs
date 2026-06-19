@@ -68,7 +68,9 @@ pub fn parse_transcript(content: &str) -> Transcript {
             None => continue,
         };
         let get = |k: &str| usage.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-        let ctx = get("input_tokens") + get("cache_read_input_tokens") + get("cache_creation_input_tokens");
+        let ctx = get("input_tokens")
+            + get("cache_read_input_tokens")
+            + get("cache_creation_input_tokens");
         if ctx > 0 {
             out.ctx_tokens = Some(ctx);
             out.max_ctx_tokens = out.max_ctx_tokens.max(ctx);
@@ -94,7 +96,11 @@ pub fn model_display(id: &str) -> String {
 /// Is opus 1M context enabled? Reads `~/.claude/settings.json` `.model` for a
 /// `[1m]` variant (and honors CLAUDE_CODE_DISABLE_1M_CONTEXT). Best-effort.
 fn one_m_enabled() -> bool {
-    if std::env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT").ok().as_deref() == Some("1") {
+    if std::env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         return false;
     }
     let home = std::env::var("HOME").unwrap_or_default();

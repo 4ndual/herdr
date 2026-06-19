@@ -55,11 +55,11 @@ pub fn claude_md_goal(root: &Path) -> Option<String> {
     let mut in_goal = false;
     for line in content.lines() {
         let t = line.trim_start();
-        if t.starts_with("## ") {
+        if let Some(heading) = t.strip_prefix("## ") {
             if in_goal {
                 break;
             } // end of the Goal section
-            in_goal = t[3..].trim().to_lowercase().starts_with("goal");
+            in_goal = heading.trim().to_lowercase().starts_with("goal");
             continue;
         }
         if in_goal {

@@ -342,7 +342,7 @@ impl App {
     pub(crate) fn sync_cons_sel(&mut self) {
         match self.selected_entity() {
             Some(e) if self.cons_expanded.contains(&e) => {
-                if !self.cons_sel.as_ref().is_some_and(|(se, _)| *se == e) {
+                if self.cons_sel.as_ref().is_none_or(|(se, _)| *se != e) {
                     let n = self.cons_indices(&e).len();
                     self.cons_sel = if n > 0 { Some((e, 0)) } else { None };
                 }
@@ -571,7 +571,7 @@ impl App {
         }
         self.refresh_plans();
         // Auto-infer once per session when empty (main single-line + structured tree).
-        if self.state.as_ref().map_or(true, |s| !has_real(&s.text))
+        if self.state.as_ref().is_none_or(|s| !has_real(&s.text))
             && self.inferred.insert(sid.to_string())
         {
             self.effects.push(Effect::SpawnClaude {
@@ -695,7 +695,7 @@ impl App {
 
     /// True when `basename` is the newest "current" plan (auto-expanded). Clicks on it fold differently.
     pub(crate) fn is_current_plan(&self, basename: &str) -> bool {
-        self.plans.first().map_or(false, |p| p.basename == basename)
+        self.plans.first().is_some_and(|p| p.basename == basename)
     }
 
     /// Fold/unfold the current (newest) plan — separate from `plans_expanded` so re-seeding on refresh
@@ -1022,16 +1022,17 @@ impl App {
     /// hasn't accepted it yet — the only case where an Approve chip should appear.
     pub(crate) fn node_is_unapproved_agent(&self, node: Node) -> bool {
         match node {
-            Node::Main => self.state.as_ref().map_or(false, |s| {
-                s.source == "agent" && !s.approved && has_real(&s.text)
-            }),
+            Node::Main => self
+                .state
+                .as_ref()
+                .is_some_and(|s| s.source == "agent" && !s.approved && has_real(&s.text)),
             Node::Current => {
                 let c = &self.tree.current;
                 c.source == "agent" && !c.approved && has_real(&c.text)
             }
-            Node::Sub(id) => self.sub_ref(id).map_or(false, |s| {
-                s.source == "agent" && !s.approved && has_real(&s.text)
-            }),
+            Node::Sub(id) => self
+                .sub_ref(id)
+                .is_some_and(|s| s.source == "agent" && !s.approved && has_real(&s.text)),
             Node::Section(..) => false,
         }
     }
@@ -1245,7 +1246,7 @@ impl App {
         }
         match node {
             Node::Main => {
-                if self.state.as_ref().map_or(false, |s| has_real(&s.text)) {
+                if self.state.as_ref().is_some_and(|s| has_real(&s.text)) {
                     let t = self.state.as_ref().unwrap().text.clone();
                     self.set_main(&t, "user", true);
                     self.status = "approved".into();
@@ -1263,7 +1264,7 @@ impl App {
                 }
             }
             Node::Sub(id) => {
-                let real = self.sub_ref(id).map_or(false, |s| has_real(&s.text));
+                let real = self.sub_ref(id).is_some_and(|s| has_real(&s.text));
                 if real {
                     self.update_sub_goal(id, |s| {
                         s.source = "user".into();
