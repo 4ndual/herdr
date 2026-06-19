@@ -14,6 +14,7 @@ pub mod infer;
 pub mod model;
 pub mod store;
 pub mod timegate;
+pub mod view;
 
 pub use model::{GoalDoc, GoalState, Links, Par, Proposal, St, Sub, Tree};
 pub use store::GoalStore;
