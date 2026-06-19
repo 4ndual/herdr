@@ -84,10 +84,16 @@ def record(h, fid, tc, label, *needles, absent=()):
     return ok
 
 
+def has_goal(sid):
+    return os.path.exists(os.path.expanduser(f"~/.claude/goal/{sid}.goal.json"))
+
+
 def main():
-    nogoal = [s for s in newest_claude_sids(12)
-              if not os.path.exists(os.path.expanduser(f"~/.claude/goal/{s}.goal.json"))]
-    SID_NOGOAL = nogoal[0] if nogoal else newest_claude_sids(1)[0]
+    # Two sessions that BOTH have a real transcript AND a real goal file, so a
+    # focus switch demonstrably moves BOTH the usage strip and the goal tree.
+    both = [s for s in newest_claude_sids(60) if has_goal(s)]
+    sid_a = GOAL_A if GOAL_A in both else (both[0] if both else newest_claude_sids(1)[0])
+    sid_b = next((s for s in both if s != sid_a), GOAL_B)
 
     # ---- Scenario 1: startup config (TC14) — strip on, panel off ----
     h = Herdr(usage_strip=True, goal_panel=False, session="dse1")
@@ -99,7 +105,7 @@ def main():
         p1 = h.current_pane()
 
         # ---- TC1 + TC15: claude usage strip, full real surface ----
-        h.report_agent(p1, "herdr:claude", "claude", GOAL_A)
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
         h.pump(3.0)
         record(h, "02_usage_claude", "TC1/TC15",
                "focused claude agent -> real usage strip (model/ctx/5h/week/today/AC)",
@@ -135,38 +141,45 @@ def main():
     try:
         h.start()
         p1 = h.current_pane()
-        h.report_agent(p1, "herdr:claude", "claude", GOAL_A)
+        h.report_agent(p1, "herdr:claude", "claude", sid_a)
         h.pump(2.5)
         record(h, "07_focusA", "TC2/TC7",
-               "pane A focused: goal tree = session A (herdr native dashes goal)",
-               "GOALS", "MAIN")
+               "pane A focused: usage strip + goal tree = session A",
+               "GOALS", "MAIN", "Claude", "ctx", absent=("no focused agent session",))
         p2 = h.split()
-        h.report_agent(p2, "herdr:claude", "claude", GOAL_B)
+        h.report_agent(p2, "herdr:claude", "claude", sid_b)
         h.pump(2.5)
+        # Both sessions have a transcript AND a goal, so BOTH regions adopt B.
         record(h, "08_focusB", "TC2/TC7",
-               "focus switched to pane B: strip + goal tree adopt session B",
-               "GOALS", "MAIN", "Claude")
+               "focus -> pane B: usage strip AND goal tree both adopt session B",
+               "GOALS", "MAIN", "Claude", "ctx", absent=("no focused agent session",))
         # focus back to A
         h.focus_pane(p1)
         h.pump(2.0)
         record(h, "09_focusA_again", "TC2/TC7",
-               "focus back to pane A: dashes follow herdr's focus",
-               "GOALS", "Claude")
+               "focus back to pane A: both regions follow herdr's focus",
+               "GOALS", "Claude", "ctx", absent=("no focused agent session",))
     finally:
         h.stop()
 
-    # ---- TC8: empty/placeholder goal tree for a session with no goal ----
+    # ---- TC8: genuinely empty goal tree (fresh cwd + unused session id, so the
+    # link -> cwd -> legacy -> global resolver finds NO existing goal) ----
+    import tempfile
+    empty_cwd = tempfile.mkdtemp(prefix="noproj-", dir="/tmp")
+    fresh_sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     h = Herdr(usage_strip=True, goal_panel=True, session="dse3")
     try:
         h.start()
-        p1 = h.current_pane()
-        h.report_agent(p1, "herdr:claude", "claude", SID_NOGOAL)
+        p = h.split(cwd=empty_cwd)
+        h.report_agent(p, "herdr:claude", "claude", fresh_sid)
         h.pump(2.5)
         record(h, "10_goal_empty", "TC8",
-               "session with no goal file -> placeholder goal tree (no crash)",
+               "fresh cwd + unused session -> empty/placeholder goal tree, no crash",
                "GOALS")
     finally:
         h.stop()
+        import shutil
+        shutil.rmtree(empty_cwd, ignore_errors=True)
 
     # ---- TC3: codex usage strip from real rollouts ----
     cx_sid, cx_cwd = newest_codex()
