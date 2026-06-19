@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::model::{GoalDoc, GoalState, Links, PromptEntry, Sub, Tree, GOAL_FILE};
+use crate::model::{GoalDoc, GoalState, Links, PromptEntry, Tree, GOAL_FILE};
 use crate::timegate::{
     cwd_from_jsonl, global_goal_path, home, project_goal_file, project_root, state_dir,
 };
@@ -392,6 +392,7 @@ pub fn session_cwd(sid: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::model::norm;
+    use crate::model::Sub;
     use std::time::Duration;
 
     fn tmp_store(tag: &str) -> GoalStore {

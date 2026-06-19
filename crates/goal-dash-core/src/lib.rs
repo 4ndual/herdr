@@ -10,6 +10,7 @@
 //! herdr fork gains its goal panel.
 
 pub mod context;
+pub mod infer;
 pub mod model;
 pub mod store;
 pub mod timegate;
