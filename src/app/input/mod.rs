@@ -230,6 +230,14 @@ impl App {
             return;
         }
 
+        // feat/native-dashes: the usage strip and goal panel are herdr UI
+        // regions, not panes — route mouse landing on them to the cores before
+        // any pane/sidebar handling.
+        if crate::dash::route_mouse(self, mouse) {
+            self.request_render();
+            return;
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.state.on_sidebar_divider(mouse.column, mouse.row)
         {

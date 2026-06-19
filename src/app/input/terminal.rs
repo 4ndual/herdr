@@ -19,6 +19,15 @@ fn is_modifier_only_key(code: &KeyCode) -> bool {
 
 impl App {
     pub(crate) fn handle_terminal_key_headless(&mut self, key: TerminalKey) {
+        // feat/native-dashes: when the goal panel holds keyboard focus, route
+        // keys to it instead of the pane. The prefix key is excluded so the
+        // leader chord (e.g. <prefix> g to toggle/unfocus) still works.
+        if !self.state.is_prefix_key(key)
+            && crate::dash::route_key_if_focused(self, &key.as_key_event())
+        {
+            self.request_render();
+            return;
+        }
         let Some(input) = self.prepare_terminal_key_forward(key) else {
             return;
         };

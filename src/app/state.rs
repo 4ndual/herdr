@@ -1346,6 +1346,9 @@ pub struct AppState {
     /// Whether the native right-side goal panel is shown (feat/native-dashes).
     /// Pure data; the renderer reads it and `compute_view` sizes the panel.
     pub goal_panel_visible: bool,
+    /// Whether keyboard input is routed to the goal panel instead of the focused
+    /// pane (feat/native-dashes). Set when the panel is toggled on or clicked.
+    pub goal_panel_focused: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_scope: AgentPanelScope,
@@ -1699,6 +1702,7 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             goal_panel_visible: false,
+            goal_panel_focused: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,

@@ -1477,6 +1477,13 @@ impl App {
 // `dim_rule` and `short_time` render helpers live in `render.rs`.
 
 impl App {
+    /// True when the panel is at its top-level tree (not in a sub-view or an
+    /// edit). The host uses this to decide whether Esc backs out of a sub-view
+    /// or releases keyboard focus back to the pane.
+    pub fn is_tree_root(&self) -> bool {
+        self.view == View::Tree && !self.editing
+    }
+
     /// Route an abstract UI intent to the active view's handler, then drain the
     /// queued host effects. Mirrors goal-widget's `event_loop` key routing so the
     /// host only forwards intents and never reimplements per-view behavior.

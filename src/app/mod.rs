@@ -534,6 +534,7 @@ impl App {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             goal_panel_visible: false,
+            goal_panel_focused: false,
             sidebar_section_split,
             agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
@@ -778,6 +779,13 @@ impl App {
         source: Box<dyn crate::platform::PrefixInputSource>,
     ) {
         self.prefix_input_source = source;
+    }
+
+    /// feat/native-dashes: request an immediate repaint after a dashboard input
+    /// event (which produces no pane output to otherwise trigger a render).
+    pub(crate) fn request_render(&self) {
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {

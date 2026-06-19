@@ -7,6 +7,7 @@
 //! routes the cores' [`dash_common::Effect`]s back onto herdr machinery.
 
 use bytes::Bytes;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use dash_common::{AgentKind, ClaudeMode, Effect, FocusInput};
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -151,6 +152,98 @@ fn spawn_claude(mode: ClaudeMode, sid: String) {
             goal_dash_core::infer::run_sort(&sid);
         }
     });
+}
+
+/// Is `(col, row)` inside a non-empty rect?
+fn in_rect(r: Rect, col: u16, row: u16) -> bool {
+    r.width > 0
+        && r.height > 0
+        && col >= r.x
+        && col < r.x + r.width
+        && row >= r.y
+        && row < r.y + r.height
+}
+
+/// Map a crossterm key to a goal-panel intent. `None` for keys the panel
+/// ignores (so the host can fall through to its own handling).
+fn key_to_goal_action(key: &KeyEvent) -> Option<goal_dash_core::GoalAction> {
+    use goal_dash_core::GoalAction as G;
+    Some(match key.code {
+        KeyCode::Up => G::Up,
+        KeyCode::Down => G::Down,
+        KeyCode::Left => G::Left,
+        KeyCode::Right | KeyCode::Tab => G::Right,
+        KeyCode::Enter => G::Enter,
+        KeyCode::Char(' ') => G::Space,
+        KeyCode::Esc => G::Back,
+        KeyCode::Backspace => G::Backspace,
+        KeyCode::Char(c) => G::Char(c),
+        _ => return None,
+    })
+}
+
+/// Route a key to the goal panel when it holds keyboard focus. Returns true if
+/// the key was consumed (so the host must not also forward it to the pane).
+///
+/// Esc at the tree root releases focus back to the focused pane; in a sub-view
+/// it backs out one level (handled by the core). The caller is responsible for
+/// not routing the prefix key here, so the leader chord still works.
+pub fn route_key_if_focused(app: &mut App, key: &KeyEvent) -> bool {
+    if !(app.state.goal_panel_focused && app.state.goal_panel_visible) {
+        return false;
+    }
+    if key.code == KeyCode::Esc && app.goal_dash.is_tree_root() {
+        app.state.goal_panel_focused = false;
+        return true;
+    }
+    let Some(action) = key_to_goal_action(key) else {
+        return false;
+    };
+    handle_goal(app, action);
+    true
+}
+
+/// Route a mouse event onto whichever dashboard region it lands in. Returns true
+/// if consumed. A left click on the goal panel also grabs keyboard focus; moves
+/// update hover for tooltips. Events outside both regions are left for the host.
+pub fn route_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    let (col, row) = (mouse.column, mouse.row);
+
+    if in_rect(app.state.view.usage_dash_area, col, row) {
+        use usage_dash_core::Action as U;
+        let action = match mouse.kind {
+            MouseEventKind::Moved => U::Hover(col, row),
+            MouseEventKind::Down(MouseButton::Left) => U::Click(col, row),
+            MouseEventKind::ScrollDown => U::ScrollDown,
+            MouseEventKind::ScrollUp => U::ScrollUp,
+            _ => return true, // swallow other events over the strip
+        };
+        usage_dash_core::handle(action, &mut app.usage_view);
+        return true;
+    }
+
+    if in_rect(app.state.view.goal_dash_area, col, row) {
+        use goal_dash_core::GoalAction as G;
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.state.goal_panel_focused = true;
+        }
+        let action = match mouse.kind {
+            MouseEventKind::Moved => G::Hover(col, row),
+            MouseEventKind::Down(MouseButton::Left) => G::Click(col, row),
+            _ => return true,
+        };
+        handle_goal(app, action);
+        return true;
+    }
+
+    false
+}
+
+/// Apply a UI [`GoalAction`](goal_dash_core::GoalAction) to the goal core and
+/// run any effects it returns.
+fn handle_goal(app: &mut App, action: goal_dash_core::GoalAction) {
+    let effects = app.goal_dash.handle(action);
+    run_effects(app, effects);
 }
 
 /// Draw the native dashboard regions for this frame, called from the app's
