@@ -43,3 +43,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[workspace]
+members = ["crates/dash-common", "crates/usage-dash-core", "crates/goal-dash-core"]
+resolver = "2"
