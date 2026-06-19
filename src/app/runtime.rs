@@ -4,8 +4,8 @@ use crossterm::terminal;
 
 use super::{
     auto_updates_enabled, repeat_key_identity, App, Mode, ANIMATION_INTERVAL,
-    AUTO_UPDATE_CHECK_INTERVAL, GIT_REMOTE_STATUS_REFRESH_INTERVAL, MIN_RENDER_INTERVAL,
-    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    AUTO_UPDATE_CHECK_INTERVAL, DASH_TICK_INTERVAL, GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+    MIN_RENDER_INTERVAL, RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
 use crate::events::AppEvent;
 use crate::workspace::{GitStatusCacheEntry, Workspace, WorkspaceGitStatus};
@@ -289,6 +289,16 @@ impl App {
             self.sync_pending_agent_resume_deadline(now);
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
+
+        // feat/native-dashes: refresh the dashboard cores from disk + run the
+        // goal observer on a flat poll, then repaint so the strip/panel reflect
+        // the focused pane.
+        if now >= self.next_dash_tick {
+            crate::dash::tick(self);
+            self.next_dash_tick = now + DASH_TICK_INTERVAL;
+            changed = true;
+        }
+
         self.sync_animation_timer(now);
         changed
     }
@@ -556,6 +566,7 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            Some(self.next_dash_tick),
             render_deadline,
         ]
         .into_iter()

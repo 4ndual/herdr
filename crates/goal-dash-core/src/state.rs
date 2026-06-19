@@ -833,7 +833,7 @@ impl App {
     /// `resolve_focus()` discovery). `Some(session_id)` ⇒ load it; `is_self_focus`
     /// ⇒ sticky (keep showing, seeding from the most-recent session on a fresh
     /// open); otherwise no agent is focused ⇒ clear.
-    pub(crate) fn refresh(&mut self, focus: FocusInput) {
+    pub fn refresh(&mut self, focus: FocusInput) {
         if let Some(sid) = self.pinned_sid.clone() {
             if self.current_sid.as_deref() != Some(&sid) {
                 self.current_sid = Some(sid.clone());

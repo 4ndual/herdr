@@ -33,6 +33,9 @@ pub(crate) const HEADLESS_ANIMATION_INTERVAL: Duration = Duration::from_millis(1
 pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = 8;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// feat/native-dashes: how often the dashboard cores refresh from disk and run
+/// the goal observer. P4 may make this focus-change-driven instead of a flat poll.
+pub(crate) const DASH_TICK_INTERVAL: Duration = Duration::from_millis(1000);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
@@ -121,6 +124,8 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
+    /// feat/native-dashes: next time [`crate::dash::tick`] refreshes the cores.
+    pub(crate) next_dash_tick: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
@@ -633,6 +638,7 @@ impl App {
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
+            next_dash_tick: Instant::now(),
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: auto_updates_enabled(no_session)

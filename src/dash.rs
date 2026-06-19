@@ -6,18 +6,19 @@
 //! that input from the currently focused pane each frame, and (later phases)
 //! routes the cores' [`dash_common::Effect`]s back onto herdr machinery.
 
-use dash_common::{AgentKind, FocusInput};
+use bytes::Bytes;
+use dash_common::{AgentKind, ClaudeMode, Effect, FocusInput};
 use ratatui::layout::Rect;
 use ratatui::Frame;
+use usage_dash_core::RefreshOutcome;
 
 use crate::agent_resume::AgentSessionRefKind;
-use crate::app::AppState;
+use crate::app::{App, AppState};
 use crate::detect::{parse_agent_label, Agent};
 
 /// Map herdr's detected agent to the core-facing [`AgentKind`]. Agents the
 /// dashboards don't model collapse to [`AgentKind::None`] (treated as a plain
 /// pane for source resolution).
-#[allow(dead_code)] // consumed by focus_input, wired into the tick loop in P3.5
 fn map_agent(agent: Agent) -> AgentKind {
     match agent {
         Agent::Claude => AgentKind::Claude,
@@ -34,7 +35,6 @@ fn map_agent(agent: Agent) -> AgentKind {
 /// label + session ref). Returns the default (nothing focused) input whenever
 /// any link in that chain is absent, so the cores simply hold their last
 /// snapshot rather than thrash.
-#[allow(dead_code)] // wired into the main tick loop in P3.5
 pub fn focus_input(state: &AppState) -> FocusInput {
     let Some(ws_idx) = state.active else {
         return FocusInput::default();
@@ -76,6 +76,81 @@ pub fn focus_input(state: &AppState) -> FocusInput {
         // when input routing lands (P3.6). Until then a pane is always focused.
         is_self_focus: false,
     }
+}
+
+/// Refresh both dashboard cores from the focused pane and execute any effects
+/// the goal core queues. Called on the dash tick (~1 Hz) from the main loop.
+///
+/// - Usage: resolve the [`FocusInput`] to a snapshot, applying the sticky
+///   semantics ([`RefreshOutcome`]) — replace, keep, or clear the stored one.
+/// - Goal: `refresh` adopts the focused session, then `poll` re-reads the goal
+///   and plan files, runs the periodic observer, and finalizes a pending sort;
+///   both drain into the same effect queue.
+pub fn tick(app: &mut App) {
+    let focus = focus_input(&app.state);
+
+    match usage_dash_core::refresh(focus.clone()) {
+        RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(snap),
+        RefreshOutcome::Clear => app.usage_snapshot = None,
+        RefreshOutcome::KeepPrevious => {}
+    }
+
+    app.goal_dash.refresh(focus);
+    let effects = app.goal_dash.poll();
+    run_effects(app, effects);
+}
+
+/// Carry out the host side of the goal core's [`Effect`]s.
+fn run_effects(app: &mut App, effects: Vec<Effect>) {
+    for effect in effects {
+        match effect {
+            // State already mutated in-core; the tick repaints regardless.
+            Effect::Refresh => {}
+            Effect::Status(msg) => tracing::debug!(target: "dash", "{msg}"),
+            Effect::SendPaneKeys { lines } => send_pane_keys(app, lines),
+            Effect::SpawnClaude { mode, sid } => spawn_claude(mode, sid),
+        }
+    }
+}
+
+/// Type each line into the focused agent's pane followed by a carriage return
+/// (the clear+rebrief sequence). Non-blocking: a full pane input buffer drops
+/// the keys rather than stalling the render loop.
+fn send_pane_keys(app: &mut App, lines: Vec<String>) {
+    let Some(ws_idx) = app.state.active else {
+        return;
+    };
+    let Some(runtime) = app
+        .state
+        .focused_runtime_in_workspace(&app.terminal_runtimes, ws_idx)
+    else {
+        return;
+    };
+    for mut line in lines {
+        line.push('\r');
+        let _ = runtime.try_send_bytes(Bytes::from(line.into_bytes()));
+    }
+}
+
+/// Run the matching headless `claude -p` for a goal inference action off the
+/// async runtime (the `run_*` entry points block on a subprocess and persist to
+/// the goal file). Fire-and-forget: the next [`tick`] reloads the written file
+/// via `poll`, so the UI never blocks on the call.
+fn spawn_claude(mode: ClaudeMode, sid: String) {
+    tokio::task::spawn_blocking(move || match mode {
+        ClaudeMode::Infer => {
+            goal_dash_core::infer::run_infer(Some(sid));
+        }
+        ClaudeMode::InferTree => {
+            goal_dash_core::infer::run_infer_tree(&sid);
+        }
+        ClaudeMode::Observe => {
+            goal_dash_core::infer::run_observe(&sid);
+        }
+        ClaudeMode::Sort => {
+            goal_dash_core::infer::run_sort(&sid);
+        }
+    });
 }
 
 /// Draw the native dashboard regions for this frame, called from the app's
