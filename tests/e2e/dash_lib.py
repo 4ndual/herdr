@@ -140,6 +140,18 @@ class Herdr:
                 out.add(row[x].fg)
         return out
 
+    def cells(self):
+        """Per-cell (char, fg, bg) grid straight from the pyte buffer, so the QA
+        video can rasterize the REAL recolored colors (Catppuccin truecolor for
+        the themed dash regions) instead of a monochrome approximation. fg/bg are
+        pyte's own values: 'default', a named ANSI color, or a lowercase 6-hex
+        truecolor string."""
+        grid = []
+        for y in range(self.rows):
+            row = self.screen.buffer[y]
+            grid.append([(row[x].data, row[x].fg, row[x].bg) for x in range(self.cols)])
+        return grid
+
     def _ps(self):
         return subprocess.run(["ps", "-axo", "pid=,ppid=,command="],
                               capture_output=True, text=True).stdout

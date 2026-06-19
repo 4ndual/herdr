@@ -71,6 +71,8 @@ def record(h, fid, tc, label, *needles, absent=()):
     with open(path, "w") as f:
         f.write(f"# {fid} [{tc}] {label}\n")
         f.write(txt)
+    # Color-carrying companion for the QA video (real recolored cells).
+    json.dump(h.cells(), open(os.path.join(OUTDIR, f"{fid}.colors.json"), "w"))
     bottom = "\n".join(h.grid()[-9:])
     ok = all(n in txt for n in needles) and all(a not in txt for a in absent)
     results.append((fid, tc, label, ok, list(needles), list(absent)))
@@ -213,12 +215,17 @@ def main():
         # the Claude caption is mauve; the strip must carry Catppuccin truecolor
         # and must NOT leave raw named ANSI (magenta/green) in the strip.
         ansi_leak = sorted(c for c in strip if c in ("magenta", "green", "yellow", "red", "blue", "cyan"))
-        ok = (MAUVE in strip) and not ansi_leak
+        # Gate: the always-present Claude caption (mauve) MUST be Catppuccin
+        # truecolor, at least two distinct palette hexes must be present (proves
+        # several semantic roles got remapped, not one), and ZERO raw named-ANSI
+        # fg may remain in the strip (a missed recolor would surface here).
+        ok = (MAUVE in strip) and (len(cat_hits) >= 2) and not ansi_leak
         with open(os.path.join(OUTDIR, "12_catppuccin.txt"), "w") as f:
             f.write("# 12_catppuccin [TC10] dash strip themed to Catppuccin palette\n")
             f.write("catppuccin truecolor fg in strip: %s\n" % cat_hits)
             f.write("raw ANSI named fg left in strip:   %s\n" % ansi_leak)
             f.write(h.text())
+        json.dump(h.cells(), open(os.path.join(OUTDIR, "12_catppuccin.colors.json"), "w"))
         results.append(("12_catppuccin", "TC10", "usage strip uses Catppuccin truecolor (no raw ANSI leak)", ok, [MAUVE], ansi_leak))
         frames.append({"id": "12_catppuccin", "tc": "TC10", "label": "Catppuccin palette", "ok": ok, "path": os.path.join(OUTDIR, "12_catppuccin.txt")})
         print(f"[{'PASS' if ok else 'FAIL'}] 12_catppuccin TC10: cat={cat_hits} ansi_leak={ansi_leak}")
@@ -269,15 +276,24 @@ def main():
         h.prefix(b"d")
         h.pump(1.0)
         before = {pid for pid, _, _ in h.claude_p_pids()}
-        h.send(b"f", settle=0.05)   # Sort — poll immediately (the launcher may be fast)
-        spawned = h.wait_claude_spawn(before, secs=12)
+        h.send(b"f", settle=0.05)        # Sort
+        # `fetch_sort` sets status="sorting…" SYNCHRONOUSLY on the keypress, then
+        # `maybe_finish_sort` flips it to "sorted → …" the instant the real
+        # claude call returns and moves the goal store. The agent's move decision
+        # is non-deterministic and the headless call is fast, so sampling
+        # "sorting" AFTER wait_claude_spawn races completion. Capture the status
+        # at dispatch (the call cannot finish in ~1s — the child stays alive for
+        # seconds), and gate on the spawned child as the stable real-call proof.
+        h.pump(1.0)
+        sorting_now = "sorting" in h.text()
         record(h, "14_sort_dispatch", "TC20",
-               "f -> herdr spawns claude --sort; panel status = sorting",
-               "sorting")
+               "f -> herdr spawns a real claude -p (sort); panel status = sorting")
+        spawned = h.wait_claude_spawn(before, secs=12)
+        ok = sorting_now and spawned is not None
         results[-1] = (results[-1][0], results[-1][1], results[-1][2],
-                       results[-1][3] and spawned is not None, results[-1][4], results[-1][5])
-        frames[-1]["ok"] = results[-1][3]
-        print(f"   herdr-spawned claude -p: {spawned[:2] if spawned else None}")
+                       ok, results[-1][4], results[-1][5])
+        frames[-1]["ok"] = ok
+        print(f"   status=sorting at dispatch: {sorting_now}; herdr-spawned claude -p: {spawned[:2] if spawned else None}")
     finally:
         h.stop()
 
@@ -305,6 +321,7 @@ def main():
             if spawned:
                 f.write("cmd: %s\n" % spawned[2][:200])
             f.write(txt)
+        json.dump(h.cells(), open(os.path.join(OUTDIR, "15_infer_live.colors.json"), "w"))
         ok = spawned is not None
         results.append(("15_infer_live", "TC19/TC21", "r -> herdr launches real claude -p goal inference", ok, ["claude -p child"], []))
         frames.append({"id": "15_infer_live", "tc": "TC19/TC21", "label": "live Claude infer in-herdr", "ok": ok, "path": path})

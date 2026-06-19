@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Rasterize captured dash E2E frames (the exact pyte grids) into a QA video.
 
-Reads OUTDIR/manifest.json + each <id>.txt grid, renders a labelled monospace
-PNG per scenario (header banner with TC + label + PASS/FAIL), then encodes an
-MP4 holding each frame a few seconds. The .txt grids remain the ground-truth
-artifact for frame-by-frame transcription; this video is the visual companion.
+Reads OUTDIR/manifest.json and, per scenario, the color-carrying
+<id>.colors.json grid (per-cell char + fg + bg straight from pyte) so the video
+shows the REAL recolored output — Catppuccin truecolor for the themed dash
+regions, named ANSI for unthemed panes. Falls back to the monochrome <id>.txt
+grid when no color grid exists. Renders a labelled PNG per scenario (header
+banner with TC + label + PASS/FAIL), then encodes an MP4 holding each frame a
+few seconds. The .txt grids remain the ground-truth artifact for frame-by-frame
+transcription; this video is the visual companion.
 """
 import os, sys, json, subprocess
 from PIL import Image, ImageDraw, ImageFont
@@ -18,6 +22,7 @@ SECS_PER_FRAME = float(os.environ.get("SECS_PER_FRAME", "3.0"))
 
 font = ImageFont.truetype(MONO, FS)
 hfont = ImageFont.truetype(MONO, 22)
+lfont = ImageFont.truetype(MONO, 15)
 # Cell metrics from the monospace font.
 bbox = font.getbbox("M")
 CW = font.getlength("M")
@@ -29,10 +34,53 @@ OKC = (166, 227, 161)    # green
 BADC = (243, 139, 168)   # red
 BANNER = (49, 50, 68)
 
+# pyte named-ANSI -> catppuccin mocha RGB, so unthemed panes still read sensibly
+# and any raw-ANSI leak in a themed region would visibly differ from truecolor.
+NAMED = {
+    "default": FG, "white": (205, 214, 244), "black": (69, 71, 90),
+    "red": (243, 139, 168), "green": (166, 227, 161), "brown": (249, 226, 175),
+    "yellow": (249, 226, 175), "blue": (137, 180, 250), "magenta": (203, 166, 247),
+    "cyan": (148, 226, 213), "brightblack": (108, 112, 134),
+}
 
-def render_frame(fid, tc, label, ok, txt, out_png):
+
+def fg_rgb(fg):
+    """pyte fg -> RGB. 'default'/named via NAMED; lowercase 6-hex truecolor parsed."""
+    if fg in NAMED:
+        return NAMED[fg]
+    if isinstance(fg, str) and len(fg) == 6:
+        try:
+            return (int(fg[0:2], 16), int(fg[2:4], 16), int(fg[4:6], 16))
+        except ValueError:
+            pass
+    return FG
+
+
+def render_cells(fid, tc, label, ok, cells, out_png):
+    rows = len(cells)
+    cols = max((len(r) for r in cells), default=80)
+    W = int(CW * cols) + 2 * PAD
+    H = int(CH * rows) + 2 * PAD + HEADER_H
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, HEADER_H], fill=BANNER)
+    status = "PASS" if ok else "FAIL"
+    d.text((PAD, 8), f"{tc}  {status}", font=hfont, fill=OKC if ok else BADC)
+    d.text((PAD, 36), label[:120], font=lfont, fill=FG)
+    y = HEADER_H + PAD
+    for row in cells:
+        x = PAD
+        for ch, fg, _bg in row:
+            if ch and ch != " ":
+                d.text((x, y), ch, font=font, fill=fg_rgb(fg))
+            x += CW
+        y += CH
+    img.save(out_png)
+    return out_png
+
+
+def render_txt(fid, tc, label, ok, txt, out_png):
     lines = txt.split("\n")
-    # drop the leading "# ..." comment line written into the .txt
     if lines and lines[0].startswith("# "):
         lines = lines[1:]
     cols = max((len(l) for l in lines), default=80)
@@ -44,7 +92,7 @@ def render_frame(fid, tc, label, ok, txt, out_png):
     d.rectangle([0, 0, W, HEADER_H], fill=BANNER)
     status = "PASS" if ok else "FAIL"
     d.text((PAD, 8), f"{tc}  {status}", font=hfont, fill=OKC if ok else BADC)
-    d.text((PAD, 36), label[:120], font=ImageFont.truetype(MONO, 15), fill=FG)
+    d.text((PAD, 36), label[:120], font=lfont, fill=FG)
     y = HEADER_H + PAD
     for line in lines:
         d.text((PAD, y), line, font=font, fill=FG)
@@ -57,9 +105,14 @@ def main():
     manifest = json.load(open(os.path.join(OUTDIR, "manifest.json")))
     pngs = []
     for fr in manifest:
-        txt = open(fr["path"]).read()
         png = os.path.join(OUTDIR, fr["id"] + ".png")
-        render_frame(fr["id"], fr["tc"], fr["label"], fr["ok"], txt, png)
+        colors_path = os.path.join(OUTDIR, fr["id"] + ".colors.json")
+        if os.path.exists(colors_path):
+            cells = json.load(open(colors_path))
+            render_cells(fr["id"], fr["tc"], fr["label"], fr["ok"], cells, png)
+        else:
+            txt = open(fr["path"]).read()
+            render_txt(fr["id"], fr["tc"], fr["label"], fr["ok"], txt, png)
         pngs.append(png)
         print("rendered", png)
 
