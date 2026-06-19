@@ -28,7 +28,7 @@ use crate::timegate::{
     add_minutes, fill_estimate, list_project_plans, parse_duration_min, plans_scope_key,
     plans_watermark, project_goal_file, short_time, state_dir, PlanMeta,
 };
-use crate::view::{Act, ChipSpec, EditTarget, HistTarget, Node, View};
+use crate::view::{Act, ChipSpec, EditTarget, GoalAction, HistTarget, Node, View};
 
 pub struct App {
     pub(crate) current_sid: Option<String>,
@@ -107,7 +107,7 @@ fn default_collapsed(_st: St) -> bool {
 }
 
 impl App {
-    pub(crate) fn new(pinned_sid: Option<String>) -> Self {
+    pub fn new(pinned_sid: Option<String>) -> Self {
         App {
             current_sid: None,
             effects: Vec::new(),
@@ -1475,3 +1475,316 @@ impl App {
 }
 
 // `dim_rule` and `short_time` render helpers live in `render.rs`.
+
+impl App {
+    /// Route an abstract UI intent to the active view's handler, then drain the
+    /// queued host effects. Mirrors goal-widget's `event_loop` key routing so the
+    /// host only forwards intents and never reimplements per-view behavior.
+    pub fn handle(&mut self, action: GoalAction) -> Vec<Effect> {
+        use GoalAction as A;
+        match action {
+            A::Hover(c, r) => {
+                self.hover = Some((c, r));
+                return self.take_effects();
+            }
+            A::Click(c, r) => {
+                self.handle_click(c, r);
+                return self.take_effects();
+            }
+            _ => {}
+        }
+        match self.view {
+            View::History => match action {
+                A::Back => self.close_history(),
+                A::Up => {
+                    if self.sel_hist + 1 < self.history.len() {
+                        self.sel_hist += 1; // toward newest (top)
+                    }
+                }
+                A::Down => self.sel_hist = self.sel_hist.saturating_sub(1),
+                A::Enter | A::Space => self.restore(self.sel_hist),
+                _ => {}
+            },
+            View::Proposals => match action {
+                A::Back => {
+                    self.view = View::Tree;
+                    self.status.clear();
+                }
+                A::Up => self.sel_prop = self.sel_prop.saturating_sub(1),
+                A::Down => {
+                    self.sel_prop = (self.sel_prop + 1).min(self.proposals.len().saturating_sub(1))
+                }
+                A::Enter | A::Space => self.toggle_proposal(),
+                A::Char('y') => self.accept_proposal(self.sel_prop),
+                A::Char('x') => self.dismiss_proposal(self.sel_prop),
+                _ => {}
+            },
+            View::PromptLog => match action {
+                A::Back | A::Char('m') => {
+                    self.view = View::Tree;
+                    self.status.clear();
+                }
+                _ => {}
+            },
+            View::Tree if self.editing => match action {
+                A::Back => {
+                    self.editing = false;
+                    self.edit_buf.clear();
+                    self.status = "cancelled".into();
+                }
+                A::Enter => self.commit_edit(),
+                A::Backspace => {
+                    self.edit_buf.pop();
+                }
+                A::Space => self.edit_buf.push(' '),
+                A::Char(c) => self.edit_buf.push(c),
+                _ => {}
+            },
+            View::Tree => match action {
+                A::Up => {
+                    if !self.move_cons_sel(-1) {
+                        self.sel_node = self.sel_node.saturating_sub(1);
+                        self.sel_ctrl = 0;
+                        self.sync_cons_sel();
+                    }
+                }
+                A::Down => {
+                    if !self.move_cons_sel(1) {
+                        self.sel_node = (self.sel_node + 1).min(self.nodes.len().saturating_sub(1));
+                        self.sel_ctrl = 0;
+                        self.sync_cons_sel();
+                    }
+                }
+                A::Left => {
+                    let n = self.ctrl_count();
+                    if n > 0 {
+                        self.sel_ctrl = (self.sel_ctrl + n - 1) % n;
+                    }
+                }
+                A::Right => {
+                    let n = self.ctrl_count();
+                    if n > 0 {
+                        self.sel_ctrl = (self.sel_ctrl + 1) % n;
+                    }
+                }
+                A::Enter | A::Space => self.activate_selected(),
+                A::Char('a') => {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, Act::Approve)
+                    }
+                }
+                A::Char('e') => {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, Act::Edit)
+                    }
+                }
+                A::Char('r') => {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, Act::Infer)
+                    }
+                }
+                A::Char('l') => {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, Act::Log)
+                    }
+                }
+                A::Char('n') => self.begin_add_sub(),
+                A::Char('s') => {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, Act::State)
+                    }
+                }
+                A::Char('d') => {
+                    if !self.delete_selected_constraint() {
+                        if let Some(n) = self.selected() {
+                            self.run_act(n, Act::Discard)
+                        }
+                    }
+                }
+                A::Char('p') => self.cycle_parent(),
+                A::Char('w') => self.save_to_project(),
+                A::Char('x') => self.clear_rebrief(),
+                A::Char('f') => self.fetch_sort(),
+                A::Char('v') => self.open_proposals(),
+                A::Char('m') => self.open_prompt_log(),
+                A::Char('t') => self.begin_time_edit(),
+                A::Char('c') => self.toggle_constraints(),
+                A::Char('C') => self.begin_constraint_edit(),
+                A::Char('P') => self.plans_section_open = !self.plans_section_open,
+                _ => {}
+            },
+        }
+        self.take_effects()
+    }
+
+    /// Resolve a left-click against the last frame's hit-rects (mirrors the
+    /// `event_loop` mouse branch). `handle` drains the effects afterward.
+    fn handle_click(&mut self, col: u16, row: u16) {
+        let hit = |r: &Rect| row == r.y && col >= r.x && col < r.x + r.width;
+        match self.view {
+            View::History => {
+                if let Some(idx) = self
+                    .hist_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, i)| *i)
+                {
+                    self.sel_hist = idx;
+                    self.restore(idx);
+                }
+            }
+            View::Proposals => {
+                if let Some(idx) = self
+                    .prop_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, i)| *i)
+                {
+                    let was = self.sel_prop;
+                    self.sel_prop = idx;
+                    if was == idx {
+                        self.toggle_proposal();
+                    }
+                }
+            }
+            View::PromptLog => {}
+            View::Tree => {
+                if self.editing {
+                    return;
+                }
+                if let Some(br) = self.banner_rect {
+                    if hit(&br) {
+                        self.open_proposals();
+                        return;
+                    }
+                }
+                if let Some(ent) = self
+                    .cons_header_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, e)| e.clone())
+                {
+                    if let Some(idx) = self
+                        .node_rects
+                        .iter()
+                        .find(|(r, _)| hit(r))
+                        .map(|(_, i)| *i)
+                    {
+                        self.sel_node = idx;
+                    }
+                    self.toggle_constraints_entity(&ent);
+                    return;
+                }
+                if let Some(hr) = self.plans_head_rect {
+                    if hit(&hr) {
+                        self.plans_section_open = !self.plans_section_open;
+                        return;
+                    }
+                }
+                if let Some(b) = self
+                    .plans_row_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, b)| b.clone())
+                {
+                    if self.is_current_plan(&b) {
+                        self.toggle_current_plan_fold();
+                    } else {
+                        self.toggle_plan(&b);
+                    }
+                    return;
+                }
+                if let Some(act) = self
+                    .chip_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, a)| *a)
+                {
+                    if let Some(n) = self.selected() {
+                        self.run_act(n, act);
+                    }
+                    return;
+                }
+                if let Some(idx) = self
+                    .node_rects
+                    .iter()
+                    .find(|(r, _)| hit(r))
+                    .map(|(_, i)| *i)
+                {
+                    if idx != self.sel_node {
+                        self.sel_ctrl = 0; // new node → reset chip cursor
+                    }
+                    self.sel_node = idx;
+                    if let Some(Node::Section(par, st)) = self.selected() {
+                        self.toggle_section(par, st);
+                    }
+                } else if let Some(act) =
+                    self.controls.iter().find(|(r, _)| hit(r)).map(|(_, c)| *c)
+                {
+                    let n = self.selected().unwrap_or(Node::Main);
+                    self.run_act(n, act);
+                }
+            }
+        }
+    }
+
+    /// Periodic tick the host calls (~every 250ms): re-read the goal/plan files,
+    /// dispatch the observer when new prompts land, and adopt a sorted/moved
+    /// store. Returns any effects (e.g. a queued observer `SpawnClaude`).
+    pub fn poll(&mut self) -> Vec<Effect> {
+        self.refresh_if_changed();
+        self.refresh_plans_if_changed();
+        self.maybe_observe();
+        self.maybe_finish_sort();
+        self.take_effects()
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+    use crate::view::GoalAction as A;
+
+    #[test]
+    fn p_toggles_plans_section_with_no_effects() {
+        let mut app = App::new(None);
+        assert!(app.plans_section_open);
+        let fx = app.handle(A::Char('P'));
+        assert!(!app.plans_section_open);
+        assert!(fx.is_empty());
+        app.handle(A::Char('P'));
+        assert!(app.plans_section_open);
+    }
+
+    #[test]
+    fn editing_mode_accepts_text_space_backspace_and_cancels() {
+        let mut app = App::new(None);
+        app.editing = true; // simulate an in-progress edit (no fs needed)
+        app.edit_buf.clear();
+        app.handle(A::Char('h'));
+        app.handle(A::Space);
+        app.handle(A::Char('i'));
+        assert_eq!(app.edit_buf, "h i");
+        app.handle(A::Backspace);
+        assert_eq!(app.edit_buf, "h ");
+        app.handle(A::Back); // Esc cancels
+        assert!(!app.editing);
+        assert!(app.edit_buf.is_empty());
+    }
+
+    #[test]
+    fn hover_records_position_and_emits_no_effects() {
+        let mut app = App::new(None);
+        let fx = app.handle(A::Hover(5, 3));
+        assert_eq!(app.hover, Some((5, 3)));
+        assert!(fx.is_empty());
+    }
+
+    #[test]
+    fn opening_proposals_with_none_stays_on_tree() {
+        let mut app = App::new(None);
+        app.handle(A::Char('v'));
+        assert_eq!(app.view, View::Tree);
+        assert_eq!(app.status, "no proposals");
+    }
+}

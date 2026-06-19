@@ -80,7 +80,7 @@ pub enum EditTarget {
     ConstraintCurrent,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
     Tree,
     History,
@@ -97,4 +97,34 @@ pub fn badge_marker(source: &str, approved: bool) -> (&'static str, Color) {
     } else {
         ("~", Color::Yellow)
     }
+}
+
+/// An abstract UI intent for [`crate::state::App::handle`]. The host maps its
+/// crossterm key/mouse events onto these, so the core never depends on a
+/// terminal backend (mirrors `usage-dash-core::Action`). Routing per active
+/// [`View`]/editing mode happens inside `handle`, not in the host.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GoalAction {
+    /// ↑ — select toward newest / move constraint highlight up.
+    Up,
+    /// ↓ — select toward oldest / move constraint highlight down.
+    Down,
+    /// ← — previous contextual chip.
+    Left,
+    /// → / Tab — next contextual chip.
+    Right,
+    /// Enter — activate selection (commit edit / restore / toggle / run chip).
+    Enter,
+    /// Space — same as Enter in tree/views; a literal space while editing.
+    Space,
+    /// Esc — cancel edit / leave a sub-view back to the tree.
+    Back,
+    /// Backspace — delete a char while editing.
+    Backspace,
+    /// A character key: a shortcut on the tree, or text input while editing.
+    Char(char),
+    /// Cursor moved to `(col, row)` — updates the hover target for tooltips.
+    Hover(u16, u16),
+    /// Left click at `(col, row)` — resolved against the last frame's hit-rects.
+    Click(u16, u16),
 }
