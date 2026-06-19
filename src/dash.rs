@@ -138,25 +138,36 @@ fn send_pane_keys(app: &mut App, lines: Vec<String>) {
     }
 }
 
-/// Run the matching headless `claude -p` for a goal inference action off the
-/// async runtime (the `run_*` entry points block on a subprocess and persist to
-/// the goal file). Fire-and-forget: the next [`tick`] reloads the written file
-/// via `poll`, so the UI never blocks on the call.
+/// Run the matching headless `claude -p` for a goal inference action on a
+/// detached OS thread (the `run_*` entry points block on a `std::process`
+/// subprocess and persist to the goal file). Fire-and-forget: the next [`tick`]
+/// reloads the written file via `poll`, so the UI never blocks on the call.
+///
+/// Uses `std::thread::spawn` rather than `tokio::task::spawn_blocking` on
+/// purpose: effects are executed from herdr's INPUT path (a key in the focused
+/// goal panel → [`route_key_if_focused`] → [`handle_goal`] → [`run_effects`]),
+/// which the headless server drives on a plain reader thread with no ambient
+/// Tokio runtime. `spawn_blocking` there panics with "must be called from the
+/// context of a Tokio runtime" — the panic unwinds after the action's status is
+/// already set, so the panel reads "sorting…"/"inferring…" while no Claude ever
+/// launches. A std thread has no runtime dependency and works from any caller.
 fn spawn_claude(mode: ClaudeMode, sid: String) {
-    tokio::task::spawn_blocking(move || match mode {
-        ClaudeMode::Infer => {
-            goal_dash_core::infer::run_infer(Some(sid));
-        }
-        ClaudeMode::InferTree => {
-            goal_dash_core::infer::run_infer_tree(&sid);
-        }
-        ClaudeMode::Observe => {
-            goal_dash_core::infer::run_observe(&sid);
-        }
-        ClaudeMode::Sort => {
-            goal_dash_core::infer::run_sort(&sid);
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name("dash-claude".into())
+        .spawn(move || match mode {
+            ClaudeMode::Infer => {
+                goal_dash_core::infer::run_infer(Some(sid));
+            }
+            ClaudeMode::InferTree => {
+                goal_dash_core::infer::run_infer_tree(&sid);
+            }
+            ClaudeMode::Observe => {
+                goal_dash_core::infer::run_observe(&sid);
+            }
+            ClaudeMode::Sort => {
+                goal_dash_core::infer::run_sort(&sid);
+            }
+        });
 }
 
 /// Is `(col, row)` inside a non-empty rect?
@@ -264,13 +275,66 @@ pub fn draw(
     goal: &mut goal_dash_core::App,
     usage_view: &mut usage_dash_core::UsageView,
     usage_snapshot: Option<&usage_dash_core::UsageSnapshot>,
+    palette: &crate::app::state::Palette,
 ) {
     if usage_area.width > 0 && usage_area.height > 0 {
         usage_dash_core::render(frame, usage_area, usage_snapshot, usage_view);
+        recolor_to_palette(frame, usage_area, palette);
     }
     if goal_area.width > 0 && goal_area.height > 0 {
         goal_dash_core::draw(frame, goal_area, goal);
+        recolor_to_palette(frame, goal_area, palette);
     }
+}
+
+/// Re-map a dash region's named-ANSI foreground/background colors onto herdr's
+/// resolved [`Palette`](crate::app::state::Palette) so the baked-in dashes are
+/// themed by the host (Catppuccin by default) and stay visually consistent with
+/// herdr's own RGB widgets — instead of the terminal's 16-color ANSI palette.
+///
+/// The cores deliberately render in semantic *named* colors (`Color::Green` =
+/// "good", `Color::Yellow` = "attention", `Color::DarkGray` = "dim", …) and the
+/// standalone binaries keep that terminal-adaptive look. Inside herdr we lift
+/// each named color to the matching palette role. Anything already truecolor
+/// (the selection bar's explicit `Rgb`, indexed/reset cells) is left untouched.
+fn recolor_to_palette(frame: &mut Frame, area: Rect, palette: &crate::app::state::Palette) {
+    let buf = frame.buffer_mut();
+    let x1 = area.x.saturating_add(area.width);
+    let y1 = area.y.saturating_add(area.height);
+    for y in area.y..y1 {
+        for x in area.x..x1 {
+            let cell = &mut buf[(x, y)];
+            if let Some(fg) = map_named_color(cell.fg, palette) {
+                cell.fg = fg;
+            }
+            if let Some(bg) = map_named_color(cell.bg, palette) {
+                cell.bg = bg;
+            }
+        }
+    }
+}
+
+/// Lift a single semantic *named* ANSI color to its matching palette role.
+/// Returns `None` for colors that should pass through untouched (already
+/// truecolor `Rgb`, indexed, `Reset`, or `Black`) so we never flatten a
+/// deliberately-chosen RGB or the terminal's own background.
+fn map_named_color(
+    c: ratatui::style::Color,
+    palette: &crate::app::state::Palette,
+) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    Some(match c {
+        Color::Green | Color::LightGreen => palette.green,
+        Color::Yellow | Color::LightYellow => palette.yellow,
+        Color::Red | Color::LightRed => palette.red,
+        Color::Blue | Color::LightBlue => palette.blue,
+        Color::Cyan | Color::LightCyan => palette.teal,
+        Color::Magenta | Color::LightMagenta => palette.mauve,
+        Color::Gray => palette.subtext0,
+        Color::DarkGray => palette.overlay0,
+        Color::White => palette.text,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -285,6 +349,29 @@ mod tests {
         assert_eq!(map_agent(Agent::Pi), AgentKind::Pi);
         assert_eq!(map_agent(Agent::Gemini), AgentKind::None);
         assert_eq!(map_agent(Agent::Cursor), AgentKind::None);
+    }
+
+    #[test]
+    fn named_colors_lift_to_catppuccin_palette_roles() {
+        use crate::app::state::Palette;
+        use ratatui::style::Color;
+        let p = Palette::catppuccin();
+        // semantic named colors map to the matching palette role …
+        assert_eq!(map_named_color(Color::Green, &p), Some(p.green));
+        assert_eq!(map_named_color(Color::Yellow, &p), Some(p.yellow));
+        assert_eq!(map_named_color(Color::Red, &p), Some(p.red));
+        assert_eq!(map_named_color(Color::Magenta, &p), Some(p.mauve));
+        assert_eq!(map_named_color(Color::Cyan, &p), Some(p.teal));
+        assert_eq!(map_named_color(Color::DarkGray, &p), Some(p.overlay0));
+        assert_eq!(map_named_color(Color::White, &p), Some(p.text));
+        // catppuccin green is a specific truecolor, not the terminal's ANSI green
+        assert_eq!(
+            map_named_color(Color::Green, &p),
+            Some(Color::Rgb(166, 227, 161))
+        );
+        // … while explicit truecolor / reset pass through untouched.
+        assert_eq!(map_named_color(Color::Rgb(246, 165, 160), &p), None);
+        assert_eq!(map_named_color(Color::Reset, &p), None);
     }
 
     #[test]

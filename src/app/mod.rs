@@ -937,6 +937,7 @@ impl App {
                         &mut self.goal_dash,
                         &mut self.usage_view,
                         self.usage_snapshot.as_ref(),
+                        &self.state.palette,
                     );
                 })?;
                 if kitty_graphics_enabled {

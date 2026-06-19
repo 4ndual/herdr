@@ -333,6 +333,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
                     dash.goal,
                     dash.usage_view,
                     dash.usage_snapshot,
+                    &app_state.palette,
                 );
             }
         })
