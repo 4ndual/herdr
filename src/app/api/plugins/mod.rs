@@ -224,6 +224,60 @@ impl App {
         .map_err(|(_, message)| message)
     }
 
+    pub(crate) fn invoke_plugin_action_from_ui_surface(
+        &mut self,
+        plugin_id: String,
+        action_id: String,
+        context_menu_kind: Option<crate::app::state::ContextMenuKind>,
+    ) -> Result<(), String> {
+        let (plugin, action) = self
+            .find_plugin_action(Some(&plugin_id), &action_id)
+            .map_err(|(_, message)| message)?;
+        if !plugin.enabled {
+            return Err(format!("plugin {} is disabled", plugin.plugin_id));
+        }
+        ensure_platform_supported(
+            effective_platforms(&action.platforms, &plugin.platforms),
+            &action.qualified_id(),
+        )
+        .map_err(|(_, message)| message)?;
+        let mut context = match context_menu_kind {
+            Some(crate::app::state::ContextMenuKind::Workspace { ws_idx })
+            | Some(crate::app::state::ContextMenuKind::GitWorkspace { ws_idx, .. }) => {
+                self.plugin_context_for_workspace(ws_idx, "context_menu")
+            }
+            Some(crate::app::state::ContextMenuKind::Pane { ws_idx, pane_id, .. }) => {
+                self.plugin_context_for_pane(ws_idx, pane_id, "context_menu")
+            }
+            Some(crate::app::state::ContextMenuKind::Tab { ws_idx, tab_idx }) => {
+                let mut context = self.plugin_context_for_workspace(ws_idx, "context_menu");
+                context.tab_id = self.public_tab_id(ws_idx, tab_idx);
+                context.tab_label = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tab_display_name(tab_idx));
+                context.focused_pane_id = None;
+                context.focused_pane_cwd = None;
+                context.focused_pane_agent = None;
+                context.focused_pane_status = None;
+                context
+            }
+            None => self.current_plugin_context("ui_surface"),
+        };
+        context.invocation_source = Some("context_menu".to_string());
+        self.start_plugin_command(
+            &plugin,
+            Some(action.action_id),
+            None,
+            action.command,
+            &context,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|(_, message)| message)
+    }
+
     pub(crate) fn invoke_plugin_link_handler_for_url(
         &mut self,
         url: &str,
@@ -789,6 +843,62 @@ platforms = ["linux", "macos", "windows"]
     }
 
     #[test]
+    fn relink_same_plugin_id_keeps_stable_user_dirs_and_data() {
+        let mut app = test_app();
+        let root_a = unique_temp_path("plugin-relink-a");
+        let root_b = unique_temp_path("plugin-relink-b");
+        let config_dir = super::env::plugin_config_dir("example.relink");
+        let state_dir = super::env::plugin_state_dir("example.relink");
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+
+        let manifest = r#"
+id = "example.relink"
+name = "Relink"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["echo", "ok"]
+"#;
+        write_manifest_content(&root_a, manifest);
+        write_manifest_content(&root_b, manifest);
+        link_manifest(&mut app, &root_a);
+
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(config_dir.join("settings.json"), "{\"theme\":\"custom\"}").unwrap();
+        std::fs::write(state_dir.join("cache.json"), "{\"seen\":1}").unwrap();
+
+        let result = app.handle_api_request(Request {
+            id: "relink".into(),
+            method: Method::PluginLink(PluginLinkParams {
+                path: root_b.display().to_string(),
+                enabled: true,
+                source: None,
+            }),
+        });
+        assert!(result.contains("plugin_linked"), "expected plugin_linked: {result}");
+
+        let plugin = app
+            .state
+            .installed_plugins
+            .get("example.relink")
+            .expect("plugin should remain linked");
+        assert_eq!(plugin.plugin_root, canonical_path_string(&root_b));
+        assert_eq!(std::fs::read_to_string(config_dir.join("settings.json")).unwrap(), "{\"theme\":\"custom\"}");
+        assert_eq!(std::fs::read_to_string(state_dir.join("cache.json")).unwrap(), "{\"seen\":1}");
+
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
+
+    #[test]
     fn plugin_link_seeds_stable_config_dir_from_legacy_unhashed_dir() {
         let mut app = test_app();
         let root = unique_temp_path("plugin-link-legacy-config");
@@ -1067,7 +1177,43 @@ command = ["echo", "b"]
         assert_eq!(plugin.actions.len(), 1);
         assert_eq!(plugin.events.len(), 1);
         assert_eq!(plugin.panes.len(), 1);
+        assert_eq!(plugin.ui_modules.len(), 1);
+        assert_eq!(plugin.ui_modules[0].module, "dist/goal-ui.wasm");
         assert!(plugin.warnings.is_empty());
+    }
+
+    #[test]
+    fn link_with_missing_ui_module_succeeds_with_warning() {
+        let root = unique_temp_path("plugin-missing-ui-module");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.missing-ui-module"
+name = "Missing UI Module"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos", "windows"]
+
+[[ui_modules]]
+id = "goal-ui"
+title = "Goal UI"
+kind = "wasm"
+api_version = 1
+module = "dist/goal-ui.wasm"
+hot_reload = "on"
+surfaces = ["header"]
+capabilities = ["focused_session"]
+"#,
+        );
+
+        let plugin = load_plugin_manifest(&root.display().to_string(), true)
+            .expect("missing ui module should be warning-only");
+        assert!(plugin
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ui module goal-ui file not found")));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1469,6 +1615,7 @@ command = ["sh", "-c", "sleep 1"]
                     correlation_id: Some("external-correlation".into()),
                     clicked_url: None,
                     link_handler_id: None,
+                    plugin_payload_json: Some("{\"hello\":true}".into()),
                 }),
             }),
         });
@@ -1489,6 +1636,7 @@ command = ["sh", "-c", "sleep 1"]
         assert_eq!(log.action_id.as_deref(), Some("bootstrap"));
         assert_eq!(context.workspace_id.as_deref(), Some("1"));
         assert_eq!(context.invocation_source.as_deref(), Some("test"));
+        assert_eq!(context.plugin_payload_json.as_deref(), Some("{\"hello\":true}"));
         assert_eq!(
             context.correlation_id.as_deref(),
             Some("external-correlation")
@@ -1714,6 +1862,74 @@ command = ["sh", "-c", "printf '%s\n%s\n%s' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PLUG
                     .as_str()
             )
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_action_invoke_exports_plugin_payload_env() {
+        let mut app = test_app();
+        let root = unique_temp_path("plugin-action-payload-env");
+        write_manifest_content(
+            &root,
+            r#"
+id = "example.action-payload"
+name = "Action Payload"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "run"
+title = "Run"
+command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_PAYLOAD_JSON\""]
+"#,
+        );
+        link_manifest(&mut app, &root);
+
+        let invoke = app.handle_api_request(Request {
+            id: "invoke-runner".into(),
+            method: Method::PluginActionInvoke(PluginActionInvokeParams {
+                plugin_id: Some("example.action-payload".into()),
+                action_id: "run".into(),
+                context: Some(PluginInvocationContext {
+                    plugin_payload_json: Some("{\"source\":\"test\"}".into()),
+                    ..Default::default()
+                }),
+            }),
+        });
+        let ResponseResult::PluginActionInvoked { log, .. } = response_result(&invoke) else {
+            panic!("expected plugin action invocation: {invoke}");
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.drain_all_internal_events();
+            if app.state.plugin_command_logs.iter().any(|entry| {
+                entry.log_id == log.log_id && entry.status != PluginCommandStatus::Running
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let logs = app.handle_api_request(Request {
+            id: "logs".into(),
+            method: Method::PluginLogList(PluginLogListParams {
+                plugin_id: Some("example.action-payload".into()),
+                limit: Some(10),
+            }),
+        });
+        let ResponseResult::PluginLogList { logs } = response_result(&logs) else {
+            panic!("expected plugin logs: {logs}");
+        };
+        let finished = logs
+            .iter()
+            .find(|entry| entry.log_id == log.log_id)
+            .expect("log should exist");
+        assert_eq!(finished.status, PluginCommandStatus::Succeeded);
+        assert_eq!(finished.stdout.as_deref(), Some("{\"source\":\"test\"}"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2382,6 +2598,64 @@ command = ["sh", "-c", "echo ok"]
         assert!(!app.state.plugin_panes.contains_key(&pane_b));
         // other plugin's pane record survives
         assert!(app.state.plugin_panes.contains_key(&pane_other));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_pane_open_forwards_payload_env() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("plugin-pane-payload")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = crate::app::Mode::Terminal;
+        let root = unique_temp_path("plugin-pane-payload-env");
+        let capture = root.join("capture.txt");
+        write_manifest_content(
+            &root,
+            &format!(
+                r#"
+id = "example.payload-pane"
+name = "Payload Pane"
+version = "0.1.0"
+min_herdr_version = "0.6.10"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "board"
+title = "Plugin Board"
+command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_PAYLOAD_JSON\" > {}"]
+"#,
+                capture.display()
+            ),
+        );
+        link_manifest(&mut app, &root);
+
+        let _ = app.handle_api_request(Request {
+            id: "pane-open".into(),
+            method: Method::PluginPaneOpen(PluginPaneOpenParams {
+                plugin_id: "example.payload-pane".into(),
+                entrypoint: "board".into(),
+                placement: Some(PluginPanePlacement::Overlay),
+                workspace_id: None,
+                target_pane_id: None,
+                direction: None,
+                cwd: None,
+                focus: true,
+                env: std::collections::HashMap::from([(
+                    "HERDR_PLUGIN_PAYLOAD_JSON".to_string(),
+                    "{\"pane\":true}".to_string(),
+                )]),
+            }),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !capture.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(&capture).unwrap(), "{\"pane\":true}");
 
         let _ = std::fs::remove_dir_all(root);
     }

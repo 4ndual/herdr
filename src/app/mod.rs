@@ -104,6 +104,9 @@ pub struct App {
     /// last frame's hit-rects) and the latest resolved snapshot.
     pub(crate) usage_view: usage_dash_core::UsageView,
     pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
+    /// Registered hot-reloadable UI plugin modules discovered from the plugin registry.
+    pub(crate) ui_plugins: crate::ui_plugins::UiPluginManager,
+    pub(crate) last_ui_plugin_focus: Option<dash_common::FocusInput>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -535,6 +538,7 @@ impl App {
             sidebar_collapsed: false,
             usage_strip_enabled: config.ui.usage_strip,
             goal_panel_visible: config.ui.goal_panel,
+            goal_panel_width: config.ui.goal_panel_width,
             goal_panel_focused: false,
             sidebar_section_split,
             agent_panel_scope,
@@ -584,6 +588,9 @@ impl App {
             installed_plugins: load_plugin_registry(no_session),
             plugin_panes: std::collections::HashMap::new(),
             plugin_command_logs: Vec::new(),
+            ui_context_menu_items: Vec::new(),
+            ui_surface_layers: Vec::new(),
+            pending_plugin_action_invocation: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
@@ -613,6 +620,12 @@ impl App {
             });
         }
 
+        let ui_plugins = crate::ui_plugins::UiPluginManager::from_installed_plugins(
+            &state.installed_plugins,
+        );
+        state.ui_context_menu_items = ui_plugins.context_menu_items();
+        state.ui_surface_layers = ui_plugins.surface_layers();
+
         let last_focus = state.active.and_then(|idx| {
             state
                 .workspaces
@@ -630,6 +643,8 @@ impl App {
             goal_dash: goal_dash_core::App::new(None),
             usage_view: usage_dash_core::UsageView::default(),
             usage_snapshot: None,
+            ui_plugins,
+            last_ui_plugin_focus: None,
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -885,6 +900,17 @@ impl App {
                 needs_render = true;
             }
 
+            if let Some(request) = self.state.pending_plugin_action_invocation.take() {
+                if let Err(err) = self.invoke_plugin_action_from_ui_surface(
+                    request.plugin_id,
+                    request.action_id,
+                    request.context_menu_kind,
+                ) {
+                    tracing::warn!(err = %err, "failed to invoke ui-surface plugin action");
+                }
+                needs_render = true;
+            }
+
             if self.ensure_default_workspace() {
                 needs_render = true;
             }
@@ -922,6 +948,8 @@ impl App {
                             area,
                         );
                     }
+                    self.sync_ui_plugin_focus_event();
+                    self.dispatch_ui_plugin_frame_events();
                     crate::ui::render_with_runtime_registry(
                         &self.state,
                         &self.terminal_runtimes,
@@ -1487,6 +1515,308 @@ impl App {
         }
     }
 
+    pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {
+        self.state.ui_context_menu_items = self.ui_plugins.context_menu_items();
+        self.state.ui_surface_layers = self.ui_plugins.surface_layers();
+    }
+
+    pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
+        let focus = crate::dash::focus_input(&self.state);
+        if self
+            .last_ui_plugin_focus
+            .as_ref()
+            .is_some_and(|last| {
+                last.session_id == focus.session_id
+                    && last.session_ref == focus.session_ref
+                    && last.cwd == focus.cwd
+                    && last.agent == focus.agent
+                    && last.is_self_focus == focus.is_self_focus
+            })
+        {
+            return;
+        }
+        self.last_ui_plugin_focus = Some(focus.clone());
+        if self.ui_plugins.dispatch_focus_changed(focus) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_notifications();
+            self.apply_ui_plugin_effects();
+        }
+    }
+
+    pub(crate) fn dispatch_ui_plugin_frame_events(&mut self) {
+        let focus = crate::dash::focus_input(&self.state);
+        let plugin_context = self.current_plugin_context("ui_frame");
+        let plugin_context_json = serde_json::to_string(&plugin_context).ok();
+        let modules = self
+            .ui_plugins
+            .all()
+            .iter()
+            .map(|module| {
+                (
+                    module.plugin_id.clone(),
+                    module.module_id.clone(),
+                    module.surfaces.clone(),
+                    serde_json::to_string(&module.manifest_ref()).ok(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (plugin_id, module_id, surfaces, manifest_json) in modules {
+            for surface in surfaces {
+                let surface = match surface {
+                    crate::api::schema::PluginUiSurface::Header => herdr_ui_plugin_api::UiSurface::Header,
+                    crate::api::schema::PluginUiSurface::Footer => herdr_ui_plugin_api::UiSurface::Footer,
+                    crate::api::schema::PluginUiSurface::TabBar => herdr_ui_plugin_api::UiSurface::TabBar,
+                    crate::api::schema::PluginUiSurface::Sidebar => herdr_ui_plugin_api::UiSurface::Sidebar,
+                    crate::api::schema::PluginUiSurface::RightPanel => herdr_ui_plugin_api::UiSurface::RightPanel,
+                    crate::api::schema::PluginUiSurface::Overlay => herdr_ui_plugin_api::UiSurface::Overlay,
+                    crate::api::schema::PluginUiSurface::ContextMenu => herdr_ui_plugin_api::UiSurface::ContextMenu,
+                };
+                let rect = crate::ui::ui_plugin_surface_rect(
+                    &self.state,
+                    crate::ui::ui_plugin_frame_area(&self.state),
+                    surface,
+                );
+                let env = self.build_ui_plugin_frame_env(
+                    &plugin_id,
+                    &module_id,
+                    manifest_json.as_deref(),
+                    plugin_context_json.as_deref(),
+                    &plugin_context,
+                    &focus,
+                );
+                changed |= self.ui_plugins.dispatch_frame(
+                    &plugin_id,
+                    &module_id,
+                    surface,
+                    herdr_ui_plugin_api::UiLayoutRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    false,
+                    focus.clone(),
+                    env,
+                );
+            }
+        }
+        if changed {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_notifications();
+            self.apply_ui_plugin_effects();
+        }
+    }
+
+    pub(crate) fn build_ui_plugin_frame_env(
+        &self,
+        plugin_id: &str,
+        module_id: &str,
+        manifest_json: Option<&str>,
+        plugin_context_json: Option<&str>,
+        plugin_context: &crate::api::schema::PluginInvocationContext,
+        focus: &dash_common::FocusInput,
+    ) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
+            ("HERDR_PLUGIN_ID".to_string(), plugin_id.to_string()),
+            ("HERDR_UI_MODULE_ID".to_string(), module_id.to_string()),
+            ("HERDR_THEME_NAME".to_string(), self.state.theme_name.clone()),
+            (
+                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+                crate::api::socket_path().display().to_string(),
+            ),
+        ]);
+        if let Ok(current_exe) = std::env::current_exe() {
+            env.insert("HERDR_BIN_PATH".to_string(), current_exe.display().to_string());
+        }
+        if let Some(plugin) = self.state.installed_plugins.get(plugin_id) {
+            env.insert("HERDR_PLUGIN_ROOT".to_string(), plugin.plugin_root.clone());
+            env.insert(
+                "HERDR_PLUGIN_CONFIG_DIR".to_string(),
+                crate::plugin_paths::plugin_config_dir(&plugin.plugin_id)
+                    .display()
+                    .to_string(),
+            );
+            env.insert(
+                "HERDR_PLUGIN_STATE_DIR".to_string(),
+                crate::plugin_paths::plugin_state_dir(&plugin.plugin_id)
+                    .display()
+                    .to_string(),
+            );
+        }
+        if let Some(manifest_json) = manifest_json {
+            env.insert("HERDR_UI_MODULE_MANIFEST_JSON".to_string(), manifest_json.to_string());
+        }
+        if let Some(plugin_context_json) = plugin_context_json {
+            env.insert("HERDR_PLUGIN_CONTEXT_JSON".to_string(), plugin_context_json.to_string());
+        }
+        if let Some(workspace_id) = plugin_context.workspace_id.as_ref() {
+            env.insert("HERDR_WORKSPACE_ID".to_string(), workspace_id.clone());
+        }
+        if let Some(tab_id) = plugin_context.tab_id.as_ref() {
+            env.insert("HERDR_TAB_ID".to_string(), tab_id.clone());
+        }
+        if let Some(pane_id) = plugin_context.focused_pane_id.as_ref() {
+            env.insert("HERDR_PANE_ID".to_string(), pane_id.clone());
+        }
+        if let Some(selected_text) = plugin_context.selected_text.as_ref() {
+            env.insert("HERDR_SELECTED_TEXT".to_string(), selected_text.clone());
+        }
+        if let Some(session_id) = focus.session_id.as_ref() {
+            env.insert("HERDR_FOCUS_SESSION_ID".to_string(), session_id.clone());
+        }
+        if let Some(session_ref) = focus.session_ref.as_ref() {
+            env.insert("HERDR_FOCUS_SESSION_REF".to_string(), session_ref.clone());
+        }
+        if let Some(cwd) = focus.cwd.as_ref() {
+            env.insert("HERDR_FOCUS_CWD".to_string(), cwd.display().to_string());
+        }
+        env.insert(
+            "HERDR_FOCUS_AGENT".to_string(),
+            format!("{:?}", focus.agent).to_lowercase(),
+        );
+        env
+    }
+
+    pub(crate) fn apply_ui_plugin_notifications(&mut self) {
+        for message in self.ui_plugins.take_pending_notifications() {
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::Finished,
+                title: message,
+                context: "ui plugin".into(),
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
+        }
+    }
+
+    pub(crate) fn apply_ui_plugin_effects(&mut self) {
+        for effect in self.ui_plugins.take_pending_effects() {
+            match effect {
+                herdr_ui_plugin_api::HostEffect::CopyText(text) => {
+                    self.state.request_clipboard_write = Some(text.into_bytes());
+                }
+                herdr_ui_plugin_api::HostEffect::SendPaneKeys { lines } => {
+                    let Some(ws_idx) = self.state.active else {
+                        continue;
+                    };
+                    let Some(runtime) = self
+                        .state
+                        .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+                    else {
+                        continue;
+                    };
+                    for mut line in lines {
+                        line.push('\r');
+                        let _ = runtime.try_send_bytes(bytes::Bytes::from(line.into_bytes()));
+                    }
+                }
+                herdr_ui_plugin_api::HostEffect::SpawnHeadless {
+                    agent,
+                    mode,
+                    sid,
+                    session_ref,
+                    cwd,
+                } => {
+                    let _ = std::thread::Builder::new()
+                        .name("ui-plugin-headless".into())
+                        .spawn(move || match mode {
+                            dash_common::HeadlessMode::Infer => {
+                                goal_dash_core::infer::run_infer_for(
+                                    agent,
+                                    session_ref.as_deref(),
+                                    cwd.as_deref(),
+                                    Some(sid),
+                                );
+                            }
+                            dash_common::HeadlessMode::InferTree => {
+                                goal_dash_core::infer::run_infer_tree_for(
+                                    agent,
+                                    session_ref.as_deref(),
+                                    cwd.as_deref(),
+                                    &sid,
+                                );
+                            }
+                            dash_common::HeadlessMode::Observe => {
+                                goal_dash_core::infer::run_observe_for(
+                                    agent,
+                                    session_ref.as_deref(),
+                                    cwd.as_deref(),
+                                    &sid,
+                                );
+                            }
+                            dash_common::HeadlessMode::Sort => {
+                                goal_dash_core::infer::run_sort_for(
+                                    agent,
+                                    session_ref.as_deref(),
+                                    cwd.as_deref(),
+                                    &sid,
+                                );
+                            }
+                        });
+                }
+                herdr_ui_plugin_api::HostEffect::ShowToast { message } => {
+                    let previous_toast = self.state.toast.clone();
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: crate::app::state::ToastKind::Finished,
+                        title: message,
+                        context: "ui plugin".into(),
+                        position: None,
+                        target: None,
+                    });
+                    self.sync_toast_deadline(previous_toast);
+                }
+                herdr_ui_plugin_api::HostEffect::OpenPluginPane {
+                    plugin_id,
+                    entrypoint,
+                    payload_json,
+                } => {
+                    let mut env = std::collections::HashMap::new();
+                    if let Some(payload_json) = payload_json {
+                        env.insert("HERDR_PLUGIN_PAYLOAD_JSON".to_string(), payload_json);
+                    }
+                    let _ = self.handle_api_request(crate::api::schema::Request {
+                        id: "ui-plugin-effect".into(),
+                        method: crate::api::schema::Method::PluginPaneOpen(
+                            crate::api::schema::PluginPaneOpenParams {
+                                plugin_id,
+                                entrypoint,
+                                placement: None,
+                                workspace_id: None,
+                                target_pane_id: None,
+                                direction: None,
+                                cwd: None,
+                                focus: true,
+                                env,
+                            },
+                        ),
+                    });
+                }
+                herdr_ui_plugin_api::HostEffect::InvokePluginAction {
+                    plugin_id,
+                    action_id,
+                    payload_json,
+                } => {
+                    let _ = self.handle_api_request(crate::api::schema::Request {
+                        id: "ui-plugin-effect".into(),
+                        method: crate::api::schema::Method::PluginActionInvoke(
+                            crate::api::schema::PluginActionInvokeParams {
+                                action_id,
+                                plugin_id: Some(plugin_id),
+                                context: Some(crate::api::schema::PluginInvocationContext {
+                                    plugin_payload_json: payload_json,
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     /// Handles a key event in non-terminal mode for the headless server.
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
@@ -1614,6 +1944,74 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_exposes_plugin_and_focus_context() {
+        let mut app = test_app();
+        app.state.theme_name = "test-theme".into();
+        app.state.installed_plugins.insert(
+            "example.ui".into(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.ui".into(),
+                name: "Example UI".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: crate::build_info::BASE_VERSION.into(),
+                description: None,
+                manifest_path: "/tmp/example.ui/herdr-plugin.toml".into(),
+                plugin_root: "/tmp/example.ui".into(),
+                enabled: true,
+                platforms: None,
+                build: vec![],
+                actions: vec![],
+                events: vec![],
+                panes: vec![],
+                ui_modules: vec![],
+                link_handlers: vec![],
+                source: Default::default(),
+                warnings: vec![],
+            },
+        );
+
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "goal-ui",
+            Some("{\"module\":true}"),
+            Some("{\"context\":true}"),
+            &crate::api::schema::PluginInvocationContext {
+                workspace_id: Some("w1".into()),
+                tab_id: Some("w1:t1".into()),
+                focused_pane_id: Some("w1:p1".into()),
+                selected_text: Some("hello".into()),
+                ..Default::default()
+            },
+            &dash_common::FocusInput {
+                session_id: Some("sid-1".into()),
+                session_ref: Some("ref-1".into()),
+                cwd: Some(std::path::PathBuf::from("/tmp/repo")),
+                agent: dash_common::AgentKind::Claude,
+                is_self_focus: false,
+            },
+        );
+
+        assert_eq!(env.get("HERDR_PLUGIN_ID").map(String::as_str), Some("example.ui"));
+        assert_eq!(env.get("HERDR_UI_MODULE_ID").map(String::as_str), Some("goal-ui"));
+        assert_eq!(env.get("HERDR_UI_MODULE_MANIFEST_JSON").map(String::as_str), Some("{\"module\":true}"));
+        assert_eq!(env.get("HERDR_PLUGIN_CONTEXT_JSON").map(String::as_str), Some("{\"context\":true}"));
+        assert_eq!(env.get("HERDR_PLUGIN_ROOT").map(String::as_str), Some("/tmp/example.ui"));
+        assert_eq!(env.get("HERDR_THEME_NAME").map(String::as_str), Some("test-theme"));
+        assert_eq!(env.get("HERDR_WORKSPACE_ID").map(String::as_str), Some("w1"));
+        assert_eq!(env.get("HERDR_TAB_ID").map(String::as_str), Some("w1:t1"));
+        assert_eq!(env.get("HERDR_PANE_ID").map(String::as_str), Some("w1:p1"));
+        assert_eq!(env.get("HERDR_SELECTED_TEXT").map(String::as_str), Some("hello"));
+        assert_eq!(env.get("HERDR_FOCUS_SESSION_ID").map(String::as_str), Some("sid-1"));
+        assert_eq!(env.get("HERDR_FOCUS_SESSION_REF").map(String::as_str), Some("ref-1"));
+        assert_eq!(env.get("HERDR_FOCUS_CWD").map(String::as_str), Some("/tmp/repo"));
+        assert_eq!(env.get("HERDR_FOCUS_AGENT").map(String::as_str), Some("claude"));
+        assert!(env.contains_key("HERDR_PLUGIN_CONFIG_DIR"));
+        assert!(env.contains_key("HERDR_PLUGIN_STATE_DIR"));
+        assert!(env.contains_key("HERDR_BIN_PATH"));
+        assert!(env.contains_key(crate::api::SOCKET_PATH_ENV_VAR));
     }
 
     #[cfg(windows)]

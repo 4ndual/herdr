@@ -3472,6 +3472,34 @@ impl HeadlessServer {
             && now >= self.app.next_dash_tick
         {
             crate::dash::tick(&mut self.app);
+            // feat/native-dashes: mirror the ui-plugin hot-reload + tick dispatch
+            // from the direct-mode `App::handle_scheduled_tasks` loop. The server
+            // owns the UiPluginManager, so without this the mtime-poll reload and
+            // periodic on-tick dispatch never run under the headless server that
+            // production always uses (client + server), and `.wasm` UI modules
+            // would only load at startup and never hot-reload.
+            let changed_ui_modules = self.app.ui_plugins.detect_changed_modules();
+            let changed_reload = if changed_ui_modules.is_empty() {
+                false
+            } else {
+                self.app.ui_plugins.dispatch_reload_requested()
+            };
+            let changed_ui_events = self.app.ui_plugins.dispatch_tick() || changed_reload;
+            let has_pending = self.app.ui_plugins.has_pending_updates();
+            if !changed_ui_modules.is_empty() || changed_ui_events || has_pending {
+                self.app.refresh_ui_plugin_state_from_manager();
+                self.app.apply_ui_plugin_notifications();
+                self.app.apply_ui_plugin_effects();
+                tracing::info!(
+                    count = changed_ui_modules.len(),
+                    modules = ?changed_ui_modules
+                        .iter()
+                        .map(|module| format!("{}:{}", module.plugin_id, module.module_id))
+                        .collect::<Vec<_>>(),
+                    changed_ui_events,
+                    "updated ui plugin modules on scheduled headless tick"
+                );
+            }
             self.app.next_dash_tick = now + app::DASH_TICK_INTERVAL;
             changed = true;
         }

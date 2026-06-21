@@ -204,6 +204,12 @@ impl App {
                 current_exe.display().to_string(),
             ));
         }
+        if let Some(plugin_payload_json) = context.plugin_payload_json.as_ref() {
+            env.push((
+                "HERDR_PLUGIN_PAYLOAD_JSON".to_string(),
+                plugin_payload_json.clone(),
+            ));
+        }
         Ok(env)
     }
 

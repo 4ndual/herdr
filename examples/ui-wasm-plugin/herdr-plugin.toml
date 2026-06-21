@@ -1,0 +1,37 @@
+id = "example.ui-wasm"
+name = "UI WASM Example"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Hot-reloadable native UI surfaces powered by a local WASM module"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[actions]]
+id = "fork"
+title = "Fork"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "printf 'fork action from %s\npayload %s\n' \"${HERDR_PLUGIN_CONTEXT_JSON:-unknown}\" \"${HERDR_PLUGIN_PAYLOAD_JSON:-none}\""]
+
+[[ui_modules]]
+id = "goal-ui"
+title = "Goal UI"
+description = "Adds header/footer/tab/context-menu layers without rebuilding Herdr"
+kind = "wasm"
+api_version = 1
+module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
+hot_reload = "on"
+surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
+capabilities = [
+  "focused_session",
+  "layout_read",
+  "mouse_all",
+  "keyboard_input",
+  "context_menu_augment",
+  "clipboard_write",
+  "pane_input",
+  "headless_actions",
+  "toasts",
+  "plugin_actions",
+]

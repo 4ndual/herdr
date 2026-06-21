@@ -12,7 +12,26 @@ use std::time::SystemTime;
 use crate::model::{GoalState, GOAL_FILE};
 
 pub fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME not set"))
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return PathBuf::from(profile);
+        }
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
+        ) {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            return home;
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 pub fn state_dir() -> PathBuf {
     home().join(".claude/goal")
@@ -671,6 +690,20 @@ mod tests {
         };
         fill_estimate(&mut pinned, &root);
         assert_eq!(pinned.est_minutes, Some(5));
+    }
+
+    #[test]
+    fn time_labels_stay_compact_and_defensive() {
+        assert_eq!(short_time("2026-06-15T14:23:01-0500"), "06-15 14:23");
+        assert_eq!(short_time("bad"), "bad");
+        assert_eq!(est_label(Some(45)), "45m");
+        assert_eq!(est_label(Some(90)), "1h30m");
+        assert_eq!(est_label(Some(120)), "2h");
+        assert_eq!(est_label(None), "—");
+        assert_eq!(left_label(45), ("45m left".into(), false));
+        assert_eq!(left_label(120), ("2h left".into(), false));
+        assert_eq!(left_label(-15), ("-15m".into(), true));
+        assert_eq!(left_label(-120), ("-2h".into(), true));
     }
 }
 

@@ -84,6 +84,35 @@ impl AppState {
             return self.handle_settings_mouse(mouse);
         }
 
+        if self.mode == Mode::Terminal && !self.ui_surface_layers.is_empty() {
+            if let Some(hit) = crate::ui::ui_plugin_hit_at(
+                self,
+                crate::ui::ui_plugin_frame_area(self),
+                mouse.column,
+                mouse.row,
+            ) {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if let Some(action_id) = hit.action_id {
+                        if let Some((plugin_id, action_id)) =
+                            action_id.strip_prefix("plugin:").and_then(|rest| rest.split_once(':'))
+                        {
+                            self.pending_plugin_action_invocation = Some(
+                                crate::app::state::PendingPluginActionInvocation {
+                                    plugin_id: plugin_id.to_string(),
+                                    action_id: action_id.to_string(),
+                                    context_menu_kind: None,
+                                },
+                            );
+                            return None;
+                        }
+                    }
+                }
+                if hit.consumes_mouse {
+                    return None;
+                }
+            }
+        }
+
         let launcher_enabled = self.view.layout != ViewLayout::Mobile
             && !self.sidebar_collapsed
             && matches!(
@@ -944,6 +973,7 @@ impl AppState {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
+                        plugin_items: self.ui_context_menu_items.clone(),
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -960,6 +990,7 @@ impl AppState {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
+                        plugin_items: self.ui_context_menu_items.clone(),
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -996,6 +1027,7 @@ impl AppState {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
+                        plugin_items: self.ui_context_menu_items.clone(),
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -2221,6 +2253,64 @@ mod tests {
     }
 
     #[test]
+    fn consuming_ui_plugin_overlay_blocks_underlying_mouse_routing() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.ui_surface_layers = vec![herdr_ui_plugin_api::UiLayer {
+            surface: herdr_ui_plugin_api::UiSurface::Overlay,
+            z_index: 50,
+            consumes_mouse: true,
+            nodes: vec![herdr_ui_plugin_api::UiNode::Line {
+                spans: vec![herdr_ui_plugin_api::UiTextSpan {
+                    text: "Overlay".into(),
+                    role: Some("accent".into()),
+                }],
+            }],
+        }];
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let x = app.state.view.terminal_area.x;
+        let y = app.state.view.terminal_area.y;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert!(app.state.pending_plugin_action_invocation.is_none());
+        assert!(app.state.selection.is_none());
+    }
+
+    #[test]
+    fn clicking_ui_plugin_surface_schedules_plugin_action() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.ui_surface_layers = vec![herdr_ui_plugin_api::UiLayer {
+            surface: herdr_ui_plugin_api::UiSurface::Header,
+            z_index: 1,
+            consumes_mouse: false,
+            nodes: vec![herdr_ui_plugin_api::UiNode::Tabs {
+                items: vec![herdr_ui_plugin_api::UiActionRef {
+                    id: "plugin:example.ui-wasm:fork".into(),
+                    label: "Fork".into(),
+                }],
+                selected: 0,
+            }],
+        }];
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let x = app.state.view.terminal_area.x + 1;
+        let y = app.state.view.terminal_area.y;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        let pending = app
+            .state
+            .pending_plugin_action_invocation
+            .as_ref()
+            .expect("pending plugin action");
+        assert_eq!(pending.plugin_id, "example.ui-wasm");
+        assert_eq!(pending.action_id, "fork");
+    }
+
+    #[test]
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
@@ -2228,6 +2318,7 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         });
         app.state.mode = Mode::ContextMenu;
 
@@ -2497,6 +2588,7 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(1),
+            plugin_items: Vec::new(),
         });
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
@@ -2560,6 +2652,7 @@ mod tests {
             x: 2,
             y: 2,
             list: MenuListState::new(1),
+            plugin_items: Vec::new(),
         });
         app.state.mode = Mode::ContextMenu;
 

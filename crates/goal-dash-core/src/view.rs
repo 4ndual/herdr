@@ -16,6 +16,7 @@ pub enum Act {
     Edit,
     Infer,
     Log,
+    Copy,
     AddSub,
     State,
     Discard,

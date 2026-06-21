@@ -1,0 +1,2 @@
+[env]
+ZIG = "/opt/homebrew/opt/zig@0.15/bin/zig"

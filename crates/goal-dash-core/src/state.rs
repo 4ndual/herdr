@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ratatui::layout::Rect;
 
-use dash_common::{ClaudeMode, Effect, FocusInput};
+use dash_common::{Effect, FocusInput, HeadlessMode};
 
 use crate::context::{compose_rebrief, rebrief_read_prompt, user_prompts};
 use crate::infer::{has_new_user_prompt, transcript_line_count};
@@ -36,6 +36,7 @@ pub struct App {
     /// pane key sends). Drained by `take_effects()` after each `handle`.
     pub(crate) effects: Vec<Effect>,
     pub(crate) pinned_sid: Option<String>,
+    pub(crate) focused: FocusInput,
     pub(crate) state: Option<GoalState>, // the MAIN goal (in-memory; persisted into the consolidated GoalDoc)
     pub(crate) tree: Tree,               // current goal + sub-goals (in-memory)
     pub(crate) store: GoalStore,         // the resolved goal file for current_sid
@@ -112,6 +113,7 @@ impl App {
             current_sid: None,
             effects: Vec::new(),
             pinned_sid,
+            focused: FocusInput::default(),
             state: None,
             tree: Tree::default(),
             store: GoalStore::default(),
@@ -574,19 +576,13 @@ impl App {
         if self.state.as_ref().is_none_or(|s| !has_real(&s.text))
             && self.inferred.insert(sid.to_string())
         {
-            self.effects.push(Effect::SpawnClaude {
-                mode: ClaudeMode::Infer,
-                sid: sid.to_string(),
-            });
+            self.push_headless(HeadlessMode::Infer, sid.to_string());
         }
         if !has_real(&self.tree.current.text)
             && self.tree.subs.is_empty()
             && self.inferred_tree.insert(sid.to_string())
         {
-            self.effects.push(Effect::SpawnClaude {
-                mode: ClaudeMode::InferTree,
-                sid: sid.to_string(),
-            });
+            self.push_headless(HeadlessMode::InferTree, sid.to_string());
         }
         self.status.clear();
     }
@@ -834,6 +830,7 @@ impl App {
     /// ⇒ sticky (keep showing, seeding from the most-recent session on a fresh
     /// open); otherwise no agent is focused ⇒ clear.
     pub fn refresh(&mut self, focus: FocusInput) {
+        self.focused = focus.clone();
         if let Some(sid) = self.pinned_sid.clone() {
             if self.current_sid.as_deref() != Some(&sid) {
                 self.current_sid = Some(sid.clone());
@@ -873,7 +870,17 @@ impl App {
         }
     }
 
-    /// Drain queued host effects (claude spawns, pane key sends) after a `handle`.
+    fn push_headless(&mut self, mode: HeadlessMode, sid: String) {
+        self.effects.push(Effect::SpawnHeadless {
+            agent: self.focused.agent,
+            mode,
+            sid,
+            session_ref: self.focused.session_ref.clone(),
+            cwd: self.focused.cwd.clone(),
+        });
+    }
+
+    /// Drain queued host effects (backend spawns, pane key sends) after a `handle`.
     pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -940,10 +947,7 @@ impl App {
             return;
         }
         let total = transcript_line_count(&path) as u64;
-        self.effects.push(Effect::SpawnClaude {
-            mode: ClaudeMode::Observe,
-            sid: sid.clone(),
-        });
+        self.push_headless(HeadlessMode::Observe, sid.clone());
         self.observe_pending = Some(total);
         self.observe_at = Some(Instant::now());
     }
@@ -1047,7 +1051,7 @@ impl App {
                 if self.node_is_unapproved_agent(node) {
                     v.push(Act::Approve);
                 }
-                v.extend([Act::Edit, Act::Log, Act::Infer]);
+                v.extend([Act::Edit, Act::Log, Act::Copy, Act::Infer]);
                 v
             }
             Node::Sub(_) => {
@@ -1055,7 +1059,7 @@ impl App {
                 if self.node_is_unapproved_agent(node) {
                     v.push(Act::Approve);
                 }
-                v.extend([Act::Edit, Act::State, Act::Discard]);
+                v.extend([Act::Edit, Act::Copy, Act::State, Act::Discard]);
                 v
             }
         }
@@ -1068,6 +1072,7 @@ impl App {
             Act::Approve => ("✓".into(), "approve — accept this as yours".into()),
             Act::Edit => ("✎".into(), "edit — rewrite this goal".into()),
             Act::Log => ("☰".into(), "history — see past versions".into()),
+            Act::Copy => ("⧉".into(), "copy — copy this goal text".into()),
             Act::Infer => ("↻".into(), "re-suggest — let the agent redraft it".into()),
             Act::Discard => ("🗑".into(), "remove — discard this subgoal".into()),
             Act::State => {
@@ -1140,6 +1145,7 @@ impl App {
             Act::Edit => self.begin_edit(node),
             Act::Infer => self.infer_node(node),
             Act::Log => self.open_log(node),
+            Act::Copy => self.copy_node(node),
             Act::AddSub => self.begin_add_sub(),
             Act::State => self.cycle_state(node),
             Act::Discard => self.discard(node),
@@ -1203,10 +1209,7 @@ impl App {
             self.status = "already sorting…".into();
             return;
         }
-        self.effects.push(Effect::SpawnClaude {
-            mode: ClaudeMode::Sort,
-            sid: sid.clone(),
-        });
+        self.push_headless(HeadlessMode::Sort, sid.clone());
         self.sort_pending = Some(Instant::now());
         self.status = "sorting…".into();
     }
@@ -1351,6 +1354,21 @@ impl App {
         self.status = "saved".into();
     }
 
+    pub(crate) fn copy_node(&mut self, node: Node) {
+        let text = match node {
+            Node::Main => self.state.as_ref().map(|s| s.text.clone()).unwrap_or_default(),
+            Node::Current => self.tree.current.text.clone(),
+            Node::Sub(id) => self.sub_ref(id).map(|s| s.text.clone()).unwrap_or_default(),
+            Node::Section(..) => String::new(),
+        };
+        if !has_real(&text) {
+            self.status = "nothing to copy".into();
+            return;
+        }
+        self.effects.push(Effect::CopyText(text));
+        self.status = "copied".into();
+    }
+
     pub(crate) fn infer_node(&mut self, node: Node) {
         let Some(sid) = self.current_sid.clone() else {
             return;
@@ -1358,18 +1376,12 @@ impl App {
         match node {
             Node::Main => {
                 self.inferred.remove(&sid);
-                self.effects.push(Effect::SpawnClaude {
-                    mode: ClaudeMode::Infer,
-                    sid: sid.clone(),
-                });
+                self.push_headless(HeadlessMode::Infer, sid.clone());
                 self.status = "inferring main…".into();
             }
             _ => {
                 self.inferred_tree.remove(&sid);
-                self.effects.push(Effect::SpawnClaude {
-                    mode: ClaudeMode::InferTree,
-                    sid: sid.clone(),
-                });
+                self.push_headless(HeadlessMode::InferTree, sid.clone());
                 self.status = "inferring current + subs…".into();
             }
         }
@@ -1794,5 +1806,59 @@ mod handle_tests {
         app.handle(A::Char('v'));
         assert_eq!(app.view, View::Tree);
         assert_eq!(app.status, "no proposals");
+    }
+
+    #[test]
+    fn infer_uses_focused_backend_and_session_ref() {
+        let mut app = App::new(None);
+        app.current_sid = Some("sid-123".into());
+        app.focused = FocusInput {
+            session_id: Some("sid-123".into()),
+            session_ref: Some("/tmp/pi-session.jsonl".into()),
+            cwd: Some(PathBuf::from("/tmp")),
+            agent: dash_common::AgentKind::Pi,
+            is_self_focus: false,
+        };
+        app.infer_node(Node::Main);
+        let fx = app.take_effects();
+        assert_eq!(
+            fx,
+            vec![Effect::SpawnHeadless {
+                agent: dash_common::AgentKind::Pi,
+                mode: HeadlessMode::Infer,
+                sid: "sid-123".into(),
+                session_ref: Some("/tmp/pi-session.jsonl".into()),
+                cwd: Some(PathBuf::from("/tmp")),
+            }]
+        );
+    }
+
+    #[test]
+    fn copy_main_goal_emits_clipboard_effect() {
+        let mut app = App::new(None);
+        app.current_sid = Some("sid-123".into());
+        app.state = Some(GoalState {
+            text: "Ship the native goal pane".into(),
+            ..Default::default()
+        });
+        app.copy_node(Node::Main);
+        let fx = app.take_effects();
+        assert_eq!(fx, vec![Effect::CopyText("Ship the native goal pane".into())]);
+        assert_eq!(app.status, "copied");
+    }
+
+    #[test]
+    fn clicking_copy_chip_emits_clipboard_effect() {
+        let mut app = App::new(None);
+        app.current_sid = Some("sid-123".into());
+        app.state = Some(GoalState {
+            text: "Ship the native goal pane".into(),
+            ..Default::default()
+        });
+        app.nodes = vec![Node::Main];
+        app.sel_node = 0;
+        app.chip_rects = vec![(Rect { x: 3, y: 2, width: 4, height: 1 }, Act::Copy)];
+        let fx = app.handle(A::Click(3, 2));
+        assert_eq!(fx, vec![Effect::CopyText("Ship the native goal pane".into())]);
     }
 }

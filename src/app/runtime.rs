@@ -296,6 +296,28 @@ impl App {
         // data so an idle, agent-less herdr does no per-second work (TC13).
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::dash::tick(self);
+            let changed_ui_modules = self.ui_plugins.detect_changed_modules();
+            let changed_reload = if changed_ui_modules.is_empty() {
+                false
+            } else {
+                self.ui_plugins.dispatch_reload_requested()
+            };
+            let changed_ui_events = self.ui_plugins.dispatch_tick() || changed_reload;
+            let has_pending = self.ui_plugins.has_pending_updates();
+            if !changed_ui_modules.is_empty() || changed_ui_events || has_pending {
+                self.refresh_ui_plugin_state_from_manager();
+                self.apply_ui_plugin_notifications();
+                self.apply_ui_plugin_effects();
+                tracing::info!(
+                    count = changed_ui_modules.len(),
+                    modules = ?changed_ui_modules
+                        .iter()
+                        .map(|module| format!("{}:{}", module.plugin_id, module.module_id))
+                        .collect::<Vec<_>>(),
+                    changed_ui_events,
+                    "updated ui plugin modules on scheduled tick"
+                );
+            }
             self.next_dash_tick = now + DASH_TICK_INTERVAL;
             changed = true;
         }
@@ -529,6 +551,7 @@ impl App {
     pub(crate) fn dashboards_need_tick(&self) -> bool {
         self.state.goal_panel_visible
             || crate::dash::focus_input(&self.state).agent != dash_common::AgentKind::None
+            || self.ui_plugins.has_modules()
     }
 
     pub(crate) fn next_loop_deadline(&self, now: Instant, needs_render: bool) -> Option<Instant> {

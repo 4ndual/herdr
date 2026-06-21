@@ -597,6 +597,18 @@ fn plugin_link_list_unlink_round_trip() {
             placement: PluginPanePlacement::Overlay,
             command: vec!["bun".into(), "run".into(), "board.ts".into()],
         }],
+        ui_modules: vec![PluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: Some("Hot-reloadable native panel layer".into()),
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: "dist/goal-ui.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::Header, PluginUiSurface::Footer, PluginUiSurface::TabBar, PluginUiSurface::RightPanel, PluginUiSurface::Overlay, PluginUiSurface::ContextMenu],
+            capabilities: vec![PluginUiCapability::FocusedSession, PluginUiCapability::MouseAll, PluginUiCapability::ContextMenuAugment, PluginUiCapability::ClipboardWrite],
+        }],
         link_handlers: vec![PluginManifestLinkHandler {
             id: "github-pr".into(),
             title: "Open GitHub PR".into(),

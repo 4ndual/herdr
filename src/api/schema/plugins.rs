@@ -55,6 +55,8 @@ pub struct InstalledPluginInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panes: Vec<PluginManifestPane>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_modules: Vec<PluginManifestUiModule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub link_handlers: Vec<PluginManifestLinkHandler>,
     #[serde(default)]
     pub source: PluginSourceInfo,
@@ -272,6 +274,70 @@ pub struct PluginManifestLinkHandler {
     pub platforms: Option<Vec<PluginPlatform>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifestUiModule {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<PluginPlatform>>,
+    #[serde(default)]
+    pub kind: PluginUiModuleKind,
+    pub api_version: u32,
+    pub module: String,
+    #[serde(default)]
+    pub hot_reload: PluginHotReloadMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<PluginUiSurface>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<PluginUiCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiModuleKind {
+    #[default]
+    Wasm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHotReloadMode {
+    Off,
+    #[default]
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiSurface {
+    Header,
+    Footer,
+    TabBar,
+    Sidebar,
+    RightPanel,
+    Overlay,
+    ContextMenu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiCapability {
+    FocusedSession,
+    ThemeRead,
+    LayoutRead,
+    MouseAll,
+    KeyboardInput,
+    ContextMenuAugment,
+    ClipboardWrite,
+    PaneInput,
+    HeadlessActions,
+    Toasts,
+    OpenPluginPanes,
+    PluginActions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PluginActionListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -344,7 +410,7 @@ pub enum PluginActionContext {
     Selection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PluginInvocationContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -376,6 +442,8 @@ pub struct PluginInvocationContext {
     pub clicked_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_handler_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use dash_common::{AgentKind, ClaudeMode, Effect, FocusInput};
+use dash_common::{AgentKind, Effect, FocusInput, HeadlessMode};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 use usage_dash_core::RefreshOutcome;
@@ -69,13 +69,21 @@ pub fn focus_input(state: &AppState) -> FocusInput {
         .or_else(|| terminal.effective_known_agent())
         .map(map_agent)
         .unwrap_or(AgentKind::None);
-    // Only an Id-kind ref is a usable session id; Path refs key on cwd.
-    let session_id = identity
-        .filter(|(_, _, kind, _)| *kind == AgentSessionRefKind::Id)
-        .map(|(_, _, _, value)| value);
+    let (session_id, session_ref) = match identity {
+        Some((_, _, AgentSessionRefKind::Id, value)) => (Some(value.clone()), Some(value)),
+        Some((_, _, AgentSessionRefKind::Path, value)) => {
+            let sid = std::path::Path::new(&value)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string());
+            (sid, Some(value))
+        }
+        None => (None, None),
+    };
 
     FocusInput {
         session_id,
+        session_ref,
         cwd: Some(terminal.cwd.clone()),
         agent,
         // Set true only when a herdr dashboard region itself holds focus; wired
@@ -114,7 +122,16 @@ fn run_effects(app: &mut App, effects: Vec<Effect>) {
             Effect::Refresh => {}
             Effect::Status(msg) => tracing::debug!(target: "dash", "{msg}"),
             Effect::SendPaneKeys { lines } => send_pane_keys(app, lines),
-            Effect::SpawnClaude { mode, sid } => spawn_claude(mode, sid),
+            Effect::CopyText(text) => {
+                app.state.request_clipboard_write = Some(text.into_bytes());
+            }
+            Effect::SpawnHeadless {
+                agent,
+                mode,
+                sid,
+                session_ref,
+                cwd,
+            } => spawn_headless(agent, mode, sid, session_ref, cwd),
         }
     }
 }
@@ -138,34 +155,30 @@ fn send_pane_keys(app: &mut App, lines: Vec<String>) {
     }
 }
 
-/// Run the matching headless `claude -p` for a goal inference action on a
-/// detached OS thread (the `run_*` entry points block on a `std::process`
-/// subprocess and persist to the goal file). Fire-and-forget: the next [`tick`]
-/// reloads the written file via `poll`, so the UI never blocks on the call.
-///
-/// Uses `std::thread::spawn` rather than `tokio::task::spawn_blocking` on
-/// purpose: effects are executed from herdr's INPUT path (a key in the focused
-/// goal panel → [`route_key_if_focused`] → [`handle_goal`] → [`run_effects`]),
-/// which the headless server drives on a plain reader thread with no ambient
-/// Tokio runtime. `spawn_blocking` there panics with "must be called from the
-/// context of a Tokio runtime" — the panic unwinds after the action's status is
-/// already set, so the panel reads "sorting…"/"inferring…" while no Claude ever
-/// launches. A std thread has no runtime dependency and works from any caller.
-fn spawn_claude(mode: ClaudeMode, sid: String) {
+/// Run the matching headless goal action on the focused backend on a detached
+/// OS thread. Fire-and-forget: the next [`tick`] reloads the written file via
+/// `poll`, so the UI never blocks on the call.
+fn spawn_headless(
+    agent: AgentKind,
+    mode: HeadlessMode,
+    sid: String,
+    session_ref: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+) {
     let _ = std::thread::Builder::new()
-        .name("dash-claude".into())
+        .name("dash-headless".into())
         .spawn(move || match mode {
-            ClaudeMode::Infer => {
-                goal_dash_core::infer::run_infer(Some(sid));
+            HeadlessMode::Infer => {
+                goal_dash_core::infer::run_infer_for(agent, session_ref.as_deref(), cwd.as_deref(), Some(sid));
             }
-            ClaudeMode::InferTree => {
-                goal_dash_core::infer::run_infer_tree(&sid);
+            HeadlessMode::InferTree => {
+                goal_dash_core::infer::run_infer_tree_for(agent, session_ref.as_deref(), cwd.as_deref(), &sid);
             }
-            ClaudeMode::Observe => {
-                goal_dash_core::infer::run_observe(&sid);
+            HeadlessMode::Observe => {
+                goal_dash_core::infer::run_observe_for(agent, session_ref.as_deref(), cwd.as_deref(), &sid);
             }
-            ClaudeMode::Sort => {
-                goal_dash_core::infer::run_sort(&sid);
+            HeadlessMode::Sort => {
+                goal_dash_core::infer::run_sort_for(agent, session_ref.as_deref(), cwd.as_deref(), &sid);
             }
         });
 }
@@ -341,6 +354,18 @@ fn map_named_color(
 mod tests {
     use super::*;
     use crate::app::state::AppState;
+    use crate::config::Config;
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
 
     #[test]
     fn agent_label_maps_known_agents_and_collapses_rest() {
@@ -406,14 +431,101 @@ mod tests {
             .get_mut(&term_id)
             .expect("terminal state")
             .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
-                source: "herdr:claude".to_string(),
-                agent: "claude".to_string(),
+                source: "herdr:codex".to_string(),
+                agent: "codex".to_string(),
                 session_ref: crate::agent_resume::AgentSessionRef::id(sid)
                     .expect("valid session id"),
             });
 
         let fi = focus_input(&state);
-        assert_eq!(fi.agent, AgentKind::Claude);
+        assert_eq!(fi.agent, AgentKind::Codex);
         assert_eq!(fi.session_id.as_deref(), Some(sid));
+        assert_eq!(fi.session_ref.as_deref(), Some(sid));
+    }
+
+    #[test]
+    fn focus_input_derives_pi_session_id_from_path_ref() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        let ws = state
+            .active
+            .and_then(|i| state.workspaces.get(i))
+            .expect("active workspace");
+        let pane_id = ws.focused_pane_id().expect("focused pane");
+        let term_id = ws.terminal_id(pane_id).expect("terminal id").clone();
+
+        let path = "/Users/andual/.pi/agent/sessions/--Users-andual--/2026-06-19T17-00-37-280Z_019ee0d3-cc20-7b86-972d-4882847039df.jsonl";
+        state
+            .terminals
+            .get_mut(&term_id)
+            .expect("terminal state")
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".to_string(),
+                agent: "pi".to_string(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(path)
+                    .expect("valid session path"),
+            });
+
+        let fi = focus_input(&state);
+        assert_eq!(fi.agent, AgentKind::Pi);
+        assert_eq!(fi.session_ref.as_deref(), Some(path));
+        assert_eq!(
+            fi.session_id.as_deref(),
+            Some("2026-06-19T17-00-37-280Z_019ee0d3-cc20-7b86-972d-4882847039df")
+        );
+    }
+
+    #[test]
+    fn route_mouse_hover_over_goal_panel_is_consumed_without_stealing_focus() {
+        let mut app = test_app();
+        app.state.goal_panel_visible = true;
+        app.state.goal_panel_focused = false;
+        app.state.view.goal_dash_area = Rect::new(10, 4, 20, 8);
+
+        let consumed = route_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 12,
+                row: 6,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            },
+        );
+
+        assert!(consumed);
+        assert!(!app.state.goal_panel_focused);
+    }
+
+    #[test]
+    fn route_mouse_click_focuses_goal_panel() {
+        let mut app = test_app();
+        app.state.goal_panel_visible = true;
+        app.state.goal_panel_focused = false;
+        app.state.view.goal_dash_area = Rect::new(10, 4, 20, 8);
+
+        let consumed = route_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 12,
+                row: 6,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            },
+        );
+
+        assert!(consumed);
+        assert!(app.state.goal_panel_focused);
+    }
+
+    #[test]
+    fn copy_effect_routes_to_host_clipboard_buffer() {
+        let mut app = test_app();
+        run_effects(
+            &mut app,
+            vec![Effect::CopyText("Ship the native goal pane".into())],
+        );
+        assert_eq!(
+            app.state.request_clipboard_write,
+            Some(b"Ship the native goal pane".to_vec())
+        );
     }
 }

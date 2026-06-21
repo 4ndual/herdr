@@ -455,8 +455,11 @@ pub struct UiConfig {
     /// terminal area (feat/native-dashes). Default: true.
     pub usage_strip: bool,
     /// Open the native right-side goal panel on startup (feat/native-dashes).
-    /// It can still be toggled at runtime with `<prefix> g`. Default: false.
+    /// It can still be toggled at runtime with `<prefix> d`. Default: false.
     pub goal_panel: bool,
+    /// Optional fixed width (columns) for the native right-side goal panel.
+    /// When unset, Herdr auto-sizes it to about one third of the pane area.
+    pub goal_panel_width: Option<u16>,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -641,6 +644,7 @@ impl Default for UiConfig {
             sound: SoundConfig::default(),
             usage_strip: true,
             goal_panel: false,
+            goal_panel_width: None,
         }
     }
 }

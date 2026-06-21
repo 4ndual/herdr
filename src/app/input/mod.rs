@@ -75,6 +75,12 @@ impl App {
             return;
         }
 
+        if self.ui_plugins.dispatch_crossterm_key_event(key_event) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+            self.request_render();
+        }
+
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
@@ -226,6 +232,12 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.ui_plugins.dispatch_crossterm_mouse_event(mouse) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+            self.request_render();
+        }
+
         if self.handle_overlay_mouse(mouse) {
             return;
         }

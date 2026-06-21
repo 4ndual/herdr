@@ -921,10 +921,11 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::ToggleGoalPanel => {
-            // feat/native-dashes: show/hide the right goal panel and move keyboard
-            // focus to it while open (released when hidden).
+            // feat/native-dashes: show/hide the right goal panel without stealing
+            // keyboard focus from the active pane. The panel becomes keyboard-
+            // focused only after an explicit click inside it.
             state.goal_panel_visible = !state.goal_panel_visible;
-            state.goal_panel_focused = state.goal_panel_visible;
+            state.goal_panel_focused = false;
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {

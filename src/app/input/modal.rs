@@ -670,8 +670,9 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
-    let item = menu.items().get(idx).copied();
-    match (menu.kind, item) {
+    let plugin_item = menu.plugin_item(idx).cloned();
+    let item = menu.builtin_items().get(idx).copied();
+    match (menu.kind.clone(), item) {
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
             state.request_new_linked_worktree = Some(ws_idx);
             leave_modal(state);
@@ -863,8 +864,31 @@ pub(super) fn apply_context_menu_action(
                 };
             }
         }
-        _ => leave_modal(state),
+        _ => {
+            if let Some(plugin_item) = plugin_item {
+                if let Some((plugin_id, action_id)) = plugin_action_parts(&plugin_item.id) {
+                    state.pending_plugin_action_invocation = Some(
+                        crate::app::state::PendingPluginActionInvocation {
+                            plugin_id: plugin_id.to_string(),
+                            action_id: action_id.to_string(),
+                            context_menu_kind: Some(menu.kind),
+                        },
+                    );
+                    state.mode = Mode::Terminal;
+                } else {
+                    leave_modal(state);
+                }
+            } else {
+                leave_modal(state);
+            }
+        }
     }
+}
+
+fn plugin_action_parts(id: &str) -> Option<(&str, &str)> {
+    let rest = id.strip_prefix("plugin:")?;
+    let (plugin_id, action_id) = rest.split_once(':')?;
+    (!plugin_id.is_empty() && !action_id.is_empty()).then_some((plugin_id, action_id))
 }
 
 pub(crate) fn handle_context_menu_key(
@@ -1420,6 +1444,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
@@ -1465,6 +1490,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let idx = menu
             .items()

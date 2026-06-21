@@ -458,6 +458,7 @@ fn plugin_action_invoke(args: &[String]) -> std::io::Result<i32> {
             correlation_id: None,
             clicked_url: None,
             link_handler_id: None,
+            plugin_payload_json: None,
         }),
     }))
 }
@@ -1641,6 +1642,7 @@ mod tests {
             actions: vec![],
             events: vec![],
             panes: vec![],
+            ui_modules: vec![],
             link_handlers: vec![],
             source: PluginSourceInfo {
                 kind: PluginSourceKind::Github,

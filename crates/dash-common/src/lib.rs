@@ -3,10 +3,8 @@
 //! the same `FocusInput`/`Effect` types — the multi-worker integration contract.
 //!
 //! herdr fills a [`FocusInput`] from its own `AppState` (the focused pane's
-//! session id / cwd / agent kind) and hands it to each core's `refresh()`.
-//! A core's `handle()` returns [`Effect`]s the host executes — file writes the
-//! core already performed (host just re-renders) and, crucially,
-//! [`Effect::SpawnClaude`] so the host runs `claude -p` without blocking the UI.
+//! session identity / cwd / agent kind) and hands it to each core's `refresh()`.
+//! A core's `handle()` returns [`Effect`]s the host executes.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -26,10 +24,14 @@ pub enum AgentKind {
 /// Replaces the old cmux `focus.rs`/`events.rs` discovery entirely.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FocusInput {
-    /// Agent session id (e.g. Claude `--session-id` / `--resume` uuid), if any.
+    /// Agent session id keyed into the goal/usage stores (often a transcript
+    /// stem). For path-backed sessions like pi, herdr derives this from the
+    /// session file stem so the core can still resolve transcript + goal files.
     pub session_id: Option<String>,
-    /// Working directory of the focused pane, used for cwd-keyed sources
-    /// (Codex/pi rollouts, goal-file project resolution).
+    /// Raw native session reference used to resume or send a headless action on
+    /// the focused agent backend. Examples: Claude/Codex UUID, Pi session path.
+    pub session_ref: Option<String>,
+    /// Working directory of the focused pane, used for cwd-keyed sources.
     pub cwd: Option<PathBuf>,
     /// Which agent CLI is focused.
     pub agent: AgentKind,
@@ -38,10 +40,9 @@ pub struct FocusInput {
     pub is_self_focus: bool,
 }
 
-/// A headless Claude oneshot a goal action wants the host to run.
-/// Mirrors goal-widget's `--infer` / `--infer-tree` / `--observe` / `--sort`.
+/// A headless goal action the host should run on the focused agent backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClaudeMode {
+pub enum HeadlessMode {
     /// Infer the MAIN goal text.
     Infer,
     /// Infer CURRENT + sub-goals (merge).
@@ -52,18 +53,25 @@ pub enum ClaudeMode {
     Sort,
 }
 
-/// Returned by a core's `handle()` for the host to execute. File mutations are
-/// performed inside the core (it owns the `.goal.json`/history store); the host
-/// only re-renders for those. `SpawnClaude`/`SendPaneKeys` need host machinery.
+/// Returned by a core's `handle()` for the host to execute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
     /// Nothing further; state already updated in-core (host re-renders).
     Refresh,
-    /// Run `claude -p` for `sid` in `mode`; host streams the result back to the
-    /// core via `apply_claude_result()` so the UI never blocks on the call.
-    SpawnClaude { mode: ClaudeMode, sid: String },
+    /// Run the matching headless action on the focused backend without blocking
+    /// the UI. `sid` stays the canonical goal/transcript lookup key; `session_ref`
+    /// carries the raw backend-native resume token/path when required.
+    SpawnHeadless {
+        agent: AgentKind,
+        mode: HeadlessMode,
+        sid: String,
+        session_ref: Option<String>,
+        cwd: Option<PathBuf>,
+    },
     /// Send a key/text sequence to the focused agent's pane (clear+rebrief).
     SendPaneKeys { lines: Vec<String> },
+    /// Copy text through Herdr's host clipboard path.
+    CopyText(String),
     /// Surface a transient status line in the panel.
     Status(String),
 }

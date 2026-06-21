@@ -29,6 +29,10 @@ impl App {
         }
         self.state.host_terminal_theme = theme;
         self.apply_host_terminal_theme_to_panes();
+        if self.ui_plugins.dispatch_theme_changed() {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+        }
         true
     }
 

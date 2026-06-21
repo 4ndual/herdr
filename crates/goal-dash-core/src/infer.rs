@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use dash_common::AgentKind;
 use serde::Deserialize;
 
 use crate::context::{claude_md_goal, recent_activity, user_prompts};
@@ -23,19 +24,7 @@ use crate::timegate::{
     project_root,
 };
 
-fn claude_infer(prompt: &str, timeout: Duration) -> Option<String> {
-    // `--strict-mcp-config` with no `--mcp-config` ⇒ no MCP servers loaded (inference needs no tools;
-    // skipping the MCP load keeps the cold `claude -p` start fast and inside the timeout).
-    let mut child = Command::new("claude")
-        .arg("-p")
-        .arg(prompt)
-        .arg("--strict-mcp-config")
-        .args(["--model", "haiku"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+fn run_child_capture(mut child: std::process::Child, timeout: Duration) -> Option<String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -56,6 +45,79 @@ fn claude_infer(prompt: &str, timeout: Duration) -> Option<String> {
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(_) => return None,
+        }
+    }
+}
+
+fn agent_infer(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    cwd: Option<&Path>,
+    prompt: &str,
+    timeout: Duration,
+) -> Option<String> {
+    match agent {
+        AgentKind::Claude | AgentKind::None => {
+            let mut command = Command::new("claude");
+            command
+                .arg("-p")
+                .arg(prompt)
+                .arg("--strict-mcp-config")
+                .args(["--model", "haiku"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            run_child_capture(command.spawn().ok()?, timeout)
+        }
+        AgentKind::Pi => {
+            let mut command = Command::new("pi");
+            command
+                .arg("-p")
+                .arg("--no-tools")
+                .arg("--no-context-files")
+                .arg("--no-skills")
+                .arg("--no-extensions")
+                .arg(prompt)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if let Some(session_ref) = session_ref {
+                command.args(["--session", session_ref]);
+            }
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            run_child_capture(command.spawn().ok()?, timeout)
+        }
+        AgentKind::Codex => {
+            let out_path = std::env::temp_dir().join(format!(
+                "goal-dash-codex-{}-{}.txt",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            let mut command = Command::new("codex");
+            command
+                .arg("exec")
+                .arg("resume")
+                .arg(session_ref?)
+                .args(["-s", "read-only", "-a", "never", "--skip-git-repo-check"])
+                .arg("-o")
+                .arg(&out_path)
+                .arg(prompt)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(cwd) = cwd {
+                command.arg("-C").arg(cwd);
+            }
+            let child = command.spawn().ok()?;
+            let _ = run_child_capture(child, timeout)?;
+            let text = std::fs::read_to_string(&out_path).ok();
+            let _ = std::fs::remove_file(&out_path);
+            text
         }
     }
 }
@@ -98,7 +160,7 @@ fn looks_like_refusal(s: &str) -> bool {
     SIGS.iter().any(|sig| l.contains(sig))
 }
 
-fn infer_goal(context: &str) -> Option<String> {
+fn infer_goal(agent: AgentKind, session_ref: Option<&str>, cwd: Option<&Path>, context: &str) -> Option<String> {
     if context.trim().is_empty() {
         return None;
     }
@@ -109,7 +171,7 @@ fn infer_goal(context: &str) -> Option<String> {
          ALL of the developer's prompts MORE than the latest activity. In ONE line (max 14 words, \
          imperative, no quotes, no preamble) state that north-star goal. Output ONLY that line.\n\n{context}"
     );
-    let out = claude_infer(&prompt, Duration::from_secs(90))?;
+    let out = agent_infer(agent, session_ref, cwd, &prompt, Duration::from_secs(90))?;
     for ln in out.lines() {
         let ln = ln
             .trim()
@@ -130,6 +192,16 @@ fn infer_goal(context: &str) -> Option<String> {
 
 /// Infer once for `sid` (or the most-recent session) and persist under that session's state file.
 pub fn run_infer(sid: Option<String>) -> i32 {
+    let session_ref = sid.clone();
+    run_infer_for(AgentKind::Claude, session_ref.as_deref(), None, sid)
+}
+
+pub fn run_infer_for(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    cwd: Option<&Path>,
+    sid: Option<String>,
+) -> i32 {
     let path = match &sid {
         Some(s) => session_jsonl(s),
         None => most_recent_session(),
@@ -179,7 +251,7 @@ pub fn run_infer(sid: Option<String>) -> i32 {
     }
     let store = GoalStore::resolve(&target_sid);
     let mut doc = store.load();
-    match infer_goal(&context) {
+    match infer_goal(agent, session_ref, cwd, &context) {
         Some(g) => {
             doc.main = GoalState {
                 text: g.clone(),
@@ -219,7 +291,7 @@ pub fn run_infer(sid: Option<String>) -> i32 {
 // ---- structured tree inference (current goal + sub-goal list) ----
 
 /// Ask the model for `{ "current": "...", "subgoals": ["...", ...] }` from recent activity.
-fn infer_tree(activity: &str) -> Option<(String, Vec<String>)> {
+fn infer_tree(agent: AgentKind, session_ref: Option<&str>, cwd: Option<&Path>, activity: &str) -> Option<(String, Vec<String>)> {
     if activity.trim().is_empty() {
         return None;
     }
@@ -230,7 +302,7 @@ fn infer_tree(activity: &str) -> Option<(String, Vec<String>)> {
          {{\"current\":\"<one short imperative line>\",\"subgoals\":[\"<short task>\",\"<short task>\"]}}. \
          Use 2-5 subgoals. Output ONLY the JSON object.\n\n--- activity ---\n{activity}"
     );
-    let out = claude_infer(&prompt, Duration::from_secs(90))?;
+    let out = agent_infer(agent, session_ref, cwd, &prompt, Duration::from_secs(90))?;
     parse_infer_tree_json(&out)
 }
 
@@ -279,10 +351,19 @@ fn parse_infer_tree_json(out: &str) -> Option<(String, Vec<String>)> {
 /// set `current` only if empty/agent-unapproved; add only agent subgoals whose text is new (dedup),
 /// never touching user-added, approved, or discarded subs.
 pub fn run_infer_tree(sid: &str) -> i32 {
+    run_infer_tree_for(AgentKind::Claude, Some(sid), None, sid)
+}
+
+pub fn run_infer_tree_for(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    cwd: Option<&Path>,
+    sid: &str,
+) -> i32 {
     let activity = session_jsonl(sid)
         .map(|p| recent_activity(&p, 18))
         .unwrap_or_default();
-    let Some((current, subs)) = infer_tree(&activity) else {
+    let Some((current, subs)) = infer_tree(agent, session_ref, cwd, &activity) else {
         eprintln!("infer-tree: nothing inferred");
         return 1;
     };
@@ -348,46 +429,97 @@ pub fn run_infer_tree(sid: &str) -> i32 {
 
 // ============================ Goal Observer (per-prompt, full-context, Opus) ============================
 
-/// Run `claude -p --model opus` with the prompt fed on STDIN (prompts can be large), small JSON out.
-fn claude_observe(prompt: String, timeout: Duration) -> Option<String> {
-    // `--strict-mcp-config` with no `--mcp-config` ⇒ ZERO MCP servers. The observer needs no tools,
-    // and loading the user's full MCP set on a cold `claude -p` adds enough startup latency to blow
-    // past the timeout. Disabling MCP makes the cold start fast and deterministic.
-    let mut child = Command::new("claude")
-        .arg("-p")
-        .arg("--strict-mcp-config")
-        .args(["--model", "opus"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut si) = child.stdin.take() {
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = si.write_all(prompt.as_bytes());
-        });
-    }
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let mut out = String::new();
-                child.stdout.take()?.read_to_string(&mut out).ok()?;
-                return Some(out);
+/// Run the larger observe/sort prompt on the focused backend. For Claude/pi the
+/// prompt goes on stdin; for Codex it is passed to `exec resume` and the final
+/// message is captured through `-o`.
+fn agent_observe(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    cwd: Option<&Path>,
+    prompt: String,
+    timeout: Duration,
+) -> Option<String> {
+    match agent {
+        AgentKind::Claude | AgentKind::None => {
+            let mut command = Command::new("claude");
+            command
+                .arg("-p")
+                .arg("--strict-mcp-config")
+                .args(["--model", "opus"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
             }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(200));
+            let mut child = command.spawn().ok()?;
+            if let Some(mut si) = child.stdin.take() {
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = si.write_all(prompt.as_bytes());
+                });
             }
-            Err(_) => return None,
+            run_child_capture(child, timeout)
+        }
+        AgentKind::Pi => {
+            let mut command = Command::new("pi");
+            command
+                .arg("-p")
+                .arg("--no-tools")
+                .arg("--no-context-files")
+                .arg("--no-skills")
+                .arg("--no-extensions")
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            if let Some(session_ref) = session_ref {
+                command.args(["--session", session_ref]);
+            }
+            if let Some(cwd) = cwd {
+                command.current_dir(cwd);
+            }
+            let mut child = command.spawn().ok()?;
+            if let Some(mut si) = child.stdin.take() {
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = si.write_all(prompt.as_bytes());
+                });
+            }
+            run_child_capture(child, timeout)
+        }
+        AgentKind::Codex => {
+            let out_path = std::env::temp_dir().join(format!(
+                "goal-dash-codex-observe-{}-{}.txt",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            let mut command = Command::new("codex");
+            command
+                .arg("exec")
+                .arg("resume")
+                .arg(session_ref?)
+                .args(["-s", "read-only", "-a", "never", "--skip-git-repo-check"])
+                .arg("-o")
+                .arg(&out_path)
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(cwd) = cwd {
+                command.arg("-C").arg(cwd);
+            }
+            let mut child = command.spawn().ok()?;
+            if let Some(mut si) = child.stdin.take() {
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = si.write_all(prompt.as_bytes());
+                });
+            }
+            let _ = run_child_capture(child, timeout)?;
+            let text = std::fs::read_to_string(&out_path).ok();
+            let _ = std::fs::remove_file(&out_path);
+            text
         }
     }
 }
@@ -945,6 +1077,15 @@ fn build_observer_prompt(doc: &GoalDoc, log_tail: &[PromptEntry], delta: &str) -
 
 /// `goal-widget --observe <sid>`: process new turns since the cursor, update the tree, log the prompt.
 pub fn run_observe(sid: &str) -> i32 {
+    run_observe_for(AgentKind::Claude, Some(sid), None, sid)
+}
+
+pub fn run_observe_for(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    cwd: Option<&Path>,
+    sid: &str,
+) -> i32 {
     let Some(path) = session_jsonl(sid) else {
         eprintln!("observe: no transcript for {sid}");
         return 1;
@@ -964,7 +1105,7 @@ pub fn run_observe(sid: &str) -> i32 {
     let log = store.read_prompt_log();
     let tail = &log[log.len().saturating_sub(12)..];
     let prompt = build_observer_prompt(&doc, tail, &delta);
-    let Some(out) = claude_observe(prompt, Duration::from_secs(180)) else {
+    let Some(out) = agent_observe(agent, session_ref, cwd, prompt, Duration::from_secs(180)) else {
         eprintln!("observe: agent produced no output");
         return 1;
     };
@@ -1028,6 +1169,15 @@ fn build_sort_prompt(doc: &GoalDoc, prompts: &str, candidates: &[PathBuf], plans
 /// set the goal's `project_key` (so its plans index), and MOVE the goal docs into that folder. Headless —
 /// the TUI spawns it detached and reloads from the repointed link. Changes nothing on a refusal / bad pick.
 pub fn run_sort(sid: &str) -> i32 {
+    run_sort_for(AgentKind::Claude, Some(sid), None, sid)
+}
+
+pub fn run_sort_for(
+    agent: AgentKind,
+    session_ref: Option<&str>,
+    _cwd: Option<&Path>,
+    sid: &str,
+) -> i32 {
     let store = GoalStore::resolve(sid);
     let mut doc = store.load();
     let cwd = session_cwd(sid);
@@ -1040,7 +1190,7 @@ pub fn run_sort(sid: &str) -> i32 {
         .map(|p| user_prompts(&p, 8))
         .unwrap_or_default();
     let prompt = build_sort_prompt(&doc, &prompts, &candidates, &plan_inventory_block());
-    let Some(out) = claude_observe(prompt, Duration::from_secs(180)) else {
+    let Some(out) = agent_observe(agent, session_ref, cwd.as_deref(), prompt, Duration::from_secs(180)) else {
         eprintln!("sort: agent produced no output");
         return 1;
     };
@@ -1086,7 +1236,7 @@ mod tests {
 
     #[test]
     fn infer_goal_empty_activity_is_none() {
-        assert!(infer_goal("   ").is_none());
+        assert!(infer_goal(AgentKind::Claude, None, None, "   ").is_none());
     }
 
     #[test]

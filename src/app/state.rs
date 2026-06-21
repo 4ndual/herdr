@@ -1,5 +1,6 @@
 use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
 use crossterm::event::{KeyCode, KeyModifiers};
+use herdr_ui_plugin_api::{UiActionRef, UiLayer};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 
@@ -1080,10 +1081,24 @@ pub struct ContextMenuState {
     pub x: u16,
     pub y: u16,
     pub list: MenuListState,
+    pub plugin_items: Vec<UiActionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPluginActionInvocation {
+    pub plugin_id: String,
+    pub action_id: String,
+    pub context_menu_kind: Option<ContextMenuKind>,
 }
 
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
+    pub fn items(&self) -> Vec<&str> {
+        let mut items = self.builtin_items().iter().copied().collect::<Vec<_>>();
+        items.extend(self.plugin_items.iter().map(|item| item.label.as_str()));
+        items
+    }
+
+    pub fn builtin_items(&self) -> &'static [&'static str] {
         match self.kind {
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
@@ -1169,6 +1184,11 @@ impl ContextMenuState {
                 "Close pane",
             ],
         }
+    }
+
+    pub fn plugin_item(&self, idx: usize) -> Option<&UiActionRef> {
+        idx.checked_sub(self.builtin_items().len())
+            .and_then(|idx| self.plugin_items.get(idx))
     }
 }
 
@@ -1350,8 +1370,12 @@ pub struct AppState {
     /// Whether the native right-side goal panel is shown (feat/native-dashes).
     /// Pure data; the renderer reads it and `compute_view` sizes the panel.
     pub goal_panel_visible: bool,
+    /// Optional fixed width (columns) for the native right-side goal panel.
+    /// When absent, the renderer auto-sizes it relative to the terminal width.
+    pub goal_panel_width: Option<u16>,
     /// Whether keyboard input is routed to the goal panel instead of the focused
-    /// pane (feat/native-dashes). Set when the panel is toggled on or clicked.
+    /// pane (feat/native-dashes). Click-to-focus only; toggling visibility alone
+    /// should not steal typing from the focused pane.
     pub goal_panel_focused: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
@@ -1414,6 +1438,12 @@ pub struct AppState {
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
     /// Recent plugin action/event command executions.
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
+    /// Context-menu items surfaced by loaded UI plugins.
+    pub(crate) ui_context_menu_items: Vec<UiActionRef>,
+    /// Static surface layers surfaced by loaded UI plugins.
+    pub(crate) ui_surface_layers: Vec<UiLayer>,
+    /// Deferred plugin action invocations requested by UI/plugin surfaces.
+    pub(crate) pending_plugin_action_invocation: Option<PendingPluginActionInvocation>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
@@ -1707,6 +1737,7 @@ impl AppState {
             sidebar_collapsed: false,
             usage_strip_enabled: true,
             goal_panel_visible: false,
+            goal_panel_width: None,
             goal_panel_focused: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
@@ -1754,6 +1785,9 @@ impl AppState {
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
             plugin_command_logs: Vec::new(),
+            ui_context_menu_items: Vec::new(),
+            ui_surface_layers: Vec::new(),
+            pending_plugin_action_invocation: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),
@@ -2196,11 +2230,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            vec!["Rename", "Close", "Delete worktree checkout..."]
         );
     }
 
@@ -2216,11 +2251,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "New worktree", "Open worktree..."]
+            vec!["Rename", "Close", "New worktree", "Open worktree..."]
         );
     }
 
@@ -2236,11 +2272,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &[
+            vec![
                 "Rename",
                 "Close group",
                 "New worktree",

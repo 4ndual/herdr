@@ -1,7 +1,9 @@
+use herdr_ui_plugin_api::{UiLayer, UiNode, UiSurface, UiTextSpan};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Span,
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -97,7 +99,7 @@ const COLLAPSED_WIDTH: u16 = 4;
 // the toggleable right goal panel. P4 will derive the strip height from usage
 // content height rather than reserving a fixed band.
 const USAGE_STRIP_HEIGHT: u16 = 7;
-const GOAL_PANEL_MIN_WIDTH: u16 = 36;
+const GOAL_PANEL_MIN_WIDTH: u16 = 28;
 const GOAL_PANEL_MAX_WIDTH: u16 = 56; // num + space + dot + separator
 
 // Braille spinner frames — smooth rotation
@@ -239,7 +241,12 @@ fn compute_view_internal(
     let (terminal_area, goal_dash_area) = if app.goal_panel_visible
         && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
     {
-        let panel_w = (terminal_area.width / 3).clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH);
+        let auto_w = (terminal_area.width / 4).clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH);
+        let panel_w = app
+            .goal_panel_width
+            .unwrap_or(auto_w)
+            .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
+            .min(terminal_area.width.saturating_sub(24));
         let [panes, panel] = Layout::horizontal([Constraint::Min(24), Constraint::Length(panel_w)])
             .areas(terminal_area);
         (panes, panel)
@@ -434,6 +441,7 @@ pub fn render_with_runtime_registry(
         render_tab_bar(app, frame, tab_bar_area);
     }
     render_panes(app, terminal_runtimes, frame, terminal_area);
+    render_ui_plugin_layers(app, frame);
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
@@ -466,6 +474,234 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
+    }
+}
+
+pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: UiSurface) -> Rect {
+    match surface {
+        UiSurface::Header => {
+            if app.view.layout == ViewLayout::Mobile {
+                app.view.mobile_header_rect
+            } else if app.view.terminal_area.height > 0 {
+                Rect::new(
+                    app.view.terminal_area.x,
+                    app.view.terminal_area.y,
+                    app.view.terminal_area.width,
+                    1,
+                )
+            } else {
+                Rect::default()
+            }
+        }
+        UiSurface::Footer => {
+            let area = if app.view.layout == ViewLayout::Mobile {
+                app.view.terminal_area
+            } else {
+                app.view.terminal_area
+            };
+            if area.height > 0 {
+                Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1)
+            } else {
+                Rect::default()
+            }
+        }
+        UiSurface::TabBar => app.view.tab_bar_rect,
+        UiSurface::Sidebar => app.view.sidebar_rect,
+        UiSurface::RightPanel => app.view.goal_dash_area,
+        UiSurface::Overlay => app.view.terminal_area,
+        UiSurface::ContextMenu => frame_area,
+    }
+}
+
+fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
+    match role.unwrap_or_default() {
+        "accent" => Style::default().fg(app.palette.accent).add_modifier(Modifier::BOLD),
+        "muted" => Style::default().fg(app.palette.overlay0),
+        "success" => Style::default().fg(app.palette.green),
+        "warning" => Style::default().fg(app.palette.yellow),
+        "danger" => Style::default().fg(app.palette.red),
+        "panel" => Style::default().fg(app.palette.text).bg(app.palette.panel_bg),
+        _ => Style::default().fg(app.palette.text),
+    }
+}
+
+fn plugin_line(app: &AppState, spans: &[UiTextSpan]) -> Line<'static> {
+    Line::from(
+        spans
+            .iter()
+            .map(|span| Span::styled(span.text.clone(), plugin_span_style(app, span.role.as_deref())))
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) struct UiPluginHit {
+    pub action_id: Option<String>,
+    pub consumes_mouse: bool,
+}
+
+fn ui_plugin_node_action_at(
+    _app: &AppState,
+    area: Rect,
+    mut line_y: u16,
+    node: &UiNode,
+    col: u16,
+    row: u16,
+) -> (Option<String>, u16) {
+    match node {
+        UiNode::Line { .. } | UiNode::Status { .. } => (None, line_y.saturating_add(1)),
+        UiNode::Tabs { items, .. } => {
+            if row == line_y && col >= area.x && col < area.x + area.width {
+                let mut x = area.x;
+                for item in items {
+                    let label = format!(" {} ", item.label);
+                    let w = label.chars().count() as u16;
+                    if col >= x && col < x.saturating_add(w) {
+                        return (Some(item.id.clone()), line_y.saturating_add(1));
+                    }
+                    x = x.saturating_add(w + 1);
+                }
+            }
+            (None, line_y.saturating_add(1))
+        }
+        UiNode::Menu { items, .. } => {
+            line_y = line_y.saturating_add(1); // title row
+            for item in items {
+                if row == line_y && col >= area.x && col < area.x + area.width {
+                    return (Some(item.id.clone()), line_y.saturating_add(1));
+                }
+                line_y = line_y.saturating_add(1);
+            }
+            (None, line_y)
+        }
+    }
+}
+
+pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
+    let rects = [
+        app.view.sidebar_rect,
+        app.view.tab_bar_rect,
+        app.view.terminal_area,
+        app.view.mobile_header_rect,
+        app.view.goal_dash_area,
+        app.view.usage_dash_area,
+    ];
+    let mut min_x = u16::MAX;
+    let mut min_y = u16::MAX;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for rect in rects {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x + rect.width);
+        max_y = max_y.max(rect.y + rect.height);
+    }
+    if min_x == u16::MAX {
+        Rect::default()
+    } else {
+        Rect::new(min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y))
+    }
+}
+
+pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: u16) -> Option<UiPluginHit> {
+    for layer in app.ui_surface_layers.iter().rev() {
+        let area = ui_plugin_surface_rect(app, frame_area, layer.surface);
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height {
+            continue;
+        }
+        let mut line_y = area.y;
+        for node in &layer.nodes {
+            let (action, next_line_y) = ui_plugin_node_action_at(app, area, line_y, node, col, row);
+            if action.is_some() || layer.consumes_mouse {
+                return Some(UiPluginHit {
+                    action_id: action,
+                    consumes_mouse: layer.consumes_mouse,
+                });
+            }
+            line_y = next_line_y;
+            if line_y >= area.y + area.height {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
+    for layer in &app.ui_surface_layers {
+        let area = ui_plugin_surface_rect(app, frame.area(), layer.surface);
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        render_ui_plugin_layer(app, frame, area, layer);
+    }
+}
+
+fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: &UiLayer) {
+    let mut line_y = area.y;
+    for node in &layer.nodes {
+        match node {
+            UiNode::Line { spans } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                frame.render_widget(Paragraph::new(plugin_line(app, spans)), Rect::new(area.x, line_y, area.width, 1));
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Status { left, right } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                let mut combined = left.clone();
+                if !right.is_empty() {
+                    combined.push(UiTextSpan { text: " ".into(), role: Some("muted".into()) });
+                    combined.extend(right.clone());
+                }
+                frame.render_widget(Paragraph::new(plugin_line(app, &combined)), Rect::new(area.x, line_y, area.width, 1));
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Tabs { items, selected } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                let spans = items
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(idx, item)| {
+                        let role = if idx == *selected { Some("accent") } else { Some("muted") };
+                        [
+                            UiTextSpan { text: format!(" {} ", item.label), role: role.map(str::to_string) },
+                            UiTextSpan { text: " ".into(), role: Some("muted".into()) },
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(plugin_line(app, &spans)), Rect::new(area.x, line_y, area.width, 1));
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Menu { title, items, selected } => {
+                if line_y < area.y + area.height {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(title.clone(), plugin_span_style(app, Some("accent"))))),
+                        Rect::new(area.x, line_y, area.width, 1),
+                    );
+                    line_y = line_y.saturating_add(1);
+                }
+                for (idx, item) in items.iter().enumerate() {
+                    if line_y >= area.y + area.height {
+                        break;
+                    }
+                    let role = if idx == *selected { Some("accent") } else { None };
+                    let spans = vec![UiTextSpan { text: item.label.clone(), role: role.map(str::to_string) }];
+                    frame.render_widget(Paragraph::new(plugin_line(app, &spans)), Rect::new(area.x, line_y, area.width, 1));
+                    line_y = line_y.saturating_add(1);
+                }
+            }
+        }
     }
 }
 
@@ -1186,6 +1422,102 @@ mod tests {
         )
         .expect("write HEAD");
         root
+    }
+
+    #[test]
+    fn ui_plugin_hit_testing_marks_consumed_overlay() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![UiLayer {
+            surface: UiSurface::Overlay,
+            z_index: 99,
+            consumes_mouse: true,
+            nodes: vec![UiNode::Line {
+                spans: vec![UiTextSpan {
+                    text: "Consumes".into(),
+                    role: Some("accent".into()),
+                }],
+            }],
+        }];
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let frame_area = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(&app, frame_area, app.view.terminal_area.x, app.view.terminal_area.y)
+            .expect("plugin hit");
+        assert!(hit.consumes_mouse);
+        assert!(hit.action_id.is_none());
+    }
+
+    #[test]
+    fn ui_plugin_action_hit_testing_finds_tab_action() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![UiLayer {
+            surface: UiSurface::Header,
+            z_index: 1,
+            consumes_mouse: false,
+            nodes: vec![UiNode::Tabs {
+                items: vec![herdr_ui_plugin_api::UiActionRef { id: "plugin:example.ui-wasm:fork".into(), label: "Fork".into() }],
+                selected: 0,
+            }],
+        }];
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let header = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(&app, header, app.view.terminal_area.x + 1, app.view.terminal_area.y)
+            .expect("plugin hit");
+        assert_eq!(hit.action_id.as_deref(), Some("plugin:example.ui-wasm:fork"));
+    }
+
+    #[test]
+    fn ui_plugin_surface_layers_render_into_header_and_footer() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![
+            UiLayer {
+                surface: UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: "WASM HEADER".into(),
+                        role: Some("accent".into()),
+                    }],
+                }],
+            },
+            UiLayer {
+                surface: UiSurface::Footer,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: "WASM FOOTER".into(),
+                        role: Some("accent".into()),
+                    }],
+                }],
+            },
+        ];
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20))
+            .expect("test terminal");
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("WASM HEADER"));
+        assert!(rendered.contains("WASM FOOTER"));
     }
 
     #[test]

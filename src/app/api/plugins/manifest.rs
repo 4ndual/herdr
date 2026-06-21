@@ -1,7 +1,8 @@
 use crate::api::schema::{
-    InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
-    PluginManifestLinkHandler, PluginManifestPane, PluginPanePlacement, PluginPlatform,
-    PluginSourceInfo, PluginSourceKind,
+    InstalledPluginInfo, PluginHotReloadMode, PluginManifestAction, PluginManifestBuild,
+    PluginManifestEventHook, PluginManifestLinkHandler, PluginManifestPane, PluginManifestUiModule,
+    PluginPanePlacement, PluginPlatform, PluginSourceInfo, PluginSourceKind,
+    PluginUiCapability, PluginUiModuleKind, PluginUiSurface,
 };
 
 const PLUGIN_ID_MAX_CHARS: usize = 120;
@@ -26,6 +27,8 @@ struct RawPluginManifest {
     events: Vec<RawPluginManifestEventHook>,
     #[serde(default)]
     panes: Vec<RawPluginManifestPane>,
+    #[serde(default)]
+    ui_modules: Vec<RawPluginManifestUiModule>,
     #[serde(default)]
     link_handlers: Vec<RawPluginManifestLinkHandler>,
 }
@@ -79,6 +82,26 @@ struct RawPluginManifestLinkHandler {
     action: String,
     #[serde(default)]
     platforms: Option<Vec<RawPlatform>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPluginManifestUiModule {
+    id: String,
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    platforms: Option<Vec<RawPlatform>>,
+    #[serde(default)]
+    kind: PluginUiModuleKind,
+    api_version: u32,
+    module: String,
+    #[serde(default)]
+    hot_reload: PluginHotReloadMode,
+    #[serde(default)]
+    surfaces: Vec<PluginUiSurface>,
+    #[serde(default)]
+    capabilities: Vec<PluginUiCapability>,
 }
 
 /// Raw string platform value from the manifest, validated before conversion.
@@ -166,6 +189,13 @@ pub(crate) fn load_plugin_manifest(
         .collect::<Result<Vec<_>, _>>()?;
     reject_duplicate_pane_ids(&panes)?;
     panes.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut ui_modules = raw
+        .ui_modules
+        .into_iter()
+        .map(normalize_manifest_ui_module)
+        .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_ui_module_ids(&ui_modules)?;
+    ui_modules.sort_by(|a, b| a.id.cmp(&b.id));
     let link_handlers = raw
         .link_handlers
         .into_iter()
@@ -178,6 +208,7 @@ pub(crate) fn load_plugin_manifest(
     if platforms.is_none() {
         warnings.push("manifest does not declare platforms; platform support unknown".to_string());
     }
+    warnings.extend(validate_ui_module_paths(&plugin_root, &ui_modules));
 
     Ok(InstalledPluginInfo {
         plugin_id,
@@ -193,10 +224,41 @@ pub(crate) fn load_plugin_manifest(
         actions,
         events,
         panes,
+        ui_modules,
         link_handlers,
         source: Default::default(),
         warnings,
     })
+}
+
+fn validate_ui_module_paths(
+    plugin_root: &std::path::Path,
+    ui_modules: &[PluginManifestUiModule],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for module in ui_modules {
+        let path = plugin_root.join(&module.module);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => warnings.push(format!(
+                "ui module {} path is not a file: {}",
+                module.id,
+                path.display()
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => warnings.push(format!(
+                "ui module {} file not found: {}",
+                module.id,
+                path.display()
+            )),
+            Err(err) => warnings.push(format!(
+                "ui module {} could not be read at {}: {}",
+                module.id,
+                path.display(),
+                err
+            )),
+        }
+    }
+    warnings
 }
 
 fn validate_min_herdr_version(value: Option<&str>) -> Result<String, (&'static str, String)> {
@@ -317,6 +379,21 @@ fn reject_duplicate_pane_ids(panes: &[PluginManifestPane]) -> Result<(), (&'stat
     Ok(())
 }
 
+fn reject_duplicate_ui_module_ids(
+    modules: &[PluginManifestUiModule],
+) -> Result<(), (&'static str, String)> {
+    let mut seen = std::collections::HashSet::new();
+    for module in modules {
+        if !seen.insert(module.id.as_str()) {
+            return Err((
+                "duplicate_plugin_ui_module_id",
+                format!("duplicate ui module id '{}'", module.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_link_handler_ids(
     handlers: &[PluginManifestLinkHandler],
 ) -> Result<(), (&'static str, String)> {
@@ -399,6 +476,52 @@ fn normalize_manifest_pane(
         platforms,
         placement: pane.placement,
         command,
+    })
+}
+
+fn normalize_manifest_ui_module(
+    module: RawPluginManifestUiModule,
+) -> Result<PluginManifestUiModule, (&'static str, String)> {
+    let id = normalize_action_id(&module.id)
+        .ok_or_else(|| ("invalid_plugin_ui_module_id", "invalid ui module id".to_string()))?;
+    let title = non_empty_trimmed(
+        &module.title,
+        "invalid_plugin_ui_module_title",
+        "ui module title is required",
+    )?;
+    let description = module
+        .description
+        .map(|description| description.trim().to_string())
+        .filter(|description| !description.is_empty());
+    let platforms = normalize_platforms(module.platforms)?;
+    let module_path = non_empty_trimmed(
+        &module.module,
+        "invalid_plugin_ui_module_path",
+        "ui module path is required",
+    )?;
+    if module.api_version == 0 {
+        return Err((
+            "invalid_plugin_ui_module_api_version",
+            "ui module api_version must be >= 1".to_string(),
+        ));
+    }
+    if module.surfaces.is_empty() {
+        return Err((
+            "invalid_plugin_ui_module_surfaces",
+            "ui module surfaces must declare at least one host surface".to_string(),
+        ));
+    }
+    Ok(PluginManifestUiModule {
+        id,
+        title,
+        description,
+        platforms,
+        kind: module.kind,
+        api_version: module.api_version,
+        module: module_path,
+        hot_reload: module.hot_reload,
+        surfaces: module.surfaces,
+        capabilities: module.capabilities,
     })
 }
 
@@ -571,4 +694,76 @@ fn normalize_local_identifier(value: &str, max_chars: usize) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')))
     .then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_module_requires_surface_and_api_version() {
+        let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 0,
+            module: "dist/goal.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::RightPanel],
+            capabilities: vec![PluginUiCapability::FocusedSession],
+        })
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
+
+        let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: "dist/goal.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![],
+            capabilities: vec![PluginUiCapability::FocusedSession],
+        })
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_plugin_ui_module_surfaces");
+    }
+
+    #[test]
+    fn ui_module_normalizes_wasm_panel_manifest() {
+        let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: " Goal UI ".into(),
+            description: Some(" Native overlays ".into()),
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: " dist/goal.wasm ".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![
+                PluginUiSurface::Header,
+                PluginUiSurface::Footer,
+                PluginUiSurface::TabBar,
+                PluginUiSurface::RightPanel,
+                PluginUiSurface::Overlay,
+                PluginUiSurface::ContextMenu,
+            ],
+            capabilities: vec![
+                PluginUiCapability::FocusedSession,
+                PluginUiCapability::MouseAll,
+                PluginUiCapability::ContextMenuAugment,
+            ],
+        })
+        .unwrap();
+        assert_eq!(module.id, "goal-ui");
+        assert_eq!(module.title, "Goal UI");
+        assert_eq!(module.description.as_deref(), Some("Native overlays"));
+        assert_eq!(module.module, "dist/goal.wasm");
+        assert_eq!(module.api_version, 1);
+        assert_eq!(module.surfaces.len(), 6);
+    }
 }
