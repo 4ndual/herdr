@@ -7,6 +7,7 @@ description = "goal-widget data + render + action core, embeddable in herdr (Pha
 
 [dependencies]
 dash-common = { path = "../dash-common" }
+goal-dash-model = { path = "../goal-dash-model" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

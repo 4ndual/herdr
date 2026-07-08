@@ -53,5 +53,5 @@ windows-sys = { version = "0.61.2", features = [
 wat = "1"
 
 [workspace]
-members = ["crates/dash-common", "crates/usage-dash-core", "crates/goal-dash-core", "crates/herdr-ui-plugin-api"]
+members = ["crates/dash-common", "crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api"]
 resolver = "2"

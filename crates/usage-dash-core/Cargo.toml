@@ -7,6 +7,7 @@ description = "usage-dash data + render core, embeddable in herdr (Phase 2 fills
 
 [dependencies]
 dash-common = { path = "../dash-common" }
+usage-dash-model = { path = "../usage-dash-model" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

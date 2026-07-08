@@ -46,6 +46,7 @@ mod agent_resume;
 mod api;
 mod app;
 mod build_info;
+mod builtin_ui_plugins;
 #[cfg(not(windows))]
 mod checksum;
 mod cli;

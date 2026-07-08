@@ -508,6 +508,7 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
         UiSurface::TabBar => app.view.tab_bar_rect,
         UiSurface::Sidebar => app.view.sidebar_rect,
         UiSurface::RightPanel => app.view.goal_dash_area,
+        UiSurface::UsageStrip => app.view.usage_dash_area,
         UiSurface::Overlay => app.view.terminal_area,
         UiSurface::ContextMenu => frame_area,
     }
@@ -517,9 +518,14 @@ fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
     match role.unwrap_or_default() {
         "accent" => Style::default().fg(app.palette.accent).add_modifier(Modifier::BOLD),
         "muted" => Style::default().fg(app.palette.overlay0),
-        "success" => Style::default().fg(app.palette.green),
-        "warning" => Style::default().fg(app.palette.yellow),
-        "danger" => Style::default().fg(app.palette.red),
+        "success" | "green" => Style::default().fg(app.palette.green),
+        "warning" | "yellow" => Style::default().fg(app.palette.yellow),
+        "danger" | "red" => Style::default().fg(app.palette.red),
+        "blue" => Style::default().fg(app.palette.blue),
+        "teal" | "cyan" => Style::default().fg(app.palette.teal),
+        "mauve" | "magenta" => Style::default().fg(app.palette.mauve),
+        "subtext" | "gray" => Style::default().fg(app.palette.subtext0),
+        "peach" => Style::default().fg(app.palette.peach),
         "panel" => Style::default().fg(app.palette.text).bg(app.palette.panel_bg),
         _ => Style::default().fg(app.palette.text),
     }
@@ -529,7 +535,19 @@ fn plugin_line(app: &AppState, spans: &[UiTextSpan]) -> Line<'static> {
     Line::from(
         spans
             .iter()
-            .map(|span| Span::styled(span.text.clone(), plugin_span_style(app, span.role.as_deref())))
+            .map(|span| {
+                let mut style = plugin_span_style(app, span.role.as_deref());
+                if span.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if span.underline {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if span.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                Span::styled(span.text.clone(), style)
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -614,6 +632,20 @@ pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: 
         if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height {
             continue;
         }
+        // API v2: absolute-coordinate hit-rects the guest declared take priority
+        // over the line-walked Menu/Tabs hits.
+        for hit in &layer.hits {
+            if col >= hit.x
+                && col < hit.x.saturating_add(hit.width)
+                && row >= hit.y
+                && row < hit.y.saturating_add(hit.height)
+            {
+                return Some(UiPluginHit {
+                    action_id: Some(hit.action_id.clone()),
+                    consumes_mouse: layer.consumes_mouse,
+                });
+            }
+        }
         let mut line_y = area.y;
         for node in &layer.nodes {
             let (action, next_line_y) = ui_plugin_node_action_at(app, area, line_y, node, col, row);
@@ -633,6 +665,16 @@ pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: 
 }
 
 fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
+    let usage = app
+        .ui_surface_layers
+        .iter()
+        .find(|l| l.surface == UiSurface::UsageStrip);
+    tracing::info!(
+        layers = app.ui_surface_layers.len(),
+        usage_nodes = usage.map(|l| l.nodes.len()).unwrap_or(0),
+        usage_rect = ?usage.map(|l| ui_plugin_surface_rect(app, frame.area(), l.surface)),
+        "render_ui_plugin_layers"
+    );
     for layer in &app.ui_surface_layers {
         let area = ui_plugin_surface_rect(app, frame.area(), layer.surface);
         if area.width == 0 || area.height == 0 {
@@ -659,7 +701,7 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                 }
                 let mut combined = left.clone();
                 if !right.is_empty() {
-                    combined.push(UiTextSpan { text: " ".into(), role: Some("muted".into()) });
+                    combined.push(UiTextSpan { text: " ".into(), role: Some("muted".into()), ..Default::default() });
                     combined.extend(right.clone());
                 }
                 frame.render_widget(Paragraph::new(plugin_line(app, &combined)), Rect::new(area.x, line_y, area.width, 1));
@@ -675,8 +717,8 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                     .flat_map(|(idx, item)| {
                         let role = if idx == *selected { Some("accent") } else { Some("muted") };
                         [
-                            UiTextSpan { text: format!(" {} ", item.label), role: role.map(str::to_string) },
-                            UiTextSpan { text: " ".into(), role: Some("muted".into()) },
+                            UiTextSpan { text: format!(" {} ", item.label), role: role.map(str::to_string), ..Default::default() },
+                            UiTextSpan { text: " ".into(), role: Some("muted".into()), ..Default::default() },
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -696,7 +738,7 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                         break;
                     }
                     let role = if idx == *selected { Some("accent") } else { None };
-                    let spans = vec![UiTextSpan { text: item.label.clone(), role: role.map(str::to_string) }];
+                    let spans = vec![UiTextSpan { text: item.label.clone(), role: role.map(str::to_string), ..Default::default() }];
                     frame.render_widget(Paragraph::new(plugin_line(app, &spans)), Rect::new(area.x, line_y, area.width, 1));
                     line_y = line_y.saturating_add(1);
                 }

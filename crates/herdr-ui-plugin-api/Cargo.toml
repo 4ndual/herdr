@@ -8,3 +8,10 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 dash-common = { path = "../dash-common" }
 serde = { version = "1", features = ["derive"] }
+ratatui = { version = "0.30", default-features = false, optional = true }
+
+[features]
+# Enabled by WASM guest crates that render with ratatui into an off-screen
+# Buffer and flatten it back to UiNode::Line rows. The host never enables it.
+guest = ["dep:ratatui"]
+

@@ -3500,6 +3500,15 @@ impl HeadlessServer {
                     "updated ui plugin modules on scheduled headless tick"
                 );
             }
+            // feat/native-dashes: run the dash WASM plugins for this frame LAST,
+            // after the generic Tick/reload dispatch above. The dash guests only
+            // emit their layer on a Frame event (with live render env + rect);
+            // they return an empty update on Tick, so this must run after
+            // `dispatch_tick` or the empty Tick result would overwrite the real
+            // Frame layer in the manager's loaded-updates cache. The render then
+            // reads the populated UsageStrip/RightPanel layers. `dispatch_event_update`
+            // re-reads each `.wasm` from disk, so a rebuilt module hot-reloads next tick.
+            self.app.dispatch_ui_plugin_frame_events();
             self.app.next_dash_tick = now + app::DASH_TICK_INTERVAL;
             changed = true;
         }

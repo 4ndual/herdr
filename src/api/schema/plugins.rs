@@ -319,6 +319,8 @@ pub enum PluginUiSurface {
     RightPanel,
     Overlay,
     ContextMenu,
+    /// The multi-row usage dashboard strip (host `usage_dash_area`). API v2.
+    UsageStrip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

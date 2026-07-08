@@ -283,17 +283,16 @@ fn handle_goal(app: &mut App, action: goal_dash_core::GoalAction) {
 /// passed-in view/model so a later `handle` resolves clicks against this frame.
 pub fn draw(
     frame: &mut Frame,
-    usage_area: Rect,
+    _usage_area: Rect,
     goal_area: Rect,
     goal: &mut goal_dash_core::App,
-    usage_view: &mut usage_dash_core::UsageView,
-    usage_snapshot: Option<&usage_dash_core::UsageSnapshot>,
+    _usage_view: &mut usage_dash_core::UsageView,
+    _usage_snapshot: Option<&usage_dash_core::UsageSnapshot>,
     palette: &crate::app::state::Palette,
 ) {
-    if usage_area.width > 0 && usage_area.height > 0 {
-        usage_dash_core::render(frame, usage_area, usage_snapshot, usage_view);
-        recolor_to_palette(frame, usage_area, palette);
-    }
+    // feat/native-dashes: the usage strip is now rendered exclusively by the
+    // built-in WASM plugin (`builtin.usage-dash`) via `render_ui_plugin_layers`.
+    // There is no native fallback — a missing `.wasm` leaves the strip empty.
     if goal_area.width > 0 && goal_area.height > 0 {
         goal_dash_core::draw(frame, goal_area, goal);
         recolor_to_palette(frame, goal_area, palette);

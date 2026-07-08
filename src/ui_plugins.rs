@@ -579,6 +579,7 @@ fn map_surface(surface: PluginUiSurface) -> UiSurface {
         PluginUiSurface::RightPanel => UiSurface::RightPanel,
         PluginUiSurface::Overlay => UiSurface::Overlay,
         PluginUiSurface::ContextMenu => UiSurface::ContextMenu,
+        PluginUiSurface::UsageStrip => UiSurface::UsageStrip,
     }
 }
 

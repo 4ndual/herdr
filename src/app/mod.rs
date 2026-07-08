@@ -206,6 +206,21 @@ fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
 }
 
+/// Absolute reset-time string for a rate-limit window, computed host-side (the
+/// usage WASM plugin has no process access). Mirrors the former native
+/// `usage_dash_core::render::abs_time`: `+%a` (weekday) for the weekly window,
+/// `+%H:%M` (clock) for the 5-hour window.
+fn host_abs_time(epoch: i64, weekly: bool) -> String {
+    let fmt = if weekly { "+%a" } else { "+%H:%M" };
+    std::process::Command::new("date")
+        .args(["-r", &epoch.to_string(), fmt])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 fn load_plugin_registry(no_session: bool) -> crate::app::state::InstalledPluginRegistry {
     if no_session {
         return std::collections::HashMap::new();
@@ -618,6 +633,16 @@ impl App {
             std::thread::spawn(move || {
                 crate::detect::manifest_update::auto_update(manifest_update_tx)
             });
+        }
+
+        // The two dashboards are rendered exclusively by built-in WASM UI
+        // plugins (no native fallback). Register them so their surfaces always
+        // have a renderer, the same as a linked plugin.
+        for builtin in crate::builtin_ui_plugins::builtin_dash_plugins() {
+            state
+                .installed_plugins
+                .entry(builtin.plugin_id.clone())
+                .or_insert(builtin);
         }
 
         let ui_plugins = crate::ui_plugins::UiPluginManager::from_installed_plugins(
@@ -1518,6 +1543,36 @@ impl App {
     pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {
         self.state.ui_context_menu_items = self.ui_plugins.context_menu_items();
         self.state.ui_surface_layers = self.ui_plugins.surface_layers();
+        self.sync_usage_view_hits_from_layers();
+    }
+
+    /// feat/native-dashes: the usage strip is rendered by the WASM plugin, which
+    /// returns its clickable hit-rects (expand/stats toggles) on the UsageStrip
+    /// layer. Mirror them onto `usage_view.hits` so `dash::route_mouse` resolves
+    /// clicks the same way the native renderer used to (which wrote `hits` back
+    /// onto the view each frame). When the plugin reports no expandable state
+    /// hit, drop stale expand/scroll — exactly the old `render()` cleanup.
+    fn sync_usage_view_hits_from_layers(&mut self) {
+        use ratatui::layout::Rect;
+        let mut hits = usage_dash_core::Hits::default();
+        for layer in &self.state.ui_surface_layers {
+            if layer.surface != herdr_ui_plugin_api::UiSurface::UsageStrip {
+                continue;
+            }
+            for hit in &layer.hits {
+                let rect = Rect::new(hit.x, hit.y, hit.width, hit.height);
+                match hit.action_id.as_str() {
+                    "usage:toggle_expand" => hits.state = Some(rect),
+                    "usage:toggle_stats" => hits.stats = Some(rect),
+                    _ => {}
+                }
+            }
+        }
+        if hits.state.is_none() {
+            self.usage_view.expanded = false;
+            self.usage_view.scroll = 0;
+        }
+        self.usage_view.hits = hits;
     }
 
     pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
@@ -1571,12 +1626,21 @@ impl App {
                     crate::api::schema::PluginUiSurface::RightPanel => herdr_ui_plugin_api::UiSurface::RightPanel,
                     crate::api::schema::PluginUiSurface::Overlay => herdr_ui_plugin_api::UiSurface::Overlay,
                     crate::api::schema::PluginUiSurface::ContextMenu => herdr_ui_plugin_api::UiSurface::ContextMenu,
+                    crate::api::schema::PluginUiSurface::UsageStrip => herdr_ui_plugin_api::UiSurface::UsageStrip,
                 };
                 let rect = crate::ui::ui_plugin_surface_rect(
                     &self.state,
                     crate::ui::ui_plugin_frame_area(&self.state),
                     surface,
                 );
+                if surface == herdr_ui_plugin_api::UiSurface::UsageStrip {
+                    tracing::info!(
+                        ?rect,
+                        usage_area = ?self.state.view.usage_dash_area,
+                        has_snapshot = self.usage_snapshot.is_some(),
+                        "usage frame dispatch"
+                    );
+                }
                 let env = self.build_ui_plugin_frame_env(
                     &plugin_id,
                     &module_id,
@@ -1606,6 +1670,14 @@ impl App {
             self.apply_ui_plugin_notifications();
             self.apply_ui_plugin_effects();
         }
+        let usage_nodes: usize = self
+            .state
+            .ui_surface_layers
+            .iter()
+            .filter(|l| l.surface == herdr_ui_plugin_api::UiSurface::UsageStrip)
+            .map(|l| l.nodes.len())
+            .sum();
+        tracing::info!(changed, usage_nodes, layers = self.state.ui_surface_layers.len(), "frame events done");
     }
 
     pub(crate) fn build_ui_plugin_frame_env(
@@ -1675,7 +1747,49 @@ impl App {
             "HERDR_FOCUS_AGENT".to_string(),
             format!("{:?}", focus.agent).to_lowercase(),
         );
+        // feat/native-dashes: the usage strip is rendered by the built-in WASM
+        // plugin, which has zero I/O. Feed it the live render input (snapshot +
+        // view toggles + host-computed reset-time strings) as JSON each frame.
+        if plugin_id == "builtin.usage-dash" {
+            if let Some(json) = self.usage_render_input_json() {
+                env.insert("HERDR_USAGE_RENDER_JSON".to_string(), json);
+            }
+        }
         env
+    }
+
+    /// Serialize the live [`usage_dash_core::model::UsageRenderInput`] for the
+    /// usage WASM plugin: the current snapshot plus the host-owned view toggles
+    /// and the absolute reset-time strings (the guest can't run `date`).
+    fn usage_render_input_json(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (five_hour_abs, weekly_abs) = match self.usage_snapshot.as_ref() {
+            Some(snap) => (
+                snap.five_hour
+                    .resets_at
+                    .map(|e| host_abs_time(e, false))
+                    .unwrap_or_default(),
+                snap.weekly
+                    .resets_at
+                    .map(|e| host_abs_time(e, true))
+                    .unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let input = usage_dash_core::model::UsageRenderInput {
+            snapshot: self.usage_snapshot.clone(),
+            expanded: self.usage_view.expanded,
+            collapsed: self.usage_view.collapsed,
+            stats_shown: self.usage_view.stats_shown,
+            scroll: self.usage_view.scroll,
+            now,
+            five_hour_abs,
+            weekly_abs,
+        };
+        serde_json::to_string(&input).ok()
     }
 
     pub(crate) fn apply_ui_plugin_notifications(&mut self) {

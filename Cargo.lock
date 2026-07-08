@@ -890,10 +890,19 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dash-common",
+ "goal-dash-model",
  "ratatui",
  "serde",
  "serde_json",
  "unicode-width",
+]
+
+[[package]]
+name = "goal-dash-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -960,6 +969,7 @@ name = "herdr-ui-plugin-api"
 version = "0.1.0"
 dependencies = [
  "dash-common",
+ "ratatui",
  "serde",
 ]
 
@@ -2495,6 +2505,15 @@ version = "0.1.0"
 dependencies = [
  "dash-common",
  "ratatui",
+ "serde",
+ "serde_json",
+ "usage-dash-model",
+]
+
+[[package]]
+name = "usage-dash-model"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

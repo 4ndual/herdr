@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +15,9 @@ pub enum UiSurface {
     RightPanel,
     Overlay,
     ContextMenu,
+    /// The multi-row usage dashboard strip (maps to the host's `usage_dash_area`).
+    /// Added in API v2 for the WASM usage-dash module.
+    UsageStrip,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,11 +115,22 @@ pub enum UiEvent {
     ReloadRequested,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct UiTextSpan {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Text modifiers (API v2). Default false so v1 spans deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +160,19 @@ pub enum UiNode {
     },
 }
 
+/// An absolute-coordinate clickable region a layer exposes (API v2). The guest
+/// computes these while rendering (e.g. the usage STATE/STATS toggles, or goal
+/// node/chip rows); the host resolves a click inside one to its `action_id` and
+/// dispatches it back to the owning module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiHitRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub action_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiLayer {
     pub surface: UiSurface,
@@ -155,6 +182,13 @@ pub struct UiLayer {
     pub consumes_mouse: bool,
     #[serde(default)]
     pub nodes: Vec<UiNode>,
+    /// Absolute-coordinate clickable regions (API v2). Empty for v1 plugins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hits: Vec<UiHitRect>,
+    /// Free-form module-owned payload (API v2). The goal module ships its full
+    /// `GoalHits` JSON here (richer than `hits`); the usage path leaves it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,4 +232,106 @@ pub struct UiUpdate {
     pub effects: Vec<HostEffect>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumed_action_ids: Vec<String>,
+}
+
+/// Guest-side rendering support: render with ratatui into an off-screen
+/// [`ratatui::buffer::Buffer`], then flatten it back into [`UiNode::Line`] rows
+/// that the host's existing Line renderer paints verbatim. This lets a WASM
+/// module reuse the exact native `render.rs` layout code (compiled to wasm) while
+/// speaking only the host's text+role vocabulary. The host never enables this.
+#[cfg(feature = "guest")]
+pub mod guest {
+    use super::{UiNode, UiTextSpan};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
+
+    /// Map a semantic ratatui named color to the host role string. Truecolor /
+    /// indexed / reset cells map to `None` (host draws them as default text).
+    /// Mirrors the host's old `recolor_to_palette` mapping so themed colors match.
+    pub fn color_role(c: Color) -> Option<&'static str> {
+        Some(match c {
+            Color::Green | Color::LightGreen => "success",
+            Color::Yellow | Color::LightYellow => "warning",
+            Color::Red | Color::LightRed => "danger",
+            Color::Blue | Color::LightBlue => "blue",
+            Color::Cyan | Color::LightCyan => "teal",
+            Color::Magenta | Color::LightMagenta => "mauve",
+            Color::Gray => "subtext",
+            Color::DarkGray => "muted",
+            Color::White => "default",
+            _ => return None,
+        })
+    }
+
+    #[derive(PartialEq, Eq, Clone, Copy)]
+    struct CellStyle {
+        role: Option<&'static str>,
+        bold: bool,
+        underline: bool,
+        italic: bool,
+    }
+
+    /// Flatten every row of `buf` into one [`UiNode::Line`], run-length-merging
+    /// adjacent cells that share a style into a single span. Trailing default
+    /// whitespace on each row is dropped so the host doesn't paint empty bg.
+    pub fn flatten_buffer(buf: &Buffer) -> Vec<UiNode> {
+        let area = buf.area;
+        let mut nodes = Vec::with_capacity(area.height as usize);
+        for y in area.top()..area.bottom() {
+            let mut spans: Vec<UiTextSpan> = Vec::new();
+            let mut cur_text = String::new();
+            let mut cur_style: Option<CellStyle> = None;
+            for x in area.left()..area.right() {
+                let cell = &buf[(x, y)];
+                let m = cell.modifier;
+                let style = CellStyle {
+                    role: color_role(cell.fg),
+                    bold: m.contains(Modifier::BOLD),
+                    underline: m.contains(Modifier::UNDERLINED),
+                    italic: m.contains(Modifier::ITALIC),
+                };
+                let sym = cell.symbol();
+                match cur_style {
+                    Some(s) if s == style => cur_text.push_str(sym),
+                    _ => {
+                        if let Some(s) = cur_style.take() {
+                            push_span(&mut spans, &cur_text, s);
+                        }
+                        cur_text.clear();
+                        cur_text.push_str(sym);
+                        cur_style = Some(style);
+                    }
+                }
+            }
+            if let Some(s) = cur_style.take() {
+                push_span(&mut spans, &cur_text, s);
+            }
+            trim_trailing_default(&mut spans);
+            nodes.push(UiNode::Line { spans });
+        }
+        nodes
+    }
+
+    fn push_span(spans: &mut Vec<UiTextSpan>, text: &str, s: CellStyle) {
+        spans.push(UiTextSpan {
+            text: text.to_string(),
+            role: s.role.map(str::to_string),
+            bold: s.bold,
+            underline: s.underline,
+            italic: s.italic,
+        });
+    }
+
+    /// Drop trailing spans that are pure whitespace with no role/modifiers, so a
+    /// padded row doesn't carry a long empty tail into the host paint.
+    fn trim_trailing_default(spans: &mut Vec<UiTextSpan>) {
+        while let Some(last) = spans.last() {
+            let plain = last.role.is_none() && !last.bold && !last.underline && !last.italic;
+            if plain && last.text.trim().is_empty() {
+                spans.pop();
+            } else {
+                break;
+            }
+        }
+    }
 }

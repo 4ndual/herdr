@@ -21,6 +21,7 @@ pub mod state;
 pub mod store;
 pub mod timegate;
 pub mod view;
+pub mod wasm_bridge;
 
 pub use model::{GoalDoc, GoalState, Links, Par, Proposal, St, Sub, Tree};
 pub use render::draw;
