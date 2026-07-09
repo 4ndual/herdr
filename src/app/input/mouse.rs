@@ -2267,8 +2267,11 @@ mod tests {
                 spans: vec![herdr_ui_plugin_api::UiTextSpan {
                     text: "Overlay".into(),
                     role: Some("accent".into()),
+                    ..Default::default()
                 }],
             }],
+            hits: vec![],
+            data: None,
         }];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
         let x = app.state.view.terminal_area.x;
@@ -2296,6 +2299,8 @@ mod tests {
                 }],
                 selected: 0,
             }],
+            hits: vec![],
+            data: None,
         }];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
         let x = app.state.view.terminal_area.x + 1;

@@ -232,6 +232,11 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // fork(f5-mouse-dedupe): the raw MouseAll broadcast is deduped per module
+        // against each module's declared hit-rects inside the manager (see
+        // `UiPluginManager::should_deliver_raw_mouse`), so a module whose current
+        // layers own this cell does not also see the click here and via the
+        // hit-rect path in `AppState::handle_mouse`/`ui_plugin_hit_at`.
         if self.ui_plugins.dispatch_crossterm_mouse_event(mouse) {
             self.refresh_ui_plugin_state_from_manager();
             self.apply_ui_plugin_effects();

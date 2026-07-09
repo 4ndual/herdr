@@ -1,9 +1,17 @@
 use crate::api::schema::{InstalledPluginInfo, PluginHotReloadMode, PluginUiSurface};
 use dash_common::FocusInput;
-use herdr_ui_plugin_api::{HostEffect, HostSnapshot, KeyEvent as UiKeyEvent, MouseEvent, MouseEventKind, UiActionRef, UiCapability, UiEvent, UiFrameContext, UiLayer, UiLayoutRect, UiNode, UiPluginManifestRef, UiSurface, UiUpdate, API_VERSION};
+use herdr_ui_plugin_api::{
+    HostEffect, HostSnapshot, KeyEvent as UiKeyEvent, MouseEvent, MouseEventKind, UiActionRef,
+    UiCapability, UiEvent, UiFrameContext, UiLayer, UiLayoutRect, UiNode, UiPluginManifestRef,
+    UiSurface, UiUpdate, API_VERSION,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
+use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegisteredUiModule {
@@ -39,7 +47,12 @@ impl RegisteredUiModule {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+/// How often the shared engine epoch is bumped, and how many bumps a single
+/// guest call is granted before it is trapped. 5 * 100ms bounds a runaway guest
+/// (`loop {}`) to well under a second without hanging the render thread.
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
+const EPOCH_DEADLINE_TICKS: u64 = 5;
+
 pub(crate) struct UiPluginManager {
     modules: Vec<RegisteredUiModule>,
     by_surface: HashMap<PluginUiSurface, Vec<usize>>,
@@ -48,17 +61,279 @@ pub(crate) struct UiPluginManager {
     last_errors: HashMap<(String, String), String>,
     pending_effects: Vec<HostEffect>,
     pending_notifications: Vec<String>,
+    /// Shared wasm runtime holding the live per-module instances. `None` only if
+    /// the engine failed to initialize, in which case plugins are inert.
+    runtime: Option<PluginRuntime>,
+}
+
+/// Background thread that increments the shared engine epoch so a guest call
+/// that never yields (e.g. `loop {}`) hits its epoch deadline and traps instead
+/// of hanging the render thread. Stops and joins on drop.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    fn spawn(engine: &Engine) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let engine = engine.clone();
+        let stop_flag = Arc::clone(&stop);
+        let handle = match std::thread::Builder::new()
+            .name("herdr-ui-plugin-epoch".to_string())
+            .spawn(move || {
+                while !stop_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(EPOCH_TICK_INTERVAL);
+                    engine.increment_epoch();
+                }
+            }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to spawn ui plugin epoch ticker; guest calls will not be time-limited"
+                );
+                None
+            }
+        };
+        Self { stop, handle }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One epoch-interruptible `Engine` shared by every UI plugin module, plus a
+/// cache of live instances keyed by `(plugin_id, module_id)`. Events reuse the
+/// cached instance so guest linear memory (statics + heap) persists across
+/// events and no recompile/re-instantiate happens per event.
+struct PluginRuntime {
+    engine: Engine,
+    // Held only for its `Drop` (stops the epoch thread); never read directly.
+    _ticker: EpochTicker,
+    instances: HashMap<(String, String), ModuleInstance>,
+}
+
+impl PluginRuntime {
+    fn new() -> Result<Self, String> {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine =
+            Engine::new(&config).map_err(|err| format!("failed to build wasm ui engine: {err}"))?;
+        let ticker = EpochTicker::spawn(&engine);
+        Ok(Self {
+            engine,
+            _ticker: ticker,
+            instances: HashMap::new(),
+        })
+    }
+
+    /// Returns the cached instance for `module`, building it (fresh store, fresh
+    /// linear memory) when it is not currently cached — first use, or after a
+    /// trap / hot-reload dropped it.
+    fn instance_for(&mut self, module: &RegisteredUiModule) -> Result<&mut ModuleInstance, String> {
+        let key = module_key(module);
+        if !self.instances.contains_key(&key) {
+            let instance = ModuleInstance::build(&self.engine, module)?;
+            self.instances.insert(key.clone(), instance);
+        }
+        self.instances
+            .get_mut(&key)
+            .ok_or_else(|| "ui plugin instance missing after build".to_string())
+    }
+
+    fn dispatch(
+        &mut self,
+        module: &RegisteredUiModule,
+        event: &UiEvent,
+    ) -> Result<Option<UiUpdate>, String> {
+        self.instance_for(module)?.dispatch(event)
+    }
+
+    fn static_update(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+        self.instance_for(module)?.static_update(module)
+    }
+
+    /// Drop the cached instance so the next call rebuilds from disk. Used for
+    /// crash isolation (a trapped guest) and for hot-reload, where the rebuild
+    /// also discards the guest's persisted state.
+    fn invalidate(&mut self, module: &RegisteredUiModule) {
+        self.instances.remove(&module_key(module));
+    }
+
+    fn reload_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+        self.invalidate(module);
+        self.static_update(module)
+    }
+}
+
+/// A live wasm instance for one UI plugin module. Holds its `Store` so guest
+/// linear memory persists across events. Every guest entry point re-arms the
+/// epoch deadline so a runaway call traps instead of blocking the caller.
+struct ModuleInstance {
+    store: Store<()>,
+    memory: Memory,
+    alloc: Option<TypedFunc<i32, i32>>,
+    on_event: Option<TypedFunc<(i32, i32), i32>>,
+    on_event_len: Option<TypedFunc<(), i32>>,
+    static_ptr: TypedFunc<(), i32>,
+    static_len: TypedFunc<(), i32>,
+}
+
+impl ModuleInstance {
+    fn build(engine: &Engine, module: &RegisteredUiModule) -> Result<Self, String> {
+        let path = module.module_path.display();
+        let wasm = std::fs::read(&module.module_path)
+            .map_err(|err| format!("failed to read wasm ui module {path}: {err}"))?;
+        let compiled = Module::new(engine, &wasm)
+            .map_err(|err| format!("failed to compile wasm ui module {path}: {err}"))?;
+        let mut store = Store::new(engine, ());
+        // Arm a finite deadline so instantiation/start code cannot hang either;
+        // every subsequent guest call re-arms before running.
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let instance = Instance::new(&mut store, &compiled, &[])
+            .map_err(|err| format!("failed to instantiate wasm ui module {path}: {err}"))?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| format!("wasm ui module {path} exports no memory"))?;
+        let api_fn = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_api_version")
+            .map_err(|_| format!("wasm ui module {path} missing export herdr_ui_api_version"))?;
+        store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let api_version = api_fn.call(&mut store, ()).map_err(|err| {
+            format!("wasm ui module {path} export herdr_ui_api_version failed: {err}")
+        })? as u32;
+        if api_version != module.api_version || api_version != API_VERSION {
+            return Err(format!(
+                "wasm ui module {path} api version mismatch: module exports {api_version}, manifest says {}, host supports {API_VERSION}",
+                module.api_version
+            ));
+        }
+        let static_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_static_update_ptr")
+            .map_err(|_| {
+                format!("wasm ui module {path} missing export herdr_ui_static_update_ptr")
+            })?;
+        let static_len = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_static_update_len")
+            .map_err(|_| {
+                format!("wasm ui module {path} missing export herdr_ui_static_update_len")
+            })?;
+        // Event entry points are optional: a static-only module omits them and
+        // simply produces no update on events.
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "herdr_ui_alloc")
+            .ok();
+        let on_event = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "herdr_ui_on_event")
+            .ok();
+        let on_event_len = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_on_event_len")
+            .ok();
+        Ok(Self {
+            store,
+            memory,
+            alloc,
+            on_event,
+            on_event_len,
+            static_ptr,
+            static_len,
+        })
+    }
+
+    fn static_update(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+        let path = module.module_path.display();
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let ptr = self.static_ptr.call(&mut self.store, ()).map_err(|err| {
+            format!("wasm ui module {path} export herdr_ui_static_update_ptr failed: {err}")
+        })? as usize;
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let len = self.static_len.call(&mut self.store, ()).map_err(|err| {
+            format!("wasm ui module {path} export herdr_ui_static_update_len failed: {err}")
+        })? as usize;
+        let data = self.memory.data(&self.store);
+        let end = ptr
+            .checked_add(len)
+            .ok_or_else(|| "wasm ui module update overflow".to_string())?;
+        if end > data.len() {
+            return Err(format!(
+                "wasm ui module {path} returned out-of-bounds static update slice"
+            ));
+        }
+        serde_json::from_slice::<UiUpdate>(&data[ptr..end])
+            .map_err(|err| format!("failed to parse wasm ui module update {path}: {err}"))
+    }
+
+    fn dispatch(&mut self, event: &UiEvent) -> Result<Option<UiUpdate>, String> {
+        // Borrow the func handles by reference; they live in fields disjoint from
+        // `self.store`, so calling them while mutably borrowing the store is fine.
+        let (Some(alloc), Some(on_event), Some(on_event_len)) =
+            (&self.alloc, &self.on_event, &self.on_event_len)
+        else {
+            return Ok(None);
+        };
+        let bytes = serde_json::to_vec(event)
+            .map_err(|err| format!("failed to serialize ui event: {err}"))?;
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let ptr = alloc
+            .call(&mut self.store, bytes.len() as i32)
+            .map_err(|err| format!("ui wasm alloc failed: {err}"))? as usize;
+        let data = self.memory.data_mut(&mut self.store);
+        let end = ptr
+            .checked_add(bytes.len())
+            .ok_or_else(|| "ui wasm event buffer overflow".to_string())?;
+        if end > data.len() {
+            return Err("ui wasm alloc returned out-of-bounds pointer".to_string());
+        }
+        data[ptr..end].copy_from_slice(&bytes);
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let result_ptr = on_event
+            .call(&mut self.store, (ptr as i32, bytes.len() as i32))
+            .map_err(|err| format!("ui wasm on_event failed: {err}"))?
+            as usize;
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let result_len = on_event_len
+            .call(&mut self.store, ())
+            .map_err(|err| format!("ui wasm on_event_len failed: {err}"))?
+            as usize;
+        let data = self.memory.data(&self.store);
+        let end = result_ptr
+            .checked_add(result_len)
+            .ok_or_else(|| "ui wasm result overflow".to_string())?;
+        if end > data.len() {
+            return Err("ui wasm on_event returned out-of-bounds slice".to_string());
+        }
+        let update = serde_json::from_slice::<UiUpdate>(&data[result_ptr..end])
+            .map_err(|err| format!("failed to parse ui wasm event update: {err}"))?;
+        Ok(Some(update))
+    }
 }
 
 impl UiPluginManager {
-    pub(crate) fn from_installed_plugins(
-        plugins: &HashMap<String, InstalledPluginInfo>,
-    ) -> Self {
-        let mut modules = Vec::new();
-        let mut by_surface: HashMap<PluginUiSurface, Vec<usize>> = HashMap::new();
-        let mut mtimes = HashMap::new();
-        let mut loaded_updates = HashMap::new();
-        let mut last_errors = HashMap::new();
+    pub(crate) fn from_installed_plugins(plugins: &HashMap<String, InstalledPluginInfo>) -> Self {
+        let runtime = match PluginRuntime::new() {
+            Ok(runtime) => Some(runtime),
+            Err(err) => {
+                tracing::error!(error = %err, "failed to init wasm ui plugin runtime; ui plugins disabled");
+                None
+            }
+        };
+        let mut manager = Self {
+            modules: Vec::new(),
+            by_surface: HashMap::new(),
+            mtimes: HashMap::new(),
+            loaded_updates: HashMap::new(),
+            last_errors: HashMap::new(),
+            pending_effects: Vec::new(),
+            pending_notifications: Vec::new(),
+            runtime,
+        };
 
         let mut plugin_list = plugins.values().collect::<Vec<_>>();
         plugin_list.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
@@ -80,18 +355,20 @@ impl UiPluginManager {
                     surfaces: module.surfaces.clone(),
                     requested_capabilities: module.capabilities.clone(),
                 };
-                let idx = modules.len();
+                let idx = manager.modules.len();
                 for surface in &registered.surfaces {
-                    by_surface.entry(*surface).or_default().push(idx);
+                    manager.by_surface.entry(*surface).or_default().push(idx);
                 }
                 if let Ok(meta) = std::fs::metadata(&registered.module_path) {
                     if let Ok(mtime) = meta.modified() {
-                        mtimes.insert(registered.module_path.clone(), mtime);
+                        manager.mtimes.insert(registered.module_path.clone(), mtime);
                     }
                 }
-                match load_static_update(&registered) {
+                match manager.load_module_static(&registered) {
                     Ok(update) => {
-                        loaded_updates.insert(module_key(&registered), update);
+                        manager
+                            .loaded_updates
+                            .insert(module_key(&registered), update);
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -101,21 +378,32 @@ impl UiPluginManager {
                             error = %err,
                             "failed to load ui plugin module"
                         );
-                        last_errors.insert(module_key(&registered), err);
+                        manager.last_errors.insert(module_key(&registered), err);
                     }
                 }
-                modules.push(registered);
+                manager.modules.push(registered);
             }
         }
 
-        Self {
-            modules,
-            by_surface,
-            mtimes,
-            loaded_updates,
-            last_errors,
-            pending_effects: Vec::new(),
-            pending_notifications: Vec::new(),
+        manager
+    }
+
+    /// Build (if needed) the live instance for `module` and read its initial
+    /// static update. Used at load time; errors when the shared runtime failed
+    /// to initialize.
+    fn load_module_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+        match self.runtime.as_mut() {
+            Some(runtime) => runtime.static_update(module),
+            None => Err("wasm ui plugin runtime unavailable".to_string()),
+        }
+    }
+
+    /// Drop and rebuild `module`'s instance from disk (fresh linear memory),
+    /// then read its static update. Used on hot-reload so guest state resets.
+    fn reload_module_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+        match self.runtime.as_mut() {
+            Some(runtime) => runtime.reload_static(module),
+            None => Err("wasm ui plugin runtime unavailable".to_string()),
         }
     }
 
@@ -138,7 +426,10 @@ impl UiPluginManager {
 
     pub(crate) fn detect_changed_modules(&mut self) -> Vec<RegisteredUiModule> {
         let mut changed = Vec::new();
-        for module in &self.modules {
+        // Clone the module list so the reload path can take `&mut self` without
+        // aliasing the borrow of `self.modules`.
+        let modules = self.modules.clone();
+        for module in &modules {
             let Ok(meta) = std::fs::metadata(&module.module_path) else {
                 continue;
             };
@@ -149,7 +440,7 @@ impl UiPluginManager {
             if old.is_none() || old.is_some_and(|old| old < mtime) {
                 self.mtimes.insert(module.module_path.clone(), mtime);
                 let key = module_key(module);
-                match load_static_update(module) {
+                match self.reload_module_static(module) {
                     Ok(update) => {
                         self.loaded_updates.insert(key.clone(), update);
                         if self.last_errors.remove(&key).is_some() {
@@ -225,13 +516,63 @@ impl UiPluginManager {
             column: mouse.column,
             row: mouse.row,
         });
-        self.dispatch_event(&event)
+        let keys = self
+            .modules
+            .iter()
+            .map(|module| (module.plugin_id.clone(), module.module_id.clone()))
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (plugin_id, module_id) in keys {
+            // fork(f5-mouse-dedupe): a module whose current layers declare an
+            // absolute hit-rect over this cell already receives the click through
+            // the hit-rect resolution path (`ui::ui_plugin_hit_at` ->
+            // pending_plugin_action_invocation), so suppress the duplicate raw
+            // MouseAll broadcast for cells inside its own hit-rects. The raw
+            // stream continues for every other cell. Kept general so v3 Action
+            // routing can reuse `should_deliver_raw_mouse`.
+            if !self.should_deliver_raw_mouse(&plugin_id, &module_id, mouse.column, mouse.row) {
+                continue;
+            }
+            changed |= self.dispatch_event_for_module(&plugin_id, &module_id, &event);
+        }
+        changed
     }
 
-    pub(crate) fn dispatch_crossterm_key_event(
-        &mut self,
-        key: crossterm::event::KeyEvent,
+    /// Single decision point for whether `module` should receive a raw mouse
+    /// event through the MouseAll broadcast. Returns `false` when the module's
+    /// currently loaded layers declare an absolute hit-rect covering
+    /// `(col, row)`, because that cell is already handled by the declarative
+    /// hit-rect path (see the `fork(f5-mouse-dedupe)` block in
+    /// `dispatch_crossterm_mouse_event`). General enough to be reused by v3
+    /// Action routing.
+    pub(crate) fn should_deliver_raw_mouse(
+        &self,
+        plugin_id: &str,
+        module_id: &str,
+        col: u16,
+        row: u16,
     ) -> bool {
+        let Some(update) = self
+            .loaded_updates
+            .get(&(plugin_id.to_string(), module_id.to_string()))
+        else {
+            return true;
+        };
+        for layer in &update.layers {
+            for hit in &layer.hits {
+                if col >= hit.x
+                    && col < hit.x.saturating_add(hit.width)
+                    && row >= hit.y
+                    && row < hit.y.saturating_add(hit.height)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn dispatch_crossterm_key_event(&mut self, key: crossterm::event::KeyEvent) -> bool {
         let Some(event) = map_crossterm_key_event(key) else {
             return false;
         };
@@ -308,18 +649,26 @@ impl UiPluginManager {
         module_id: &str,
         event: &UiEvent,
     ) -> bool {
+        // Clone so the reused live instance can be driven through `&mut self`
+        // without aliasing the borrow of `self.modules`.
         let Some(module) = self
             .modules
             .iter()
             .find(|module| module.plugin_id == plugin_id && module.module_id == module_id)
+            .cloned()
         else {
             return false;
         };
-        if !module_accepts_event(module, event) {
+        if !module_accepts_event(&module, event) {
             return false;
         }
         let key = (plugin_id.to_string(), module_id.to_string());
-        let update = match dispatch_event_update(module, event) {
+        let started = Instant::now();
+        let result = match self.runtime.as_mut() {
+            Some(runtime) => runtime.dispatch(&module, event),
+            None => Ok(None),
+        };
+        let update = match result {
             Ok(Some(update)) => update,
             Ok(None) => return false,
             Err(err) => {
@@ -330,6 +679,11 @@ impl UiPluginManager {
                     error = %err,
                     "failed to handle ui plugin event"
                 );
+                // Crash isolation: drop the poisoned/trapped store so the module
+                // is rebuilt from disk on the next event instead of reused.
+                if let Some(runtime) = self.runtime.as_mut() {
+                    runtime.invalidate(&module);
+                }
                 let notify = self.last_errors.get(&key) != Some(&err);
                 self.last_errors.insert(key, err.clone());
                 if notify {
@@ -341,6 +695,12 @@ impl UiPluginManager {
                 return false;
             }
         };
+        tracing::debug!(
+            plugin_id = %module.plugin_id,
+            module_id = %module.module_id,
+            elapsed_us = started.elapsed().as_micros(),
+            "ui plugin event dispatched"
+        );
         if self.last_errors.remove(&key).is_some() {
             self.pending_notifications.push(format!(
                 "ui plugin {}:{} recovered",
@@ -348,9 +708,18 @@ impl UiPluginManager {
             ));
         }
         self.pending_effects
-            .extend(filter_effects_for_module(module, &update.effects));
+            .extend(filter_effects_for_module(&module, &update.effects));
         self.loaded_updates.insert(key, update);
         true
+    }
+
+    #[cfg(test)]
+    fn test_instance_cached(&self, plugin_id: &str, module_id: &str) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .instances
+                .contains_key(&(plugin_id.to_string(), module_id.to_string()))
+        })
     }
 }
 
@@ -404,57 +773,6 @@ fn filter_effects_for_module(
         .collect()
 }
 
-fn dispatch_event_update(module: &RegisteredUiModule, event: &UiEvent) -> Result<Option<UiUpdate>, String> {
-    let engine = wasmtime::Engine::default();
-    let wasm = std::fs::read(&module.module_path)
-        .map_err(|err| format!("failed to read wasm ui module {}: {err}", module.module_path.display()))?;
-    let wasm_module = wasmtime::Module::new(&engine, &wasm)
-        .map_err(|err| format!("failed to compile wasm ui module {}: {err}", module.module_path.display()))?;
-    let mut store = wasmtime::Store::new(&engine, ());
-    let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[])
-        .map_err(|err| format!("failed to instantiate wasm ui module {}: {err}", module.module_path.display()))?;
-    let Some(memory) = instance.get_memory(&mut store, "memory") else {
-        return Ok(None);
-    };
-    if call_i32_export(&instance, &mut store, "herdr_ui_api_version")? as u32 != API_VERSION {
-        return Ok(None);
-    }
-    let alloc = match instance.get_typed_func::<i32, i32>(&mut store, "herdr_ui_alloc") {
-        Ok(func) => func,
-        Err(_) => return Ok(None),
-    };
-    let on_event = match instance.get_typed_func::<(i32, i32), i32>(&mut store, "herdr_ui_on_event") {
-        Ok(func) => func,
-        Err(_) => return Ok(None),
-    };
-    let event_len = match instance.get_typed_func::<(), i32>(&mut store, "herdr_ui_on_event_len") {
-        Ok(func) => func,
-        Err(_) => return Ok(None),
-    };
-    let bytes = serde_json::to_vec(event).map_err(|err| format!("failed to serialize ui event: {err}"))?;
-    let ptr = alloc.call(&mut store, bytes.len() as i32).map_err(|err| format!("ui wasm alloc failed: {err}"))? as usize;
-    let data = memory.data_mut(&mut store);
-    let end = ptr.checked_add(bytes.len()).ok_or_else(|| "ui wasm event buffer overflow".to_string())?;
-    if end > data.len() {
-        return Err("ui wasm alloc returned out-of-bounds pointer".to_string());
-    }
-    data[ptr..end].copy_from_slice(&bytes);
-    let result_ptr = on_event
-        .call(&mut store, (ptr as i32, bytes.len() as i32))
-        .map_err(|err| format!("ui wasm on_event failed: {err}"))? as usize;
-    let result_len = event_len
-        .call(&mut store, ())
-        .map_err(|err| format!("ui wasm on_event_len failed: {err}"))? as usize;
-    let data = memory.data(&store);
-    let end = result_ptr.checked_add(result_len).ok_or_else(|| "ui wasm result overflow".to_string())?;
-    if end > data.len() {
-        return Err("ui wasm on_event returned out-of-bounds slice".to_string());
-    }
-    let update = serde_json::from_slice::<UiUpdate>(&data[result_ptr..end])
-        .map_err(|err| format!("failed to parse ui wasm event update: {err}"))?;
-    Ok(Some(update))
-}
-
 fn map_crossterm_key_event(event: crossterm::event::KeyEvent) -> Option<UiKeyEvent> {
     use crossterm::event::KeyCode;
 
@@ -481,16 +799,22 @@ fn map_crossterm_key_event(event: crossterm::event::KeyEvent) -> Option<UiKeyEve
 
     Some(UiKeyEvent {
         key,
-        shift: event.modifiers.contains(crossterm::event::KeyModifiers::SHIFT),
-        ctrl: event.modifiers.contains(crossterm::event::KeyModifiers::CONTROL),
-        alt: event.modifiers.contains(crossterm::event::KeyModifiers::ALT),
-        meta: event.modifiers.contains(crossterm::event::KeyModifiers::SUPER),
+        shift: event
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT),
+        ctrl: event
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL),
+        alt: event
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::ALT),
+        meta: event
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SUPER),
     })
 }
 
-fn map_crossterm_mouse_kind(
-    kind: crossterm::event::MouseEventKind,
-) -> Option<MouseEventKind> {
+fn map_crossterm_mouse_kind(kind: crossterm::event::MouseEventKind) -> Option<MouseEventKind> {
     use crossterm::event::{MouseButton, MouseEventKind as K};
     Some(match kind {
         K::Moved => MouseEventKind::Move,
@@ -522,54 +846,6 @@ fn context_menu_items_from_update(update: &UiUpdate) -> Vec<UiActionRef> {
     out
 }
 
-fn load_static_update(module: &RegisteredUiModule) -> Result<UiUpdate, String> {
-    let engine = wasmtime::Engine::default();
-    let wasm = std::fs::read(&module.module_path)
-        .map_err(|err| format!("failed to read wasm ui module {}: {err}", module.module_path.display()))?;
-    let wasm_module = wasmtime::Module::new(&engine, &wasm)
-        .map_err(|err| format!("failed to compile wasm ui module {}: {err}", module.module_path.display()))?;
-    let mut store = wasmtime::Store::new(&engine, ());
-    let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[])
-        .map_err(|err| format!("failed to instantiate wasm ui module {}: {err}", module.module_path.display()))?;
-    let memory = instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| format!("wasm ui module {} exports no memory", module.module_path.display()))?;
-    let api_version = call_i32_export(&instance, &mut store, "herdr_ui_api_version")? as u32;
-    if api_version != module.api_version || api_version != API_VERSION {
-        return Err(format!(
-            "wasm ui module {} api version mismatch: module exports {}, manifest says {}, host supports {}",
-            module.module_path.display(),
-            api_version,
-            module.api_version,
-            API_VERSION
-        ));
-    }
-    let ptr = call_i32_export(&instance, &mut store, "herdr_ui_static_update_ptr")? as usize;
-    let len = call_i32_export(&instance, &mut store, "herdr_ui_static_update_len")? as usize;
-    let data = memory.data(&store);
-    let end = ptr.checked_add(len).ok_or_else(|| "wasm ui module update overflow".to_string())?;
-    if end > data.len() {
-        return Err(format!(
-            "wasm ui module {} returned out-of-bounds static update slice",
-            module.module_path.display()
-        ));
-    }
-    serde_json::from_slice::<UiUpdate>(&data[ptr..end])
-        .map_err(|err| format!("failed to parse wasm ui module update {}: {err}", module.module_path.display()))
-}
-
-fn call_i32_export(
-    instance: &wasmtime::Instance,
-    store: &mut wasmtime::Store<()>,
-    name: &str,
-) -> Result<i32, String> {
-    let func = instance
-        .get_typed_func::<(), i32>(&mut *store, name)
-        .map_err(|_| format!("wasm ui module missing export {name}"))?;
-    func.call(&mut *store, ())
-        .map_err(|err| format!("wasm ui module export {name} failed: {err}"))
-}
-
 fn map_surface(surface: PluginUiSurface) -> UiSurface {
     match surface {
         PluginUiSurface::Header => UiSurface::Header,
@@ -590,7 +866,9 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::LayoutRead => UiCapability::LayoutRead,
         crate::api::schema::PluginUiCapability::MouseAll => UiCapability::MouseAll,
         crate::api::schema::PluginUiCapability::KeyboardInput => UiCapability::KeyboardInput,
-        crate::api::schema::PluginUiCapability::ContextMenuAugment => UiCapability::ContextMenuAugment,
+        crate::api::schema::PluginUiCapability::ContextMenuAugment => {
+            UiCapability::ContextMenuAugment
+        }
         crate::api::schema::PluginUiCapability::ClipboardWrite => UiCapability::ClipboardWrite,
         crate::api::schema::PluginUiCapability::PaneInput => UiCapability::PaneInput,
         crate::api::schema::PluginUiCapability::HeadlessActions => UiCapability::HeadlessActions,
@@ -615,7 +893,7 @@ mod tests {
             .map(|byte| format!("\\{:02x}", byte))
             .collect::<String>();
         let wat = format!(
-            "(module (memory (export \"memory\") 1) (data (i32.const 0) \"{data}\") (func (export \"herdr_ui_api_version\") (result i32) i32.const 1) (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0) (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {}) )",
+            "(module (memory (export \"memory\") 1) (data (i32.const 0) \"{data}\") (func (export \"herdr_ui_api_version\") (result i32) i32.const 2) (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0) (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {}) )",
             json.len()
         );
         let wasm = wat::parse_str(&wat).unwrap();
@@ -643,11 +921,14 @@ mod tests {
                 description: None,
                 platforms: None,
                 kind: PluginUiModuleKind::Wasm,
-                api_version: 1,
+                api_version: 2,
                 module: "dist/goal-ui.wasm".into(),
                 hot_reload: PluginHotReloadMode::On,
                 surfaces: vec![PluginUiSurface::Header, PluginUiSurface::ContextMenu],
-                capabilities: vec![PluginUiCapability::FocusedSession, PluginUiCapability::MouseAll],
+                capabilities: vec![
+                    PluginUiCapability::FocusedSession,
+                    PluginUiCapability::MouseAll,
+                ],
             }],
             link_handlers: vec![],
             source: Default::default(),
@@ -668,7 +949,7 @@ mod tests {
         let modules = manager.for_surface(PluginUiSurface::ContextMenu);
         assert_eq!(modules.len(), 1);
         let manifest = modules[0].manifest_ref();
-        assert_eq!(manifest.api_version, 1);
+        assert_eq!(manifest.api_version, 2);
     }
 
     #[test]
@@ -717,15 +998,23 @@ mod tests {
         let module_path = root.join("dist/goal-ui.wasm");
         let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Initial","role":"accent"}]}]}]}"#;
         let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"After mouse","role":"accent"}]}]},{"surface":"context_menu","nodes":[{"kind":"menu","title":"Tab actions","items":[{"id":"plugin:example.goal-ui:fork","label":"Fork mouse"}],"selected":0}]}]}"#;
-        let initial_data = initial.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
-        let updated_data = updated.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
+        let initial_data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let updated_data = updated
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
         let wat = format!(
             "(module
                 (memory (export \"memory\") 1)
                 (global $next_len (mut i32) (i32.const {updated_len}))
                 (data (i32.const 0) \"{initial_data}\")
                 (data (i32.const 2048) \"{updated_data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 1)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
@@ -748,7 +1037,9 @@ mod tests {
             plugin,
         )]));
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else { panic!("expected line node"); };
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node");
+        };
         assert_eq!(spans[0].text, "Initial");
 
         let changed = manager.dispatch_crossterm_mouse_event(crossterm::event::MouseEvent {
@@ -759,7 +1050,9 @@ mod tests {
         });
         assert!(changed);
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else { panic!("expected line node"); };
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node");
+        };
         assert_eq!(spans[0].text, "After mouse");
         assert_eq!(manager.context_menu_items()[0].label, "Fork mouse");
 
@@ -780,15 +1073,23 @@ mod tests {
         let module_path = root.join("dist/goal-ui.wasm");
         let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Initial","role":"accent"}]}]}]}"#;
         let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Should not apply","role":"accent"}]}]}],"effects":[{"kind":"show_toast","message":"blocked"}]}"#;
-        let initial_data = initial.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
-        let updated_data = updated.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
+        let initial_data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let updated_data = updated
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
         let wat = format!(
             "(module
                 (memory (export \"memory\") 1)
                 (global $next_len (mut i32) (i32.const {updated_len}))
                 (data (i32.const 0) \"{initial_data}\")
                 (data (i32.const 2048) \"{updated_data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 1)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
@@ -818,7 +1119,9 @@ mod tests {
         assert!(!changed);
         assert!(manager.take_pending_effects().is_empty());
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else { panic!("expected line node"); };
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node");
+        };
         assert_eq!(spans[0].text, "Initial");
 
         let _ = std::fs::remove_dir_all(root);
@@ -838,15 +1141,23 @@ mod tests {
         let module_path = root.join("dist/goal-ui.wasm");
         let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Initial","role":"accent"}]}]}]}"#;
         let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"After frame","role":"accent"}]}]}]}"#;
-        let initial_data = initial.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
-        let updated_data = updated.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
+        let initial_data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let updated_data = updated
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
         let wat = format!(
             "(module
                 (memory (export \"memory\") 1)
                 (global $next_len (mut i32) (i32.const {updated_len}))
                 (data (i32.const 0) \"{initial_data}\")
                 (data (i32.const 2048) \"{updated_data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 1)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
@@ -864,7 +1175,9 @@ mod tests {
         let mut plugin = sample_plugin();
         plugin.plugin_root = root.display().to_string();
         plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
-        plugin.ui_modules[0].capabilities.push(PluginUiCapability::LayoutRead);
+        plugin.ui_modules[0]
+            .capabilities
+            .push(PluginUiCapability::LayoutRead);
         let mut manager = UiPluginManager::from_installed_plugins(&HashMap::from([(
             plugin.plugin_id.clone(),
             plugin,
@@ -874,14 +1187,21 @@ mod tests {
             "example.goal-ui",
             "goal-ui",
             UiSurface::Header,
-            UiLayoutRect { x: 0, y: 0, width: 80, height: 1 },
+            UiLayoutRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 1,
+            },
             false,
             FocusInput::default(),
             HashMap::new(),
         );
         assert!(changed);
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else { panic!("expected line node"); };
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node");
+        };
         assert_eq!(spans[0].text, "After frame");
 
         let _ = std::fs::remove_dir_all(root);
@@ -901,15 +1221,23 @@ mod tests {
         let module_path = root.join("dist/goal-ui.wasm");
         let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Initial","role":"accent"}]}]}]}"#;
         let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"After key","role":"accent"}]}]}],"effects":[{"kind":"invoke_plugin_action","plugin_id":"example.goal-ui","action_id":"fork"}]}"#;
-        let initial_data = initial.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
-        let updated_data = updated.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
+        let initial_data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let updated_data = updated
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
         let wat = format!(
             "(module
                 (memory (export \"memory\") 1)
                 (global $next_len (mut i32) (i32.const {updated_len}))
                 (data (i32.const 0) \"{initial_data}\")
                 (data (i32.const 2048) \"{updated_data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 1)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
@@ -927,7 +1255,9 @@ mod tests {
         let mut plugin = sample_plugin();
         plugin.plugin_root = root.display().to_string();
         plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
-        plugin.ui_modules[0].capabilities.push(PluginUiCapability::KeyboardInput);
+        plugin.ui_modules[0]
+            .capabilities
+            .push(PluginUiCapability::KeyboardInput);
         let mut manager = UiPluginManager::from_installed_plugins(&HashMap::from([(
             plugin.plugin_id.clone(),
             plugin,
@@ -957,15 +1287,23 @@ mod tests {
         let module_path = root.join("dist/goal-ui.wasm");
         let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"Initial","role":"accent"}]}]}]}"#;
         let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"After key","role":"accent"}]}]}],"effects":[{"kind":"show_toast","message":"toast from wasm"},{"kind":"invoke_plugin_action","plugin_id":"example.goal-ui","action_id":"fork"}]}"#;
-        let initial_data = initial.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
-        let updated_data = updated.as_bytes().iter().map(|byte| format!("\\{:02x}", byte)).collect::<String>();
+        let initial_data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let updated_data = updated
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
         let wat = format!(
             "(module
                 (memory (export \"memory\") 1)
                 (global $next_len (mut i32) (i32.const {updated_len}))
                 (data (i32.const 0) \"{initial_data}\")
                 (data (i32.const 2048) \"{updated_data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 1)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
@@ -983,9 +1321,15 @@ mod tests {
         let mut plugin = sample_plugin();
         plugin.plugin_root = root.display().to_string();
         plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
-        plugin.ui_modules[0].capabilities.push(PluginUiCapability::KeyboardInput);
-        plugin.ui_modules[0].capabilities.push(PluginUiCapability::Toasts);
-        plugin.ui_modules[0].capabilities.push(PluginUiCapability::PluginActions);
+        plugin.ui_modules[0]
+            .capabilities
+            .push(PluginUiCapability::KeyboardInput);
+        plugin.ui_modules[0]
+            .capabilities
+            .push(PluginUiCapability::Toasts);
+        plugin.ui_modules[0]
+            .capabilities
+            .push(PluginUiCapability::PluginActions);
         let mut manager = UiPluginManager::from_installed_plugins(&HashMap::from([(
             plugin.plugin_id.clone(),
             plugin,
@@ -998,10 +1342,16 @@ mod tests {
         assert!(changed);
         let effects = manager.take_pending_effects();
         assert_eq!(effects.len(), 2);
-        assert!(matches!(&effects[0], HostEffect::ShowToast { message } if message == "toast from wasm"));
-        assert!(matches!(&effects[1], HostEffect::InvokePluginAction { plugin_id, action_id, payload_json: None } if plugin_id == "example.goal-ui" && action_id == "fork"));
+        assert!(
+            matches!(&effects[0], HostEffect::ShowToast { message } if message == "toast from wasm")
+        );
+        assert!(
+            matches!(&effects[1], HostEffect::InvokePluginAction { plugin_id, action_id, payload_json: None } if plugin_id == "example.goal-ui" && action_id == "fork")
+        );
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else { panic!("expected line node"); };
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node");
+        };
         assert_eq!(spans[0].text, "After key");
 
         let _ = std::fs::remove_dir_all(root);
@@ -1110,6 +1460,258 @@ mod tests {
         let notifications = manager.take_pending_notifications();
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].contains("reloaded"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn unique_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-ui-plugin-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        root
+    }
+
+    fn installed(plugin: InstalledPluginInfo) -> UiPluginManager {
+        UiPluginManager::from_installed_plugins(&HashMap::from([(
+            plugin.plugin_id.clone(),
+            plugin,
+        )]))
+    }
+
+    fn plugin_at(root: &std::path::Path) -> InstalledPluginInfo {
+        let mut plugin = sample_plugin();
+        plugin.plugin_root = root.display().to_string();
+        plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
+        plugin
+    }
+
+    fn header_text(manager: &UiPluginManager) -> String {
+        let layers = manager.surface_layers();
+        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+            panic!("expected line node, got {:?}", layers.first());
+        };
+        spans[0].text.clone()
+    }
+
+    /// A guest with a persistent mutable counter. Each `on_event` increments the
+    /// counter and writes `'0' + counter` into the single `@` placeholder byte of
+    /// `template`, returning the whole template. If the instance were recreated
+    /// per event the counter would reset, so the rendered digit proves guest
+    /// linear memory persists.
+    fn write_counter_wasm(path: &std::path::Path, template: &str) {
+        let digit_offset = template
+            .find('@')
+            .expect("template needs a '@' placeholder");
+        let initial = template.replace('@', "0");
+        let len = initial.len();
+        let data = initial
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            "(module
+                (memory (export \"memory\") 1)
+                (global $counter (mut i32) (i32.const 0))
+                (data (i32.const 0) \"{data}\")
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
+                (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
+                (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {len})
+                (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 4096)
+                (func (export \"herdr_ui_on_event\") (param i32 i32) (result i32)
+                    (global.set $counter (i32.add (global.get $counter) (i32.const 1)))
+                    (i32.store8 (i32.const {digit_offset}) (i32.add (i32.const 48) (global.get $counter)))
+                    (i32.const 0))
+                (func (export \"herdr_ui_on_event_len\") (result i32) i32.const {len}))"
+        );
+        let wasm = wat::parse_str(&wat).unwrap();
+        std::fs::write(path, wasm).unwrap();
+    }
+
+    /// A guest whose static update is valid but whose `on_event` runs
+    /// `on_event_body` (used for traps and infinite loops that never return).
+    fn write_event_wasm(path: &std::path::Path, static_json: &str, on_event_body: &str) {
+        let data = static_json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            "(module
+                (memory (export \"memory\") 1)
+                (data (i32.const 0) \"{data}\")
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
+                (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
+                (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {len})
+                (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 4096)
+                (func (export \"herdr_ui_on_event\") (param i32 i32) (result i32) {on_event_body})
+                (func (export \"herdr_ui_on_event_len\") (result i32) i32.const 0))",
+            len = static_json.len()
+        );
+        let wasm = wat::parse_str(&wat).unwrap();
+        std::fs::write(path, wasm).unwrap();
+    }
+
+    const COUNTER_TEMPLATE: &str =
+        r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"@"}]}]}]}"#;
+
+    #[test]
+    fn guest_state_persists_across_events() {
+        let root = unique_root("state-persist");
+        write_counter_wasm(&root.join("dist/goal-ui.wasm"), COUNTER_TEMPLATE);
+        let mut manager = installed(plugin_at(&root));
+
+        assert_eq!(header_text(&manager), "0");
+        assert!(manager.dispatch_tick());
+        assert_eq!(header_text(&manager), "1");
+        assert!(manager.dispatch_tick());
+        // A per-event rebuild would reset the counter to 1 each time; "2" proves
+        // the live instance (and its linear memory) is reused across events.
+        assert_eq!(header_text(&manager), "2");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hot_reload_swaps_instance_and_resets_state() {
+        let root = unique_root("hot-reload-reset");
+        let module_path = root.join("dist/goal-ui.wasm");
+        write_counter_wasm(&module_path, COUNTER_TEMPLATE);
+        let mut manager = installed(plugin_at(&root));
+
+        assert!(manager.dispatch_tick());
+        assert!(manager.dispatch_tick());
+        assert_eq!(header_text(&manager), "2");
+
+        // Rewrite the module so its mtime advances; hot-reload must swap the live
+        // instance and discard the counter (fresh linear memory).
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_counter_wasm(&module_path, COUNTER_TEMPLATE);
+        let changed = manager.detect_changed_modules();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(header_text(&manager), "0");
+
+        // Counting resumes from the fresh instance's zeroed state.
+        assert!(manager.dispatch_tick());
+        assert_eq!(header_text(&manager), "1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn trap_marks_module_failed_then_next_event_recreates() {
+        let root = unique_root("trap-recreate");
+        let module_path = root.join("dist/goal-ui.wasm");
+        let broken_static = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"broken"}]}]}]}"#;
+        write_event_wasm(&module_path, broken_static, "unreachable");
+        let mut manager = installed(plugin_at(&root));
+
+        // Static loaded fine, so the instance is cached.
+        assert_eq!(header_text(&manager), "broken");
+        assert!(manager.test_instance_cached("example.goal-ui", "goal-ui"));
+
+        // The event traps: no update applied, a "event failed" toast is queued,
+        // and the poisoned store is dropped (crash isolation).
+        assert!(!manager.dispatch_tick());
+        assert!(!manager.test_instance_cached("example.goal-ui", "goal-ui"));
+        let notes = manager.take_pending_notifications();
+        assert!(
+            notes.iter().any(|note| note.contains("event failed")),
+            "expected event-failed toast, got {notes:?}"
+        );
+
+        // Replace the module on disk with a working guest WITHOUT a mtime-driven
+        // reload; the next event must rebuild the instance from disk and succeed.
+        write_counter_wasm(&module_path, COUNTER_TEMPLATE);
+        assert!(manager.dispatch_tick());
+        assert!(manager.test_instance_cached("example.goal-ui", "goal-ui"));
+        assert_eq!(header_text(&manager), "1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn epoch_deadline_traps_spinning_guest() {
+        let root = unique_root("epoch-spin");
+        let spin_static = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"spin"}]}]}]}"#;
+        write_event_wasm(
+            &root.join("dist/goal-ui.wasm"),
+            spin_static,
+            "(loop $l (br $l)) unreachable",
+        );
+        let mut manager = installed(plugin_at(&root));
+
+        let started = std::time::Instant::now();
+        // The guest never returns; the epoch ticker must trap it. Without epoch
+        // interruption this call would hang the test forever.
+        assert!(!manager.dispatch_tick());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "spinning guest was not interrupted in time: {elapsed:?}"
+        );
+        let notes = manager.take_pending_notifications();
+        assert!(
+            notes.iter().any(|note| note.contains("event failed")),
+            "expected event-failed toast, got {notes:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn should_deliver_raw_mouse_suppresses_declared_hit_rects() {
+        let root = unique_root("f5-decision");
+        write_static_wasm(
+            &root.join("dist/goal-ui.wasm"),
+            r#"{"layers":[{"surface":"header","hits":[{"x":10,"y":0,"width":5,"height":1,"action_id":"a"}],"nodes":[]}]}"#,
+        );
+        let manager = installed(plugin_at(&root));
+
+        // Cells covered by the module's own hit-rect are handled by the
+        // declarative path, so the raw MouseAll broadcast is suppressed.
+        assert!(!manager.should_deliver_raw_mouse("example.goal-ui", "goal-ui", 10, 0));
+        assert!(!manager.should_deliver_raw_mouse("example.goal-ui", "goal-ui", 14, 0));
+        // Cells outside still get the raw broadcast.
+        assert!(manager.should_deliver_raw_mouse("example.goal-ui", "goal-ui", 9, 0));
+        assert!(manager.should_deliver_raw_mouse("example.goal-ui", "goal-ui", 15, 0));
+        assert!(manager.should_deliver_raw_mouse("example.goal-ui", "goal-ui", 12, 1));
+        // Unknown module: nothing to dedupe against.
+        assert!(manager.should_deliver_raw_mouse("nope", "nope", 12, 0));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_mouse_broadcast_skips_declared_hit_rects() {
+        let root = unique_root("f5-behavioral");
+        write_counter_wasm(
+            &root.join("dist/goal-ui.wasm"),
+            r#"{"layers":[{"surface":"header","hits":[{"x":10,"y":0,"width":5,"height":1,"action_id":"a"}],"nodes":[{"kind":"line","spans":[{"text":"@"}]}]}]}"#,
+        );
+        let mut manager = installed(plugin_at(&root));
+
+        let moved = |col: u16, row: u16| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+
+        assert_eq!(header_text(&manager), "0");
+        // Inside the module's declared hit-rect: raw broadcast suppressed, the
+        // guest's on_event is never invoked, so the counter does not advance.
+        assert!(!manager.dispatch_crossterm_mouse_event(moved(12, 0)));
+        assert_eq!(header_text(&manager), "0");
+        // Outside the hit-rect: delivered, counter advances.
+        assert!(manager.dispatch_crossterm_mouse_event(moved(0, 0)));
+        assert_eq!(header_text(&manager), "1");
 
         let _ = std::fs::remove_dir_all(root);
     }

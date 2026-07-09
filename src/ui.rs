@@ -1481,8 +1481,11 @@ mod tests {
                 spans: vec![UiTextSpan {
                     text: "Consumes".into(),
                     role: Some("accent".into()),
+                    ..Default::default()
                 }],
             }],
+            hits: vec![],
+            data: None,
         }];
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         let frame_area = ui_plugin_frame_area(&app);
@@ -1507,6 +1510,8 @@ mod tests {
                 items: vec![herdr_ui_plugin_api::UiActionRef { id: "plugin:example.ui-wasm:fork".into(), label: "Fork".into() }],
                 selected: 0,
             }],
+            hits: vec![],
+            data: None,
         }];
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         let header = ui_plugin_frame_area(&app);
@@ -1531,8 +1536,11 @@ mod tests {
                     spans: vec![UiTextSpan {
                         text: "WASM HEADER".into(),
                         role: Some("accent".into()),
+                        ..Default::default()
                     }],
                 }],
+                hits: vec![],
+                data: None,
             },
             UiLayer {
                 surface: UiSurface::Footer,
@@ -1542,8 +1550,11 @@ mod tests {
                     spans: vec![UiTextSpan {
                         text: "WASM FOOTER".into(),
                         role: Some("accent".into()),
+                        ..Default::default()
                     }],
                 }],
+                hits: vec![],
+                data: None,
             },
         ];
 
