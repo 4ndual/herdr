@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::protocol::RenderEncoding;
 use crate::server::client_transport::ClientWriter;
@@ -39,6 +40,10 @@ pub(crate) struct ClientConnection {
     pub(crate) raw_input: crate::raw_input::RawInputFramer,
     /// Monotonic activity stamp used to choose the fallback foreground client.
     pub(crate) last_activity: u64,
+    /// fork: wall-clock time of this client's most recent activity, used by the
+    /// foreground hysteresis + idle-demotion policy. Seeded at attach so a
+    /// freshly attached, never-typed client still has a demotion reference.
+    pub(crate) last_active_at: Instant,
     /// Render baseline for the negotiated client encoding.
     pub(crate) render_state: ClientRenderState,
     /// Client-local host Kitty graphics cache.
@@ -102,6 +107,7 @@ impl ClientConnection {
             outer_terminal_focus,
             raw_input: crate::raw_input::RawInputFramer::default(),
             last_activity,
+            last_active_at: Instant::now(),
             render_state: ClientRenderState::new(render_encoding),
             graphics_cache: crate::kitty_graphics::HostGraphicsCache::default(),
             graphics_surface_reset_pending: false,
@@ -162,16 +168,25 @@ impl ClientConnection {
     }
 }
 
-pub(crate) fn events_include_interaction(events: &[crate::raw_input::RawInputEvent]) -> bool {
+// fork: split "interaction" into typing vs. window-focus. Typing (keys/mouse/
+// paste) reassigns foreground through the hysteresis policy so two people
+// typing at once don't thrash resizes; an explicit focus-gained is an
+// unambiguous "make this client active" signal and promotes immediately.
+pub(crate) fn events_include_active_input(events: &[crate::raw_input::RawInputEvent]) -> bool {
     events.iter().any(|event| {
         matches!(
             event,
             crate::raw_input::RawInputEvent::Key(_)
                 | crate::raw_input::RawInputEvent::Mouse(_)
                 | crate::raw_input::RawInputEvent::Paste(_)
-                | crate::raw_input::RawInputEvent::OuterFocusGained
         )
     })
+}
+
+pub(crate) fn events_include_focus_gained(events: &[crate::raw_input::RawInputEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, crate::raw_input::RawInputEvent::OuterFocusGained))
 }
 
 pub(crate) fn latest_app_client(clients: &HashMap<u64, ClientConnection>) -> Option<u64> {
