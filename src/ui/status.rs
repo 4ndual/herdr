@@ -190,6 +190,33 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
+/// fork: one-line badge shown to a NON-foreground client warning that the
+/// shared panes are sized to another client, so any bottom-edge clipping is
+/// never silent. Mirrors `render_config_diagnostic`'s top-right one-line banner
+/// idiom (same anchor, same reused-widget style) rather than a new widget.
+pub(crate) fn render_foreground_pin_badge(
+    frame: &mut Frame,
+    area: Rect,
+    foreground_client_id: u64,
+    cols: u16,
+    rows: u16,
+    p: &Palette,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = format!(" panes pinned to client {foreground_client_id} ({cols}x{rows}) ");
+    let width = (text.len() as u16).min(area.width);
+    let badge_area = Rect::new(area.x + area.width.saturating_sub(width), area.y, width, 1);
+    let style = Style::default()
+        .fg(panel_contrast_fg(p))
+        .bg(p.yellow)
+        .add_modifier(Modifier::BOLD);
+
+    frame.render_widget(Clear, badge_area);
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), badge_area);
+}
+
 pub(super) fn state_dot(state: AgentState, seen: bool, p: &Palette) -> (&'static str, Style) {
     match (state, seen) {
         (AgentState::Blocked, _) => ("●", Style::default().fg(p.red)),

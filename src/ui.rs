@@ -56,6 +56,9 @@ use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
+// fork: non-foreground "panes pinned to ..." badge, drawn by the headless
+// server's per-client render path (see server::render_stream).
+pub(crate) use self::status::render_foreground_pin_badge;
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
