@@ -328,7 +328,7 @@ fn summarize_panes(response: Option<&Value>) -> String {
 fn render_update(effects: Vec<HostEffectV3>) -> UiUpdateV3 {
     UiUpdateV3 {
         scope: "partial",
-        layers: vec![header_layer(), footer_layer(), right_panel_layer()],
+        layers: vec![header_layer(), right_panel_layer()],
         effects,
     }
 }
@@ -356,44 +356,6 @@ fn header_layer() -> UiLayer {
             ],
         }],
         hits: Vec::new(),
-        data: None,
-    }
-}
-
-fn footer_layer() -> UiLayer {
-    let count = COUNTER.load(Ordering::SeqCst);
-    let mut spans = Vec::new();
-    let mut hits = Vec::new();
-    let mut col: u16 = 0;
-
-    push_button(
-        &mut spans,
-        &mut hits,
-        &mut col,
-        0,
-        &format!("count: {count} [+]"),
-        "demo:increment",
-        "accent",
-    );
-    push_gap(&mut spans, &mut col, "   ");
-    push_button(&mut spans, &mut hits, &mut col, 0, "party", "demo:party", "mauve");
-    push_gap(&mut spans, &mut col, "   ");
-    push_button(
-        &mut spans,
-        &mut hits,
-        &mut col,
-        0,
-        "\u{26A0} hang test",
-        "demo:hang",
-        "danger",
-    );
-
-    UiLayer {
-        surface: UiSurface::Footer,
-        z_index: 10,
-        consumes_mouse: false,
-        nodes: vec![UiNode::Line { spans }],
-        hits,
         data: None,
     }
 }
@@ -453,6 +415,41 @@ fn right_panel_layer() -> UiLayer {
         "teal",
     );
     nodes.push(UiNode::Line { spans: split_spans });
+
+    let count = COUNTER.load(Ordering::SeqCst);
+    let demo_row = nodes.len() as u16;
+    let mut demo_spans = Vec::new();
+    let mut demo_col = 0u16;
+    push_button(
+        &mut demo_spans,
+        &mut hits,
+        &mut demo_col,
+        demo_row,
+        &format!("count: {count} [+]"),
+        "demo:increment",
+        "accent",
+    );
+    push_gap(&mut demo_spans, &mut demo_col, "  ");
+    push_button(
+        &mut demo_spans,
+        &mut hits,
+        &mut demo_col,
+        demo_row,
+        "party",
+        "demo:party",
+        "mauve",
+    );
+    push_gap(&mut demo_spans, &mut demo_col, "  ");
+    push_button(
+        &mut demo_spans,
+        &mut hits,
+        &mut demo_col,
+        demo_row,
+        "\u{26A0} hang",
+        "demo:hang",
+        "danger",
+    );
+    nodes.push(UiNode::Line { spans: demo_spans });
 
     if let Some(err) = SPLIT_ERROR
         .lock()
