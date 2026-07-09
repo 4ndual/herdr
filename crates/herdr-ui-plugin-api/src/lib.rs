@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-pub const API_VERSION: u32 = 2;
+pub const API_VERSION: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiSurface {
     Header,
@@ -35,6 +35,14 @@ pub enum UiCapability {
     Toasts,
     OpenPluginPanes,
     PluginActions,
+    /// API v3 (§5.3): read-only socket API methods via `HostEffect::Api`.
+    ApiRead,
+    /// API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.
+    ApiWrite,
+    /// API v3 (§5.3): text/keystroke-injecting socket API methods via
+    /// `HostEffect::Api`. Split out from `ApiWrite` because injecting text into a
+    /// pane/agent is arbitrary command execution in the user's shells.
+    ApiInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +111,18 @@ pub struct KeyEvent {
     pub meta: bool,
 }
 
+/// Kind of click that resolved to a v3 `UiEvent::Action` (spec §4). A closed set
+/// distinct from [`MouseEventKind`]: actions never fire for move/drag/scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiActionKind {
+    LeftDown,
+    LeftUp,
+    RightDown,
+    RightUp,
+    MiddleDown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UiEvent {
@@ -113,6 +133,27 @@ pub enum UiEvent {
     Tick,
     ThemeChanged,
     ReloadRequested,
+    /// API v3 (§4): dynamic click routing. Delivered only to the v3 module that
+    /// declared the `UiHitRect` the click resolved to; `column`/`row` are
+    /// surface-local (relative to the surface rect origin from the module's most
+    /// recent `frame` event for that surface).
+    Action {
+        action_id: String,
+        surface: UiSurface,
+        column: u16,
+        row: u16,
+        kind: UiActionKind,
+    },
+    /// API v3 (§5.2): the synchronous result of a `HostEffect::Api` request,
+    /// delivered only to v3 modules that are still registered at dispatch time.
+    ApiResult {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -222,6 +263,32 @@ pub enum HostEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload_json: Option<String>,
     },
+    /// API v3 (§5.1): guest → host bridge call. `request_id` is guest-chosen and
+    /// opaque; the host echoes it verbatim in the matching `UiEvent::ApiResult`.
+    /// `method`/`params` mirror the existing socket API surface exactly
+    /// (src/api/schema.rs `Method` serde tag/content) and are executed
+    /// synchronously, in-process, in effect-declaration order.
+    Api {
+        request_id: String,
+        method: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+}
+
+/// API v3 (§6) update merge scope. Only meaningful for v3 modules — v2 modules
+/// keep implicit full-replace regardless of what this field parses to, decided
+/// host-side from the module's negotiated version, so the `Default` below (used
+/// when the field is entirely absent from a v2 payload) is inert for v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiUpdateScope {
+    /// Merge keyed by surface: replaces all z-levels of each surface named in
+    /// `layers`, leaving unnamed surfaces untouched. Default for v3.
+    #[default]
+    Partial,
+    /// v2 semantics: replaces the module's entire cached layer set.
+    Full,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -230,6 +297,11 @@ pub struct UiUpdate {
     pub layers: Vec<UiLayer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<HostEffect>,
+    /// API v3 (§6). Ignored (forced to `Full`) for v2 modules by the host.
+    #[serde(default)]
+    pub scope: UiUpdateScope,
+    /// Dead since v2 (F3); v3 parsing no longer reads it, but the field stays so
+    /// old v2 payloads that still emit it keep parsing (accept-and-ignore).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consumed_action_ids: Vec<String>,
 }

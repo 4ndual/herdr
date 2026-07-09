@@ -92,21 +92,53 @@ impl AppState {
                 mouse.row,
             ) {
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    if let Some(action_id) = hit.action_id {
-                        if let Some((plugin_id, action_id)) =
-                            action_id.strip_prefix("plugin:").and_then(|rest| rest.split_once(':'))
+                    if let Some(action_id) = hit.action_id.as_deref() {
+                        if let Some((plugin_id, action_id)) = action_id
+                            .strip_prefix("plugin:")
+                            .and_then(|rest| rest.split_once(':'))
                         {
-                            self.pending_plugin_action_invocation = Some(
-                                crate::app::state::PendingPluginActionInvocation {
+                            self.pending_plugin_action_invocation =
+                                Some(crate::app::state::PendingPluginActionInvocation {
                                     plugin_id: plugin_id.to_string(),
                                     action_id: action_id.to_string(),
                                     context_menu_kind: None,
-                                },
-                            );
+                                });
                             return None;
                         }
                     }
                 }
+
+                // §4: in addition to the legacy `plugin:`-prefix carve-out
+                // above, a click landing on a v3 module's declared `UiHitRect`
+                // also gets routed as an `Action` event, converted to
+                // surface-local coordinates. `App::handle_mouse` (input/mod.rs)
+                // drains `pending_plugin_ui_action` and dispatches it — it
+                // can't be dispatched here because `AppState` (pure data) has
+                // no access to the runtime `UiPluginManager`.
+                if let Some((plugin_id, module_id, negotiated_version)) =
+                    hit.declared_hit_owner.clone()
+                {
+                    if negotiated_version == 3 {
+                        if let Some(kind) = ui_action_kind_for_crossterm(mouse.kind) {
+                            let rect = crate::ui::ui_plugin_surface_rect(
+                                self,
+                                crate::ui::ui_plugin_frame_area(self),
+                                hit.surface,
+                            );
+                            self.pending_plugin_ui_action =
+                                Some(crate::app::state::PendingPluginUiAction {
+                                    plugin_id,
+                                    module_id,
+                                    action_id: hit.action_id.clone().unwrap_or_default(),
+                                    surface: hit.surface,
+                                    column: mouse.column.saturating_sub(rect.x),
+                                    row: mouse.row.saturating_sub(rect.y),
+                                    kind,
+                                });
+                        }
+                    }
+                }
+
                 if hit.consumes_mouse {
                     return None;
                 }
@@ -1750,6 +1782,27 @@ fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
     }
 }
 
+/// Spec §4: maps a crossterm mouse event kind to the closed `UiActionKind` set
+/// a v3 module's `Action` event can carry. Only the five press/release kinds
+/// §4 defines are routed; drags, moves, and wheel events yield `None` (no
+/// `Action` is dispatched for them).
+fn ui_action_kind_for_crossterm(kind: MouseEventKind) -> Option<herdr_ui_plugin_api::UiActionKind> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            Some(herdr_ui_plugin_api::UiActionKind::LeftDown)
+        }
+        MouseEventKind::Up(MouseButton::Left) => Some(herdr_ui_plugin_api::UiActionKind::LeftUp),
+        MouseEventKind::Down(MouseButton::Right) => {
+            Some(herdr_ui_plugin_api::UiActionKind::RightDown)
+        }
+        MouseEventKind::Up(MouseButton::Right) => Some(herdr_ui_plugin_api::UiActionKind::RightUp),
+        MouseEventKind::Down(MouseButton::Middle) => {
+            Some(herdr_ui_plugin_api::UiActionKind::MiddleDown)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -2259,19 +2312,26 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.ui_surface_layers = vec![herdr_ui_plugin_api::UiLayer {
-            surface: herdr_ui_plugin_api::UiSurface::Overlay,
-            z_index: 50,
-            consumes_mouse: true,
-            nodes: vec![herdr_ui_plugin_api::UiNode::Line {
-                spans: vec![herdr_ui_plugin_api::UiTextSpan {
-                    text: "Overlay".into(),
-                    role: Some("accent".into()),
-                    ..Default::default()
+        app.state.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "overlay".into(),
+            negotiated_version: 2,
+            layer: herdr_ui_plugin_api::UiLayer {
+                surface: herdr_ui_plugin_api::UiSurface::Overlay,
+                z_index: 50,
+                consumes_mouse: true,
+                nodes: vec![herdr_ui_plugin_api::UiNode::Line {
+                    spans: vec![herdr_ui_plugin_api::UiTextSpan {
+                        text: "Overlay".into(),
+                        role: Some("accent".into()),
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
                 }],
-            }],
-            hits: vec![],
-            data: None,
+                hits: Vec::new(),
+                data: None,
+            },
         }];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
         let x = app.state.view.terminal_area.x;
@@ -2288,19 +2348,24 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.ui_surface_layers = vec![herdr_ui_plugin_api::UiLayer {
-            surface: herdr_ui_plugin_api::UiSurface::Header,
-            z_index: 1,
-            consumes_mouse: false,
-            nodes: vec![herdr_ui_plugin_api::UiNode::Tabs {
-                items: vec![herdr_ui_plugin_api::UiActionRef {
-                    id: "plugin:example.ui-wasm:fork".into(),
-                    label: "Fork".into(),
+        app.state.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "header".into(),
+            negotiated_version: 2,
+            layer: herdr_ui_plugin_api::UiLayer {
+                surface: herdr_ui_plugin_api::UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![herdr_ui_plugin_api::UiNode::Tabs {
+                    items: vec![herdr_ui_plugin_api::UiActionRef {
+                        id: "plugin:example.ui-wasm:fork".into(),
+                        label: "Fork".into(),
+                    }],
+                    selected: 0,
                 }],
-                selected: 0,
-            }],
-            hits: vec![],
-            data: None,
+                hits: Vec::new(),
+                data: None,
+            },
         }];
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
         let x = app.state.view.terminal_area.x + 1;
@@ -2313,6 +2378,103 @@ mod tests {
             .expect("pending plugin action");
         assert_eq!(pending.plugin_id, "example.ui-wasm");
         assert_eq!(pending.action_id, "fork");
+    }
+
+    /// Spec §4: a click landing on a v3 module's declared `UiHitRect` queues a
+    /// `PendingPluginUiAction` (drained and dispatched as an `Action` event by
+    /// `App::handle_mouse` in `input/mod.rs`) with surface-local coordinates,
+    /// independent of any `plugin:`-prefixed action id.
+    #[test]
+    fn clicking_v3_declared_hit_rect_queues_pending_ui_action() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "header".into(),
+            negotiated_version: 3,
+            layer: herdr_ui_plugin_api::UiLayer {
+                surface: herdr_ui_plugin_api::UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: Vec::new(),
+                hits: Vec::new(),
+                data: None,
+            },
+        }];
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let rect_x = app.state.view.terminal_area.x;
+        let rect_y = app.state.view.terminal_area.y;
+        // `UiHitRect` coordinates are absolute-frame (§4 doc comment on
+        // `UiLayer::hits`), so the rect must be placed at the surface's real
+        // computed position, not (0,0).
+        app.state.ui_surface_layers[0].layer.hits = vec![herdr_ui_plugin_api::UiHitRect {
+            x: rect_x,
+            y: rect_y,
+            width: 10,
+            height: 1,
+            action_id: "toggle".into(),
+        }];
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect_x + 2,
+            rect_y,
+        ));
+        let pending = app
+            .state
+            .pending_plugin_ui_action
+            .as_ref()
+            .expect("pending plugin ui action");
+        assert_eq!(pending.plugin_id, "example.ui-wasm");
+        assert_eq!(pending.module_id, "header");
+        assert_eq!(pending.action_id, "toggle");
+        assert_eq!(pending.surface, herdr_ui_plugin_api::UiSurface::Header);
+        assert_eq!(pending.column, 2);
+        assert_eq!(pending.row, 0);
+        assert_eq!(pending.kind, herdr_ui_plugin_api::UiActionKind::LeftDown);
+    }
+
+    /// Same declared hit rect, but the module only negotiated v2 — no `Action`
+    /// event exists in v2, so no `PendingPluginUiAction` should be queued (the
+    /// legacy `plugin:`-prefix path, tested above, is the only v2 action route).
+    #[test]
+    fn clicking_v2_declared_hit_rect_does_not_queue_pending_ui_action() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "header".into(),
+            negotiated_version: 2,
+            layer: herdr_ui_plugin_api::UiLayer {
+                surface: herdr_ui_plugin_api::UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: Vec::new(),
+                hits: Vec::new(),
+                data: None,
+            },
+        }];
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 80, 20));
+        let rect_x = app.state.view.terminal_area.x;
+        let rect_y = app.state.view.terminal_area.y;
+        app.state.ui_surface_layers[0].layer.hits = vec![herdr_ui_plugin_api::UiHitRect {
+            x: rect_x,
+            y: rect_y,
+            width: 10,
+            height: 1,
+            action_id: "toggle".into(),
+        }];
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect_x + 2,
+            rect_y,
+        ));
+        assert!(app.state.pending_plugin_ui_action.is_none());
     }
 
     #[test]

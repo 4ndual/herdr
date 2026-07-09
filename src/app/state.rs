@@ -1,6 +1,7 @@
 use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::ui_plugins::UiSurfaceLayer;
 use crossterm::event::{KeyCode, KeyModifiers};
-use herdr_ui_plugin_api::{UiActionRef, UiLayer};
+use herdr_ui_plugin_api::UiActionRef;
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 
@@ -1091,6 +1092,20 @@ pub struct PendingPluginActionInvocation {
     pub context_menu_kind: Option<ContextMenuKind>,
 }
 
+/// API v3 (§4): a resolved `UiHitRect` click on a negotiated-v3 module, queued by
+/// `AppState::handle_mouse` (pure state, no wasmtime access) for `App` to
+/// dispatch as a `UiEvent::Action` once it has the runtime `UiPluginManager`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPluginUiAction {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub action_id: String,
+    pub surface: herdr_ui_plugin_api::UiSurface,
+    pub column: u16,
+    pub row: u16,
+    pub kind: herdr_ui_plugin_api::UiActionKind,
+}
+
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&str> {
         let mut items = self.builtin_items().iter().copied().collect::<Vec<_>>();
@@ -1440,10 +1455,15 @@ pub struct AppState {
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
     /// Context-menu items surfaced by loaded UI plugins.
     pub(crate) ui_context_menu_items: Vec<UiActionRef>,
-    /// Static surface layers surfaced by loaded UI plugins.
-    pub(crate) ui_surface_layers: Vec<UiLayer>,
+    /// Static surface layers surfaced by loaded UI plugins, each tagged with its
+    /// owning `(plugin_id, module_id)` and negotiated API version (§4 identity
+    /// threading). Ordered `(z_index desc, plugin_id asc, module_id asc)`.
+    pub(crate) ui_surface_layers: Vec<UiSurfaceLayer>,
     /// Deferred plugin action invocations requested by UI/plugin surfaces.
     pub(crate) pending_plugin_action_invocation: Option<PendingPluginActionInvocation>,
+    /// API v3 (§4): a resolved click awaiting `UiEvent::Action` dispatch by
+    /// `App` (which owns the runtime `UiPluginManager`).
+    pub(crate) pending_plugin_ui_action: Option<PendingPluginUiAction>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
@@ -1788,6 +1808,7 @@ impl AppState {
             ui_context_menu_items: Vec::new(),
             ui_surface_layers: Vec::new(),
             pending_plugin_action_invocation: None,
+            pending_plugin_ui_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),

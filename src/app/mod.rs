@@ -606,6 +606,7 @@ impl App {
             ui_context_menu_items: Vec::new(),
             ui_surface_layers: Vec::new(),
             pending_plugin_action_invocation: None,
+            pending_plugin_ui_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
@@ -645,9 +646,8 @@ impl App {
                 .or_insert(builtin);
         }
 
-        let ui_plugins = crate::ui_plugins::UiPluginManager::from_installed_plugins(
-            &state.installed_plugins,
-        );
+        let ui_plugins =
+            crate::ui_plugins::UiPluginManager::from_installed_plugins(&state.installed_plugins);
         state.ui_context_menu_items = ui_plugins.context_menu_items();
         state.ui_surface_layers = ui_plugins.surface_layers();
 
@@ -932,6 +932,28 @@ impl App {
                     request.context_menu_kind,
                 ) {
                     tracing::warn!(err = %err, "failed to invoke ui-surface plugin action");
+                }
+                needs_render = true;
+            }
+
+            // §4: the v3 counterpart of the block above — `AppState::handle_mouse`
+            // (pure data) can only record the resolved click as a
+            // `PendingPluginUiAction`; only here, with access to the runtime
+            // `UiPluginManager`, can it actually be dispatched as an `Action`
+            // event and its resulting effects applied.
+            if let Some(action) = self.state.pending_plugin_ui_action.take() {
+                if self.ui_plugins.dispatch_action(
+                    &action.plugin_id,
+                    &action.module_id,
+                    action.action_id,
+                    action.surface,
+                    action.column,
+                    action.row,
+                    action.kind,
+                ) {
+                    self.refresh_ui_plugin_state_from_manager();
+                    self.apply_ui_plugin_notifications();
+                    self.apply_ui_plugin_effects();
                 }
                 needs_render = true;
             }
@@ -1555,11 +1577,11 @@ impl App {
     fn sync_usage_view_hits_from_layers(&mut self) {
         use ratatui::layout::Rect;
         let mut hits = usage_dash_core::Hits::default();
-        for layer in &self.state.ui_surface_layers {
-            if layer.surface != herdr_ui_plugin_api::UiSurface::UsageStrip {
+        for entry in &self.state.ui_surface_layers {
+            if entry.layer.surface != herdr_ui_plugin_api::UiSurface::UsageStrip {
                 continue;
             }
-            for hit in &layer.hits {
+            for hit in &entry.layer.hits {
                 let rect = Rect::new(hit.x, hit.y, hit.width, hit.height);
                 match hit.action_id.as_str() {
                     "usage:toggle_expand" => hits.state = Some(rect),
@@ -1577,17 +1599,13 @@ impl App {
 
     pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
         let focus = crate::dash::focus_input(&self.state);
-        if self
-            .last_ui_plugin_focus
-            .as_ref()
-            .is_some_and(|last| {
-                last.session_id == focus.session_id
-                    && last.session_ref == focus.session_ref
-                    && last.cwd == focus.cwd
-                    && last.agent == focus.agent
-                    && last.is_self_focus == focus.is_self_focus
-            })
-        {
+        if self.last_ui_plugin_focus.as_ref().is_some_and(|last| {
+            last.session_id == focus.session_id
+                && last.session_ref == focus.session_ref
+                && last.cwd == focus.cwd
+                && last.agent == focus.agent
+                && last.is_self_focus == focus.is_self_focus
+        }) {
             return;
         }
         self.last_ui_plugin_focus = Some(focus.clone());
@@ -1602,6 +1620,9 @@ impl App {
         let focus = crate::dash::focus_input(&self.state);
         let plugin_context = self.current_plugin_context("ui_frame");
         let plugin_context_json = serde_json::to_string(&plugin_context).ok();
+        // §7: computed once per frame and shared across every module/surface
+        // event dispatched this frame, not recomputed per surface.
+        let layout_json = self.ui_plugin_layout_json(&plugin_context);
         let modules = self
             .ui_plugins
             .all()
@@ -1610,23 +1631,40 @@ impl App {
                 (
                     module.plugin_id.clone(),
                     module.module_id.clone(),
+                    module.negotiated_version,
                     module.surfaces.clone(),
                     serde_json::to_string(&module.manifest_ref()).ok(),
                 )
             })
             .collect::<Vec<_>>();
         let mut changed = false;
-        for (plugin_id, module_id, surfaces, manifest_json) in modules {
+        for (plugin_id, module_id, negotiated_version, surfaces, manifest_json) in modules {
             for surface in surfaces {
                 let surface = match surface {
-                    crate::api::schema::PluginUiSurface::Header => herdr_ui_plugin_api::UiSurface::Header,
-                    crate::api::schema::PluginUiSurface::Footer => herdr_ui_plugin_api::UiSurface::Footer,
-                    crate::api::schema::PluginUiSurface::TabBar => herdr_ui_plugin_api::UiSurface::TabBar,
-                    crate::api::schema::PluginUiSurface::Sidebar => herdr_ui_plugin_api::UiSurface::Sidebar,
-                    crate::api::schema::PluginUiSurface::RightPanel => herdr_ui_plugin_api::UiSurface::RightPanel,
-                    crate::api::schema::PluginUiSurface::Overlay => herdr_ui_plugin_api::UiSurface::Overlay,
-                    crate::api::schema::PluginUiSurface::ContextMenu => herdr_ui_plugin_api::UiSurface::ContextMenu,
-                    crate::api::schema::PluginUiSurface::UsageStrip => herdr_ui_plugin_api::UiSurface::UsageStrip,
+                    crate::api::schema::PluginUiSurface::Header => {
+                        herdr_ui_plugin_api::UiSurface::Header
+                    }
+                    crate::api::schema::PluginUiSurface::Footer => {
+                        herdr_ui_plugin_api::UiSurface::Footer
+                    }
+                    crate::api::schema::PluginUiSurface::TabBar => {
+                        herdr_ui_plugin_api::UiSurface::TabBar
+                    }
+                    crate::api::schema::PluginUiSurface::Sidebar => {
+                        herdr_ui_plugin_api::UiSurface::Sidebar
+                    }
+                    crate::api::schema::PluginUiSurface::RightPanel => {
+                        herdr_ui_plugin_api::UiSurface::RightPanel
+                    }
+                    crate::api::schema::PluginUiSurface::Overlay => {
+                        herdr_ui_plugin_api::UiSurface::Overlay
+                    }
+                    crate::api::schema::PluginUiSurface::ContextMenu => {
+                        herdr_ui_plugin_api::UiSurface::ContextMenu
+                    }
+                    crate::api::schema::PluginUiSurface::UsageStrip => {
+                        herdr_ui_plugin_api::UiSurface::UsageStrip
+                    }
                 };
                 let rect = crate::ui::ui_plugin_surface_rect(
                     &self.state,
@@ -1648,6 +1686,7 @@ impl App {
                     plugin_context_json.as_deref(),
                     &plugin_context,
                     &focus,
+                    (negotiated_version == 3).then_some(layout_json.as_str()),
                 );
                 changed |= self.ui_plugins.dispatch_frame(
                     &plugin_id,
@@ -1674,10 +1713,62 @@ impl App {
             .state
             .ui_surface_layers
             .iter()
-            .filter(|l| l.surface == herdr_ui_plugin_api::UiSurface::UsageStrip)
-            .map(|l| l.nodes.len())
+            .filter(|entry| entry.layer.surface == herdr_ui_plugin_api::UiSurface::UsageStrip)
+            .map(|entry| entry.layer.nodes.len())
             .sum();
-        tracing::info!(changed, usage_nodes, layers = self.state.ui_surface_layers.len(), "frame events done");
+        tracing::info!(
+            changed,
+            usage_nodes,
+            layers = self.state.ui_surface_layers.len(),
+            "frame events done"
+        );
+    }
+
+    /// Spec §7: builds the `HERDR_LAYOUT_JSON` blob delivered to v3 modules'
+    /// frame env — a cheap read-slice of the query API's layout basics so a
+    /// plugin doesn't need a socket round trip just to learn geometry/focus
+    /// that changes every frame. Any zero-width/height area (e.g.
+    /// `goal_dash_area` when the panel is hidden) is emitted as `null` per
+    /// spec. `dispatch_ui_plugin_frame_events` runs once against the shared
+    /// `AppState`, not per attached client, so `client.is_foreground` is
+    /// always `true` and `client.pinned_to` is always `null` here — true
+    /// multi-client pinning (the F11 fix in `server/clients.rs`'s
+    /// foreground-client tracking) is out of this pass's scope.
+    fn ui_plugin_layout_json(
+        &self,
+        plugin_context: &crate::api::schema::PluginInvocationContext,
+    ) -> String {
+        fn area_or_null(rect: ratatui::layout::Rect) -> serde_json::Value {
+            if rect.width == 0 || rect.height == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})
+            }
+        }
+
+        let sidebar = self.state.view.sidebar_rect;
+        let terminal = self.state.view.terminal_area;
+        let client_width = sidebar.width.max(terminal.x.saturating_add(terminal.width));
+        let client_height = terminal
+            .y
+            .saturating_add(terminal.height)
+            .max(sidebar.y.saturating_add(sidebar.height));
+
+        let blob = serde_json::json!({
+            "active_workspace_id": plugin_context.workspace_id,
+            "active_tab_id": plugin_context.tab_id,
+            "focused_pane_id": plugin_context.focused_pane_id,
+            "terminal_area": area_or_null(terminal),
+            "usage_dash_area": area_or_null(self.state.view.usage_dash_area),
+            "goal_dash_area": area_or_null(self.state.view.goal_dash_area),
+            "client": {
+                "is_foreground": true,
+                "width": client_width,
+                "height": client_height,
+                "pinned_to": serde_json::Value::Null,
+            },
+        });
+        serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
     }
 
     pub(crate) fn build_ui_plugin_frame_env(
@@ -1688,18 +1779,25 @@ impl App {
         plugin_context_json: Option<&str>,
         plugin_context: &crate::api::schema::PluginInvocationContext,
         focus: &dash_common::FocusInput,
+        layout_json: Option<&str>,
     ) -> std::collections::HashMap<String, String> {
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
             ("HERDR_PLUGIN_ID".to_string(), plugin_id.to_string()),
             ("HERDR_UI_MODULE_ID".to_string(), module_id.to_string()),
-            ("HERDR_THEME_NAME".to_string(), self.state.theme_name.clone()),
+            (
+                "HERDR_THEME_NAME".to_string(),
+                self.state.theme_name.clone(),
+            ),
             (
                 crate::api::SOCKET_PATH_ENV_VAR.to_string(),
                 crate::api::socket_path().display().to_string(),
             ),
         ]);
         if let Ok(current_exe) = std::env::current_exe() {
-            env.insert("HERDR_BIN_PATH".to_string(), current_exe.display().to_string());
+            env.insert(
+                "HERDR_BIN_PATH".to_string(),
+                current_exe.display().to_string(),
+            );
         }
         if let Some(plugin) = self.state.installed_plugins.get(plugin_id) {
             env.insert("HERDR_PLUGIN_ROOT".to_string(), plugin.plugin_root.clone());
@@ -1717,10 +1815,16 @@ impl App {
             );
         }
         if let Some(manifest_json) = manifest_json {
-            env.insert("HERDR_UI_MODULE_MANIFEST_JSON".to_string(), manifest_json.to_string());
+            env.insert(
+                "HERDR_UI_MODULE_MANIFEST_JSON".to_string(),
+                manifest_json.to_string(),
+            );
         }
         if let Some(plugin_context_json) = plugin_context_json {
-            env.insert("HERDR_PLUGIN_CONTEXT_JSON".to_string(), plugin_context_json.to_string());
+            env.insert(
+                "HERDR_PLUGIN_CONTEXT_JSON".to_string(),
+                plugin_context_json.to_string(),
+            );
         }
         if let Some(workspace_id) = plugin_context.workspace_id.as_ref() {
             env.insert("HERDR_WORKSPACE_ID".to_string(), workspace_id.clone());
@@ -1754,6 +1858,9 @@ impl App {
             if let Some(json) = self.usage_render_input_json() {
                 env.insert("HERDR_USAGE_RENDER_JSON".to_string(), json);
             }
+        }
+        if let Some(layout_json) = layout_json {
+            env.insert("HERDR_LAYOUT_JSON".to_string(), layout_json.to_string());
         }
         env
     }
@@ -1806,7 +1913,186 @@ impl App {
         }
     }
 
+    /// API v3 (§5.4): at most this many chained rounds of `HostEffect::Api`
+    /// execution run per host turn. Each round delivers `ApiResult` back to the
+    /// emitting module, which may itself enqueue another `Api` call for the
+    /// next round; capping this prevents a plugin that keeps chaining calls
+    /// from wedging the host turn. Anything still queued once the cap is hit is
+    /// parked (never dropped) for the next tick.
+    const MAX_API_BRIDGE_ROUNDS_PER_TURN: usize = 4;
+
     pub(crate) fn apply_ui_plugin_effects(&mut self) {
+        self.apply_ui_plugin_host_effects();
+        for _ in 0..Self::MAX_API_BRIDGE_ROUNDS_PER_TURN {
+            let pending = self.ui_plugins.take_pending_api_effects();
+            if pending.is_empty() {
+                return;
+            }
+            for effect in pending {
+                self.execute_ui_plugin_api_call(effect);
+            }
+            // Delivering each ApiResult above may have enqueued plain host
+            // effects (e.g. a plugin action.invoke reacting to its own read);
+            // flush those before checking for another chained round.
+            self.apply_ui_plugin_host_effects();
+        }
+        let overflow = self.ui_plugins.take_pending_api_effects();
+        if !overflow.is_empty() {
+            tracing::warn!(
+                count = overflow.len(),
+                "ui plugin api bridge: chained-round budget exhausted, parking for next tick"
+            );
+            self.ui_plugins.park_pending_api_effects(overflow);
+        }
+    }
+
+    /// API v3 (§5.3/§5.4): resolve one `HostEffect::Api` call end to end —
+    /// per-update budget check, capability-policy check (`ui_plugin_api_bridge`),
+    /// synchronous execution via `handle_api_request_after_internal_events_drained`
+    /// (never `handle_api_request`, which would re-drain internal events
+    /// re-entrantly from inside a UI-plugin dispatch), and delivery of the
+    /// `ApiResult` back to the emitting module. Every call resolves to exactly
+    /// one `ApiResult`, or is silently discarded by `dispatch_api_result` if the
+    /// module was unlinked before delivery (§5.4).
+    fn execute_ui_plugin_api_call(&mut self, effect: crate::ui_plugins::PendingApiEffect) {
+        /// The spec does not pin an exact wall-clock bound for a single bridge
+        /// method call; 250ms is chosen so a slow call is logged loudly (the
+        /// render thread is blocked for its duration) without adding a second
+        /// timeout/cancellation mechanism beyond the existing per-update and
+        /// chained-round caps.
+        const API_METHOD_WALL_CLOCK_BUDGET: std::time::Duration =
+            std::time::Duration::from_millis(250);
+
+        let crate::ui_plugins::PendingApiEffect {
+            plugin_id,
+            module_id,
+            request_id,
+            method,
+            params,
+            budget_exhausted,
+        } = effect;
+
+        if budget_exhausted {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                request_id = %request_id,
+                method = %method,
+                "ui plugin api call refused: per-update budget exhausted"
+            );
+            self.ui_plugins.dispatch_api_result(
+                &plugin_id,
+                &module_id,
+                request_id,
+                false,
+                None,
+                Some("api_budget_exhausted".to_string()),
+            );
+            return;
+        }
+
+        let capability = match crate::ui_plugin_api_bridge::decide(&method) {
+            crate::ui_plugin_api_bridge::ApiMethodDecision::Deny => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    module_id = %module_id,
+                    request_id = %request_id,
+                    method = %method,
+                    "ui plugin api call denied by policy"
+                );
+                self.ui_plugins.dispatch_api_result(
+                    &plugin_id,
+                    &module_id,
+                    request_id,
+                    false,
+                    None,
+                    Some("method_not_permitted".to_string()),
+                );
+                return;
+            }
+            crate::ui_plugin_api_bridge::ApiMethodDecision::Allow(capability) => capability,
+        };
+
+        if !self
+            .ui_plugins
+            .module_requests(&plugin_id, &module_id, capability)
+        {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                request_id = %request_id,
+                method = %method,
+                ?capability,
+                "ui plugin api call denied: module lacks required capability"
+            );
+            self.ui_plugins.dispatch_api_result(
+                &plugin_id,
+                &module_id,
+                request_id,
+                false,
+                None,
+                Some("capability_not_granted".to_string()),
+            );
+            return;
+        }
+
+        let request_value = serde_json::json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        });
+        let request: crate::api::schema::Request = match serde_json::from_value(request_value) {
+            Ok(request) => request,
+            Err(err) => {
+                self.ui_plugins.dispatch_api_result(
+                    &plugin_id,
+                    &module_id,
+                    request_id,
+                    false,
+                    None,
+                    Some(format!("invalid_params: {err}")),
+                );
+                return;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let response_json = self.handle_api_request_after_internal_events_drained(request);
+        let elapsed = started.elapsed();
+        if elapsed > API_METHOD_WALL_CLOCK_BUDGET {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                method = %method,
+                elapsed_ms = elapsed.as_millis(),
+                "ui plugin api call exceeded wall-clock budget"
+            );
+        }
+
+        let (ok, response, error) = match serde_json::from_str::<serde_json::Value>(&response_json)
+        {
+            Ok(value) if value.get("error").is_some() => {
+                let message = value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(|message| message.as_str())
+                    .unwrap_or("api call failed")
+                    .to_string();
+                (false, None, Some(message))
+            }
+            Ok(value) => (true, value.get("result").cloned(), None),
+            Err(err) => (false, None, Some(format!("malformed response: {err}"))),
+        };
+
+        self.ui_plugins
+            .dispatch_api_result(&plugin_id, &module_id, request_id, ok, response, error);
+    }
+
+    /// Applies the plain (non-`Api`) `HostEffect`s a UI plugin update queued.
+    /// `HostEffect::Api` never reaches this queue — `dispatch_event_for_module`
+    /// (ui_plugins.rs) routes it into `pending_api_effects` instead, handled by
+    /// `apply_ui_plugin_effects`/`execute_ui_plugin_api_call` above.
+    fn apply_ui_plugin_host_effects(&mut self) {
         for effect in self.ui_plugins.take_pending_effects() {
             match effect {
                 herdr_ui_plugin_api::HostEffect::CopyText(text) => {
@@ -1926,6 +2212,15 @@ impl App {
                             },
                         ),
                     });
+                }
+                herdr_ui_plugin_api::HostEffect::Api {
+                    request_id, method, ..
+                } => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        method = %method,
+                        "ui plugin api effect reached the host-effect queue unexpectedly; dropping (should have been routed to pending_api_effects)"
+                    );
                 }
             }
         }
@@ -2106,26 +2401,103 @@ mod tests {
                 agent: dash_common::AgentKind::Claude,
                 is_self_focus: false,
             },
+            None,
         );
 
-        assert_eq!(env.get("HERDR_PLUGIN_ID").map(String::as_str), Some("example.ui"));
-        assert_eq!(env.get("HERDR_UI_MODULE_ID").map(String::as_str), Some("goal-ui"));
-        assert_eq!(env.get("HERDR_UI_MODULE_MANIFEST_JSON").map(String::as_str), Some("{\"module\":true}"));
-        assert_eq!(env.get("HERDR_PLUGIN_CONTEXT_JSON").map(String::as_str), Some("{\"context\":true}"));
-        assert_eq!(env.get("HERDR_PLUGIN_ROOT").map(String::as_str), Some("/tmp/example.ui"));
-        assert_eq!(env.get("HERDR_THEME_NAME").map(String::as_str), Some("test-theme"));
-        assert_eq!(env.get("HERDR_WORKSPACE_ID").map(String::as_str), Some("w1"));
+        assert!(!env.contains_key("HERDR_LAYOUT_JSON"));
+        assert_eq!(
+            env.get("HERDR_PLUGIN_ID").map(String::as_str),
+            Some("example.ui")
+        );
+        assert_eq!(
+            env.get("HERDR_UI_MODULE_ID").map(String::as_str),
+            Some("goal-ui")
+        );
+        assert_eq!(
+            env.get("HERDR_UI_MODULE_MANIFEST_JSON").map(String::as_str),
+            Some("{\"module\":true}")
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_CONTEXT_JSON").map(String::as_str),
+            Some("{\"context\":true}")
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_ROOT").map(String::as_str),
+            Some("/tmp/example.ui")
+        );
+        assert_eq!(
+            env.get("HERDR_THEME_NAME").map(String::as_str),
+            Some("test-theme")
+        );
+        assert_eq!(
+            env.get("HERDR_WORKSPACE_ID").map(String::as_str),
+            Some("w1")
+        );
         assert_eq!(env.get("HERDR_TAB_ID").map(String::as_str), Some("w1:t1"));
         assert_eq!(env.get("HERDR_PANE_ID").map(String::as_str), Some("w1:p1"));
-        assert_eq!(env.get("HERDR_SELECTED_TEXT").map(String::as_str), Some("hello"));
-        assert_eq!(env.get("HERDR_FOCUS_SESSION_ID").map(String::as_str), Some("sid-1"));
-        assert_eq!(env.get("HERDR_FOCUS_SESSION_REF").map(String::as_str), Some("ref-1"));
-        assert_eq!(env.get("HERDR_FOCUS_CWD").map(String::as_str), Some("/tmp/repo"));
-        assert_eq!(env.get("HERDR_FOCUS_AGENT").map(String::as_str), Some("claude"));
+        assert_eq!(
+            env.get("HERDR_SELECTED_TEXT").map(String::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_SESSION_ID").map(String::as_str),
+            Some("sid-1")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_SESSION_REF").map(String::as_str),
+            Some("ref-1")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_CWD").map(String::as_str),
+            Some("/tmp/repo")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_AGENT").map(String::as_str),
+            Some("claude")
+        );
         assert!(env.contains_key("HERDR_PLUGIN_CONFIG_DIR"));
         assert!(env.contains_key("HERDR_PLUGIN_STATE_DIR"));
         assert!(env.contains_key("HERDR_BIN_PATH"));
         assert!(env.contains_key(crate::api::SOCKET_PATH_ENV_VAR));
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_injects_layout_json_only_when_provided() {
+        let app = test_app();
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "v3-ui",
+            None,
+            None,
+            &crate::api::schema::PluginInvocationContext::default(),
+            &dash_common::FocusInput::default(),
+            Some("{\"active_workspace_id\":null}"),
+        );
+        assert_eq!(
+            env.get("HERDR_LAYOUT_JSON").map(String::as_str),
+            Some("{\"active_workspace_id\":null}")
+        );
+    }
+
+    #[test]
+    fn ui_plugin_layout_json_emits_null_for_zero_size_areas() {
+        let mut app = test_app();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(26, 1, 194, 42);
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 1, 26, 42);
+        app.state.view.usage_dash_area = ratatui::layout::Rect::new(26, 43, 194, 7);
+        app.state.view.goal_dash_area = ratatui::layout::Rect::default();
+
+        let context = crate::api::schema::PluginInvocationContext {
+            workspace_id: Some("w1".into()),
+            ..Default::default()
+        };
+        let json = app.ui_plugin_layout_json(&context);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value["active_workspace_id"], "w1");
+        assert!(value["goal_dash_area"].is_null());
+        assert!(!value["usage_dash_area"].is_null());
+        assert_eq!(value["client"]["is_foreground"], true);
+        assert!(value["client"]["pinned_to"].is_null());
     }
 
     #[cfg(windows)]

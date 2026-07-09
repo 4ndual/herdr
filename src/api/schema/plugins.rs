@@ -338,6 +338,13 @@ pub enum PluginUiCapability {
     Toasts,
     OpenPluginPanes,
     PluginActions,
+    /// API v3 (§5.3): read-only socket API methods via `HostEffect::Api`.
+    ApiRead,
+    /// API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.
+    ApiWrite,
+    /// API v3 (§5.3): text/keystroke-injecting socket API methods via
+    /// `HostEffect::Api` (`pane.send_text`, `agent.send`).
+    ApiInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

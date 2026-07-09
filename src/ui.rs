@@ -500,7 +500,12 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
                 app.view.terminal_area
             };
             if area.height > 0 {
-                Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1)
+                Rect::new(
+                    area.x,
+                    area.y + area.height.saturating_sub(1),
+                    area.width,
+                    1,
+                )
             } else {
                 Rect::default()
             }
@@ -516,7 +521,9 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
 
 fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
     match role.unwrap_or_default() {
-        "accent" => Style::default().fg(app.palette.accent).add_modifier(Modifier::BOLD),
+        "accent" => Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
         "muted" => Style::default().fg(app.palette.overlay0),
         "success" | "green" => Style::default().fg(app.palette.green),
         "warning" | "yellow" => Style::default().fg(app.palette.yellow),
@@ -526,7 +533,9 @@ fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
         "mauve" | "magenta" => Style::default().fg(app.palette.mauve),
         "subtext" | "gray" => Style::default().fg(app.palette.subtext0),
         "peach" => Style::default().fg(app.palette.peach),
-        "panel" => Style::default().fg(app.palette.text).bg(app.palette.panel_bg),
+        "panel" => Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.panel_bg),
         _ => Style::default().fg(app.palette.text),
     }
 }
@@ -555,6 +564,12 @@ fn plugin_line(app: &AppState, spans: &[UiTextSpan]) -> Line<'static> {
 pub(crate) struct UiPluginHit {
     pub action_id: Option<String>,
     pub consumes_mouse: bool,
+    /// Spec §4: set only when the hit resolved through a declared `UiHitRect`
+    /// (not the Menu/Tabs node-walk fallback below) — "Emitted when a resolved
+    /// click lands on a `UiHitRect` declared by a v3 module's current layers."
+    /// `(plugin_id, module_id, negotiated_version)` of the owning module.
+    pub declared_hit_owner: Option<(String, String, u32)>,
+    pub surface: UiSurface,
 }
 
 fn ui_plugin_node_action_at(
@@ -619,21 +634,38 @@ pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
     if min_x == u16::MAX {
         Rect::default()
     } else {
-        Rect::new(min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y))
+        Rect::new(
+            min_x,
+            min_y,
+            max_x.saturating_sub(min_x),
+            max_y.saturating_sub(min_y),
+        )
     }
 }
 
-pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: u16) -> Option<UiPluginHit> {
-    for layer in app.ui_surface_layers.iter().rev() {
+pub(crate) fn ui_plugin_hit_at(
+    app: &AppState,
+    frame_area: Rect,
+    col: u16,
+    row: u16,
+) -> Option<UiPluginHit> {
+    // §4 deterministic overlap ownership: `ui_surface_layers` is already ordered
+    // `(z_index desc, plugin_id asc, module_id asc)` by `surface_layers()`, i.e.
+    // topmost-owner-first, so walking it forward (no `.rev()`) already checks the
+    // topmost layer first.
+    for entry in app.ui_surface_layers.iter() {
+        let layer = &entry.layer;
         let area = ui_plugin_surface_rect(app, frame_area, layer.surface);
         if area.width == 0 || area.height == 0 {
             continue;
         }
-        if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height {
+        if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height
+        {
             continue;
         }
         // API v2: absolute-coordinate hit-rects the guest declared take priority
-        // over the line-walked Menu/Tabs hits.
+        // over the line-walked Menu/Tabs hits. API v3 (§4): only these declared
+        // hits carry an owner, so only they can route a `UiEvent::Action`.
         for hit in &layer.hits {
             if col >= hit.x
                 && col < hit.x.saturating_add(hit.width)
@@ -643,6 +675,12 @@ pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: 
                 return Some(UiPluginHit {
                     action_id: Some(hit.action_id.clone()),
                     consumes_mouse: layer.consumes_mouse,
+                    declared_hit_owner: Some((
+                        entry.plugin_id.clone(),
+                        entry.module_id.clone(),
+                        entry.negotiated_version,
+                    )),
+                    surface: layer.surface,
                 });
             }
         }
@@ -653,6 +691,8 @@ pub(crate) fn ui_plugin_hit_at(app: &AppState, frame_area: Rect, col: u16, row: 
                 return Some(UiPluginHit {
                     action_id: action,
                     consumes_mouse: layer.consumes_mouse,
+                    declared_hit_owner: None,
+                    surface: layer.surface,
                 });
             }
             line_y = next_line_y;
@@ -668,19 +708,22 @@ fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
     let usage = app
         .ui_surface_layers
         .iter()
-        .find(|l| l.surface == UiSurface::UsageStrip);
+        .find(|entry| entry.layer.surface == UiSurface::UsageStrip);
     tracing::info!(
         layers = app.ui_surface_layers.len(),
-        usage_nodes = usage.map(|l| l.nodes.len()).unwrap_or(0),
-        usage_rect = ?usage.map(|l| ui_plugin_surface_rect(app, frame.area(), l.surface)),
+        usage_nodes = usage.map(|entry| entry.layer.nodes.len()).unwrap_or(0),
+        usage_rect = ?usage.map(|entry| ui_plugin_surface_rect(app, frame.area(), entry.layer.surface)),
         "render_ui_plugin_layers"
     );
-    for layer in &app.ui_surface_layers {
-        let area = ui_plugin_surface_rect(app, frame.area(), layer.surface);
+    // `ui_surface_layers` is ordered topmost-owner-first (§4:
+    // `(z_index desc, plugin_id asc, module_id asc)`); paint bottom-to-top so the
+    // topmost layer ends up drawn last (visually on top), so walk it reversed.
+    for entry in app.ui_surface_layers.iter().rev() {
+        let area = ui_plugin_surface_rect(app, frame.area(), entry.layer.surface);
         if area.width == 0 || area.height == 0 {
             continue;
         }
-        render_ui_plugin_layer(app, frame, area, layer);
+        render_ui_plugin_layer(app, frame, area, &entry.layer);
     }
 }
 
@@ -692,7 +735,10 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                 if line_y >= area.y + area.height {
                     break;
                 }
-                frame.render_widget(Paragraph::new(plugin_line(app, spans)), Rect::new(area.x, line_y, area.width, 1));
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, spans)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
                 line_y = line_y.saturating_add(1);
             }
             UiNode::Status { left, right } => {
@@ -701,10 +747,17 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                 }
                 let mut combined = left.clone();
                 if !right.is_empty() {
-                    combined.push(UiTextSpan { text: " ".into(), role: Some("muted".into()), ..Default::default() });
+                    combined.push(UiTextSpan {
+                        text: " ".into(),
+                        role: Some("muted".into()),
+                        ..Default::default()
+                    });
                     combined.extend(right.clone());
                 }
-                frame.render_widget(Paragraph::new(plugin_line(app, &combined)), Rect::new(area.x, line_y, area.width, 1));
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, &combined)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
                 line_y = line_y.saturating_add(1);
             }
             UiNode::Tabs { items, selected } => {
@@ -715,20 +768,42 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                     .iter()
                     .enumerate()
                     .flat_map(|(idx, item)| {
-                        let role = if idx == *selected { Some("accent") } else { Some("muted") };
+                        let role = if idx == *selected {
+                            Some("accent")
+                        } else {
+                            Some("muted")
+                        };
                         [
-                            UiTextSpan { text: format!(" {} ", item.label), role: role.map(str::to_string), ..Default::default() },
-                            UiTextSpan { text: " ".into(), role: Some("muted".into()), ..Default::default() },
+                            UiTextSpan {
+                                text: format!(" {} ", item.label),
+                                role: role.map(str::to_string),
+                                ..Default::default()
+                            },
+                            UiTextSpan {
+                                text: " ".into(),
+                                role: Some("muted".into()),
+                                ..Default::default()
+                            },
                         ]
                     })
                     .collect::<Vec<_>>();
-                frame.render_widget(Paragraph::new(plugin_line(app, &spans)), Rect::new(area.x, line_y, area.width, 1));
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, &spans)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
                 line_y = line_y.saturating_add(1);
             }
-            UiNode::Menu { title, items, selected } => {
+            UiNode::Menu {
+                title,
+                items,
+                selected,
+            } => {
                 if line_y < area.y + area.height {
                     frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(title.clone(), plugin_span_style(app, Some("accent"))))),
+                        Paragraph::new(Line::from(Span::styled(
+                            title.clone(),
+                            plugin_span_style(app, Some("accent")),
+                        ))),
                         Rect::new(area.x, line_y, area.width, 1),
                     );
                     line_y = line_y.saturating_add(1);
@@ -737,9 +812,20 @@ fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: 
                     if line_y >= area.y + area.height {
                         break;
                     }
-                    let role = if idx == *selected { Some("accent") } else { None };
-                    let spans = vec![UiTextSpan { text: item.label.clone(), role: role.map(str::to_string), ..Default::default() }];
-                    frame.render_widget(Paragraph::new(plugin_line(app, &spans)), Rect::new(area.x, line_y, area.width, 1));
+                    let role = if idx == *selected {
+                        Some("accent")
+                    } else {
+                        None
+                    };
+                    let spans = vec![UiTextSpan {
+                        text: item.label.clone(),
+                        role: role.map(str::to_string),
+                        ..Default::default()
+                    }];
+                    frame.render_widget(
+                        Paragraph::new(plugin_line(app, &spans)),
+                        Rect::new(area.x, line_y, area.width, 1),
+                    );
                     line_y = line_y.saturating_add(1);
                 }
             }
@@ -1473,24 +1559,36 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.ui_surface_layers = vec![UiLayer {
-            surface: UiSurface::Overlay,
-            z_index: 99,
-            consumes_mouse: true,
-            nodes: vec![UiNode::Line {
-                spans: vec![UiTextSpan {
-                    text: "Consumes".into(),
-                    role: Some("accent".into()),
-                    ..Default::default()
+        app.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "overlay".into(),
+            negotiated_version: 2,
+            layer: UiLayer {
+                surface: UiSurface::Overlay,
+                z_index: 99,
+                consumes_mouse: true,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: "Consumes".into(),
+                        role: Some("accent".into()),
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
                 }],
-            }],
-            hits: vec![],
-            data: None,
+                hits: Vec::new(),
+                data: None,
+            },
         }];
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         let frame_area = ui_plugin_frame_area(&app);
-        let hit = ui_plugin_hit_at(&app, frame_area, app.view.terminal_area.x, app.view.terminal_area.y)
-            .expect("plugin hit");
+        let hit = ui_plugin_hit_at(
+            &app,
+            frame_area,
+            app.view.terminal_area.x,
+            app.view.terminal_area.y,
+        )
+        .expect("plugin hit");
         assert!(hit.consumes_mouse);
         assert!(hit.action_id.is_none());
     }
@@ -1502,22 +1600,38 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.ui_surface_layers = vec![UiLayer {
-            surface: UiSurface::Header,
-            z_index: 1,
-            consumes_mouse: false,
-            nodes: vec![UiNode::Tabs {
-                items: vec![herdr_ui_plugin_api::UiActionRef { id: "plugin:example.ui-wasm:fork".into(), label: "Fork".into() }],
-                selected: 0,
-            }],
-            hits: vec![],
-            data: None,
+        app.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "header".into(),
+            negotiated_version: 2,
+            layer: UiLayer {
+                surface: UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Tabs {
+                    items: vec![herdr_ui_plugin_api::UiActionRef {
+                        id: "plugin:example.ui-wasm:fork".into(),
+                        label: "Fork".into(),
+                    }],
+                    selected: 0,
+                }],
+                hits: Vec::new(),
+                data: None,
+            },
         }];
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         let header = ui_plugin_frame_area(&app);
-        let hit = ui_plugin_hit_at(&app, header, app.view.terminal_area.x + 1, app.view.terminal_area.y)
-            .expect("plugin hit");
-        assert_eq!(hit.action_id.as_deref(), Some("plugin:example.ui-wasm:fork"));
+        let hit = ui_plugin_hit_at(
+            &app,
+            header,
+            app.view.terminal_area.x + 1,
+            app.view.terminal_area.y,
+        )
+        .expect("plugin hit");
+        assert_eq!(
+            hit.action_id.as_deref(),
+            Some("plugin:example.ui-wasm:fork")
+        );
     }
 
     #[test]
@@ -1528,33 +1642,47 @@ mod tests {
         app.selected = 0;
         app.mode = Mode::Terminal;
         app.ui_surface_layers = vec![
-            UiLayer {
-                surface: UiSurface::Header,
-                z_index: 1,
-                consumes_mouse: false,
-                nodes: vec![UiNode::Line {
-                    spans: vec![UiTextSpan {
-                        text: "WASM HEADER".into(),
-                        role: Some("accent".into()),
-                        ..Default::default()
+            crate::ui_plugins::UiSurfaceLayer {
+                plugin_id: "example.ui-wasm".into(),
+                module_id: "header".into(),
+                negotiated_version: 2,
+                layer: UiLayer {
+                    surface: UiSurface::Header,
+                    z_index: 1,
+                    consumes_mouse: false,
+                    nodes: vec![UiNode::Line {
+                        spans: vec![UiTextSpan {
+                            text: "WASM HEADER".into(),
+                            role: Some("accent".into()),
+                            bold: false,
+                            underline: false,
+                            italic: false,
+                        }],
                     }],
-                }],
-                hits: vec![],
-                data: None,
+                    hits: Vec::new(),
+                    data: None,
+                },
             },
-            UiLayer {
-                surface: UiSurface::Footer,
-                z_index: 1,
-                consumes_mouse: false,
-                nodes: vec![UiNode::Line {
-                    spans: vec![UiTextSpan {
-                        text: "WASM FOOTER".into(),
-                        role: Some("accent".into()),
-                        ..Default::default()
+            crate::ui_plugins::UiSurfaceLayer {
+                plugin_id: "example.ui-wasm".into(),
+                module_id: "footer".into(),
+                negotiated_version: 2,
+                layer: UiLayer {
+                    surface: UiSurface::Footer,
+                    z_index: 1,
+                    consumes_mouse: false,
+                    nodes: vec![UiNode::Line {
+                        spans: vec![UiTextSpan {
+                            text: "WASM FOOTER".into(),
+                            role: Some("accent".into()),
+                            bold: false,
+                            underline: false,
+                            italic: false,
+                        }],
                     }],
-                }],
-                hits: vec![],
-                data: None,
+                    hits: Vec::new(),
+                    data: None,
+                },
             },
         ];
 

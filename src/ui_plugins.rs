@@ -1,9 +1,9 @@
 use crate::api::schema::{InstalledPluginInfo, PluginHotReloadMode, PluginUiSurface};
 use dash_common::FocusInput;
 use herdr_ui_plugin_api::{
-    HostEffect, HostSnapshot, KeyEvent as UiKeyEvent, MouseEvent, MouseEventKind, UiActionRef,
-    UiCapability, UiEvent, UiFrameContext, UiLayer, UiLayoutRect, UiNode, UiPluginManifestRef,
-    UiSurface, UiUpdate, API_VERSION,
+    HostEffect, HostSnapshot, KeyEvent as UiKeyEvent, MouseEvent, MouseEventKind, UiActionKind,
+    UiActionRef, UiCapability, UiEvent, UiFrameContext, UiLayer, UiLayoutRect, UiNode,
+    UiPluginManifestRef, UiSurface, UiUpdate, UiUpdateScope, API_VERSION,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
+/// Spec §5.4: at most this many `HostEffect::Api` effects are executed from one
+/// `UiUpdate`; any beyond it are refused (never silently dropped — the caller
+/// still gets an `ok:false error:"api_budget_exhausted"` result).
+pub(crate) const MAX_API_EFFECTS_PER_UPDATE: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegisteredUiModule {
     pub plugin_id: String,
@@ -21,9 +26,41 @@ pub(crate) struct RegisteredUiModule {
     pub module_path: PathBuf,
     pub manifest_path: PathBuf,
     pub api_version: u32,
+    /// The version actually negotiated with the loaded guest export (2 or 3),
+    /// recomputed on every successful hot-reload (§2). Gates delivery of the v3
+    /// `Action`/`ApiResult` events in `module_accepts_event`.
+    pub negotiated_version: u32,
     pub hot_reload: PluginHotReloadMode,
     pub surfaces: Vec<PluginUiSurface>,
     pub requested_capabilities: Vec<crate::api::schema::PluginUiCapability>,
+}
+
+/// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
+/// (spec §4 identity threading). Ordered by `surface_layers()` using the total
+/// order `(z_index desc, plugin_id asc, module_id asc)` reserved for §9 dock
+/// arbitration, so the vec is already topmost-hit-owner-first; rendering walks
+/// it in reverse to paint bottom-to-top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UiSurfaceLayer {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub negotiated_version: u32,
+    pub layer: UiLayer,
+}
+
+/// A `HostEffect::Api` effect extracted from a module's update, tagged with the
+/// emitting module's identity so `App::apply_ui_plugin_effects` can run the
+/// capability policy (§5.3) and deliver the `ApiResult` back to the right
+/// module. `budget_exhausted` is set at extraction time for anything past the
+/// per-update `MAX_API_EFFECTS_PER_UPDATE`th effect: those are never executed.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingApiEffect {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub request_id: String,
+    pub method: String,
+    pub params: serde_json::Value,
+    pub budget_exhausted: bool,
 }
 
 impl RegisteredUiModule {
@@ -64,6 +101,10 @@ pub(crate) struct UiPluginManager {
     /// Shared wasm runtime holding the live per-module instances. `None` only if
     /// the engine failed to initialize, in which case plugins are inert.
     runtime: Option<PluginRuntime>,
+    /// API v3 (§5): effects pending capability-policy check + execution by
+    /// `App::apply_ui_plugin_effects`. Includes budget-refused entries so every
+    /// request still resolves to exactly one result (§5.4).
+    pending_api_effects: Vec<PendingApiEffect>,
 }
 
 /// Background thread that increments the shared engine epoch so a guest call
@@ -136,28 +177,46 @@ impl PluginRuntime {
 
     /// Returns the cached instance for `module`, building it (fresh store, fresh
     /// linear memory) when it is not currently cached — first use, or after a
-    /// trap / hot-reload dropped it.
-    fn instance_for(&mut self, module: &RegisteredUiModule) -> Result<&mut ModuleInstance, String> {
+    /// trap / hot-reload dropped it. The returned bool is `true` when this call
+    /// built a fresh instance, so the caller can clear the merge cache (§6:
+    /// trap-recovery / hot-reload full-replace) before applying its next update.
+    fn instance_for(
+        &mut self,
+        module: &RegisteredUiModule,
+    ) -> Result<(&mut ModuleInstance, bool), String> {
         let key = module_key(module);
-        if !self.instances.contains_key(&key) {
+        let rebuilt = !self.instances.contains_key(&key);
+        if rebuilt {
             let instance = ModuleInstance::build(&self.engine, module)?;
             self.instances.insert(key.clone(), instance);
         }
-        self.instances
+        let instance = self
+            .instances
             .get_mut(&key)
-            .ok_or_else(|| "ui plugin instance missing after build".to_string())
+            .ok_or_else(|| "ui plugin instance missing after build".to_string())?;
+        Ok((instance, rebuilt))
     }
 
+    /// Dispatches `event` to the module's live instance, reporting whether the
+    /// instance had to be (re)built for this call (§3 trap-recovery / first use)
+    /// so the caller can honor the §6 cache-clear rule.
     fn dispatch(
         &mut self,
         module: &RegisteredUiModule,
         event: &UiEvent,
-    ) -> Result<Option<UiUpdate>, String> {
-        self.instance_for(module)?.dispatch(event)
+    ) -> Result<(Option<UiUpdate>, bool), String> {
+        let (instance, rebuilt) = self.instance_for(module)?;
+        let update = instance.dispatch(event)?;
+        Ok((update, rebuilt))
     }
 
-    fn static_update(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
-        self.instance_for(module)?.static_update(module)
+    /// Reads the module's static update and reports the version negotiated with
+    /// the freshly-read guest export (§2), so the caller can store it on
+    /// `RegisteredUiModule.negotiated_version`.
+    fn static_update(&mut self, module: &RegisteredUiModule) -> Result<(UiUpdate, u32), String> {
+        let (instance, _rebuilt) = self.instance_for(module)?;
+        let update = instance.static_update(module)?;
+        Ok((update, instance.negotiated_version))
     }
 
     /// Drop the cached instance so the next call rebuilds from disk. Used for
@@ -167,7 +226,7 @@ impl PluginRuntime {
         self.instances.remove(&module_key(module));
     }
 
-    fn reload_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+    fn reload_static(&mut self, module: &RegisteredUiModule) -> Result<(UiUpdate, u32), String> {
         self.invalidate(module);
         self.static_update(module)
     }
@@ -184,6 +243,10 @@ struct ModuleInstance {
     on_event_len: Option<TypedFunc<(), i32>>,
     static_ptr: TypedFunc<(), i32>,
     static_len: TypedFunc<(), i32>,
+    /// The version negotiated with the guest's `herdr_ui_api_version` export at
+    /// build time (2 or 3, §2). Surfaced to the manager so it can be stored on
+    /// the module and gate v3-only event delivery in `module_accepts_event`.
+    negotiated_version: u32,
 }
 
 impl ModuleInstance {
@@ -209,12 +272,17 @@ impl ModuleInstance {
         let api_version = api_fn.call(&mut store, ()).map_err(|err| {
             format!("wasm ui module {path} export herdr_ui_api_version failed: {err}")
         })? as u32;
-        if api_version != module.api_version || api_version != API_VERSION {
+        // §2 version negotiation (replaces the old exact `== API_VERSION` check):
+        // the guest export must equal its manifest `api_version` and be one of
+        // the host-supported versions {2, 3}. The negotiated value is stored per
+        // instance so v3-only events are gated on it downstream.
+        if api_version != module.api_version || !matches!(api_version, 2 | 3) {
             return Err(format!(
-                "wasm ui module {path} api version mismatch: module exports {api_version}, manifest says {}, host supports {API_VERSION}",
+                "wasm ui module {path} api version mismatch: module exports {api_version}, manifest says {}, host supports 2 or {API_VERSION}",
                 module.api_version
             ));
         }
+        let negotiated_version = api_version;
         let static_ptr = instance
             .get_typed_func::<(), i32>(&mut store, "herdr_ui_static_update_ptr")
             .map_err(|_| {
@@ -244,6 +312,7 @@ impl ModuleInstance {
             on_event_len,
             static_ptr,
             static_len,
+            negotiated_version,
         })
     }
 
@@ -332,6 +401,7 @@ impl UiPluginManager {
             last_errors: HashMap::new(),
             pending_effects: Vec::new(),
             pending_notifications: Vec::new(),
+            pending_api_effects: Vec::new(),
             runtime,
         };
 
@@ -344,13 +414,14 @@ impl UiPluginManager {
             let root = Path::new(&plugin.plugin_root);
             let manifest_path = PathBuf::from(&plugin.manifest_path);
             for module in &plugin.ui_modules {
-                let registered = RegisteredUiModule {
+                let mut registered = RegisteredUiModule {
                     plugin_id: plugin.plugin_id.clone(),
                     module_id: module.id.clone(),
                     title: module.title.clone(),
                     module_path: root.join(&module.module),
                     manifest_path: manifest_path.clone(),
                     api_version: module.api_version,
+                    negotiated_version: module.api_version,
                     hot_reload: module.hot_reload,
                     surfaces: module.surfaces.clone(),
                     requested_capabilities: module.capabilities.clone(),
@@ -365,7 +436,8 @@ impl UiPluginManager {
                     }
                 }
                 match manager.load_module_static(&registered) {
-                    Ok(update) => {
+                    Ok((update, negotiated_version)) => {
+                        registered.negotiated_version = negotiated_version;
                         manager
                             .loaded_updates
                             .insert(module_key(&registered), update);
@@ -389,9 +461,12 @@ impl UiPluginManager {
     }
 
     /// Build (if needed) the live instance for `module` and read its initial
-    /// static update. Used at load time; errors when the shared runtime failed
-    /// to initialize.
-    fn load_module_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+    /// static update plus negotiated version (§2). Used at load time; errors
+    /// when the shared runtime failed to initialize.
+    fn load_module_static(
+        &mut self,
+        module: &RegisteredUiModule,
+    ) -> Result<(UiUpdate, u32), String> {
         match self.runtime.as_mut() {
             Some(runtime) => runtime.static_update(module),
             None => Err("wasm ui plugin runtime unavailable".to_string()),
@@ -399,8 +474,12 @@ impl UiPluginManager {
     }
 
     /// Drop and rebuild `module`'s instance from disk (fresh linear memory),
-    /// then read its static update. Used on hot-reload so guest state resets.
-    fn reload_module_static(&mut self, module: &RegisteredUiModule) -> Result<UiUpdate, String> {
+    /// then read its static update plus negotiated version. Used on hot-reload
+    /// so guest state resets.
+    fn reload_module_static(
+        &mut self,
+        module: &RegisteredUiModule,
+    ) -> Result<(UiUpdate, u32), String> {
         match self.runtime.as_mut() {
             Some(runtime) => runtime.reload_static(module),
             None => Err("wasm ui plugin runtime unavailable".to_string()),
@@ -426,10 +505,11 @@ impl UiPluginManager {
 
     pub(crate) fn detect_changed_modules(&mut self) -> Vec<RegisteredUiModule> {
         let mut changed = Vec::new();
-        // Clone the module list so the reload path can take `&mut self` without
-        // aliasing the borrow of `self.modules`.
-        let modules = self.modules.clone();
-        for module in &modules {
+        // Iterate by index and clone each module so the reload path can take
+        // `&mut self` without aliasing the borrow of `self.modules`, and so the
+        // negotiated version can be written back to `self.modules[idx]`.
+        for idx in 0..self.modules.len() {
+            let module = self.modules[idx].clone();
             let Ok(meta) = std::fs::metadata(&module.module_path) else {
                 continue;
             };
@@ -439,9 +519,14 @@ impl UiPluginManager {
             let old = self.mtimes.get(&module.module_path).copied();
             if old.is_none() || old.is_some_and(|old| old < mtime) {
                 self.mtimes.insert(module.module_path.clone(), mtime);
-                let key = module_key(module);
-                match self.reload_module_static(module) {
-                    Ok(update) => {
+                let key = module_key(&module);
+                match self.reload_module_static(&module) {
+                    Ok((update, negotiated_version)) => {
+                        // §6: hot-reload clears the merge cache — a full replace
+                        // (not a partial merge) so a rebuilt module that renders
+                        // fewer surfaces doesn't keep stale layers.
+                        self.modules[idx].negotiated_version = negotiated_version;
+                        self.clear_module_cache(&module.plugin_id, &module.module_id);
                         self.loaded_updates.insert(key.clone(), update);
                         if self.last_errors.remove(&key).is_some() {
                             self.pending_notifications.push(format!(
@@ -450,7 +535,7 @@ impl UiPluginManager {
                             ));
                         }
                         if module.hot_reload == PluginHotReloadMode::On {
-                            changed.push(module.clone());
+                            changed.push(self.modules[idx].clone());
                         }
                     }
                     Err(err) => {
@@ -476,6 +561,17 @@ impl UiPluginManager {
         changed
     }
 
+    /// Drops the merge cache for one module (§6: hot-reload / trap-recovery
+    /// clears the cache so the fresh instance's next surfaces fully replace the
+    /// stale ones instead of partial-merging into them). Called from the
+    /// hot-reload path in `detect_changed_modules` (before re-seeding the fresh
+    /// static update) and from `dispatch_event_for_module` when the persistent
+    /// runtime had to re-instantiate a trapped module for the current event.
+    pub(crate) fn clear_module_cache(&mut self, plugin_id: &str, module_id: &str) {
+        self.loaded_updates
+            .remove(&(plugin_id.to_string(), module_id.to_string()));
+    }
+
     pub(crate) fn context_menu_items(&self) -> Vec<UiActionRef> {
         let mut out = Vec::new();
         for module in self.for_surface(PluginUiSurface::ContextMenu) {
@@ -489,18 +585,39 @@ impl UiPluginManager {
         out
     }
 
-    pub(crate) fn surface_layers(&self) -> Vec<UiLayer> {
+    /// Spec §4: deterministic overlap ownership. Iterates `self.modules` (a
+    /// `Vec`, already sorted `plugin_id` then `module_id` at registration) so the
+    /// input is never HashMap-order-dependent, then applies the exact total sort
+    /// `(z_index desc, plugin_id asc, module_id asc)` reserved for §9 dock
+    /// arbitration — this is the fix for the old `HashMap`-iteration-order bug
+    /// (a stable sort by `z_index` alone was stable over nondeterministic input).
+    pub(crate) fn surface_layers(&self) -> Vec<UiSurfaceLayer> {
         let mut layers = Vec::new();
-        for update in self.loaded_updates.values() {
-            layers.extend(
-                update
-                    .layers
-                    .iter()
-                    .filter(|layer| layer.surface != UiSurface::ContextMenu)
-                    .cloned(),
-            );
+        for module in &self.modules {
+            let Some(update) = self.loaded_updates.get(&module_key(module)) else {
+                continue;
+            };
+            for layer in update
+                .layers
+                .iter()
+                .filter(|layer| layer.surface != UiSurface::ContextMenu)
+                .cloned()
+            {
+                layers.push(UiSurfaceLayer {
+                    plugin_id: module.plugin_id.clone(),
+                    module_id: module.module_id.clone(),
+                    negotiated_version: module.negotiated_version,
+                    layer,
+                });
+            }
         }
-        layers.sort_by_key(|layer| layer.z_index);
+        layers.sort_by(|a, b| {
+            b.layer
+                .z_index
+                .cmp(&a.layer.z_index)
+                .then_with(|| a.plugin_id.cmp(&b.plugin_id))
+                .then_with(|| a.module_id.cmp(&b.module_id))
+        });
         layers
     }
 
@@ -626,8 +743,92 @@ impl UiPluginManager {
     /// applied. Used by the scheduled tick so a failed hot-reload (which leaves
     /// `changed_ui_modules` empty and may also fail `dispatch_tick`) still
     /// flushes its "reload failed" toast to the user instead of swallowing it.
+    /// Also true for parked API bridge calls (§5.4 chained-round budget) so a
+    /// parked batch keeps getting retried on the next tick instead of stalling.
     pub(crate) fn has_pending_updates(&self) -> bool {
-        !self.pending_notifications.is_empty() || !self.pending_effects.is_empty()
+        !self.pending_notifications.is_empty()
+            || !self.pending_effects.is_empty()
+            || !self.pending_api_effects.is_empty()
+    }
+
+    /// API v3 (§5): effects awaiting policy check + execution by
+    /// `App::apply_ui_plugin_effects`.
+    pub(crate) fn take_pending_api_effects(&mut self) -> Vec<PendingApiEffect> {
+        std::mem::take(&mut self.pending_api_effects)
+    }
+
+    /// API v3 (§5.4): re-queue effects that couldn't be processed within the
+    /// per-host-turn chained-round budget, so they are retried on the next tick
+    /// instead of being dropped.
+    pub(crate) fn park_pending_api_effects(&mut self, mut effects: Vec<PendingApiEffect>) {
+        self.pending_api_effects.append(&mut effects);
+    }
+
+    /// API v3 (§5.3): whether the still-registered module `(plugin_id,
+    /// module_id)` declared `capability` in its manifest. Used by the bridge's
+    /// capability-policy check before executing a `HostEffect::Api` call; a
+    /// module that vanished (unlinked mid-turn) reports `false`, which the
+    /// caller treats as a deny.
+    pub(crate) fn module_requests(
+        &self,
+        plugin_id: &str,
+        module_id: &str,
+        capability: crate::api::schema::PluginUiCapability,
+    ) -> bool {
+        self.modules
+            .iter()
+            .find(|module| module.plugin_id == plugin_id && module.module_id == module_id)
+            .is_some_and(|module| module.requests(capability))
+    }
+
+    /// API v3 (§4): dispatch a resolved click's `Action` event to the one
+    /// owning module. `action_id` is module-private and never interpreted here.
+    pub(crate) fn dispatch_action(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        action_id: String,
+        surface: UiSurface,
+        column: u16,
+        row: u16,
+        kind: UiActionKind,
+    ) -> bool {
+        let event = UiEvent::Action {
+            action_id,
+            surface,
+            column,
+            row,
+            kind,
+        };
+        self.dispatch_event_for_module(plugin_id, module_id, &event)
+    }
+
+    /// API v3 (§5.2/§5.4): deliver a bridge call's result. Discarded (not an
+    /// error) if the module was unlinked/disabled before dispatch — exactly-one-
+    /// result only holds while the module remains registered.
+    pub(crate) fn dispatch_api_result(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        request_id: String,
+        ok: bool,
+        response: Option<serde_json::Value>,
+        error: Option<String>,
+    ) -> bool {
+        if !self
+            .modules
+            .iter()
+            .any(|module| module.plugin_id == plugin_id && module.module_id == module_id)
+        {
+            return false;
+        }
+        let event = UiEvent::ApiResult {
+            request_id,
+            ok,
+            response,
+            error,
+        };
+        self.dispatch_event_for_module(plugin_id, module_id, &event)
     }
 
     fn dispatch_event(&mut self, event: &UiEvent) -> bool {
@@ -666,11 +867,11 @@ impl UiPluginManager {
         let started = Instant::now();
         let result = match self.runtime.as_mut() {
             Some(runtime) => runtime.dispatch(&module, event),
-            None => Ok(None),
+            None => Ok((None, false)),
         };
-        let update = match result {
-            Ok(Some(update)) => update,
-            Ok(None) => return false,
+        let (update, rebuilt) = match result {
+            Ok((Some(update), rebuilt)) => (update, rebuilt),
+            Ok((None, _)) => return false,
             Err(err) => {
                 tracing::warn!(
                     plugin_id = %module.plugin_id,
@@ -707,9 +908,44 @@ impl UiPluginManager {
                 module.plugin_id, module.module_id
             ));
         }
+        let negotiated_version = module.negotiated_version;
+        let (api_effects, other_effects): (Vec<HostEffect>, Vec<HostEffect>) = update
+            .effects
+            .iter()
+            .cloned()
+            .partition(|effect| matches!(effect, HostEffect::Api { .. }));
         self.pending_effects
-            .extend(filter_effects_for_module(&module, &update.effects));
-        self.loaded_updates.insert(key, update);
+            .extend(filter_effects_for_module(&module, &other_effects));
+        queue_api_effects(
+            &mut self.pending_api_effects,
+            plugin_id,
+            module_id,
+            api_effects,
+        );
+        if rebuilt {
+            // §6: a freshly (re)built instance (first event after a trap-recovery
+            // re-instantiation) must fully replace its surfaces instead of
+            // partial-merging into the pre-trap layers kept for last-good
+            // rendering. Clearing here makes the merge below see no old layers.
+            self.clear_module_cache(plugin_id, module_id);
+        }
+        let merged_layers = merge_layers(
+            self.loaded_updates
+                .get(&key)
+                .map(|old| old.layers.as_slice()),
+            update.layers,
+            negotiated_version,
+            update.scope,
+        );
+        self.loaded_updates.insert(
+            key,
+            UiUpdate {
+                layers: merged_layers,
+                effects: Vec::new(),
+                scope: update.scope,
+                consumed_action_ids: Vec::new(),
+            },
+        );
         true
     }
 
@@ -720,6 +956,83 @@ impl UiPluginManager {
                 .instances
                 .contains_key(&(plugin_id.to_string(), module_id.to_string()))
         })
+    }
+}
+
+/// Spec §5.4 per-update budget: at most `MAX_API_EFFECTS_PER_UPDATE` `Api`
+/// effects from one update are executed; the rest are queued pre-refused with
+/// `api_budget_exhausted` so every request still resolves to exactly one result
+/// instead of being silently dropped. Takes the queue field directly (rather
+/// than being a `&mut self` method) so the borrow checker can see it touches
+/// only `pending_api_effects`, not the `modules` field the caller still holds a
+/// live reference into.
+fn queue_api_effects(
+    queue: &mut Vec<PendingApiEffect>,
+    plugin_id: &str,
+    module_id: &str,
+    effects: Vec<HostEffect>,
+) {
+    for (idx, effect) in effects.into_iter().enumerate() {
+        let HostEffect::Api {
+            request_id,
+            method,
+            params,
+        } = effect
+        else {
+            continue;
+        };
+        let budget_exhausted = idx >= MAX_API_EFFECTS_PER_UPDATE;
+        if budget_exhausted {
+            tracing::warn!(
+                plugin_id,
+                module_id,
+                request_id = %request_id,
+                method = %method,
+                "ui plugin api effect refused: per-update budget exhausted"
+            );
+        }
+        queue.push(PendingApiEffect {
+            plugin_id: plugin_id.to_string(),
+            module_id: module_id.to_string(),
+            request_id,
+            method,
+            params,
+            budget_exhausted,
+        });
+    }
+}
+
+/// Spec §6 update merge semantics. v2 modules (and any v3 update with an
+/// explicit `"full"` scope) fully replace the cached layer set; v3 modules'
+/// default `"partial"` scope merges by surface: every surface named in
+/// `incoming` replaces all of its old z-levels at once (there is no per-layer
+/// partial update — `UiLayer` has no id), leaving unnamed surfaces untouched. An
+/// incoming update naming no surfaces is therefore a pure no-op.
+fn merge_layers(
+    old: Option<&[UiLayer]>,
+    incoming: Vec<UiLayer>,
+    negotiated_version: u32,
+    scope: UiUpdateScope,
+) -> Vec<UiLayer> {
+    let effective_scope = if negotiated_version == 3 {
+        scope
+    } else {
+        UiUpdateScope::Full
+    };
+    match effective_scope {
+        UiUpdateScope::Full => incoming,
+        UiUpdateScope::Partial => {
+            let touched_surfaces: std::collections::HashSet<UiSurface> =
+                incoming.iter().map(|layer| layer.surface).collect();
+            let mut merged: Vec<UiLayer> = old
+                .unwrap_or(&[])
+                .iter()
+                .filter(|layer| !touched_surfaces.contains(&layer.surface))
+                .cloned()
+                .collect();
+            merged.extend(incoming);
+            merged
+        }
     }
 }
 
@@ -740,6 +1053,10 @@ fn module_accepts_event(module: &RegisteredUiModule, event: &UiEvent) -> bool {
                 || module.requests(crate::api::schema::PluginUiCapability::FocusedSession)
         }
         UiEvent::Tick | UiEvent::ReloadRequested => true,
+        // Spec §2 enforcement point: v3 event kinds are delivered only to
+        // negotiated-v3 modules. No new capability gate — §4 hits and §5
+        // requests already imply wanting the corresponding event.
+        UiEvent::Action { .. } | UiEvent::ApiResult { .. } => module.negotiated_version == 3,
     }
 }
 
@@ -768,6 +1085,11 @@ fn filter_effects_for_module(
             HostEffect::InvokePluginAction { .. } => {
                 module.requests(crate::api::schema::PluginUiCapability::PluginActions)
             }
+            // Api effects are never routed through this generic capability
+            // filter: `dispatch_event_for_module` extracts and queues them
+            // separately (via `queue_api_effects`) before this function ever
+            // sees `other_effects`, so this arm exists only for exhaustiveness.
+            HostEffect::Api { .. } => false,
         })
         .cloned()
         .collect()
@@ -875,6 +1197,9 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::Toasts => UiCapability::Toasts,
         crate::api::schema::PluginUiCapability::OpenPluginPanes => UiCapability::OpenPluginPanes,
         crate::api::schema::PluginUiCapability::PluginActions => UiCapability::PluginActions,
+        crate::api::schema::PluginUiCapability::ApiRead => UiCapability::ApiRead,
+        crate::api::schema::PluginUiCapability::ApiWrite => UiCapability::ApiWrite,
+        crate::api::schema::PluginUiCapability::ApiInput => UiCapability::ApiInput,
     }
 }
 
@@ -979,7 +1304,7 @@ mod tests {
         assert_eq!(items[0].id, "plugin:example.goal-ui:fork");
         let layers = manager.surface_layers();
         assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].surface, UiSurface::Header);
+        assert_eq!(layers[0].layer.surface, UiSurface::Header);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1037,7 +1362,7 @@ mod tests {
             plugin,
         )]));
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Initial");
@@ -1050,7 +1375,7 @@ mod tests {
         });
         assert!(changed);
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "After mouse");
@@ -1119,7 +1444,7 @@ mod tests {
         assert!(!changed);
         assert!(manager.take_pending_effects().is_empty());
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Initial");
@@ -1199,7 +1524,7 @@ mod tests {
         );
         assert!(changed);
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "After frame");
@@ -1349,7 +1674,7 @@ mod tests {
             matches!(&effects[1], HostEffect::InvokePluginAction { plugin_id, action_id, payload_json: None } if plugin_id == "example.goal-ui" && action_id == "fork")
         );
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "After key");
@@ -1383,7 +1708,7 @@ mod tests {
         assert_eq!(manager.context_menu_items()[0].label, "Fork A");
         let layers = manager.surface_layers();
         assert_eq!(layers.len(), 1);
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Version A");
@@ -1396,7 +1721,7 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(manager.context_menu_items()[0].label, "Fork B");
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Version B");
@@ -1437,7 +1762,7 @@ mod tests {
         // the "reload failed" toast instead of swallowing it.
         assert!(manager.has_pending_updates());
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Version A");
@@ -1453,7 +1778,7 @@ mod tests {
         let changed = manager.detect_changed_modules();
         assert_eq!(changed.len(), 1);
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node");
         };
         assert_eq!(spans[0].text, "Version B");
