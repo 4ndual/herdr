@@ -21,6 +21,7 @@ use std::sync::Mutex;
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 static REQUESTED_INITIAL: AtomicBool = AtomicBool::new(false);
+static STRIP_COLLAPSED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_WORKSPACE_HINT: Mutex<Option<String>> = Mutex::new(None);
 static WORKSPACES_LINE: Mutex<Option<String>> = Mutex::new(None);
 static PANES_LINE: Mutex<Option<String>> = Mutex::new(None);
@@ -80,6 +81,10 @@ enum HostEffectV3 {
         request_id: String,
         method: String,
         params: Value,
+    },
+    SetSurfaceCollapsed {
+        surface: UiSurface,
+        collapsed: bool,
     },
 }
 
@@ -185,6 +190,16 @@ fn handle_action(action: &ActionEvent) -> UiUpdateV3 {
             render_update(Vec::new())
         }
         "demo:refresh" => render_update(refresh_effects()),
+        // Item H (§7.2): collapse/expand the bottom usage strip. Interim home
+        // for the toggle until usage-dash is a linked v3 plugin owning it.
+        "demo:toggle_strip" => {
+            let collapsed = !STRIP_COLLAPSED.load(Ordering::SeqCst);
+            STRIP_COLLAPSED.store(collapsed, Ordering::SeqCst);
+            render_update(vec![HostEffectV3::SetSurfaceCollapsed {
+                surface: UiSurface::UsageStrip,
+                collapsed,
+            }])
+        }
         "demo:split" => render_update(vec![HostEffectV3::Api {
             request_id: REQ_SPLIT.to_string(),
             method: "pane.split".to_string(),
@@ -285,10 +300,7 @@ fn summarize_workspaces(response: Option<&Value>) -> String {
                 .iter()
                 .map(|w| {
                     let label = w.get("label").and_then(Value::as_str).unwrap_or("?");
-                    let id = w
-                        .get("workspace_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("?");
+                    let id = w.get("workspace_id").and_then(Value::as_str).unwrap_or("?");
                     format!("{label}({id})")
                 })
                 .collect();
@@ -448,6 +460,21 @@ fn right_panel_layer() -> UiLayer {
         "\u{26A0} hang",
         "demo:hang",
         "danger",
+    );
+    push_gap(&mut demo_spans, &mut demo_col, "  ");
+    let strip_label = if STRIP_COLLAPSED.load(Ordering::SeqCst) {
+        "\u{00BB} strip"
+    } else {
+        "\u{00AB} strip"
+    };
+    push_button(
+        &mut demo_spans,
+        &mut hits,
+        &mut demo_col,
+        demo_row,
+        strip_label,
+        "demo:toggle_strip",
+        "teal",
     );
     nodes.push(UiNode::Line { spans: demo_spans });
 

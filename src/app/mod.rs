@@ -85,14 +85,9 @@ fn read_ui_input_blob(
         }
     }
     use std::io::Read;
-    let mut file = std::fs::File::open(&path).ok()?;
+    let file = std::fs::File::open(&path).ok()?;
     let mut buf = Vec::new();
-    if file
-        .by_ref()
-        .take(MAX_UI_INPUT_BYTES)
-        .read_to_end(&mut buf)
-        .is_err()
-    {
+    if file.take(MAX_UI_INPUT_BYTES).read_to_end(&mut buf).is_err() {
         return None;
     }
     if meta.len() > MAX_UI_INPUT_BYTES {
@@ -621,6 +616,7 @@ impl App {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             usage_strip_enabled: config.ui.usage_strip,
+            collapsed_surfaces: std::collections::HashSet::new(),
             goal_panel_visible: config.ui.goal_panel,
             goal_panel_width: config.ui.goal_panel_width,
             goal_panel_focused: false,
@@ -2328,6 +2324,15 @@ impl App {
                             },
                         ),
                     });
+                }
+                herdr_ui_plugin_api::HostEffect::SetSurfaceCollapsed { surface, collapsed } => {
+                    // Own-surface guard already enforced at queue time
+                    // (ui_plugins::filter_effects_for_module, §7.2).
+                    if collapsed {
+                        self.state.collapsed_surfaces.insert(surface);
+                    } else {
+                        self.state.collapsed_surfaces.remove(&surface);
+                    }
                 }
                 herdr_ui_plugin_api::HostEffect::Api {
                     request_id, method, ..

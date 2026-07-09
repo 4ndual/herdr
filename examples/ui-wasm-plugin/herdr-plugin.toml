@@ -22,7 +22,7 @@ kind = "wasm"
 api_version = 3
 module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
 hot_reload = "on"
-surfaces = ["header", "footer", "right_panel"]
+surfaces = ["header", "footer", "right_panel", "usage_strip"]
 capabilities = [
   "layout_read",
   "toasts",

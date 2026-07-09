@@ -1090,6 +1090,12 @@ fn filter_effects_for_module(
             HostEffect::InvokePluginAction { .. } => {
                 module.requests(crate::api::schema::PluginUiCapability::PluginActions)
             }
+            // §7.2 own-surface guard: a module may only collapse/expand
+            // surfaces it declares in its manifest — no capability required.
+            HostEffect::SetSurfaceCollapsed { surface, .. } => module
+                .surfaces
+                .iter()
+                .any(|declared| map_surface(*declared) == *surface),
             // Api effects are never routed through this generic capability
             // filter: `dispatch_event_for_module` extracts and queues them
             // separately (via `queue_api_effects`) before this function ever
@@ -1215,6 +1221,42 @@ mod tests {
         PluginHotReloadMode, PluginManifestUiModule, PluginUiCapability, PluginUiModuleKind,
         PluginUiSurface,
     };
+
+    #[test]
+    fn set_surface_collapsed_requires_declared_surface() {
+        let module = RegisteredUiModule {
+            plugin_id: "example.demo".into(),
+            module_id: "demo".into(),
+            title: "Demo".into(),
+            module_path: std::path::PathBuf::from("demo.wasm"),
+            manifest_path: std::path::PathBuf::from("herdr-plugin.toml"),
+            api_version: 3,
+            negotiated_version: 3,
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::RightPanel],
+            requested_capabilities: Vec::new(),
+            ui_input_file: None,
+        };
+        let effect = HostEffect::SetSurfaceCollapsed {
+            surface: UiSurface::UsageStrip,
+            collapsed: true,
+        };
+
+        // §7.2 own-surface guard: dropped when the surface is not declared.
+        assert!(filter_effects_for_module(&module, std::slice::from_ref(&effect)).is_empty());
+
+        let mut declaring = module.clone();
+        declaring.surfaces.push(PluginUiSurface::UsageStrip);
+        let kept = filter_effects_for_module(&declaring, std::slice::from_ref(&effect));
+        assert_eq!(kept.len(), 1);
+        assert!(matches!(
+            kept[0],
+            HostEffect::SetSurfaceCollapsed {
+                surface: UiSurface::UsageStrip,
+                collapsed: true,
+            }
+        ));
+    }
 
     fn write_static_wasm(path: &std::path::Path, json: &str) {
         let data = json

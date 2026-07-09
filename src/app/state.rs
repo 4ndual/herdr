@@ -1382,6 +1382,10 @@ pub struct AppState {
     /// Honors `[ui] usage_strip` at startup; `compute_view` skips carving the
     /// strip rect when false, so panes reclaim the full height.
     pub usage_strip_enabled: bool,
+    /// Surfaces collapsed at runtime via `HostEffect::SetSurfaceCollapsed`
+    /// (wasm-ui v3 §7.2). `compute_view` shrinks a collapsed surface's reserve
+    /// to a single row so panes reclaim the space. Pure data, not persisted.
+    pub collapsed_surfaces: std::collections::HashSet<herdr_ui_plugin_api::UiSurface>,
     /// Whether the native right-side goal panel is shown (feat/native-dashes).
     /// Pure data; the renderer reads it and `compute_view` sizes the panel.
     pub goal_panel_visible: bool,
@@ -1756,6 +1760,7 @@ impl AppState {
             sidebar_width_auto: false,
             sidebar_collapsed: false,
             usage_strip_enabled: true,
+            collapsed_surfaces: std::collections::HashSet::new(),
             goal_panel_visible: false,
             goal_panel_width: None,
             goal_panel_focused: false,

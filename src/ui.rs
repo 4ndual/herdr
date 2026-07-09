@@ -232,10 +232,20 @@ fn compute_view_internal(
     // out, so panes never overlap them. Both collapse to an empty Rect when there
     // isn't room (or the goal panel is toggled off). P4 will derive the strip
     // height from usage content instead of the fixed reserve used here.
+    // wasm-ui v3 §7.2: a runtime-collapsed strip keeps a single row (so an
+    // expand affordance stays clickable) and gives the rest back to panes.
+    let usage_strip_height = if app
+        .collapsed_surfaces
+        .contains(&herdr_ui_plugin_api::UiSurface::UsageStrip)
+    {
+        1
+    } else {
+        USAGE_STRIP_HEIGHT
+    };
     let (terminal_area, usage_dash_area) =
-        if app.usage_strip_enabled && terminal_area.height > USAGE_STRIP_HEIGHT + 3 {
+        if app.usage_strip_enabled && terminal_area.height > usage_strip_height + 3 {
             let [panes, strip] =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(USAGE_STRIP_HEIGHT)])
+                Layout::vertical([Constraint::Min(3), Constraint::Length(usage_strip_height)])
                     .areas(terminal_area);
             (panes, strip)
         } else {
@@ -1172,6 +1182,33 @@ mod tests {
 
         assert!(row.contains("Keybinding syntax changed"));
         assert!(!row.contains("config warning"));
+    }
+
+    #[test]
+    fn compute_view_collapsed_usage_strip_reserves_single_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.usage_strip_enabled = true;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_dash_area.height, USAGE_STRIP_HEIGHT);
+        let expanded_strip_top = app.view.usage_dash_area.y;
+
+        // wasm-ui v3 §7.2: collapsing keeps a single clickable row and gives
+        // the reclaimed rows back to the pane area above.
+        app.collapsed_surfaces
+            .insert(herdr_ui_plugin_api::UiSurface::UsageStrip);
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_dash_area.height, 1);
+        assert!(app.view.usage_dash_area.y > expanded_strip_top);
+
+        app.collapsed_surfaces
+            .remove(&herdr_ui_plugin_api::UiSurface::UsageStrip);
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_dash_area.height, USAGE_STRIP_HEIGHT);
     }
 
     #[test]

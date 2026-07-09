@@ -274,6 +274,15 @@ pub enum HostEffect {
         #[serde(default)]
         params: serde_json::Value,
     },
+    /// API v3 (§7.2): collapse/expand one of the module's own declared
+    /// surfaces. The host reclaims the surface's reserved rows for panes while
+    /// collapsed (usage strip: full reserve ↔ 1 row) and restores them on
+    /// expand. Filtered against the module's manifest `surfaces` — a module
+    /// can only collapse surfaces it declares.
+    SetSurfaceCollapsed {
+        surface: UiSurface,
+        collapsed: bool,
+    },
 }
 
 /// API v3 (§6) update merge scope. Only meaningful for v3 modules — v2 modules
