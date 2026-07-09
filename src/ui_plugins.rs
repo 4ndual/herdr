@@ -1818,7 +1818,7 @@ mod tests {
 
     fn header_text(manager: &UiPluginManager) -> String {
         let layers = manager.surface_layers();
-        let UiNode::Line { spans } = &layers[0].nodes[0] else {
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
             panic!("expected line node, got {:?}", layers.first());
         };
         spans[0].text.clone()
@@ -1830,6 +1830,10 @@ mod tests {
     /// per event the counter would reset, so the rendered digit proves guest
     /// linear memory persists.
     fn write_counter_wasm(path: &std::path::Path, template: &str) {
+        write_counter_wasm_versioned(path, template, 2);
+    }
+
+    fn write_counter_wasm_versioned(path: &std::path::Path, template: &str, api_version: u32) {
         let digit_offset = template
             .find('@')
             .expect("template needs a '@' placeholder");
@@ -1845,7 +1849,7 @@ mod tests {
                 (memory (export \"memory\") 1)
                 (global $counter (mut i32) (i32.const 0))
                 (data (i32.const 0) \"{data}\")
-                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const {api_version})
                 (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
                 (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {len})
                 (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 4096)
@@ -2036,6 +2040,50 @@ mod tests {
         assert_eq!(header_text(&manager), "0");
         // Outside the hit-rect: delivered, counter advances.
         assert!(manager.dispatch_crossterm_mouse_event(moved(0, 0)));
+        assert_eq!(header_text(&manager), "1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Spec §4 dedupe composition: a v3 module that declares a hit-rect owns the
+    /// clicks inside it via the `Action` route, so the raw `MouseAll` broadcast
+    /// for that same cell must be suppressed — the module must not receive both.
+    /// A left-down inside the rect leaves the guest's counter untouched (no raw
+    /// delivery), while an explicit `Action` dispatch does advance it, proving
+    /// the module stays reachable through the Action path only.
+    #[test]
+    fn v3_action_click_is_not_also_delivered_as_raw_mouse() {
+        let root = unique_root("f5-v3-dedupe");
+        write_counter_wasm_versioned(
+            &root.join("dist/goal-ui.wasm"),
+            r#"{"layers":[{"surface":"header","hits":[{"x":10,"y":0,"width":5,"height":1,"action_id":"a"}],"nodes":[{"kind":"line","spans":[{"text":"@"}]}]}]}"#,
+            3,
+        );
+        let mut plugin = plugin_at(&root);
+        plugin.ui_modules[0].api_version = 3;
+        let mut manager = installed(plugin);
+
+        assert_eq!(header_text(&manager), "0");
+        // Left-down inside the declared hit-rect: the Action route owns it, so the
+        // raw MouseAll broadcast is suppressed and the guest counter never moves.
+        let left_down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 12,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        assert!(!manager.dispatch_crossterm_mouse_event(left_down));
+        assert_eq!(header_text(&manager), "0");
+        // The same v3 module IS still reachable through the Action route.
+        assert!(manager.dispatch_action(
+            "example.goal-ui",
+            "goal-ui",
+            "a".into(),
+            UiSurface::Header,
+            2,
+            0,
+            UiActionKind::LeftDown,
+        ));
         assert_eq!(header_text(&manager), "1");
 
         let _ = std::fs::remove_dir_all(root);

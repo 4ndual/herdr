@@ -925,36 +925,7 @@ impl App {
                 needs_render = true;
             }
 
-            if let Some(request) = self.state.pending_plugin_action_invocation.take() {
-                if let Err(err) = self.invoke_plugin_action_from_ui_surface(
-                    request.plugin_id,
-                    request.action_id,
-                    request.context_menu_kind,
-                ) {
-                    tracing::warn!(err = %err, "failed to invoke ui-surface plugin action");
-                }
-                needs_render = true;
-            }
-
-            // §4: the v3 counterpart of the block above — `AppState::handle_mouse`
-            // (pure data) can only record the resolved click as a
-            // `PendingPluginUiAction`; only here, with access to the runtime
-            // `UiPluginManager`, can it actually be dispatched as an `Action`
-            // event and its resulting effects applied.
-            if let Some(action) = self.state.pending_plugin_ui_action.take() {
-                if self.ui_plugins.dispatch_action(
-                    &action.plugin_id,
-                    &action.module_id,
-                    action.action_id,
-                    action.surface,
-                    action.column,
-                    action.row,
-                    action.kind,
-                ) {
-                    self.refresh_ui_plugin_state_from_manager();
-                    self.apply_ui_plugin_notifications();
-                    self.apply_ui_plugin_effects();
-                }
+            if self.drain_pending_plugin_ui_actions() {
                 needs_render = true;
             }
 
@@ -1560,6 +1531,46 @@ impl App {
             }
             self.sync_prefix_input_source(previous_mode);
         }
+    }
+
+    /// Drains the plugin actions that `AppState::handle_mouse` (pure data) could
+    /// only record while resolving a click. Only here, with access to the runtime
+    /// `UiPluginManager`, can they take effect: the legacy `pending_plugin_action_invocation`
+    /// invokes a manifest-declared process action, and the §4
+    /// `pending_plugin_ui_action` is dispatched as a v3 `Action` event with its
+    /// resulting effects applied. Runs from BOTH the interactive `run()` loop and
+    /// the headless server input path — herdr runs headless in production, so
+    /// without the headless call v3 plugin buttons would be dead. Returns true if
+    /// any pending action was drained (the caller should re-render).
+    pub(crate) fn drain_pending_plugin_ui_actions(&mut self) -> bool {
+        let mut acted = false;
+        if let Some(request) = self.state.pending_plugin_action_invocation.take() {
+            if let Err(err) = self.invoke_plugin_action_from_ui_surface(
+                request.plugin_id,
+                request.action_id,
+                request.context_menu_kind,
+            ) {
+                tracing::warn!(err = %err, "failed to invoke ui-surface plugin action");
+            }
+            acted = true;
+        }
+        if let Some(action) = self.state.pending_plugin_ui_action.take() {
+            if self.ui_plugins.dispatch_action(
+                &action.plugin_id,
+                &action.module_id,
+                action.action_id,
+                action.surface,
+                action.column,
+                action.row,
+                action.kind,
+            ) {
+                self.refresh_ui_plugin_state_from_manager();
+                self.apply_ui_plugin_notifications();
+                self.apply_ui_plugin_effects();
+            }
+            acted = true;
+        }
+        acted
     }
 
     pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {

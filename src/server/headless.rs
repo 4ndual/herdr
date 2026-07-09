@@ -2311,6 +2311,16 @@ impl HeadlessServer {
             self.sync_foreground_client_state();
         }
 
+        // §4 headless mirror of the interactive `run()` drain: `route_client_events`
+        // (mouse handling) can only record a resolved click as a pending plugin
+        // action; only here can it be invoked / dispatched as an `Action` event.
+        // herdr runs headless in production (client + server), so without this
+        // mirror v3 plugin buttons and manifest ui-surface actions never fire.
+        let plugin_action_changed = self.app.drain_pending_plugin_ui_actions();
+        if plugin_action_changed {
+            self.sync_foreground_client_state();
+        }
+
         if self.app.state.detach_requested {
             self.app.state.detach_requested = false;
             info!(client_id, "client detach requested via keybind");
@@ -2329,7 +2339,7 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || interaction
+            foreground_changed || theme_changed || interaction || plugin_action_changed
         }
     }
 
