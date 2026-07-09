@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 herdr-ui-plugin-api = { path = "../../crates/herdr-ui-plugin-api" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [profile.release]

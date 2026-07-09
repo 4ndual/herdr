@@ -17,21 +17,15 @@ command = ["sh", "-lc", "printf 'fork action from %s\npayload %s\n' \"${HERDR_PL
 [[ui_modules]]
 id = "goal-ui"
 title = "Goal UI"
-description = "Adds header/footer/tab/context-menu layers without rebuilding Herdr"
+description = "v3 API bridge demo: stateful counter, gated api read/write, arbitrary action routing"
 kind = "wasm"
-api_version = 1
+api_version = 3
 module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
 hot_reload = "on"
-surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
+surfaces = ["header", "footer", "right_panel"]
 capabilities = [
-  "focused_session",
   "layout_read",
-  "mouse_all",
-  "keyboard_input",
-  "context_menu_augment",
-  "clipboard_write",
-  "pane_input",
-  "headless_actions",
   "toasts",
-  "plugin_actions",
+  "api_read",
+  "api_write",
 ]

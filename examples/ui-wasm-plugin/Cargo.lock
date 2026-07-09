@@ -15,6 +15,7 @@ version = "0.1.0"
 dependencies = [
  "dash-common",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -22,6 +23,7 @@ name = "herdr-ui-wasm-example"
 version = "0.1.0"
 dependencies = [
  "herdr-ui-plugin-api",
+ "serde",
  "serde_json",
 ]
 
