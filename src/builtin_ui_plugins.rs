@@ -47,6 +47,7 @@ fn builtin(
     plugin_dir_name: &str,
     wasm_file: &str,
     surface: PluginUiSurface,
+    api_version: u32,
 ) -> InstalledPluginInfo {
     let root = guest_release_dir(plugin_dir_name);
     InstalledPluginInfo {
@@ -55,7 +56,10 @@ fn builtin(
         version: env!("CARGO_PKG_VERSION").to_string(),
         min_herdr_version: String::new(),
         description: Some(format!("built-in {title} (wasm)")),
-        manifest_path: root.join("herdr-plugin.toml").to_string_lossy().into_owned(),
+        manifest_path: root
+            .join("herdr-plugin.toml")
+            .to_string_lossy()
+            .into_owned(),
         plugin_root: root.to_string_lossy().into_owned(),
         enabled: true,
         platforms: None,
@@ -69,7 +73,7 @@ fn builtin(
             description: None,
             platforms: None,
             kind: PluginUiModuleKind::Wasm,
-            api_version: herdr_ui_plugin_api::API_VERSION,
+            api_version,
             module: wasm_file.to_string(),
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![surface],
@@ -99,6 +103,11 @@ pub(crate) fn builtin_dash_plugins() -> Vec<InstalledPluginInfo> {
             "usage-dash-ui",
             "usage_dash_ui.wasm",
             PluginUiSurface::UsageStrip,
+            // Both builtin guests still hardcode `herdr_ui_api_version() -> 2`
+            // (plugins/usage-dash-ui, plugins/goal-dash-ui); the manifest's
+            // declared api_version must equal the actual export (§2), so this
+            // stays 2 regardless of the host's max-supported API_VERSION.
+            2,
         ),
         builtin(
             "builtin.goal-dash",
@@ -108,6 +117,7 @@ pub(crate) fn builtin_dash_plugins() -> Vec<InstalledPluginInfo> {
             "goal-dash-ui",
             "goal_dash_ui.wasm",
             PluginUiSurface::RightPanel,
+            2,
         ),
     ]
 }

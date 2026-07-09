@@ -83,6 +83,7 @@ mod terminal;
 mod terminal_notify;
 mod terminal_theme;
 mod ui;
+mod ui_plugin_api_bridge;
 mod ui_plugins;
 mod update;
 mod workspace;
