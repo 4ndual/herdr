@@ -608,6 +608,7 @@ fn plugin_link_list_unlink_round_trip() {
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::Header, PluginUiSurface::Footer, PluginUiSurface::TabBar, PluginUiSurface::RightPanel, PluginUiSurface::Overlay, PluginUiSurface::ContextMenu],
             capabilities: vec![PluginUiCapability::FocusedSession, PluginUiCapability::MouseAll, PluginUiCapability::ContextMenuAugment, PluginUiCapability::ClipboardWrite],
+            ui_input_file: None,
         }],
         link_handlers: vec![PluginManifestLinkHandler {
             id: "github-pr".into(),

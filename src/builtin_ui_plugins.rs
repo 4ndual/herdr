@@ -84,6 +84,7 @@ fn builtin(
                 PluginUiCapability::LayoutRead,
                 PluginUiCapability::FocusedSession,
             ],
+            ui_input_file: None,
         }],
         link_handlers: Vec::new(),
         source: PluginSourceInfo::default(),

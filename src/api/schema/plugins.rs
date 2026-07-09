@@ -292,6 +292,13 @@ pub struct PluginManifestUiModule {
     pub surfaces: Vec<PluginUiSurface>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<PluginUiCapability>,
+    /// Optional single path segment (no separators, no `..`) naming a file under
+    /// this module's `HERDR_PLUGIN_STATE_DIR`. When declared, the host reads the
+    /// file each frame (size-capped, mtime-cached) and injects its contents as
+    /// `HERDR_PLUGIN_UI_INPUT_JSON` in the module's frame env (spec §7.1). The
+    /// plugin's own process side writes the file; the host never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_input_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

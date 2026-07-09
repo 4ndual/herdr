@@ -44,6 +44,70 @@ const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
+/// Max bytes read from a module's `ui_input_file` (spec §7.1). Matches the
+/// existing guest memory-read bounds; larger files are truncated with a WARN.
+const MAX_UI_INPUT_BYTES: u64 = 64 * 1024;
+
+/// Resolve and read a module's `ui_input_file` under `state_dir` (spec §7.1),
+/// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached in `cache`. Returns
+/// the current contents, or `None` when the name is not a single path segment,
+/// or the file is missing/empty. Pure over its inputs so it is testable without
+/// the host's real state dir. The bytes are opaque — the host never parses them.
+fn read_ui_input_blob(
+    state_dir: &std::path::Path,
+    ui_input_file: &str,
+    key: (String, String),
+    cache: &mut HashMap<(String, String), (std::time::SystemTime, std::sync::Arc<str>)>,
+) -> Option<String> {
+    // Defense in depth: the manifest loader already rejects non-segment names,
+    // but never resolve one that slipped through outside the state dir.
+    if ui_input_file.is_empty()
+        || ui_input_file == "."
+        || ui_input_file == ".."
+        || ui_input_file.contains('/')
+        || ui_input_file.contains('\\')
+    {
+        tracing::warn!(
+            plugin_id = %key.0,
+            module_id = %key.1,
+            ui_input_file,
+            "ignoring ui_input_file: not a single path segment"
+        );
+        return None;
+    }
+    let path = state_dir.join(ui_input_file);
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    if let Some((cached_mtime, cached)) = cache.get(&key) {
+        if *cached_mtime == mtime {
+            let cached = cached.to_string();
+            return (!cached.is_empty()).then_some(cached);
+        }
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::new();
+    if file
+        .by_ref()
+        .take(MAX_UI_INPUT_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return None;
+    }
+    if meta.len() > MAX_UI_INPUT_BYTES {
+        tracing::warn!(
+            plugin_id = %key.0,
+            module_id = %key.1,
+            len = meta.len(),
+            cap = MAX_UI_INPUT_BYTES,
+            "ui_input_file exceeds cap; truncating"
+        );
+    }
+    let contents = String::from_utf8_lossy(&buf).into_owned();
+    cache.insert(key, (mtime, std::sync::Arc::from(contents.as_str())));
+    (!contents.is_empty()).then_some(contents)
+}
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -107,6 +171,11 @@ pub struct App {
     /// Registered hot-reloadable UI plugin modules discovered from the plugin registry.
     pub(crate) ui_plugins: crate::ui_plugins::UiPluginManager,
     pub(crate) last_ui_plugin_focus: Option<dash_common::FocusInput>,
+    /// Per-module mtime cache for `ui_input_file` reads (spec §7.1): keyed by
+    /// `(plugin_id, module_id)`, holds the last-seen mtime and file contents so
+    /// an unchanged file costs one `stat` and no re-read per frame.
+    pub(crate) ui_input_cache:
+        HashMap<(String, String), (std::time::SystemTime, std::sync::Arc<str>)>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -670,6 +739,7 @@ impl App {
             usage_snapshot: None,
             ui_plugins,
             last_ui_plugin_focus: None,
+            ui_input_cache: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -1645,11 +1715,19 @@ impl App {
                     module.negotiated_version,
                     module.surfaces.clone(),
                     serde_json::to_string(&module.manifest_ref()).ok(),
+                    module.ui_input_file.clone(),
                 )
             })
             .collect::<Vec<_>>();
         let mut changed = false;
-        for (plugin_id, module_id, negotiated_version, surfaces, manifest_json) in modules {
+        for (plugin_id, module_id, negotiated_version, surfaces, manifest_json, ui_input_file) in
+            modules
+        {
+            // §7.1: read the module's input file once per frame (mtime-cached),
+            // shared across all its surface events like `HERDR_LAYOUT_JSON`.
+            let ui_input_json = ui_input_file
+                .as_deref()
+                .and_then(|file| self.read_ui_input_json(&plugin_id, &module_id, file));
             for surface in surfaces {
                 let surface = match surface {
                     crate::api::schema::PluginUiSurface::Header => {
@@ -1698,6 +1776,7 @@ impl App {
                     &plugin_context,
                     &focus,
                     (negotiated_version == 3).then_some(layout_json.as_str()),
+                    ui_input_json.as_deref(),
                 );
                 changed |= self.ui_plugins.dispatch_frame(
                     &plugin_id,
@@ -1791,6 +1870,7 @@ impl App {
         plugin_context: &crate::api::schema::PluginInvocationContext,
         focus: &dash_common::FocusInput,
         layout_json: Option<&str>,
+        ui_input_json: Option<&str>,
     ) -> std::collections::HashMap<String, String> {
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
             ("HERDR_PLUGIN_ID".to_string(), plugin_id.to_string()),
@@ -1873,7 +1953,32 @@ impl App {
         if let Some(layout_json) = layout_json {
             env.insert("HERDR_LAYOUT_JSON".to_string(), layout_json.to_string());
         }
+        // §7.1: a module that declares `ui_input_file` gets its state-dir file's
+        // current contents as an opaque blob. The host does not parse it.
+        if let Some(ui_input_json) = ui_input_json {
+            env.insert(
+                "HERDR_PLUGIN_UI_INPUT_JSON".to_string(),
+                ui_input_json.to_string(),
+            );
+        }
         env
+    }
+
+    /// Read a module's declared `ui_input_file` from its state dir (spec §7.1),
+    /// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached. Returns the
+    /// current contents, or `None` when the module declares no file, the name is
+    /// not a single path segment, or the file is missing/empty. The host never
+    /// interprets the bytes — it moves an opaque UTF-8 blob from disk to the
+    /// guest via `HERDR_PLUGIN_UI_INPUT_JSON`.
+    fn read_ui_input_json(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        ui_input_file: &str,
+    ) -> Option<String> {
+        let state_dir = crate::plugin_paths::plugin_state_dir(plugin_id);
+        let key = (plugin_id.to_string(), module_id.to_string());
+        read_ui_input_blob(&state_dir, ui_input_file, key, &mut self.ui_input_cache)
     }
 
     /// Serialize the live [`usage_dash_core::model::UsageRenderInput`] for the
@@ -2413,6 +2518,7 @@ mod tests {
                 is_self_focus: false,
             },
             None,
+            None,
         );
 
         assert!(!env.contains_key("HERDR_LAYOUT_JSON"));
@@ -2483,11 +2589,106 @@ mod tests {
             &crate::api::schema::PluginInvocationContext::default(),
             &dash_common::FocusInput::default(),
             Some("{\"active_workspace_id\":null}"),
+            None,
         );
         assert_eq!(
             env.get("HERDR_LAYOUT_JSON").map(String::as_str),
             Some("{\"active_workspace_id\":null}")
         );
+        assert!(!env.contains_key("HERDR_PLUGIN_UI_INPUT_JSON"));
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_injects_ui_input_json_when_provided() {
+        let app = test_app();
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "usage",
+            None,
+            None,
+            &crate::api::schema::PluginInvocationContext::default(),
+            &dash_common::FocusInput::default(),
+            None,
+            Some("{\"snapshot\":null}"),
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_UI_INPUT_JSON").map(String::as_str),
+            Some("{\"snapshot\":null}")
+        );
+    }
+
+    #[test]
+    fn read_ui_input_blob_reads_present_omits_absent_and_caps_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-ui-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp state dir");
+        let key = ("plug".to_string(), "mod".to_string());
+        let mut cache = HashMap::new();
+
+        // Absent file ⇒ no key.
+        assert_eq!(
+            read_ui_input_blob(&dir, "missing.json", key.clone(), &mut cache),
+            None
+        );
+
+        // Present file ⇒ contents.
+        std::fs::write(dir.join("in.json"), b"{\"v\":1}").expect("write input");
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key.clone(), &mut cache).as_deref(),
+            Some("{\"v\":1}")
+        );
+
+        // Path traversal / separators ⇒ rejected, no read.
+        assert_eq!(
+            read_ui_input_blob(&dir, "../escape", key.clone(), &mut cache),
+            None
+        );
+
+        // Oversized file ⇒ truncated to the cap.
+        let big = "a".repeat((MAX_UI_INPUT_BYTES as usize) + 4096);
+        std::fs::write(dir.join("big.json"), big.as_bytes()).expect("write big input");
+        let got = read_ui_input_blob(&dir, "big.json", key, &mut cache).expect("some");
+        assert_eq!(got.len(), MAX_UI_INPUT_BYTES as usize);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_ui_input_blob_skips_reread_on_unchanged_mtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-ui-input-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp state dir");
+        let key = ("plug".to_string(), "mod".to_string());
+        let mut cache = HashMap::new();
+
+        std::fs::write(dir.join("in.json"), b"v1").expect("write input");
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key.clone(), &mut cache).as_deref(),
+            Some("v1")
+        );
+
+        // Poison the cache entry under the same mtime: an unchanged file must be
+        // served from cache without re-reading disk.
+        let (mtime, _) = cache.get(&key).cloned().expect("cached");
+        cache.insert(key.clone(), (mtime, std::sync::Arc::from("CACHED")));
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key, &mut cache).as_deref(),
+            Some("CACHED")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

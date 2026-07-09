@@ -102,6 +102,8 @@ struct RawPluginManifestUiModule {
     surfaces: Vec<PluginUiSurface>,
     #[serde(default)]
     capabilities: Vec<PluginUiCapability>,
+    #[serde(default)]
+    ui_input_file: Option<String>,
 }
 
 /// Raw string platform value from the manifest, validated before conversion.
@@ -511,6 +513,10 @@ fn normalize_manifest_ui_module(
             "ui module surfaces must declare at least one host surface".to_string(),
         ));
     }
+    let ui_input_file = match module.ui_input_file {
+        Some(name) => Some(normalize_ui_input_file(&name)?),
+        None => None,
+    };
     Ok(PluginManifestUiModule {
         id,
         title,
@@ -522,7 +528,28 @@ fn normalize_manifest_ui_module(
         hot_reload: module.hot_reload,
         surfaces: module.surfaces,
         capabilities: module.capabilities,
+        ui_input_file,
     })
+}
+
+/// Validate a module's `ui_input_file` (spec §7.1): a single non-empty path
+/// segment, with no separators and no parent refs. A rejected name fails
+/// manifest load so a bad declaration can never resolve outside the module's
+/// own `HERDR_PLUGIN_STATE_DIR`.
+fn normalize_ui_input_file(name: &str) -> Result<String, (&'static str, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err((
+            "invalid_plugin_ui_input_file",
+            "ui module ui_input_file must be a single path segment".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn normalize_manifest_event(
@@ -713,6 +740,7 @@ mod tests {
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::RightPanel],
             capabilities: vec![PluginUiCapability::FocusedSession],
+            ui_input_file: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
@@ -728,6 +756,7 @@ mod tests {
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![],
             capabilities: vec![PluginUiCapability::FocusedSession],
+            ui_input_file: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_surfaces");
@@ -757,6 +786,7 @@ mod tests {
                 PluginUiCapability::MouseAll,
                 PluginUiCapability::ContextMenuAugment,
             ],
+            ui_input_file: None,
         })
         .unwrap();
         assert_eq!(module.id, "goal-ui");
@@ -765,5 +795,37 @@ mod tests {
         assert_eq!(module.module, "dist/goal.wasm");
         assert_eq!(module.api_version, 1);
         assert_eq!(module.surfaces.len(), 6);
+    }
+
+    fn ui_module_with_input_file(name: &str) -> RawPluginManifestUiModule {
+        RawPluginManifestUiModule {
+            id: "usage".into(),
+            title: "Usage".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 3,
+            module: "dist/usage.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::UsageStrip],
+            capabilities: vec![PluginUiCapability::LayoutRead],
+            ui_input_file: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn ui_input_file_accepts_single_segment_and_trims() {
+        let module = normalize_manifest_ui_module(ui_module_with_input_file(" usage_input.json "))
+            .expect("plain filename is accepted");
+        assert_eq!(module.ui_input_file.as_deref(), Some("usage_input.json"));
+    }
+
+    #[test]
+    fn ui_input_file_rejects_path_traversal_and_separators() {
+        for bad in ["../escape.json", "sub/dir.json", "..", ".", "a\\b.json", "   "] {
+            let err = normalize_manifest_ui_module(ui_module_with_input_file(bad))
+                .expect_err("traversal/separator names must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_input_file");
+        }
     }
 }

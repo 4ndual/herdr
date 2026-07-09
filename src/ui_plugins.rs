@@ -33,6 +33,10 @@ pub(crate) struct RegisteredUiModule {
     pub hot_reload: PluginHotReloadMode,
     pub surfaces: Vec<PluginUiSurface>,
     pub requested_capabilities: Vec<crate::api::schema::PluginUiCapability>,
+    /// Manifest `ui_input_file` (spec §7.1): a state-dir filename whose contents
+    /// the host surfaces as `HERDR_PLUGIN_UI_INPUT_JSON` each frame. `None` when
+    /// the module declares no input file.
+    pub ui_input_file: Option<String>,
 }
 
 /// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
@@ -425,6 +429,7 @@ impl UiPluginManager {
                     hot_reload: module.hot_reload,
                     surfaces: module.surfaces.clone(),
                     requested_capabilities: module.capabilities.clone(),
+                    ui_input_file: module.ui_input_file.clone(),
                 };
                 let idx = manager.modules.len();
                 for surface in &registered.surfaces {
@@ -1254,6 +1259,7 @@ mod tests {
                     PluginUiCapability::FocusedSession,
                     PluginUiCapability::MouseAll,
                 ],
+                ui_input_file: None,
             }],
             link_handlers: vec![],
             source: Default::default(),
