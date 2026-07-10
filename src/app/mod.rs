@@ -48,6 +48,35 @@ const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 /// existing guest memory-read bounds; larger files are truncated with a WARN.
 const MAX_UI_INPUT_BYTES: u64 = 64 * 1024;
 
+/// Plugin id and `ui_input_file` name for the interim host-side usage writer
+/// (item C). The filename MUST equal `ui_input_file` in plugins/usage-dash-ui's
+/// manifest, and the id MUST equal the id the usage module registers under, so
+/// item B's generic reader resolves the same `HERDR_PLUGIN_STATE_DIR` file. This
+/// whole writer relocates into the usage-dash plugin's own collector process in
+/// items D/E — it is the last usage-specific code path in core after item C.
+const USAGE_DASH_PLUGIN_ID: &str = "builtin.usage-dash";
+const USAGE_DASH_INPUT_FILE: &str = "usage_input.json";
+
+/// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
+/// side): write a sibling temp file then rename it into place, so item B's
+/// mtime-cached reader never observes a torn file. Creates `state_dir` when
+/// missing. Pure over its inputs so it is testable against a temp dir.
+fn write_ui_input_atomic(
+    state_dir: &std::path::Path,
+    filename: &str,
+    contents: &str,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let final_path = state_dir.join(filename);
+    let tmp_path = state_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, contents.as_bytes())?;
+    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Resolve and read a module's `ui_input_file` under `state_dir` (spec §7.1),
 /// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached in `cache`. Returns
 /// the current contents, or `None` when the name is not a single path segment,
@@ -1938,14 +1967,6 @@ impl App {
             "HERDR_FOCUS_AGENT".to_string(),
             format!("{:?}", focus.agent).to_lowercase(),
         );
-        // feat/native-dashes: the usage strip is rendered by the built-in WASM
-        // plugin, which has zero I/O. Feed it the live render input (snapshot +
-        // view toggles + host-computed reset-time strings) as JSON each frame.
-        if plugin_id == "builtin.usage-dash" {
-            if let Some(json) = self.usage_render_input_json() {
-                env.insert("HERDR_USAGE_RENDER_JSON".to_string(), json);
-            }
-        }
         if let Some(layout_json) = layout_json {
             env.insert("HERDR_LAYOUT_JSON".to_string(), layout_json.to_string());
         }
@@ -2009,6 +2030,28 @@ impl App {
             weekly_abs,
         };
         serde_json::to_string(&input).ok()
+    }
+
+    /// Interim item-C writer: serialize the live usage render input and
+    /// atomically write it to the usage-dash module's state dir as
+    /// `usage_input.json`, where item B's generic `ui_input_file` reader surfaces
+    /// it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the dash tick
+    /// (~1 Hz), matching today's per-frame freshness. A failed write is logged
+    /// and swallowed so it never stalls or panics the render loop. This is the
+    /// last usage-specific path in core after item C; it relocates into the
+    /// usage-dash plugin's own collector process in items D/E.
+    pub(crate) fn write_usage_input_file(&self) {
+        let Some(json) = self.usage_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(USAGE_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, USAGE_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = USAGE_DASH_PLUGIN_ID,
+                "failed to write usage input file for the usage-dash plugin"
+            );
+        }
     }
 
     pub(crate) fn apply_ui_plugin_notifications(&mut self) {
@@ -2692,6 +2735,52 @@ mod tests {
             read_ui_input_blob(&dir, "in.json", key, &mut cache).as_deref(),
             Some("CACHED")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_input_written_atomically_is_surfaced_by_generic_reader() {
+        // Item C end-to-end on the host side: the interim writer serializes the
+        // live usage render input and writes it to the module's state dir; item
+        // B's generic ui_input_file reader must surface the exact bytes the guest
+        // will parse (which are then injected as HERDR_PLUGIN_UI_INPUT_JSON).
+        let app = test_app();
+        let json = app
+            .usage_render_input_json()
+            .expect("render input serializes");
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-usage-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        write_ui_input_atomic(&dir, USAGE_DASH_INPUT_FILE, &json).expect("atomic write succeeds");
+        assert!(
+            !dir.join(format!(
+                ".{USAGE_DASH_INPUT_FILE}.{}.tmp",
+                std::process::id()
+            ))
+            .exists(),
+            "the temp file is renamed into place, never left behind"
+        );
+
+        let mut cache = HashMap::new();
+        let surfaced = read_ui_input_blob(
+            &dir,
+            USAGE_DASH_INPUT_FILE,
+            (USAGE_DASH_PLUGIN_ID.to_string(), "usage".to_string()),
+            &mut cache,
+        )
+        .expect("generic reader surfaces the written file");
+        assert_eq!(surfaced, json, "reader returns the exact written bytes");
+
+        let parsed: usage_dash_core::model::UsageRenderInput =
+            serde_json::from_str(&surfaced).expect("surfaced bytes parse as the guest wire type");
+        assert_eq!(parsed.stats_shown, app.usage_view.stats_shown);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

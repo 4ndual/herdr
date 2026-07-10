@@ -137,6 +137,7 @@ dependencies = [
  "dash-common",
  "ratatui",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

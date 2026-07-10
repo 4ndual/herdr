@@ -1,0 +1,31 @@
+id = "builtin.usage-dash"
+name = "Usage Dashboard"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Per-session token / context / rate-limit usage strip (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module. Runs in this plugin dir, so the wasm lands at the
+# module path below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "usage"
+title = "Usage Dash"
+kind = "wasm"
+# v3: reads the generic HERDR_PLUGIN_UI_INPUT_JSON transport (spec §7.1) instead
+# of the wave-0 host-specific HERDR_USAGE_RENDER_JSON env key. Toggle state stays
+# host-owned via the existing usage_view/hits shim until items D/E relocate it.
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/usage_dash_ui.wasm"
+hot_reload = "on"
+surfaces = ["usage_strip"]
+# Frame events (per-tick render input + rect) are delivered only to modules that
+# request LayoutRead or FocusedSession.
+capabilities = ["layout_read", "focused_session"]
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
+# (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
+# host writes it today (interim, relocating to a plugin collector in D/E); the
+# generic machinery neither parses nor understands the contents.
+ui_input_file = "usage_input.json"

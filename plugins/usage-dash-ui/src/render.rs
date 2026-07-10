@@ -14,7 +14,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap};
-use usage_dash_model::{countdown, fmt_k, Cli, ThreadState, UsageRenderInput, UsageSnapshot, DAILY_BUDGET_PCT};
+use usage_dash_model::{
+    countdown, fmt_k, Cli, ThreadState, UsageRenderInput, UsageSnapshot, DAILY_BUDGET_PCT,
+};
 
 const DIM: Color = Color::DarkGray;
 /// Fixed bar width for the left box (keeps the shrink-to-fit measurement stable).
@@ -134,7 +136,13 @@ fn dash_row(name: &str) -> Line<'static> {
 /// One window row: label, bar, pct, countdown · absolute, optional (shared).
 /// `abs` is the pre-formatted reset time string (supplied by the host since WASM
 /// can't call `date`). Pass `""` when there is no reset time.
-fn window_row(name: &str, w: &usage_dash_model::Window, bar_w: usize, now: i64, abs: &str) -> Line<'static> {
+fn window_row(
+    name: &str,
+    w: &usage_dash_model::Window,
+    bar_w: usize,
+    now: i64,
+    abs: &str,
+) -> Line<'static> {
     if w.used_pct.is_none() {
         return dash_row(name);
     }
@@ -199,7 +207,12 @@ fn caption_line(snap: &UsageSnapshot) -> Line<'static> {
 }
 
 /// The USAGE left-column cells: ctx, 5h, week, today.
-fn usage_cells(snap: &UsageSnapshot, now: i64, five_hour_abs: &str, weekly_abs: &str) -> Vec<Line<'static>> {
+fn usage_cells(
+    snap: &UsageSnapshot,
+    now: i64,
+    five_hour_abs: &str,
+    weekly_abs: &str,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(ctx_row(snap, BAR_W));
     lines.push(window_row("5h", &snap.five_hour, BAR_W, now, five_hour_abs));

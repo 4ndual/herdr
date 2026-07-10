@@ -108,6 +108,11 @@ pub fn tick(app: &mut App) {
         RefreshOutcome::Clear => app.usage_snapshot = None,
         RefreshOutcome::KeepPrevious => {}
     }
+    // Interim item-C data path: publish the fresh render input to the usage-dash
+    // plugin's state dir, where item B's generic ui_input_file reader surfaces it
+    // as HERDR_PLUGIN_UI_INPUT_JSON. This host-side writer (and this call site)
+    // relocate into the plugin's own collector process in items D/E.
+    app.write_usage_input_file();
 
     app.goal_dash.refresh(focus);
     let effects = app.goal_dash.poll();
