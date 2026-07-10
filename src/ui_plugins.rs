@@ -2159,8 +2159,14 @@ mod tests {
         let root = unique_root("g-v2-compat");
         write_v2_usage_compat_guest_wasm(&root.join("dist/goal-ui.wasm"));
         let mut plugin = plugin_at(&root);
-        // Declare the surface the frozen guest actually paints.
+        // Declare the surface the frozen guest actually paints and pin its
+        // capabilities to upstream-safe (pre-v3) ones only, so this fixture never
+        // depends on a fork-only capability variant.
         plugin.ui_modules[0].surfaces = vec![PluginUiSurface::UsageStrip];
+        plugin.ui_modules[0].capabilities = vec![
+            PluginUiCapability::FocusedSession,
+            PluginUiCapability::LayoutRead,
+        ];
 
         let mut manager = installed(plugin);
 
