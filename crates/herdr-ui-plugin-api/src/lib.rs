@@ -1,8 +1,42 @@
-use dash_common::FocusInput;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub const API_VERSION: u32 = 3;
+
+/// Which agent CLI occupies the focused pane. Part of the focused-session
+/// context the bridge delivers to plugins (the `FocusedSession` capability and
+/// the `HERDR_FOCUS_*` frame env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AgentKind {
+    Claude,
+    Codex,
+    Pi,
+    /// Focused pane is a plain shell / non-agent (or nothing focused).
+    #[default]
+    None,
+}
+
+/// What herdr knows about the focused pane, delivered to plugin surfaces through
+/// the WASM UI bridge: the `FocusedSession` capability, the `HERDR_FOCUS_*` frame
+/// env, and `UiEvent::FocusChanged`. The host fills it from its own `AppState`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FocusInput {
+    /// Agent session id keyed into the usage store (often a transcript stem).
+    /// For path-backed sessions like pi, herdr derives this from the session
+    /// file stem so the reader can still resolve transcript files.
+    pub session_id: Option<String>,
+    /// Raw native session reference used to resume the focused agent backend.
+    /// Examples: Claude/Codex UUID, Pi session path.
+    pub session_ref: Option<String>,
+    /// Working directory of the focused pane, used for cwd-keyed sources.
+    pub cwd: Option<PathBuf>,
+    /// Which agent CLI is focused.
+    pub agent: AgentKind,
+    /// True when the focused pane is a plugin surface/self — the host asks the
+    /// plugin to keep its previous snapshot (sticky, no flicker).
+    pub is_self_focus: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +64,6 @@ pub enum UiCapability {
     ContextMenuAugment,
     ClipboardWrite,
     PaneInput,
-    HeadlessActions,
     Toasts,
     OpenPluginPanes,
     PluginActions,

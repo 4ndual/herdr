@@ -115,16 +115,16 @@ pub(super) fn spinner_frame(tick: u32) -> &'static str {
 /// feat/native-dashes: anchor area for desktop herdr toasts that keeps them clear
 /// of the native dashboards. The bottom usage strip sits along the window bottom
 /// and the goal panel along the right edge; a bottom/right-anchored toast drawn
-/// against the full window would overlap them and (since `dash::route_mouse`
+/// against the full window would overlap them and (since `usage_host::route_mouse`
 /// resolves the usage strip and goal panel before the toast) have its clicks
 /// swallowed by the strip. Shrinking the anchor by those rects moves the toast
 /// just above the strip and left of the panel so render and hit-area agree.
-fn toast_desktop_anchor_area(area: Rect, usage_dash_area: Rect, goal_dash_area: Rect) -> Rect {
+fn toast_desktop_anchor_area(area: Rect, usage_strip_rect: Rect, right_panel_rect: Rect) -> Rect {
     Rect::new(
         area.x,
         area.y,
-        area.width.saturating_sub(goal_dash_area.width),
-        area.height.saturating_sub(usage_dash_area.height),
+        area.width.saturating_sub(right_panel_rect.width),
+        area.height.saturating_sub(usage_strip_rect.height),
     )
 }
 
@@ -239,7 +239,7 @@ fn compute_view_internal(
     } else {
         USAGE_STRIP_HEIGHT
     };
-    let (terminal_area, usage_dash_area) =
+    let (terminal_area, usage_strip_rect) =
         if app.usage_strip_enabled && terminal_area.height > usage_strip_height + 3 {
             let [panes, strip] =
                 Layout::vertical([Constraint::Min(3), Constraint::Length(usage_strip_height)])
@@ -251,7 +251,7 @@ fn compute_view_internal(
     // The right-panel surface has no active host consumer in wave 1 (goal-dash
     // core is removed; plugin-driven docks are wave 2), so it is never carved —
     // the surface rect function still resolves it (dormant at 0×0).
-    let goal_dash_area = Rect::default();
+    let right_panel_rect = Rect::default();
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
@@ -308,7 +308,7 @@ fn compute_view_internal(
         );
     }
 
-    let toast_anchor_area = toast_desktop_anchor_area(area, usage_dash_area, goal_dash_area);
+    let toast_anchor_area = toast_desktop_anchor_area(area, usage_strip_rect, right_panel_rect);
     let toast_hit_area = app
         .toast
         .as_ref()
@@ -337,8 +337,8 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
-        usage_dash_area,
-        goal_dash_area,
+        usage_strip_rect,
+        right_panel_rect,
     };
 }
 
@@ -408,8 +408,8 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
-        usage_dash_area: Rect::default(),
-        goal_dash_area: Rect::default(),
+        usage_strip_rect: Rect::default(),
+        right_panel_rect: Rect::default(),
     };
 }
 
@@ -511,8 +511,8 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
         }
         UiSurface::TabBar => app.view.tab_bar_rect,
         UiSurface::Sidebar => app.view.sidebar_rect,
-        UiSurface::RightPanel => app.view.goal_dash_area,
-        UiSurface::UsageStrip => app.view.usage_dash_area,
+        UiSurface::RightPanel => app.view.right_panel_rect,
+        UiSurface::UsageStrip => app.view.usage_strip_rect,
         UiSurface::Overlay => app.view.terminal_area,
         UiSurface::ContextMenu => frame_area,
     }
@@ -614,8 +614,8 @@ pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
         app.view.tab_bar_rect,
         app.view.terminal_area,
         app.view.mobile_header_rect,
-        app.view.goal_dash_area,
-        app.view.usage_dash_area,
+        app.view.right_panel_rect,
+        app.view.usage_strip_rect,
     ];
     let mut min_x = u16::MAX;
     let mut min_y = u16::MAX;
@@ -853,8 +853,8 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
             // and goal panel so render matches the hit-area set in compute_view.
             let toast_anchor_area = toast_desktop_anchor_area(
                 frame.area(),
-                app.view.usage_dash_area,
-                app.view.goal_dash_area,
+                app.view.usage_strip_rect,
+                app.view.right_panel_rect,
             );
             render_toast_notification(
                 frame,
@@ -1180,21 +1180,21 @@ mod tests {
         app.usage_strip_enabled = true;
 
         compute_view(&mut app, Rect::new(0, 0, 80, 24));
-        assert_eq!(app.view.usage_dash_area.height, USAGE_STRIP_HEIGHT);
-        let expanded_strip_top = app.view.usage_dash_area.y;
+        assert_eq!(app.view.usage_strip_rect.height, USAGE_STRIP_HEIGHT);
+        let expanded_strip_top = app.view.usage_strip_rect.y;
 
         // wasm-ui v3 §7.2: collapsing keeps a single clickable row and gives
         // the reclaimed rows back to the pane area above.
         app.collapsed_surfaces
             .insert(herdr_ui_plugin_api::UiSurface::UsageStrip);
         compute_view(&mut app, Rect::new(0, 0, 80, 24));
-        assert_eq!(app.view.usage_dash_area.height, 1);
-        assert!(app.view.usage_dash_area.y > expanded_strip_top);
+        assert_eq!(app.view.usage_strip_rect.height, 1);
+        assert!(app.view.usage_strip_rect.y > expanded_strip_top);
 
         app.collapsed_surfaces
             .remove(&herdr_ui_plugin_api::UiSurface::UsageStrip);
         compute_view(&mut app, Rect::new(0, 0, 80, 24));
-        assert_eq!(app.view.usage_dash_area.height, USAGE_STRIP_HEIGHT);
+        assert_eq!(app.view.usage_strip_rect.height, USAGE_STRIP_HEIGHT);
     }
 
     #[test]

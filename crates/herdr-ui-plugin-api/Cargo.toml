@@ -6,7 +6,6 @@ description = "Versioned host/plugin contract for Herdr WASM UI modules"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-dash-common = { path = "../dash-common" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ratatui = { version = "0.30", default-features = false, optional = true }

@@ -29,4 +29,4 @@ api_version = 1
 module = "dist/goal-ui.wasm"
 hot_reload = "on"
 surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
-capabilities = ["focused_session", "mouse_all", "context_menu_augment", "clipboard_write", "pane_input", "headless_actions"]
+capabilities = ["focused_session", "mouse_all", "context_menu_augment", "clipboard_write", "pane_input"]
