@@ -98,12 +98,10 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4;
 
-// feat/native-dashes: fixed reserve for the bottom usage strip and the bounds of
-// the toggleable right goal panel. P4 will derive the strip height from usage
-// content height rather than reserving a fixed band.
+// feat/native-dashes: fixed reserve for the bottom usage strip surface. P4 will
+// derive the strip height from usage content height rather than reserving a
+// fixed band.
 const USAGE_STRIP_HEIGHT: u16 = 7;
-const GOAL_PANEL_MIN_WIDTH: u16 = 28;
-const GOAL_PANEL_MAX_WIDTH: u16 = 56; // num + space + dot + separator
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -227,10 +225,9 @@ fn compute_view_internal(
         (Rect::default(), main_area)
     };
 
-    // feat/native-dashes: carve the persistent bottom usage strip and the
-    // toggleable right goal panel out of the terminal area before panes are laid
-    // out, so panes never overlap them. Both collapse to an empty Rect when there
-    // isn't room (or the goal panel is toggled off). P4 will derive the strip
+    // feat/native-dashes: carve the persistent bottom usage strip surface out of
+    // the terminal area before panes are laid out, so panes never overlap it. It
+    // collapses to an empty Rect when there isn't room. P4 will derive the strip
     // height from usage content instead of the fixed reserve used here.
     // wasm-ui v3 §7.2: a runtime-collapsed strip keeps a single row (so an
     // expand affordance stays clickable) and gives the rest back to panes.
@@ -251,21 +248,10 @@ fn compute_view_internal(
         } else {
             (terminal_area, Rect::default())
         };
-    let (terminal_area, goal_dash_area) = if app.goal_panel_visible
-        && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
-    {
-        let auto_w = (terminal_area.width / 4).clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH);
-        let panel_w = app
-            .goal_panel_width
-            .unwrap_or(auto_w)
-            .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
-            .min(terminal_area.width.saturating_sub(24));
-        let [panes, panel] = Layout::horizontal([Constraint::Min(24), Constraint::Length(panel_w)])
-            .areas(terminal_area);
-        (panes, panel)
-    } else {
-        (terminal_area, Rect::default())
-    };
+    // The right-panel surface has no active host consumer in wave 1 (goal-dash
+    // core is removed; plugin-driven docks are wave 2), so it is never carved —
+    // the surface rect function still resolves it (dormant at 0×0).
+    let goal_dash_area = Rect::default();
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);

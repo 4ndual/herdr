@@ -1,7 +1,6 @@
-use dash_common::{AgentKind, FocusInput, HeadlessMode};
+use dash_common::FocusInput;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 pub const API_VERSION: u32 = 3;
 
@@ -238,15 +237,6 @@ pub enum HostEffect {
     CopyText(String),
     SendPaneKeys {
         lines: Vec<String>,
-    },
-    SpawnHeadless {
-        agent: AgentKind,
-        mode: HeadlessMode,
-        sid: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_ref: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<PathBuf>,
     },
     ShowToast {
         message: String,

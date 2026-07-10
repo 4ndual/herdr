@@ -1,20 +1,20 @@
-//! Built-in WASM UI dash plugins (usage strip + goal panel).
+//! Built-in WASM UI dash plugin (usage strip).
 //!
-//! Herdr's two dashboards are rendered exclusively by WASM UI plugins — there is
-//! no native fallback renderer. These builtins register the bundled guest
-//! `.wasm` modules so they load automatically at startup, the same way a
+//! Herdr's usage strip is rendered exclusively by a WASM UI plugin — there is
+//! no native fallback renderer. This builtin registers the bundled guest
+//! `.wasm` module so it loads automatically at startup, the same way a
 //! `plugin link`-ed plugin would, without requiring the user to install anything.
 //!
-//! The data layer stays native: the host collects the usage/goal data each tick
+//! The data layer stays native: the host collects the usage data each tick
 //! and feeds it to the guest via the plugin frame env. Only the render seam is
 //! WASM. Missing `.wasm` ⇒ empty surface (no native re-render) — this is by
 //! design (see the dash-wasm-migration plan).
 //!
-//! The guest modules are built from `plugins/usage-dash-ui` and
-//! `plugins/goal-dash-ui` to `target/wasm32-unknown-unknown/release/*.wasm`.
-//! They are resolved relative to the herdr source tree (`CARGO_MANIFEST_DIR`),
-//! or to `$HERDR_UI_PLUGIN_DIR` when set, so rebuilding a guest crate hot-reloads
-//! the panel in a running herdr without restarting `herdrd`.
+//! The guest module is built from `plugins/usage-dash-ui` to
+//! `target/wasm32-unknown-unknown/release/*.wasm`. It is resolved relative to
+//! the herdr source tree (`CARGO_MANIFEST_DIR`), or to `$HERDR_UI_PLUGIN_DIR`
+//! when set, so rebuilding the guest crate hot-reloads the strip in a running
+//! herdr without restarting `herdrd`.
 
 use std::path::PathBuf;
 
@@ -95,30 +95,18 @@ fn builtin(
 /// The built-in dash plugins, keyed by `plugin_id`. Merged into the installed
 /// plugin registry at `App::new` so the dash surfaces always have a renderer.
 pub(crate) fn builtin_dash_plugins() -> Vec<InstalledPluginInfo> {
-    vec![
-        builtin(
-            "builtin.usage-dash",
-            "Usage Dashboard",
-            "usage",
-            "Usage Dash",
-            "usage-dash-ui",
-            "usage_dash_ui.wasm",
-            PluginUiSurface::UsageStrip,
-            // Both builtin guests still hardcode `herdr_ui_api_version() -> 2`
-            // (plugins/usage-dash-ui, plugins/goal-dash-ui); the manifest's
-            // declared api_version must equal the actual export (§2), so this
-            // stays 2 regardless of the host's max-supported API_VERSION.
-            2,
-        ),
-        builtin(
-            "builtin.goal-dash",
-            "Goal Dashboard",
-            "goal",
-            "Goal Dash",
-            "goal-dash-ui",
-            "goal_dash_ui.wasm",
-            PluginUiSurface::RightPanel,
-            2,
-        ),
-    ]
+    vec![builtin(
+        "builtin.usage-dash",
+        "Usage Dashboard",
+        "usage",
+        "Usage Dash",
+        "usage-dash-ui",
+        "usage_dash_ui.wasm",
+        PluginUiSurface::UsageStrip,
+        // The builtin usage guest still hardcodes `herdr_ui_api_version() -> 2`
+        // (plugins/usage-dash-ui); the manifest's declared api_version must
+        // equal the actual export (§2), so this stays 2 regardless of the
+        // host's max-supported API_VERSION.
+        2,
+    )]
 }

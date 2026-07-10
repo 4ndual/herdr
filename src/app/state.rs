@@ -1386,16 +1386,6 @@ pub struct AppState {
     /// (wasm-ui v3 §7.2). `compute_view` shrinks a collapsed surface's reserve
     /// to a single row so panes reclaim the space. Pure data, not persisted.
     pub collapsed_surfaces: std::collections::HashSet<herdr_ui_plugin_api::UiSurface>,
-    /// Whether the native right-side goal panel is shown (feat/native-dashes).
-    /// Pure data; the renderer reads it and `compute_view` sizes the panel.
-    pub goal_panel_visible: bool,
-    /// Optional fixed width (columns) for the native right-side goal panel.
-    /// When absent, the renderer auto-sizes it relative to the terminal width.
-    pub goal_panel_width: Option<u16>,
-    /// Whether keyboard input is routed to the goal panel instead of the focused
-    /// pane (feat/native-dashes). Click-to-focus only; toggling visibility alone
-    /// should not steal typing from the focused pane.
-    pub goal_panel_focused: bool,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_scope: AgentPanelScope,
@@ -1761,9 +1751,6 @@ impl AppState {
             sidebar_collapsed: false,
             usage_strip_enabled: true,
             collapsed_surfaces: std::collections::HashSet::new(),
-            goal_panel_visible: false,
-            goal_panel_width: None,
-            goal_panel_focused: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             mouse_capture: true,

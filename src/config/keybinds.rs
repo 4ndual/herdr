@@ -306,7 +306,6 @@ pub struct Keybinds {
     pub zoom: ActionKeybinds,
     pub resize_mode: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
-    pub toggle_goal_panel: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -493,7 +492,6 @@ impl Config {
             zoom: action!("keys.zoom", &self.keys.zoom),
             resize_mode: action!("keys.resize_mode", &self.keys.resize_mode),
             toggle_sidebar: action!("keys.toggle_sidebar", &self.keys.toggle_sidebar),
-            toggle_goal_panel: action!("keys.toggle_goal_panel", &self.keys.toggle_goal_panel),
             custom_commands: Vec::new(),
         };
 

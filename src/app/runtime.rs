@@ -545,12 +545,11 @@ impl App {
     }
 
     /// feat/native-dashes: whether a foreground dashboard is showing live data that
-    /// a ~1 Hz tick would update — a focused agent (the usage strip) or the open
-    /// goal panel. When false, the dash tick is neither scheduled nor executed, so
-    /// an idle, agent-less herdr does no per-second work (TC13).
+    /// a ~1 Hz tick would update — a focused agent (the usage strip) or any
+    /// registered UI plugin. When false, the dash tick is neither scheduled nor
+    /// executed, so an idle, agent-less herdr does no per-second work (TC13).
     pub(crate) fn dashboards_need_tick(&self) -> bool {
-        self.state.goal_panel_visible
-            || crate::dash::focus_input(&self.state).agent != dash_common::AgentKind::None
+        crate::dash::focus_input(&self.state).agent != dash_common::AgentKind::None
             || self.ui_plugins.has_modules()
     }
 

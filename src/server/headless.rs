@@ -3150,7 +3150,6 @@ impl HeadlessServer {
                 resize_panes,
                 crate::kitty_graphics::HostCellSize::default(),
                 None,
-                None,
             );
             crate::render_prof::duration_since("full_render.render_virtual", render_started);
             self.app.full_redraw_pending = false;
@@ -3194,11 +3193,6 @@ impl HeadlessServer {
                                 area,
                                 is_foreground,
                                 cell_size,
-                                Some(crate::server::render_stream::DashRender {
-                                    goal: &mut self.app.goal_dash,
-                                    usage_view: &mut self.app.usage_view,
-                                    usage_snapshot: self.app.usage_snapshot.as_ref(),
-                                }),
                                 pin_badge,
                             )
                         } else {
@@ -3208,11 +3202,6 @@ impl HeadlessServer {
                                 area,
                                 is_foreground,
                                 crate::kitty_graphics::HostCellSize::default(),
-                                Some(crate::server::render_stream::DashRender {
-                                    goal: &mut self.app.goal_dash,
-                                    usage_view: &mut self.app.usage_view,
-                                    usage_snapshot: self.app.usage_snapshot.as_ref(),
-                                }),
                                 pin_badge,
                             )
                         };
