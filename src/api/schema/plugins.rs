@@ -326,7 +326,7 @@ pub enum PluginUiSurface {
     RightPanel,
     Overlay,
     ContextMenu,
-    /// The multi-row usage dashboard strip (host `usage_dash_area`). API v2.
+    /// The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.
     UsageStrip,
 }
 
@@ -341,7 +341,6 @@ pub enum PluginUiCapability {
     ContextMenuAugment,
     ClipboardWrite,
     PaneInput,
-    HeadlessActions,
     Toasts,
     OpenPluginPanes,
     PluginActions,

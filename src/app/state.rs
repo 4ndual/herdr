@@ -744,11 +744,13 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
-    /// Native dashboard regions (feat/native-dashes), computed in `compute_view`.
-    /// The bottom usage strip is always present; the right goal panel is
-    /// `Rect::default()` (empty) when the panel is toggled off.
-    pub usage_dash_area: Rect,
-    pub goal_dash_area: Rect,
+    /// Plugin UI surface geometry, computed in `compute_view` and published to
+    /// WASM UI modules via the layout blob. The bottom usage strip is carved
+    /// when the strip is enabled; the right panel has no host consumer in wave 1
+    /// and stays `Rect::default()` (empty, a dormant surface) until a
+    /// plugin-driven dock lands.
+    pub usage_strip_rect: Rect,
+    pub right_panel_rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1721,8 +1723,8 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
-                usage_dash_area: Rect::default(),
-                goal_dash_area: Rect::default(),
+                usage_strip_rect: Rect::default(),
+                right_panel_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,

@@ -1,6 +1,6 @@
 //! usage-dash embeddable core. The real data + render logic extracted from
 //! `~/Projects/usage-dash/src/{model,state,stats,budget,sources,render}.rs`,
-//! driven by herdr's [`dash_common::FocusInput`] instead of cmux focus discovery.
+//! driven by herdr's [`herdr_ui_plugin_api::FocusInput`] instead of cmux focus discovery.
 //!
 //! Public surface (Phase 2 contract, U-F1–U-F15):
 //!   - [`refresh`] — resolve a [`FocusInput`] to a [`UsageSnapshot`]. Replaces the
@@ -29,7 +29,7 @@ pub mod util;
 pub use model::{Cli, SessionStats, ThreadState, UsageSnapshot, Window};
 pub use render::{draw, Hits};
 
-use dash_common::{AgentKind, FocusInput};
+use herdr_ui_plugin_api::{AgentKind, FocusInput};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
