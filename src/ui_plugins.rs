@@ -1908,6 +1908,22 @@ mod tests {
         std::fs::write(path, wasm).unwrap();
     }
 
+    /// Dedicated, frozen **api_version = 2** compat guest for TC7 "old-guest
+    /// compat". It renders a single static `usage_strip` layer carrying a legacy
+    /// usage action id in a hit-rect and bumps a persistent counter on every
+    /// event it is allowed to receive — no v3 features (no Action/ApiResult
+    /// handling, no `HostEffect::Api`, no partial-scope updates). Because the
+    /// counter digit is observable through the rendered layer, a v3 event that
+    /// the host refuses to deliver leaves the digit unchanged. Kept independent
+    /// of the production usage-dash guest so TC7 survives that guest moving to
+    /// v3 (after which no other v2 guest exists in the tree).
+    fn write_v2_usage_compat_guest_wasm(path: &std::path::Path) {
+        // `@` is the counter placeholder byte the guest overwrites per event.
+        write_counter_wasm_versioned(path, V2_USAGE_COMPAT_TEMPLATE, 2);
+    }
+
+    const V2_USAGE_COMPAT_TEMPLATE: &str = r#"{"layers":[{"surface":"usage_strip","hits":[{"x":0,"y":0,"width":5,"height":1,"action_id":"usage.cycle"}],"nodes":[{"kind":"line","spans":[{"text":"@"}]}]}]}"#;
+
     /// A guest whose static update is valid but whose `on_event` runs
     /// `on_event_body` (used for traps and infinite loops that never return).
     fn write_event_wasm(path: &std::path::Path, static_json: &str, on_event_body: &str) {
@@ -2132,5 +2148,77 @@ mod tests {
         assert_eq!(header_text(&manager), "1");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// TC7 old-guest compat: a guaranteed-v2 guest negotiates version 2, renders
+    /// its static layer, still receives v2-legal events, and is NOT delivered the
+    /// v3-only `Action`/`ApiResult` events — the host refuses them and the guest
+    /// state is left untouched.
+    #[test]
+    fn v2_compat_guest_negotiates_v2_and_refuses_v3_events() {
+        let root = unique_root("g-v2-compat");
+        write_v2_usage_compat_guest_wasm(&root.join("dist/goal-ui.wasm"));
+        let mut plugin = plugin_at(&root);
+        // Declare the surface the frozen guest actually paints.
+        plugin.ui_modules[0].surfaces = vec![PluginUiSurface::UsageStrip];
+
+        let mut manager = installed(plugin);
+
+        // Version gating: the guest exports 2 and the manifest says 2, so the
+        // negotiated version is 2 (host max is 3).
+        assert_eq!(manager.all().len(), 1);
+        assert_eq!(manager.all()[0].negotiated_version, 2);
+        assert_eq!(manager.all()[0].manifest_ref().api_version, 2);
+
+        // Static layer render: the single usage-strip layer is projected with the
+        // guest's initial counter digit.
+        let layers = manager.surface_layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].layer.surface, UiSurface::UsageStrip);
+        assert_eq!(layers[0].negotiated_version, 2);
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
+            panic!(
+                "expected line node, got {:?}",
+                layers[0].layer.nodes.first()
+            );
+        };
+        assert_eq!(spans[0].text, "0");
+
+        // v3-only events are refused for a v2 guest: both dispatch calls return
+        // false and the observable counter digit stays at "0".
+        assert!(!manager.dispatch_action(
+            "example.goal-ui",
+            "goal-ui",
+            "usage.cycle".into(),
+            UiSurface::UsageStrip,
+            0,
+            0,
+            UiActionKind::LeftDown,
+        ));
+        assert!(!manager.dispatch_api_result(
+            "example.goal-ui",
+            "goal-ui",
+            "req-1".into(),
+            true,
+            None,
+            None,
+        ));
+        assert_eq!(first_layer_text(&manager), "0");
+
+        // Contrast: a v2-legal event (tick) IS delivered, advancing the counter —
+        // so the guest is healthy and the refusal above is specifically the v3
+        // event gate, not a broken guest.
+        assert!(manager.dispatch_tick());
+        assert_eq!(first_layer_text(&manager), "1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn first_layer_text(manager: &UiPluginManager) -> String {
+        let layers = manager.surface_layers();
+        let UiNode::Line { spans } = &layers[0].layer.nodes[0] else {
+            panic!("expected line node, got {:?}", layers.first());
+        };
+        spans[0].text.clone()
     }
 }
