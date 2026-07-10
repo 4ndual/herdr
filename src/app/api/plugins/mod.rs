@@ -734,6 +734,18 @@ mod tests {
             .result
     }
 
+    /// User-linked plugins in a registry listing, i.e. everything except the UI
+    /// dashboards `App::new` auto-links from the bundled `builtin.` namespace
+    /// (currently `builtin.usage-dash`). Registry tests assert on the plugins a
+    /// user linked, so the always-present bundled surface must not leak into
+    /// their counts.
+    fn user_linked(plugins: &[InstalledPluginInfo]) -> Vec<&InstalledPluginInfo> {
+        plugins
+            .iter()
+            .filter(|plugin| !plugin.plugin_id.starts_with("builtin."))
+            .collect()
+    }
+
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -979,8 +991,9 @@ platforms = ["linux", "macos", "windows"]
         let ResponseResult::PluginList { plugins } = response_result(&list) else {
             panic!("expected plugin list response: {list}");
         };
-        assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].plugin_id, "example.worktree-bootstrap");
+        let linked = user_linked(&plugins);
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].plugin_id, "example.worktree-bootstrap");
 
         let unlink = app.handle_api_request(Request {
             id: "unlink".into(),
@@ -1003,7 +1016,7 @@ platforms = ["linux", "macos", "windows"]
         let ResponseResult::PluginList { plugins } = response_result(&list) else {
             panic!("expected plugin list response: {list}");
         };
-        assert!(plugins.is_empty());
+        assert!(user_linked(&plugins).is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1178,7 +1191,7 @@ command = ["echo", "b"]
         assert_eq!(plugin.events.len(), 1);
         assert_eq!(plugin.panes.len(), 1);
         assert_eq!(plugin.ui_modules.len(), 1);
-        assert_eq!(plugin.ui_modules[0].module, "dist/goal-ui.wasm");
+        assert_eq!(plugin.ui_modules[0].module, "dist/smoke-ui.wasm");
         assert!(plugin.warnings.is_empty());
     }
 
@@ -1670,7 +1683,9 @@ command = ["sh", "-c", "sleep 1"]
         let ResponseResult::PluginList { plugins } = response_result(&list) else {
             panic!("expected plugin list: {list}");
         };
-        assert_eq!(plugins.len(), 1);
+        let linked = user_linked(&plugins);
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].plugin_id, "example.worktree-bootstrap");
 
         let actions = app.handle_api_request(Request {
             id: "action-list".into(),

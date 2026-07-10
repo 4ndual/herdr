@@ -86,20 +86,20 @@ pattern = "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$"
 action = "apply"
 
 [[ui_modules]]
-id = "goal-ui"
-title = "Goal UI"
+id = "smoke-ui"
+title = "Smoke UI"
 kind = "wasm"
 api_version = 1
 module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
 hot_reload = "on"
 surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
-capabilities = ["focused_session", "mouse_all", "keyboard_input", "context_menu_augment", "clipboard_write", "pane_input", "headless_actions", "toasts", "plugin_actions"]
+capabilities = ["focused_session", "mouse_all", "keyboard_input", "context_menu_augment", "clipboard_write", "pane_input", "toasts", "plugin_actions"]
 ```
 
 If the module also exports `herdr_ui_alloc`, `herdr_ui_on_event`, and
 `herdr_ui_on_event_len`, Herdr can push normalized mouse/key/tick events into
 WASM and apply returned `effects` such as clipboard writes, pane input, toasts,
-plugin action invocations, plugin-pane opens, and headless actions. UI effects
+plugin action invocations, and plugin-pane opens. UI effects
 can also attach `payload_json`, which Herdr forwards to plugin commands through
 `HERDR_PLUGIN_PAYLOAD_JSON` and `plugin_payload_json` in the invocation context.
 Frame events also carry a host snapshot with focus metadata plus normalized env
