@@ -1,2 +1,9 @@
 [env]
 ZIG = "/opt/homebrew/opt/zig@0.15/bin/zig"
+# Marks every build from this tree as a custom fork build. `force = true` so a
+# stray environment value cannot accidentally clear it. It gates only the
+# self-update refusal (`herdr update`/`herdr channel` abort on fork builds, which
+# would otherwise be clobbered by upstream stable assets) and deliberately does
+# NOT feed the version string, so it perturbs nothing else. See
+# src/build_info.rs::is_fork_build and src/update.rs fork-build refusal.
+HERDR_FORK_BUILD = { value = "1", force = true }
