@@ -295,7 +295,7 @@ impl App {
         // the focused pane. Skipped entirely when no dashboard is showing live
         // data so an idle, agent-less herdr does no per-second work (TC13).
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
-            crate::dash::tick(self);
+            crate::usage_host::tick(self);
             let changed_ui_modules = self.ui_plugins.detect_changed_modules();
             let changed_reload = if changed_ui_modules.is_empty() {
                 false
@@ -549,7 +549,7 @@ impl App {
     /// registered UI plugin. When false, the dash tick is neither scheduled nor
     /// executed, so an idle, agent-less herdr does no per-second work (TC13).
     pub(crate) fn dashboards_need_tick(&self) -> bool {
-        crate::dash::focus_input(&self.state).agent != dash_common::AgentKind::None
+        crate::plugin_focus::focus_input(&self.state).agent != herdr_ui_plugin_api::AgentKind::None
             || self.ui_plugins.has_modules()
     }
 

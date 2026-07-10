@@ -190,7 +190,7 @@ pub struct App {
     pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
     /// Registered hot-reloadable UI plugin modules discovered from the plugin registry.
     pub(crate) ui_plugins: crate::ui_plugins::UiPluginManager,
-    pub(crate) last_ui_plugin_focus: Option<dash_common::FocusInput>,
+    pub(crate) last_ui_plugin_focus: Option<herdr_ui_plugin_api::FocusInput>,
     /// Per-module mtime cache for `ui_input_file` reads (spec §7.1): keyed by
     /// `(plugin_id, module_id)`, holds the last-seen mtime and file contents so
     /// an unchanged file costs one `stat` and no re-read per frame.
@@ -216,7 +216,7 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
-    /// feat/native-dashes: next time [`crate::dash::tick`] refreshes the cores.
+    /// feat/native-dashes: next time [`crate::usage_host::tick`] refreshes the cores.
     pub(crate) next_dash_tick: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
@@ -612,8 +612,8 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
-                usage_dash_area: Rect::default(),
-                goal_dash_area: Rect::default(),
+                usage_strip_rect: Rect::default(),
+                right_panel_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -723,15 +723,11 @@ impl App {
             });
         }
 
-        // The two dashboards are rendered exclusively by built-in WASM UI
-        // plugins (no native fallback). Register them so their surfaces always
-        // have a renderer, the same as a linked plugin.
-        for builtin in crate::builtin_ui_plugins::builtin_dash_plugins() {
-            state
-                .installed_plugins
-                .entry(builtin.plugin_id.clone())
-                .or_insert(builtin);
-        }
+        // The usage strip is rendered exclusively by a bundled WASM UI plugin
+        // (no native fallback). Auto-link it from its shipped manifest so the
+        // surface always has a renderer, exactly as a user `plugin link` would —
+        // no synthetic in-core plugin definition.
+        crate::bundled_plugins::merge_bundled_ui_plugins(&mut state.installed_plugins);
 
         let ui_plugins =
             crate::ui_plugins::UiPluginManager::from_installed_plugins(&state.installed_plugins);
@@ -1656,7 +1652,7 @@ impl App {
 
     /// feat/native-dashes: the usage strip is rendered by the WASM plugin, which
     /// returns its clickable hit-rects (expand/stats toggles) on the UsageStrip
-    /// layer. Mirror them onto `usage_view.hits` so `dash::route_mouse` resolves
+    /// layer. Mirror them onto `usage_view.hits` so `usage_host::route_mouse` resolves
     /// clicks the same way the native renderer used to (which wrote `hits` back
     /// onto the view each frame). When the plugin reports no expandable state
     /// hit, drop stale expand/scroll — exactly the old `render()` cleanup.
@@ -1684,7 +1680,7 @@ impl App {
     }
 
     pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
-        let focus = crate::dash::focus_input(&self.state);
+        let focus = crate::plugin_focus::focus_input(&self.state);
         if self.last_ui_plugin_focus.as_ref().is_some_and(|last| {
             last.session_id == focus.session_id
                 && last.session_ref == focus.session_ref
@@ -1703,7 +1699,7 @@ impl App {
     }
 
     pub(crate) fn dispatch_ui_plugin_frame_events(&mut self) {
-        let focus = crate::dash::focus_input(&self.state);
+        let focus = crate::plugin_focus::focus_input(&self.state);
         let plugin_context = self.current_plugin_context("ui_frame");
         let plugin_context_json = serde_json::to_string(&plugin_context).ok();
         // §7: computed once per frame and shared across every module/surface
@@ -1768,7 +1764,7 @@ impl App {
                 if surface == herdr_ui_plugin_api::UiSurface::UsageStrip {
                     tracing::info!(
                         ?rect,
-                        usage_area = ?self.state.view.usage_dash_area,
+                        usage_area = ?self.state.view.usage_strip_rect,
                         has_snapshot = self.usage_snapshot.is_some(),
                         "usage frame dispatch"
                     );
@@ -1823,7 +1819,7 @@ impl App {
     /// frame env — a cheap read-slice of the query API's layout basics so a
     /// plugin doesn't need a socket round trip just to learn geometry/focus
     /// that changes every frame. Any zero-width/height area (e.g.
-    /// `goal_dash_area` when the panel is hidden) is emitted as `null` per
+    /// `right_panel_rect` when the panel is hidden) is emitted as `null` per
     /// spec. `dispatch_ui_plugin_frame_events` runs once against the shared
     /// `AppState`, not per attached client, so `client.is_foreground` is
     /// always `true` and `client.pinned_to` is always `null` here — true
@@ -1854,8 +1850,11 @@ impl App {
             "active_tab_id": plugin_context.tab_id,
             "focused_pane_id": plugin_context.focused_pane_id,
             "terminal_area": area_or_null(terminal),
-            "usage_dash_area": area_or_null(self.state.view.usage_dash_area),
-            "goal_dash_area": area_or_null(self.state.view.goal_dash_area),
+            // The `*_dash_area` JSON keys are the frozen v3 layout-blob field
+            // names (spec §7) and stay dash-named for wave-1 compatibility even
+            // though the host rects were renamed to generic surface geometry.
+            "usage_dash_area": area_or_null(self.state.view.usage_strip_rect),
+            "goal_dash_area": area_or_null(self.state.view.right_panel_rect),
             "client": {
                 "is_foreground": true,
                 "width": client_width,
@@ -1873,7 +1872,7 @@ impl App {
         manifest_json: Option<&str>,
         plugin_context_json: Option<&str>,
         plugin_context: &crate::api::schema::PluginInvocationContext,
-        focus: &dash_common::FocusInput,
+        focus: &herdr_ui_plugin_api::FocusInput,
         layout_json: Option<&str>,
         ui_input_json: Option<&str>,
     ) -> std::collections::HashMap<String, String> {
@@ -2494,11 +2493,11 @@ mod tests {
                 selected_text: Some("hello".into()),
                 ..Default::default()
             },
-            &dash_common::FocusInput {
+            &herdr_ui_plugin_api::FocusInput {
                 session_id: Some("sid-1".into()),
                 session_ref: Some("ref-1".into()),
                 cwd: Some(std::path::PathBuf::from("/tmp/repo")),
-                agent: dash_common::AgentKind::Claude,
+                agent: herdr_ui_plugin_api::AgentKind::Claude,
                 is_self_focus: false,
             },
             None,
@@ -2571,7 +2570,7 @@ mod tests {
             None,
             None,
             &crate::api::schema::PluginInvocationContext::default(),
-            &dash_common::FocusInput::default(),
+            &herdr_ui_plugin_api::FocusInput::default(),
             Some("{\"active_workspace_id\":null}"),
             None,
         );
@@ -2591,7 +2590,7 @@ mod tests {
             None,
             None,
             &crate::api::schema::PluginInvocationContext::default(),
-            &dash_common::FocusInput::default(),
+            &herdr_ui_plugin_api::FocusInput::default(),
             None,
             Some("{\"snapshot\":null}"),
         );
@@ -2726,8 +2725,8 @@ mod tests {
         let mut app = test_app();
         app.state.view.terminal_area = ratatui::layout::Rect::new(26, 1, 194, 42);
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 1, 26, 42);
-        app.state.view.usage_dash_area = ratatui::layout::Rect::new(26, 43, 194, 7);
-        app.state.view.goal_dash_area = ratatui::layout::Rect::default();
+        app.state.view.usage_strip_rect = ratatui::layout::Rect::new(26, 43, 194, 7);
+        app.state.view.right_panel_rect = ratatui::layout::Rect::default();
 
         let context = crate::api::schema::PluginInvocationContext {
             workspace_id: Some("w1".into()),

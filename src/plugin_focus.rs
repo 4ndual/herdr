@@ -1,20 +1,14 @@
-//! Focused-session bridge glue (the `feat/native-dashes` fork).
+//! Focused-session bridge seam (the `feat/native-dashes` fork).
 //!
-//! Builds the [`dash_common::FocusInput`] the WASM UI bridge delivers to every
-//! plugin (the `FocusedSession` capability, `HERDR_FOCUS_*` env, and
-//! `UiEvent::FocusChanged`) from the currently focused pane, and routes mouse
-//! events onto the native usage strip. Nothing here knows what a specific
-//! dashboard is beyond the usage strip's mouse seam (removed when usage-dash
-//! becomes a pure plugin).
-
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
-use usage_dash_core::RefreshOutcome;
+//! Builds the [`herdr_ui_plugin_api::FocusInput`] the WASM UI bridge delivers to
+//! every plugin (the `FocusedSession` capability, `HERDR_FOCUS_*` env, and
+//! `UiEvent::FocusChanged`) from the currently focused pane. This is generic
+//! bridge infrastructure — it knows nothing about any specific dashboard.
 
 use crate::agent_resume::AgentSessionRefKind;
-use crate::app::{App, AppState};
+use crate::app::AppState;
 use crate::detect::{parse_agent_label, Agent};
-use dash_common::{AgentKind, FocusInput};
+use herdr_ui_plugin_api::{AgentKind, FocusInput};
 
 /// Map herdr's detected agent to the bridge-facing [`AgentKind`]. Agents the
 /// bridge doesn't model collapse to [`AgentKind::None`] (treated as a plain
@@ -89,55 +83,6 @@ pub fn focus_input(state: &AppState) -> FocusInput {
         // input routing lands. Until then a pane is always focused.
         is_self_focus: false,
     }
-}
-
-/// Refresh the usage snapshot from the focused pane. Called on the dash tick
-/// (~1 Hz) from the main loop, applying the sticky semantics
-/// ([`RefreshOutcome`]) — replace, keep, or clear the stored snapshot.
-pub fn tick(app: &mut App) {
-    let focus = focus_input(&app.state);
-    match usage_dash_core::refresh(focus) {
-        RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(*snap),
-        RefreshOutcome::Clear => app.usage_snapshot = None,
-        RefreshOutcome::KeepPrevious => {}
-    }
-
-    // Interim item-C data path: publish the fresh render input to the usage-dash
-    // plugin's state dir, where item B's generic ui_input_file reader surfaces it
-    // as HERDR_PLUGIN_UI_INPUT_JSON. This host-side writer (and this call site)
-    // relocate into the plugin's own collector process in items D/E.
-    app.write_usage_input_file();
-}
-
-/// Is `(col, row)` inside a non-empty rect?
-fn in_rect(r: Rect, col: u16, row: u16) -> bool {
-    r.width > 0
-        && r.height > 0
-        && col >= r.x
-        && col < r.x + r.width
-        && row >= r.y
-        && row < r.y + r.height
-}
-
-/// Route a mouse event onto the native usage strip when it lands there. Returns
-/// true if consumed. Events outside the strip are left for the host.
-pub fn route_mouse(app: &mut App, mouse: MouseEvent) -> bool {
-    let (col, row) = (mouse.column, mouse.row);
-
-    if in_rect(app.state.view.usage_dash_area, col, row) {
-        use usage_dash_core::Action as U;
-        let action = match mouse.kind {
-            MouseEventKind::Moved => U::Hover(col, row),
-            MouseEventKind::Down(MouseButton::Left) => U::Click(col, row),
-            MouseEventKind::ScrollDown => U::ScrollDown,
-            MouseEventKind::ScrollUp => U::ScrollUp,
-            _ => return true, // swallow other events over the strip
-        };
-        usage_dash_core::handle(action, &mut app.usage_view);
-        return true;
-    }
-
-    false
 }
 
 #[cfg(test)]

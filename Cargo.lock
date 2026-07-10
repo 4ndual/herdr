@@ -529,13 +529,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dash-common"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "debugid"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -894,7 +887,6 @@ dependencies = [
  "bytes",
  "crossterm",
  "ctrlc",
- "dash-common",
  "herdr-ui-plugin-api",
  "interprocess",
  "libc",
@@ -920,7 +912,6 @@ dependencies = [
 name = "herdr-ui-plugin-api"
 version = "0.1.0"
 dependencies = [
- "dash-common",
  "ratatui",
  "serde",
  "serde_json",
@@ -2432,7 +2423,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 name = "usage-dash-core"
 version = "0.1.0"
 dependencies = [
- "dash-common",
+ "herdr-ui-plugin-api",
  "ratatui",
  "serde",
  "serde_json",

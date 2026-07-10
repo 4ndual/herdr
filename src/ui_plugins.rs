@@ -1,5 +1,5 @@
 use crate::api::schema::{InstalledPluginInfo, PluginHotReloadMode, PluginUiSurface};
-use dash_common::FocusInput;
+use herdr_ui_plugin_api::FocusInput;
 use herdr_ui_plugin_api::{
     HostEffect, HostSnapshot, KeyEvent as UiKeyEvent, MouseEvent, MouseEventKind, UiActionKind,
     UiActionRef, UiCapability, UiEvent, UiFrameContext, UiLayer, UiLayoutRect, UiNode,
@@ -1201,7 +1201,6 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         }
         crate::api::schema::PluginUiCapability::ClipboardWrite => UiCapability::ClipboardWrite,
         crate::api::schema::PluginUiCapability::PaneInput => UiCapability::PaneInput,
-        crate::api::schema::PluginUiCapability::HeadlessActions => UiCapability::HeadlessActions,
         crate::api::schema::PluginUiCapability::Toasts => UiCapability::Toasts,
         crate::api::schema::PluginUiCapability::OpenPluginPanes => UiCapability::OpenPluginPanes,
         crate::api::schema::PluginUiCapability::PluginActions => UiCapability::PluginActions,
