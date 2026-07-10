@@ -1936,8 +1936,26 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 // Public API
 // ---------------------------------------------------------------------------
 
+const FORK_BUILD_SELF_UPDATE_REJECTION: &str = "self-update is disabled for fork builds; this Herdr binary was built from a custom fork and must be rebuilt from source instead of updating through `herdr update` or `herdr channel`";
+
+/// Refusal reason when the running binary is a fork build. Hosted release assets
+/// are upstream stable binaries; installing one would overwrite the fork binary
+/// (and a subsequent boot of upstream would strip fork-only registry fields), so
+/// `herdr update` and `herdr channel` must refuse on fork builds.
+pub(crate) fn fork_build_self_update_rejection_for_current_build() -> Option<&'static str> {
+    fork_build_self_update_rejection(crate::build_info::is_fork_build())
+}
+
+fn fork_build_self_update_rejection(is_fork_build: bool) -> Option<&'static str> {
+    is_fork_build.then_some(FORK_BUILD_SELF_UPDATE_REJECTION)
+}
+
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if let Some(reason) = fork_build_self_update_rejection_for_current_build() {
+        return Err(reason.into());
+    }
+
     let channel = UpdateChannel::configured();
     #[cfg(windows)]
     if channel == UpdateChannel::Stable {
@@ -2514,6 +2532,31 @@ mod tests {
         let path = Path::new("/usr/local/bin/herdr");
 
         assert!(!is_nix_store_exe_path(path));
+    }
+
+    #[test]
+    fn fork_build_self_update_is_rejected() {
+        let message =
+            fork_build_self_update_rejection(true).expect("fork build must refuse self-update");
+        // main.rs prints messages starting with this prefix verbatim.
+        assert!(message.starts_with("self-update is disabled"));
+        assert!(message.contains("fork"));
+    }
+
+    #[test]
+    fn official_build_self_update_is_not_rejected() {
+        assert!(fork_build_self_update_rejection(false).is_none());
+    }
+
+    /// End-to-end proof that the fork marker is actually baked into this build
+    /// (via `.cargo/config.toml`), so the real fork binary refuses to
+    /// self-update. If this fails, the guard is disarmed at the source.
+    #[test]
+    fn fork_marker_is_baked_into_this_build() {
+        assert!(
+            fork_build_self_update_rejection_for_current_build().is_some(),
+            "HERDR_FORK_BUILD not baked; fork self-update guard is disarmed"
+        );
     }
 
     #[test]
