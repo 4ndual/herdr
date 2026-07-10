@@ -603,7 +603,6 @@ pub(crate) enum NavigateAction {
     Zoom,
     EnterResizeMode,
     ToggleSidebar,
-    ToggleGoalPanel,
     CyclePaneNext,
     CyclePanePrevious,
     LastPane,
@@ -711,7 +710,6 @@ fn action_for_key(
         (&kb.zoom, NavigateAction::Zoom),
         (&kb.resize_mode, NavigateAction::EnterResizeMode),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
-        (&kb.toggle_goal_panel, NavigateAction::ToggleGoalPanel),
         (&kb.reload_config, NavigateAction::ReloadConfig),
         (
             &kb.open_notification_target,
@@ -918,14 +916,6 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::EnterResizeMode => state.mode = Mode::Resize,
         NavigateAction::ToggleSidebar => {
             state.sidebar_collapsed = !state.sidebar_collapsed;
-            leave_navigate_mode(state);
-        }
-        NavigateAction::ToggleGoalPanel => {
-            // feat/native-dashes: show/hide the right goal panel without stealing
-            // keyboard focus from the active pane. The panel becomes keyboard-
-            // focused only after an explicit click inside it.
-            state.goal_panel_visible = !state.goal_panel_visible;
-            state.goal_panel_focused = false;
             leave_navigate_mode(state);
         }
         NavigateAction::CyclePaneNext => {

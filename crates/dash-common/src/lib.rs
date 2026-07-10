@@ -1,10 +1,9 @@
-//! Shared contract between the herdr host and the two dashboard cores
-//! (`usage-dash-core`, `goal-dash-core`). Defined FIRST so both cores import
-//! the same `FocusInput`/`Effect` types — the multi-worker integration contract.
+//! Shared focused-session context the herdr host hands to UI-plugin surfaces.
 //!
 //! herdr fills a [`FocusInput`] from its own `AppState` (the focused pane's
-//! session identity / cwd / agent kind) and hands it to each core's `refresh()`.
-//! A core's `handle()` returns [`Effect`]s the host executes.
+//! session identity / cwd / agent kind) and delivers it to plugins through the
+//! WASM UI bridge (`herdr-ui-plugin-api`): the `FocusedSession` capability, the
+//! `HERDR_FOCUS_*` frame env, and `UiEvent::FocusChanged`.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -35,43 +34,7 @@ pub struct FocusInput {
     pub cwd: Option<PathBuf>,
     /// Which agent CLI is focused.
     pub agent: AgentKind,
-    /// True when the focused pane is the dashboard region/self — host asks the
-    /// core to keep its previous snapshot (sticky, no flicker).
+    /// True when the focused pane is a plugin surface/self — the host asks the
+    /// plugin to keep its previous snapshot (sticky, no flicker).
     pub is_self_focus: bool,
-}
-
-/// A headless goal action the host should run on the focused agent backend.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HeadlessMode {
-    /// Infer the MAIN goal text.
-    Infer,
-    /// Infer CURRENT + sub-goals (merge).
-    InferTree,
-    /// Goal Observer: decide sub-goals → proposals.
-    Observe,
-    /// AI project-organizer: move goal files into the matching project folder.
-    Sort,
-}
-
-/// Returned by a core's `handle()` for the host to execute.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Effect {
-    /// Nothing further; state already updated in-core (host re-renders).
-    Refresh,
-    /// Run the matching headless action on the focused backend without blocking
-    /// the UI. `sid` stays the canonical goal/transcript lookup key; `session_ref`
-    /// carries the raw backend-native resume token/path when required.
-    SpawnHeadless {
-        agent: AgentKind,
-        mode: HeadlessMode,
-        sid: String,
-        session_ref: Option<String>,
-        cwd: Option<PathBuf>,
-    },
-    /// Send a key/text sequence to the focused agent's pane (clear+rebrief).
-    SendPaneKeys { lines: Vec<String> },
-    /// Copy text through Herdr's host clipboard path.
-    CopyText(String),
-    /// Surface a transient status line in the panel.
-    Status(String),
 }

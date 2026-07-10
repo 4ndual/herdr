@@ -391,8 +391,6 @@ pub struct KeysConfig {
     pub resize_mode: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
-    /// Toggle the native right-side goal panel (feat/native-dashes). Default: "prefix+d".
-    pub toggle_goal_panel: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -454,12 +452,6 @@ pub struct UiConfig {
     /// Show the persistent native usage strip along the bottom of the
     /// terminal area (feat/native-dashes). Default: true.
     pub usage_strip: bool,
-    /// Open the native right-side goal panel on startup (feat/native-dashes).
-    /// It can still be toggled at runtime with `<prefix> d`. Default: false.
-    pub goal_panel: bool,
-    /// Optional fixed width (columns) for the native right-side goal panel.
-    /// When unset, Herdr auto-sizes it to about one third of the pane area.
-    pub goal_panel_width: Option<u16>,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -609,7 +601,6 @@ impl Default for KeysConfig {
             zoom: BindingConfig::one("prefix+z"),
             resize_mode: BindingConfig::one("prefix+r"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
-            toggle_goal_panel: BindingConfig::one("prefix+d"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
         }
@@ -643,8 +634,6 @@ impl Default for UiConfig {
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
             usage_strip: true,
-            goal_panel: false,
-            goal_panel_width: None,
         }
     }
 }

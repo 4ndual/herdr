@@ -155,10 +155,6 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
-    /// Native goal dashboard model (feat/native-dashes): holds the goal tree,
-    /// proposals, history, and time-gate state. Refreshed/polled from the tick
-    /// loop and drawn into `state.view.goal_dash_area`.
-    pub(crate) goal_dash: goal_dash_core::App,
     /// Native usage dashboard interaction state (expand/collapse/scroll/hover +
     /// last frame's hit-rects) and the latest resolved snapshot.
     pub(crate) usage_view: usage_dash_core::UsageView,
@@ -617,9 +613,6 @@ impl App {
             sidebar_collapsed: false,
             usage_strip_enabled: config.ui.usage_strip,
             collapsed_surfaces: std::collections::HashSet::new(),
-            goal_panel_visible: config.ui.goal_panel,
-            goal_panel_width: config.ui.goal_panel_width,
-            goal_panel_focused: false,
             sidebar_section_split,
             agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
@@ -730,7 +723,6 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
-            goal_dash: goal_dash_core::App::new(None),
             usage_view: usage_dash_core::UsageView::default(),
             usage_snapshot: None,
             ui_plugins,
@@ -1038,18 +1030,6 @@ impl App {
                         &self.state,
                         &self.terminal_runtimes,
                         frame,
-                    );
-                    // feat/native-dashes: paint the usage strip + goal panel on
-                    // top of the freshly-rendered panes area. Rects come from
-                    // compute_view; empty rects are skipped inside dash::draw.
-                    crate::dash::draw(
-                        frame,
-                        self.state.view.usage_dash_area,
-                        self.state.view.goal_dash_area,
-                        &mut self.goal_dash,
-                        &mut self.usage_view,
-                        self.usage_snapshot.as_ref(),
-                        &self.state.palette,
                     );
                 })?;
                 if kitty_graphics_enabled {
@@ -2224,50 +2204,6 @@ impl App {
                         line.push('\r');
                         let _ = runtime.try_send_bytes(bytes::Bytes::from(line.into_bytes()));
                     }
-                }
-                herdr_ui_plugin_api::HostEffect::SpawnHeadless {
-                    agent,
-                    mode,
-                    sid,
-                    session_ref,
-                    cwd,
-                } => {
-                    let _ = std::thread::Builder::new()
-                        .name("ui-plugin-headless".into())
-                        .spawn(move || match mode {
-                            dash_common::HeadlessMode::Infer => {
-                                goal_dash_core::infer::run_infer_for(
-                                    agent,
-                                    session_ref.as_deref(),
-                                    cwd.as_deref(),
-                                    Some(sid),
-                                );
-                            }
-                            dash_common::HeadlessMode::InferTree => {
-                                goal_dash_core::infer::run_infer_tree_for(
-                                    agent,
-                                    session_ref.as_deref(),
-                                    cwd.as_deref(),
-                                    &sid,
-                                );
-                            }
-                            dash_common::HeadlessMode::Observe => {
-                                goal_dash_core::infer::run_observe_for(
-                                    agent,
-                                    session_ref.as_deref(),
-                                    cwd.as_deref(),
-                                    &sid,
-                                );
-                            }
-                            dash_common::HeadlessMode::Sort => {
-                                goal_dash_core::infer::run_sort_for(
-                                    agent,
-                                    session_ref.as_deref(),
-                                    cwd.as_deref(),
-                                    &sid,
-                                );
-                            }
-                        });
                 }
                 herdr_ui_plugin_api::HostEffect::ShowToast { message } => {
                     let previous_toast = self.state.toast.clone();

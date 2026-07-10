@@ -1078,9 +1078,6 @@ fn filter_effects_for_module(
             HostEffect::SendPaneKeys { .. } => {
                 module.requests(crate::api::schema::PluginUiCapability::PaneInput)
             }
-            HostEffect::SpawnHeadless { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::HeadlessActions)
-            }
             HostEffect::ShowToast { .. } => {
                 module.requests(crate::api::schema::PluginUiCapability::Toasts)
             }
