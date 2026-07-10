@@ -1,12 +1,29 @@
-//! Native usage-strip host glue (the `feat/native-dashes` fork).
+//! Usage-strip host glue (the `feat/native-dashes` fork) — usage-SPECIFIC by
+//! design, not a generic seam.
 //!
 //! Drives the host-owned usage snapshot + view-toggle state that back the WASM
 //! usage-dash plugin: the ~1 Hz refresh tick (which also republishes the render
 //! input via [`App::write_usage_input_file`]) and the mouse routing onto the
-//! strip. This is the wave-1 host-side data path for one specific dashboard; it
-//! goes away when usage-dash becomes a fully self-owned plugin (guest-owned
-//! toggles + a plugin-side collector). The generic focused-session seam every
-//! plugin gets lives in [`crate::plugin_focus`].
+//! strip. This is the wave-1 host-side data path for one specific dashboard.
+//! The generic focused-session seam every plugin gets lives in
+//! [`crate::plugin_focus`]; this module is the deliberate residual impurity that
+//! keeps the strip interactive until the wave-2 rewrite lands.
+//!
+//! FOLLOW-UP (wave-2 exit — the single canonical plan for deleting all of this):
+//! two changes ship together because the v3 `Action` rewrite is what makes both
+//! coherent —
+//!   1. guest-owned toggle state: the usage-dash guest handles its own
+//!      collapse/stats/scroll via v3 `Action` instead of the host mirroring them
+//!      into `App::usage_view`; and
+//!   2. a plugin-side collector: a usage-dash helper process subscribes to the
+//!      socket API (`events.subscribe`) and writes `usage_input.json` itself,
+//!      instead of the host tick writing it.
+//! When both land, DELETE: this entire file (`src/usage_host.rs`) AND, in
+//! `src/app/mod.rs`, the writer `write_usage_input_file` + `usage_render_input_json`,
+//! the `sync_usage_view_hits_from_layers` toggle-mirror shim, the
+//! `usage_view`/`usage_snapshot` fields, and the `USAGE_DASH_*` consts. At that
+//! point the core delta is bridge infrastructure only, with zero usage-specific
+//! host glue.
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
