@@ -19,6 +19,13 @@ use usage_dash_model::{
 };
 
 const DIM: Color = Color::DarkGray;
+/// Action id for the strip-level collapse/expand toggle. Routed back to this
+/// guest as a v3 `UiEvent::Action`; the guest answers with
+/// `HostEffect::SetSurfaceCollapsed { UsageStrip, .. }` so the host gives the
+/// reclaimed rows back to panes (a collapsed strip keeps a single row).
+pub const ACTION_TOGGLE_COLLAPSE: &str = "usage:toggle_collapse";
+/// The clickable collapse button drawn on the box's top border.
+const COLLAPSE_BTN: &str = "[▾]";
 /// Fixed bar width for the left box (keeps the shrink-to-fit measurement stable).
 const BAR_W: usize = 10;
 
@@ -425,6 +432,24 @@ fn ctx_row(snap: &UsageSnapshot, bar_w: usize) -> Line<'static> {
 /// renderer when `hover = None`).
 ///
 /// Returns the clickable hit rects for this frame.
+/// Draw the collapse button on the top-right of `rect`'s border and return its
+/// hit rect. Skipped when the box is too narrow to keep the title readable.
+fn collapse_button(rect: Rect, buf: &mut Buffer) -> Option<UiHitRect> {
+    let w = COLLAPSE_BTN.chars().count() as u16;
+    if rect.width < w + 4 || rect.height == 0 {
+        return None;
+    }
+    let bx = rect.x + rect.width - w - 1;
+    buf.set_string(bx, rect.y, COLLAPSE_BTN, Style::default().fg(DIM));
+    Some(UiHitRect {
+        x: bx,
+        y: rect.y,
+        width: w,
+        height: 1,
+        action_id: ACTION_TOGGLE_COLLAPSE.into(),
+    })
+}
+
 pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiHitRect> {
     let now = input.now;
     let expanded = input.expanded;
@@ -438,6 +463,29 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
         ..area
     };
 
+    // Surface-collapsed strip (host carves a single row): render a compact
+    // summary with an expand affordance; the whole line is the click target.
+    if area.height <= 1 {
+        let mut spans = vec![Span::styled("[▸]", Style::default().fg(DIM))];
+        match input.snapshot.as_ref() {
+            Some(snap) => {
+                spans.push(Span::raw(" "));
+                spans.extend(collapsed_line(snap).spans);
+            }
+            None => spans.push(Span::styled(" usage", Style::default().fg(DIM))),
+        }
+        let line = Line::from(spans);
+        let hit_w = (line.width() as u16).min(area.width);
+        Paragraph::new(line).render(area, buf);
+        return vec![UiHitRect {
+            x: area.x,
+            y: area.y,
+            width: hit_w.max(3),
+            height: 1,
+            action_id: ACTION_TOGGLE_COLLAPSE.into(),
+        }];
+    }
+
     let snap = match input.snapshot.as_ref() {
         Some(s) => s,
         None => {
@@ -450,7 +498,7 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
                 Style::default().fg(DIM),
             )))
             .render(inner, buf);
-            return Vec::new();
+            return collapse_button(area, buf).into_iter().collect();
         }
     };
 
@@ -462,7 +510,7 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
         Paragraph::new(collapsed_line(snap))
             .wrap(Wrap { trim: true })
             .render(inner, buf);
-        return Vec::new();
+        return collapse_button(area, buf).into_iter().collect();
     }
 
     let expandable = snap
@@ -573,6 +621,7 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
 
     // Build hit rects.
     let mut hits = Vec::new();
+    hits.extend(collapse_button(rect, buf));
     if expandable {
         hits.push(UiHitRect {
             x: inner.x,

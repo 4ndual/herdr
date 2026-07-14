@@ -1,12 +1,21 @@
 mod render;
 
-use herdr_ui_plugin_api::{UiEvent, UiLayer, UiSurface, UiUpdate};
+use herdr_ui_plugin_api::{
+    HostEffect, UiActionKind, UiEvent, UiLayer, UiSurface, UiUpdate, UiUpdateScope,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use usage_dash_model::UsageRenderInput;
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Guest-owned strip collapse state, toggled by clicks on
+/// [`render::ACTION_TOGGLE_COLLAPSE`]. Re-synced from the host's carved rect
+/// height every frame (a 1-row rect always means collapsed), so host state
+/// wins after restarts and hot-reloads — same pattern as goal-dash's panel.
+static COLLAPSED: AtomicBool = AtomicBool::new(false);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -67,6 +76,9 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &UiEvent) -> UiUpdate {
     let ctx = match event {
         UiEvent::Frame(ctx) => ctx,
+        UiEvent::Action {
+            action_id, kind, ..
+        } => return handle_action(action_id, *kind),
         _ => return UiUpdate::default(),
     };
 
@@ -84,6 +96,13 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     };
 
     let area = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
+    // Host state wins: a 1-row carve is the collapsed strip, anything taller
+    // is expanded. (A zero rect means "not carved" — leave the latch alone.)
+    if area.height == 1 {
+        COLLAPSED.store(true, Ordering::SeqCst);
+    } else if area.height > 1 {
+        COLLAPSED.store(false, Ordering::SeqCst);
+    }
     let mut buf = Buffer::empty(area);
     let hits = render::render(&input, area, &mut buf);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
@@ -101,6 +120,25 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     }
 }
 
+fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
+    // Act on press only; the host routes both left_down and left_up for one
+    // physical click, and reacting to both would double-fire the toggle.
+    if kind != UiActionKind::LeftDown || action_id != render::ACTION_TOGGLE_COLLAPSE {
+        return UiUpdate::default();
+    }
+    let collapsed = !COLLAPSED.load(Ordering::SeqCst);
+    COLLAPSED.store(collapsed, Ordering::SeqCst);
+    UiUpdate {
+        layers: Vec::new(),
+        effects: vec![HostEffect::SetSurfaceCollapsed {
+            surface: UiSurface::UsageStrip,
+            collapsed,
+        }],
+        scope: UiUpdateScope::Partial,
+        consumed_action_ids: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,9 +147,13 @@ mod tests {
     /// Build a `frame` event JSON with `env` as the host env map. Exercises the
     /// real transport: the guest only ever sees a deserialized `UiEvent`.
     fn frame_json(env: &str) -> String {
+        frame_json_with_height(env, 7)
+    }
+
+    fn frame_json_with_height(env: &str, height: u16) -> String {
         format!(
             "{{\"type\":\"frame\",\"surface\":\"usage_strip\",\
-             \"rect\":{{\"x\":0,\"y\":0,\"width\":80,\"height\":7}},\
+             \"rect\":{{\"x\":0,\"y\":0,\"width\":80,\"height\":{height}}},\
              \"focused\":false,\
              \"host\":{{\"focus\":{{\"session_id\":null,\"session_ref\":null,\
              \"cwd\":null,\"agent\":\"None\",\"is_self_focus\":false}},\
@@ -152,6 +194,72 @@ mod tests {
             !update.layers[0].nodes.is_empty(),
             "usage strip should render nodes from the injected input"
         );
+    }
+
+    fn env_json() -> String {
+        format!(
+            "{{\"HERDR_PLUGIN_UI_INPUT_JSON\":{}}}",
+            serde_json::to_string(&sample_input_json()).expect("env value serializes")
+        )
+    }
+
+    fn action_json(action_id: &str, kind: &str) -> String {
+        format!(
+            "{{\"type\":\"action\",\"action_id\":\"{action_id}\",\
+             \"surface\":\"usage_strip\",\"column\":1,\"row\":0,\"kind\":\"{kind}\"}}"
+        )
+    }
+
+    #[test]
+    fn full_render_declares_collapse_hit() {
+        let event: UiEvent =
+            serde_json::from_str(&frame_json(&env_json())).expect("frame parses");
+        let update = handle_event(&event);
+        assert!(update.layers[0]
+            .hits
+            .iter()
+            .any(|h| h.action_id == render::ACTION_TOGGLE_COLLAPSE));
+    }
+
+    #[test]
+    fn one_row_rect_renders_expand_affordance() {
+        let event: UiEvent =
+            serde_json::from_str(&frame_json_with_height(&env_json(), 1)).expect("frame parses");
+        let update = handle_event(&event);
+        assert_eq!(update.layers.len(), 1);
+        assert!(!update.layers[0].nodes.is_empty());
+        assert!(update.layers[0]
+            .hits
+            .iter()
+            .any(|h| h.action_id == render::ACTION_TOGGLE_COLLAPSE));
+        // NOTE: no assertion on the COLLAPSED static here — tests run in
+        // parallel and other frames (height 7) race on the same latch.
+    }
+
+    #[test]
+    fn collapse_action_left_down_emits_set_surface_collapsed() {
+        COLLAPSED.store(false, Ordering::SeqCst);
+        let event: UiEvent =
+            serde_json::from_str(&action_json(render::ACTION_TOGGLE_COLLAPSE, "left_down"))
+                .expect("action parses");
+        let update = handle_event(&event);
+        assert_eq!(update.effects.len(), 1);
+        match &update.effects[0] {
+            HostEffect::SetSurfaceCollapsed { surface, collapsed } => {
+                assert!(matches!(surface, UiSurface::UsageStrip));
+                assert!(*collapsed);
+            }
+            other => panic!("expected SetSurfaceCollapsed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collapse_action_ignores_left_up() {
+        let event: UiEvent =
+            serde_json::from_str(&action_json(render::ACTION_TOGGLE_COLLAPSE, "left_up"))
+                .expect("action parses");
+        let update = handle_event(&event);
+        assert!(update.effects.is_empty(), "left_up must not toggle collapse");
     }
 
     #[test]
