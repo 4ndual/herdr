@@ -16,7 +16,7 @@ use serde_json::Value;
 use support::{
     cleanup_test_base, client_handshake, encode_varint_u32, frame_message, read_server_message,
     register_runtime_dir, register_spawned_herdr_pid, unregister_spawned_herdr_pid,
-    wait_for_message_variant, wait_for_socket, wait_until,
+    wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
 };
 
 fn unique_test_dir() -> PathBuf {
@@ -311,8 +311,11 @@ fn client_connects_and_receives_frame() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14, "server should report protocol version 14");
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(
+        version, CURRENT_PROTOCOL,
+        "server should report current protocol version"
+    );
     assert!(
         error.is_none(),
         "handshake should not have error: {:?}",
@@ -379,8 +382,8 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     stream
@@ -480,23 +483,32 @@ fn server_crash_after_attach_causes_lost_connection_error() {
     // terminal setup paths are exercised.
     let mut thin_client = spawn_client_process(&config_home, &runtime_dir, &api_socket);
 
-    // Prove attached before kill by waiting for at least one frame message.
+    // Prove attached before kill by waiting for recognizable rendered app content.
     let mut thin_reader = thin_client
         ._master
         .as_ref()
         .expect("thin client master")
         .try_clone_reader()
         .expect("clone client PTY reader");
-    let attached_before_kill = {
+    let (attached_before_kill, attach_output) = {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut buf = [0u8; 4096];
         let mut seen = false;
+        let mut output = String::new();
         while Instant::now() < deadline {
             match thin_reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let out = String::from_utf8_lossy(&buf[..n]);
-                    if !out.is_empty() {
+                    output.push_str(&out);
+                    if out.contains("\u{2500}")
+                        || out.contains("workspace")
+                        || out.contains("pane")
+                        || out.contains("terminal")
+                    {
                         seen = true;
+                        break;
+                    }
+                    if output.to_lowercase().contains("herdr:") {
                         break;
                     }
                 }
@@ -504,11 +516,11 @@ fn server_crash_after_attach_causes_lost_connection_error() {
                 Err(_) => thread::sleep(Duration::from_millis(30)),
             }
         }
-        seen
+        (seen, output)
     };
     assert!(
         attached_before_kill,
-        "thin client must complete attach and receive frame before server crash"
+        "thin client must complete attach and receive frame before server crash; output: {attach_output:?}"
     );
 
     // Kill server unexpectedly.
@@ -595,8 +607,8 @@ fn client_receives_frame_after_pane_output() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
@@ -710,8 +722,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -809,8 +821,8 @@ fn client_receives_notify_on_agent_state_change() {
     // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
     let (version, error) =
-        client_handshake(&mut stream, 14, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 14);
+        client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, CURRENT_PROTOCOL);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).

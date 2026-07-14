@@ -35,3 +35,5 @@ logs/
 .vault-key
 node_modules/
 .DS_Store
+/.wrangler/
+**/.wrangler/

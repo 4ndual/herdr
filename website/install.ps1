@@ -147,7 +147,13 @@ function Test-FileDigest {
         return
     }
 
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $actual = [System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
     if ($actual -ne $ExpectedDigest.ToLowerInvariant()) {
         throw "Downloaded Herdr checksum did not match. Expected $ExpectedDigest but got $actual."
     }
@@ -394,6 +400,11 @@ switch ($architecture) {
     "X64" {
         $target = "windows-x86_64"
         $targetTriple = "x86_64-pc-windows-msvc"
+    }
+    "Arm64" {
+        $target = "windows-x86_64"
+        $targetTriple = "x86_64-pc-windows-msvc"
+        Write-Step "Windows ARM64 detected; installing the x86_64 build under Windows emulation."
     }
     default {
         Write-Error "Unsupported Windows architecture: $architecture"

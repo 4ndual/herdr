@@ -33,6 +33,25 @@ Runtime action registration and native non-terminal plugin UI are not part of
 plugin v1. Actions, event hooks, panes, and link handlers are all declared in
 the manifest.
 
+## Trust and security
+
+A plugin is ordinary code that runs on your machine. When you install or link
+one, its build and runtime commands run as your user, with your environment, and
+can call the full Herdr CLI — the same as any extension you add to an editor,
+shell, or coding agent. That openness is the point, and a little judgment keeps
+it safe.
+
+Install plugins from authors and repositories you trust, and skim what a new one
+does first: the `herdr-plugin.toml` manifest and the scripts or binaries it runs.
+`herdr plugin install` shows a preview of the source and the commands it will run
+in interactive terminals, so you can review before confirming. Use `--yes` for
+sources you already trust, and pin `--ref` when you want a specific revision.
+
+Herdr validates the manifest and keeps each plugin's config and state in its own
+directory, but it does not review or sandbox what a plugin does. Third-party
+plugins come from their authors, not from Herdr, so they are yours to vet and run
+at your own discretion.
+
 ## Manifest
 
 The manifest is the contract between Herdr and the plugin. It declares package
@@ -285,10 +304,11 @@ state should own their files or database.
 
 ## Marketplace
 
-A plugin marketplace is coming. Plugins are already shareable today: publish a
-GitHub repository with `herdr-plugin.toml`, then share
-`herdr plugin install owner/repo[/subdir]`.
+Community plugins are discoverable in the [marketplace](/plugins/), an automatic
+index of public GitHub repositories tagged with the topic `herdr-plugin`.
+Plugins stay ordinary GitHub repositories: publish one with `herdr-plugin.toml`,
+then share `herdr plugin install owner/repo[/subdir]`.
 
-If you want the plugin to appear in the website marketplace when discovery
-launches, add the GitHub topic `herdr-plugin` to the repository now. See
-[Marketplace](/docs/marketplace/) for how publishing and discovery will work.
+To get a plugin listed, add the GitHub topic `herdr-plugin` to its public
+repository. The index refreshes every 30 minutes. See
+[Marketplace](/docs/marketplace/) for how discovery works.

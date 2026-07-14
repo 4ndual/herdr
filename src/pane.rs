@@ -121,6 +121,7 @@ struct PendingAgentRelease {
 struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
+    windows_powershell_prompt_cwd_reporting: bool,
 }
 
 fn active_pending_release(
@@ -234,14 +235,6 @@ struct AgentDetectionPresence {
     consecutive_misses: u8,
 }
 
-fn should_clear_agent_for_foreground_shell(
-    previous_agent: Option<Agent>,
-    new_agent: Option<Agent>,
-    foreground_is_pane_shell: bool,
-) -> bool {
-    previous_agent.is_some() && new_agent.is_none() && foreground_is_pane_shell
-}
-
 #[cfg(unix)]
 fn usable_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     crate::platform::process_cwd(pid).filter(|cwd| cwd.is_absolute() && cwd.is_dir())
@@ -280,19 +273,22 @@ fn foreground_shell_agent_action(
     foreground_is_pane_shell: bool,
     process_exit_reported: bool,
 ) -> ForegroundShellAgentAction {
-    if !should_clear_agent_for_foreground_shell(previous_agent, new_agent, foreground_is_pane_shell)
-    {
+    if previous_agent.is_none() || new_agent.is_some() {
         return ForegroundShellAgentAction::ObserveProbe;
     }
 
-    // Do not clear identity immediately. First publish an idle process-exit
-    // transition for the previous agent so notifications and wait-agent callers
-    // observe completion before the pane becomes unknown.
     if process_exit_reported {
-        ForegroundShellAgentAction::ClearAgent
-    } else {
-        ForegroundShellAgentAction::ReportProcessExit
+        return ForegroundShellAgentAction::ClearAgent;
     }
+
+    if foreground_is_pane_shell {
+        // Do not clear identity immediately. First publish an idle process-exit
+        // transition for the previous agent so notifications and wait-agent callers
+        // observe completion before the pane becomes unknown.
+        return ForegroundShellAgentAction::ReportProcessExit;
+    }
+
+    ForegroundShellAgentAction::ObserveProbe
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -318,10 +314,13 @@ fn foreground_group_changed(
 
 fn should_skip_process_probe_for_lifecycle_authority(
     full_lifecycle_authority_active: bool,
-    process_exit_pending: bool,
-    release_pending: bool,
+    input: ProcessProbeInput,
 ) -> bool {
-    full_lifecycle_authority_active && !process_exit_pending && !release_pending
+    full_lifecycle_authority_active
+        && !input.pending_foreground_shell_clear
+        && input.suppressed_agent.is_none()
+        && input.has_process_probe
+        && !foreground_group_changed(input.foreground_pgid, input.last_foreground_pgid)
 }
 
 fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
@@ -409,23 +408,108 @@ struct ProcessProbeResult {
     process_name: Option<String>,
 }
 
-fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
-    if let Some(job) = foreground_pgid.and_then(crate::detect::foreground_group_leader_job) {
-        if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(&job) {
-            return ProcessProbeResult {
-                process_group_id: Some(job.process_group_id),
-                foreground_is_pane_shell: job.processes.iter().any(|p| p.pid == pid),
-                agent: Some(agent),
-                process_name: Some(process_name),
-            };
+fn agent_hint_for_foreground_job_members(
+    job: &crate::platform::ForegroundJob,
+    read_hint: impl Fn(u32) -> Option<Agent>,
+) -> Option<Agent> {
+    read_hint(job.process_group_id)
+        .or_else(|| agent_hint_for_non_leader_foreground_job_members(job, read_hint))
+}
+
+fn agent_hint_for_non_leader_foreground_job_members(
+    job: &crate::platform::ForegroundJob,
+    read_hint: impl Fn(u32) -> Option<Agent>,
+) -> Option<Agent> {
+    job.processes
+        .iter()
+        .filter(|process| process.pid != job.process_group_id)
+        .find_map(|process| read_hint(process.pid))
+}
+
+fn identify_process_group_leader_in_job(
+    job: &crate::platform::ForegroundJob,
+) -> Option<(Agent, String)> {
+    let leader = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)?;
+    let leader_job = crate::platform::ForegroundJob {
+        process_group_id: job.process_group_id,
+        processes: vec![leader.clone()],
+    };
+    crate::detect::identify_agent_in_job(&leader_job)
+}
+
+fn process_probe_result(
+    job: &crate::platform::ForegroundJob,
+    pid: u32,
+    agent: Agent,
+    process_name: String,
+) -> ProcessProbeResult {
+    ProcessProbeResult {
+        process_group_id: Some(job.process_group_id),
+        foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
+        agent: Some(agent),
+        process_name: Some(process_name),
+    }
+}
+
+fn hinted_process_probe_result(
+    job: &crate::platform::ForegroundJob,
+    pid: u32,
+    read_hint: impl Fn(u32) -> Option<Agent>,
+) -> Option<ProcessProbeResult> {
+    let agent = agent_hint_for_foreground_job_members(job, read_hint)?;
+    Some(process_probe_result(
+        job,
+        pid,
+        agent,
+        crate::detect::agent_label(agent).to_string(),
+    ))
+}
+
+fn probe_foreground_process_from_jobs(
+    pid: u32,
+    foreground_pgid: Option<u32>,
+    leader_job: Option<crate::platform::ForegroundJob>,
+    foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
+    read_hint: impl Fn(u32) -> Option<Agent> + Copy,
+) -> ProcessProbeResult {
+    if let Some(job) = leader_job.as_ref() {
+        if let Some(hinted) = hinted_process_probe_result(job, pid, read_hint) {
+            return hinted;
+        }
+        if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
+            return process_probe_result(job, pid, agent, process_name);
         }
     }
 
-    if let Some(job) = crate::detect::foreground_job(pid) {
-        let identified = crate::detect::identify_agent_in_job(&job);
+    let foreground_job = foreground_job();
+    if let Some(job) = foreground_job.as_ref() {
+        if let Some(agent) = read_hint(job.process_group_id) {
+            return process_probe_result(
+                job,
+                pid,
+                agent,
+                crate::detect::agent_label(agent).to_string(),
+            );
+        }
+        if let Some((agent, process_name)) = identify_process_group_leader_in_job(job) {
+            return process_probe_result(job, pid, agent, process_name);
+        }
+        if let Some(agent) = agent_hint_for_non_leader_foreground_job_members(job, read_hint) {
+            return process_probe_result(
+                job,
+                pid,
+                agent,
+                crate::detect::agent_label(agent).to_string(),
+            );
+        }
+
+        let identified = crate::detect::identify_agent_in_job(job);
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
-            foreground_is_pane_shell: job.processes.iter().any(|p| p.pid == pid),
+            foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
             agent: identified.as_ref().map(|(agent, _)| *agent),
             process_name: identified.map(|(_, process_name)| process_name),
         };
@@ -437,6 +521,16 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
         agent: None,
         process_name: None,
     }
+}
+
+fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessProbeResult {
+    probe_foreground_process_from_jobs(
+        pid,
+        foreground_pgid,
+        foreground_pgid.and_then(crate::detect::foreground_group_leader_job),
+        || crate::detect::foreground_job(pid),
+        crate::platform::process_agent_hint,
+    )
 }
 
 #[cfg(unix)]
@@ -518,9 +612,6 @@ fn spawn_basic_detection_task(
             let pid = child_pid.load(Ordering::Acquire);
             let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
-            let process_exit_pending = pending_foreground_shell_clear
-                && agent.is_some()
-                && !foreground_shell_exit_reported;
             let lifecycle_authority_active =
                 full_lifecycle_authority_active.load(Ordering::Acquire);
             let foreground_pgid = (pid > 0)
@@ -528,13 +619,8 @@ fn spawn_basic_detection_task(
                 .flatten();
             let process_group_changed =
                 foreground_group_changed(foreground_pgid, last_foreground_pgid);
-            let should_check_process = pid > 0
-                && !should_skip_process_probe_for_lifecycle_authority(
-                    lifecycle_authority_active,
-                    process_exit_pending,
-                    suppressed_agent.is_some(),
-                )
-                && should_probe_foreground_job(ProcessProbeInput {
+            let should_check_process = pid > 0 && {
+                let process_probe_input = ProcessProbeInput {
                     current_agent: agent,
                     suppressed_agent,
                     foreground_pgid,
@@ -545,7 +631,12 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear,
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
-                });
+                };
+                !should_skip_process_probe_for_lifecycle_authority(
+                    lifecycle_authority_active,
+                    process_probe_input,
+                ) && should_probe_foreground_job(process_probe_input)
+            };
 
             if should_check_process {
                 last_process_check = now;
@@ -1132,12 +1223,34 @@ impl<'a> PaneShellConfig<'a> {
     }
 }
 
+/// Target platform for shell launch policy. Parameterized (instead of raw
+/// `cfg!` checks at each decision point) so every branch stays testable on
+/// every host platform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShellLaunchTarget {
+    Windows,
+    Macos,
+    OtherUnix,
+}
+
+impl ShellLaunchTarget {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else {
+            Self::OtherUnix
+        }
+    }
+}
+
 fn shell_mode_uses_login_shell(
     mode: crate::config::ShellModeConfig,
-    target_is_macos: bool,
+    target: ShellLaunchTarget,
 ) -> bool {
     match mode {
-        crate::config::ShellModeConfig::Auto => target_is_macos,
+        crate::config::ShellModeConfig::Auto => target == ShellLaunchTarget::Macos,
         crate::config::ShellModeConfig::Login => true,
         crate::config::ShellModeConfig::NonLogin => false,
     }
@@ -1189,57 +1302,80 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
         })
 }
 
+/// Sourced via `-NoExit -Command` when launching PowerShell on Windows. It
+/// wraps whatever `prompt` function the user's profile left behind so each
+/// prompt render appends the cwd as OSC 9;9 — the sequence Windows Terminal
+/// and ConEmu standardized for shell integration. PowerShell never updates
+/// its Win32 process cwd on `Set-Location`, so prompt-time reporting is the
+/// only reliable cwd source on Windows.
+///
+/// The snippet must not contain double quotes: powershell.exe parses its
+/// command line with its own rules that disagree with the ArgvQuote escaping
+/// portable-pty applies, and embedded `\"` sequences get corrupted in
+/// transit. Single-quoted strings and `[char]` codes keep the round-trip
+/// byte-exact, and the OSC 9;9 payload is emitted unquoted (the original
+/// ConEmu form, which the cwd tracker accepts).
+///
+/// The original prompt must be invoked before any other statement in the
+/// wrapper: anything that runs first resets `$?`, so a status-aware user
+/// prompt would show success after a failed command (verified on 5.1).
+pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
+
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
-    target_is_macos: bool,
+    target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
-    if shell_mode_uses_login_shell(shell_config.mode, target_is_macos) {
+    if shell_mode_uses_login_shell(shell_config.mode, target) {
         let mut cmd = CommandBuilder::new_default_prog();
         cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
         Ok(cmd)
     } else {
         let mut cmd = CommandBuilder::new(&shell);
-        apply_windows_powershell_cwd_reporting(&mut cmd, &shell);
+        if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
+            cmd.args([
+                "-NoExit",
+                "-Command",
+                WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
+            ]);
+        }
         Ok(cmd)
     }
 }
 
 fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<CommandBuilder> {
-    pane_shell_command_builder_for_target(shell_config, cfg!(target_os = "macos"))
+    pane_shell_command_builder_for_target(shell_config, ShellLaunchTarget::current())
 }
 
-#[cfg(windows)]
-fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
-    if !is_windows_powershell_shell(shell) {
-        return;
-    }
-    cmd.arg("-NoExit");
-    cmd.arg("-Command");
-    cmd.arg(windows_powershell_cwd_prompt_wrapper());
+/// True when panes launch an interactive PowerShell directly on Windows.
+/// Gates the prompt-based cwd reporting pipeline and the agent-exit shell
+/// respawn recovery.
+pub(crate) fn uses_windows_powershell_pane_shell(shell_config: PaneShellConfig<'_>) -> bool {
+    uses_windows_powershell_pane_shell_for_target(shell_config, ShellLaunchTarget::current())
 }
 
-#[cfg(not(windows))]
-fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
-    let _ = (cmd, shell);
+fn uses_windows_powershell_pane_shell_for_target(
+    shell_config: PaneShellConfig<'_>,
+    target: ShellLaunchTarget,
+) -> bool {
+    target == ShellLaunchTarget::Windows
+        && !shell_mode_uses_login_shell(shell_config.mode, target)
+        && is_powershell_shell(&pane_shell(shell_config.default_shell))
 }
 
-#[cfg(windows)]
-fn is_windows_powershell_shell(shell: &str) -> bool {
-    let name = Path::new(shell)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
+fn is_powershell_shell(shell: &str) -> bool {
+    // Split on both separators by hand: `Path::file_name` only treats `\` as
+    // a separator on Windows hosts, and this predicate must evaluate Windows
+    // shell paths correctly from tests on any host.
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
         .unwrap_or(shell)
         .to_ascii_lowercase();
     matches!(
         name.as_str(),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
     )
-}
-
-#[cfg(windows)]
-fn windows_powershell_cwd_prompt_wrapper() -> &'static str {
-    r#"$global:__HERDR_ORIGINAL_PROMPT = if (Test-Path Function:\prompt) { (Get-Command prompt -CommandType Function).ScriptBlock } else { { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " } }; function global:prompt { try { if ($PWD.Provider.Name -eq 'FileSystem') { $uri = ([System.Uri]$PWD.ProviderPath).AbsoluteUri; [Console]::Write("$([char]27)]7;$uri$([char]7)") } } catch {}; & $global:__HERDR_ORIGINAL_PROMPT }"#
 }
 
 fn usable_reported_cwd(cwd: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -1409,6 +1545,8 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
+        let windows_powershell_prompt_cwd_reporting =
+            uses_windows_powershell_pane_shell(shell_config);
         let mut cmd = pane_shell_command_builder(shell_config)?;
         cmd.cwd(cwd);
         apply_pane_terminal_env(&mut cmd);
@@ -1427,6 +1565,7 @@ impl PaneRuntime {
             SpawnInitialState {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
+                windows_powershell_prompt_cwd_reporting,
             },
         )
     }
@@ -1446,9 +1585,7 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
-        let mut cmd = CommandBuilder::new("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg(command);
+        let mut cmd = crate::platform::pane_custom_command_pty_builder(command);
         cmd.cwd(cwd);
         apply_pane_terminal_env(&mut cmd);
         apply_pane_launch_env(&mut cmd, launch_env);
@@ -1680,6 +1817,9 @@ impl PaneRuntime {
         }
         let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
         pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+        pane_terminal.set_windows_powershell_prompt_cwd_reporting(
+            initial_state.windows_powershell_prompt_cwd_reporting,
+        );
         if let Some(ansi) = initial_state.history_ansi {
             pane_terminal.seed_history_ansi(ansi);
         }
@@ -1870,9 +2010,6 @@ impl PaneRuntime {
                     release_was_active = suppressed_agent.is_some();
                     let pid = child_pid.load(Ordering::Acquire);
                     let mut agent = agent_presence.current_agent();
-                    let process_exit_pending = pending_foreground_shell_clear
-                        && agent.is_some()
-                        && !foreground_shell_exit_reported;
                     let lifecycle_authority_active =
                         full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
                     let foreground_pgid = (pid > 0)
@@ -1880,13 +2017,8 @@ impl PaneRuntime {
                         .flatten();
                     let process_group_changed =
                         foreground_group_changed(foreground_pgid, last_foreground_pgid);
-                    let should_check_process = pid > 0
-                        && !should_skip_process_probe_for_lifecycle_authority(
-                            lifecycle_authority_active,
-                            process_exit_pending,
-                            suppressed_agent.is_some(),
-                        )
-                        && should_probe_foreground_job(ProcessProbeInput {
+                    let should_check_process = pid > 0 && {
+                        let process_probe_input = ProcessProbeInput {
                             current_agent: agent,
                             suppressed_agent,
                             foreground_pgid,
@@ -1897,7 +2029,12 @@ impl PaneRuntime {
                             pending_foreground_shell_clear,
                             pending_restore_probe,
                             elapsed_since_process_check: now.duration_since(last_process_check),
-                        });
+                        };
+                        !should_skip_process_probe_for_lifecycle_authority(
+                            lifecycle_authority_active,
+                            process_probe_input,
+                        ) && should_probe_foreground_job(process_probe_input)
+                    };
 
                     let mut agent_changed = false;
                     if should_check_process {
@@ -2466,6 +2603,7 @@ impl PaneRuntime {
         {
             return Some(cwd);
         }
+
         let pid = self.child_pid.load(Ordering::Relaxed);
         crate::platform::process_cwd(pid)
     }
@@ -2675,19 +2813,23 @@ mod tests {
     fn shell_mode_auto_uses_login_shell_only_on_macos() {
         assert!(shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Auto,
-            true
+            ShellLaunchTarget::Macos
         ));
         assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Auto,
-            false
+            ShellLaunchTarget::OtherUnix
+        ));
+        assert!(!shell_mode_uses_login_shell(
+            crate::config::ShellModeConfig::Auto,
+            ShellLaunchTarget::Windows
         ));
         assert!(shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::Login,
-            false
+            ShellLaunchTarget::OtherUnix
         ));
         assert!(!shell_mode_uses_login_shell(
             crate::config::ShellModeConfig::NonLogin,
-            true
+            ShellLaunchTarget::Macos
         ));
     }
 
@@ -2696,7 +2838,7 @@ mod tests {
     fn login_shell_builder_uses_default_prog_with_resolved_shell_env() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Login),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
         assert!(cmd.is_default_prog());
@@ -2711,7 +2853,7 @@ mod tests {
     fn auto_shell_builder_uses_login_shell_on_macos_target() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Auto),
-            true,
+            ShellLaunchTarget::Macos,
         )
         .unwrap();
         assert!(cmd.is_default_prog());
@@ -2725,32 +2867,112 @@ mod tests {
     fn auto_shell_builder_keeps_direct_shell_on_non_macos_target() {
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::Auto),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
         assert!(!cmd.is_default_prog());
         assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("/bin/sh")]);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_powershell_shell_builder_wraps_cwd_reporting_prompt() {
+    fn windows_powershell_builder_injects_prompt_cwd_shell_integration() {
+        for shell in [
+            "powershell.exe",
+            "pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ] {
+            let cmd = pane_shell_command_builder_for_target(
+                PaneShellConfig::new(shell, crate::config::ShellModeConfig::NonLogin),
+                ShellLaunchTarget::Windows,
+            )
+            .unwrap();
+
+            assert_eq!(
+                cmd.get_argv(),
+                &[
+                    std::ffi::OsString::from(shell),
+                    std::ffi::OsString::from("-NoExit"),
+                    std::ffi::OsString::from("-Command"),
+                    std::ffi::OsString::from(WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND),
+                ]
+            );
+        }
+
+        let script = WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND;
+        assert!(script.contains("]9;9;"), "missing OSC 9;9 emit: {script}");
+        assert!(
+            script.contains("$global:__HerdrOriginalPrompt = $function:prompt"),
+            "must wrap the profile-defined prompt: {script}"
+        );
+        assert!(
+            script.contains("$null -eq $global:__HerdrOriginalPrompt"),
+            "wrap must be idempotent for nested sessions: {script}"
+        );
+        assert!(
+            script.contains("'FileSystem'"),
+            "must not report non-filesystem provider paths: {script}"
+        );
+        assert!(
+            !script.contains('"'),
+            "double quotes corrupt the powershell.exe command-line round-trip: {script}"
+        );
+        let invoke_original = script
+            .find("@(& $global:__HerdrOriginalPrompt)")
+            .expect("wrapper must invoke the original prompt");
+        let cwd_lookup = script
+            .find("$loc =")
+            .expect("wrapper must look up the current location");
+        assert!(
+            invoke_original < cwd_lookup,
+            "original prompt must run first or $? is reset before a status-aware prompt reads it: {script}"
+        );
+    }
+
+    #[test]
+    fn windows_non_powershell_builder_launches_plain_shell() {
         let cmd = pane_shell_command_builder_for_target(
-            PaneShellConfig::new("powershell.exe", crate::config::ShellModeConfig::NonLogin),
-            false,
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows,
         )
         .unwrap();
-        let argv: Vec<_> = cmd
-            .get_argv()
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
 
-        assert_eq!(argv[0], "powershell.exe");
-        assert!(argv.iter().any(|arg| arg == "-NoExit"));
-        assert!(argv
-            .iter()
-            .any(|arg| arg.contains("]7;") && arg.contains("Function:\\prompt")));
+        assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("cmd.exe")]);
+    }
+
+    #[test]
+    fn unix_powershell_builder_launches_plain_shell() {
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new("pwsh", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::OtherUnix,
+        )
+        .unwrap();
+
+        assert_eq!(cmd.get_argv(), &[std::ffi::OsString::from("pwsh")]);
+    }
+
+    #[test]
+    fn windows_powershell_pane_shell_predicate_requires_windows_and_non_login() {
+        let pwsh = PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::NonLogin);
+        assert!(uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::OtherUnix
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            pwsh,
+            ShellLaunchTarget::Macos
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("pwsh.exe", crate::config::ShellModeConfig::Login),
+            ShellLaunchTarget::Windows
+        ));
+        assert!(!uses_windows_powershell_pane_shell_for_target(
+            PaneShellConfig::new("cmd.exe", crate::config::ShellModeConfig::NonLogin),
+            ShellLaunchTarget::Windows
+        ));
     }
 
     #[test]
@@ -2760,7 +2982,7 @@ mod tests {
                 "/__herdr_missing_shell__",
                 crate::config::ShellModeConfig::Login,
             ),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
@@ -2792,7 +3014,7 @@ mod tests {
 
         let cmd = pane_shell_command_builder_for_target(
             PaneShellConfig::new("fake-shell", crate::config::ShellModeConfig::Login),
-            false,
+            ShellLaunchTarget::OtherUnix,
         )
         .unwrap();
 
@@ -2984,15 +3206,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_shell_without_agent_is_immediate_clear_signal() {
-        assert!(should_clear_agent_for_foreground_shell(
-            Some(Agent::Claude),
-            None,
-            true
-        ));
-    }
-
-    #[test]
     fn foreground_shell_reports_process_exit_before_clearing_agent() {
         assert_eq!(
             foreground_shell_agent_action(Some(Agent::Codex), None, true, false),
@@ -3006,20 +3219,151 @@ mod tests {
 
     #[test]
     fn unknown_non_shell_foreground_job_is_not_immediate_clear_signal() {
-        assert!(!should_clear_agent_for_foreground_shell(
-            Some(Agent::Claude),
-            None,
-            false
-        ));
+        assert_eq!(
+            foreground_shell_agent_action(Some(Agent::Claude), None, false, false),
+            ForegroundShellAgentAction::ObserveProbe
+        );
+    }
+
+    #[test]
+    fn reported_process_exit_clears_before_unknown_foreground_probe() {
+        assert_eq!(
+            foreground_shell_agent_action(Some(Agent::Claude), None, false, true),
+            ForegroundShellAgentAction::ClearAgent
+        );
     }
 
     #[test]
     fn foreground_agent_job_is_not_clear_signal() {
-        assert!(!should_clear_agent_for_foreground_shell(
-            Some(Agent::Claude),
-            Some(Agent::OpenCode),
-            true
-        ));
+        assert_eq!(
+            foreground_shell_agent_action(Some(Agent::Claude), Some(Agent::OpenCode), true, false),
+            ForegroundShellAgentAction::ObserveProbe
+        );
+    }
+
+    fn foreground_process(pid: u32, name: &str) -> crate::platform::ForegroundProcess {
+        crate::platform::ForegroundProcess {
+            pid,
+            name: name.to_string(),
+            argv0: None,
+            argv: None,
+            cmdline: None,
+        }
+    }
+
+    #[test]
+    fn foreground_agent_hint_accepts_pane_shell_environment() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![foreground_process(42, "bash")],
+        };
+
+        assert_eq!(
+            agent_hint_for_foreground_job_members(&job, |pid| {
+                (pid == 42).then_some(Agent::Claude)
+            }),
+            Some(Agent::Claude)
+        );
+    }
+
+    #[test]
+    fn foreground_agent_hint_accepts_non_leader_foreground_process_environment() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(99, "fence"),
+                foreground_process(100, "pi"),
+            ],
+        };
+
+        assert_eq!(
+            agent_hint_for_foreground_job_members(&job, |pid| {
+                (pid == 100).then_some(Agent::Codex)
+            }),
+            Some(Agent::Codex)
+        );
+    }
+
+    #[test]
+    fn foreground_agent_hint_wins_over_process_name_detection() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "codex")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            Some(job),
+            || None,
+            |pid| (pid == 99).then_some(Agent::Claude),
+        );
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.process_name.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn foreground_agent_hint_on_inherited_child_environment_is_authoritative() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "vim")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(job),
+            |pid| (pid == 99).then_some(Agent::Claude),
+        );
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.process_name.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn non_leader_agent_hint_does_not_override_identifiable_leader() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(99, "codex"),
+                foreground_process(100, "vim"),
+            ],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(job),
+            |pid| (pid == 100).then_some(Agent::Claude),
+        );
+
+        assert_eq!(result.agent, Some(Agent::Codex));
+        assert_eq!(result.process_name.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn non_leader_agent_hint_wins_when_leader_is_unidentified() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![
+                foreground_process(99, "some_vm"),
+                foreground_process(100, "vim"),
+            ],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(job),
+            |pid| (pid == 100).then_some(Agent::Claude),
+        );
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.process_name.as_deref(), Some("claude"));
     }
 
     fn process_probe_input() -> ProcessProbeInput {
@@ -3104,22 +3448,62 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_authority_skips_normal_process_probe() {
+    fn lifecycle_authority_skips_stable_routine_process_probe() {
         assert!(should_skip_process_probe_for_lifecycle_authority(
-            true, false, false
+            true,
+            ProcessProbeInput {
+                current_agent: Some(Agent::Pi),
+                elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+                ..process_probe_input()
+            }
         ));
         assert!(!should_skip_process_probe_for_lifecycle_authority(
-            false, false, false
+            false,
+            ProcessProbeInput {
+                current_agent: Some(Agent::Pi),
+                elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+                ..process_probe_input()
+            }
         ));
     }
 
     #[test]
     fn lifecycle_authority_preserves_process_exit_and_release_probes() {
         assert!(!should_skip_process_probe_for_lifecycle_authority(
-            true, true, false
+            true,
+            ProcessProbeInput {
+                current_agent: Some(Agent::Pi),
+                pending_foreground_shell_clear: true,
+                ..process_probe_input()
+            }
         ));
         assert!(!should_skip_process_probe_for_lifecycle_authority(
-            true, false, true
+            true,
+            ProcessProbeInput {
+                current_agent: Some(Agent::Pi),
+                suppressed_agent: Some(Agent::Pi),
+                ..process_probe_input()
+            }
+        ));
+    }
+
+    #[test]
+    fn lifecycle_authority_preserves_initial_and_foreground_group_change_probes() {
+        assert!(!should_skip_process_probe_for_lifecycle_authority(
+            true,
+            ProcessProbeInput {
+                current_agent: None,
+                has_process_probe: false,
+                ..process_probe_input()
+            }
+        ));
+        assert!(!should_skip_process_probe_for_lifecycle_authority(
+            true,
+            ProcessProbeInput {
+                current_agent: Some(Agent::Pi),
+                foreground_pgid: Some(43),
+                ..process_probe_input()
+            }
         ));
     }
 

@@ -11,6 +11,7 @@ use super::terminal::GhosttyPaneCore;
 pub(super) enum DefaultColorQuery {
     Foreground,
     Background,
+    Cursor,
 }
 
 impl DefaultColorQuery {
@@ -18,6 +19,7 @@ impl DefaultColorQuery {
         match self {
             Self::Foreground => 10,
             Self::Background => 11,
+            Self::Cursor => 12,
         }
     }
 }
@@ -247,6 +249,7 @@ fn parse_default_color_event(body: &[u8]) -> Option<DefaultColorEvent> {
     match body {
         b"10;?" => Some(DefaultColorEvent::Query(DefaultColorQuery::Foreground)),
         b"11;?" => Some(DefaultColorEvent::Query(DefaultColorQuery::Background)),
+        b"12;?" => Some(DefaultColorEvent::Query(DefaultColorQuery::Cursor)),
         b"110" | b"110;" => Some(DefaultColorEvent::Reset(DefaultColorQuery::Foreground)),
         b"111" | b"111;" => Some(DefaultColorEvent::Reset(DefaultColorQuery::Background)),
         _ => parse_palette_color_query(body).or_else(|| parse_default_color_set_event(body)),
@@ -885,20 +888,42 @@ pub(super) fn write_host_terminal_theme(
     terminal: &mut crate::ghostty::Terminal,
     theme: crate::terminal_theme::TerminalTheme,
 ) {
-    if let Some(color) = theme.foreground {
-        let sequence = crate::terminal_theme::osc_set_default_color_sequence(
+    write_host_terminal_theme_selective(terminal, theme, true, true);
+}
+
+pub(super) fn write_host_terminal_theme_selective(
+    terminal: &mut crate::ghostty::Terminal,
+    theme: crate::terminal_theme::TerminalTheme,
+    foreground: bool,
+    background: bool,
+) {
+    if foreground {
+        write_host_default_color(
+            terminal,
             crate::terminal_theme::DefaultColorKind::Foreground,
-            color,
+            theme.foreground,
         );
-        terminal.write(sequence.as_bytes());
     }
-    if let Some(color) = theme.background {
-        let sequence = crate::terminal_theme::osc_set_default_color_sequence(
+    if background {
+        write_host_default_color(
+            terminal,
             crate::terminal_theme::DefaultColorKind::Background,
-            color,
+            theme.background,
         );
-        terminal.write(sequence.as_bytes());
     }
+}
+
+fn write_host_default_color(
+    terminal: &mut crate::ghostty::Terminal,
+    kind: crate::terminal_theme::DefaultColorKind,
+    color: Option<crate::terminal_theme::RgbColor>,
+) {
+    let sequence = if let Some(color) = color {
+        crate::terminal_theme::osc_set_default_color_sequence(kind, color)
+    } else {
+        crate::terminal_theme::osc_reset_default_color_sequence(kind).to_string()
+    };
+    terminal.write(sequence.as_bytes());
 }
 
 pub(super) fn restore_host_terminal_theme_if_needed(
@@ -1029,6 +1054,21 @@ mod tests {
         assert_eq!(
             tracker.drain_latest(),
             Some(std::path::PathBuf::from("C:\\Users\\herdr\\src\\herdr"))
+        );
+    }
+
+    // The quoted form is what Windows Terminal's documented shell integration
+    // snippet emits. Herdr's own injected prompt integration deliberately
+    // emits the path unquoted; see WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND.
+    #[test]
+    fn cwd_osc_tracker_detects_quoted_powershell_prompt_cwd_sequence() {
+        let mut tracker = CwdOscTracker::default();
+
+        tracker.observe(b"PS C:\\my proj> \x1b]9;9;\"C:\\my proj\"\x1b\\");
+
+        assert_eq!(
+            tracker.drain_latest(),
+            Some(std::path::PathBuf::from("C:\\my proj"))
         );
     }
 
@@ -1266,7 +1306,7 @@ mod tests {
         let mut tracker = DefaultColorEventTracker::default();
 
         tracker.observe(
-            b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]4;0;?\x07\x1b]10;rgb:11/22/33\x07\x1b]111\x07",
+            b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b]12;?\x07\x1b]4;0;?\x07\x1b]10;rgb:11/22/33\x07\x1b]111\x07",
         );
 
         assert_eq!(
@@ -1274,6 +1314,7 @@ mod tests {
             vec![
                 DefaultColorEvent::Query(DefaultColorQuery::Foreground),
                 DefaultColorEvent::Query(DefaultColorQuery::Background),
+                DefaultColorEvent::Query(DefaultColorQuery::Cursor),
                 DefaultColorEvent::PaletteQuery(0),
                 DefaultColorEvent::Set(DefaultColorQuery::Foreground),
                 DefaultColorEvent::Reset(DefaultColorQuery::Background),

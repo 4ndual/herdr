@@ -49,6 +49,8 @@ pub enum Agent {
     Devin,
     Antigravity,
     Cline,
+    Omp,
+    Mastracode,
     OpenCode,
     GithubCopilot,
     Kimi,
@@ -62,7 +64,7 @@ pub enum Agent {
 }
 
 impl Agent {
-    pub const ALL: [Self; 18] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 18] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -94,6 +96,8 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Devin => "devin",
         Agent::Antigravity => "agy",
         Agent::Cline => "cline",
+        Agent::Omp => "omp",
+        Agent::Mastracode => "mastracode",
         Agent::OpenCode => "opencode",
         Agent::GithubCopilot => "copilot",
         Agent::Kimi => "kimi",
@@ -118,6 +122,8 @@ pub fn parse_agent_label(agent: &str) -> Option<Agent> {
         "devin" | "devin-cli" | "devin cli" => Some(Agent::Devin),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "cline" => Some(Agent::Cline),
+        "omp" => Some(Agent::Omp),
+        "mastracode" | "mastra-code" | "mastra code" => Some(Agent::Mastracode),
         "opencode" | "open-code" => Some(Agent::OpenCode),
         "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
         "kimi" | "kimi-code" | "kimi code" => Some(Agent::Kimi),
@@ -146,6 +152,8 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
         "devin" | "devin-cli" | "devin cli" => Some(Agent::Devin),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "cline" => Some(Agent::Cline),
+        "omp" => Some(Agent::Omp),
+        "mastracode" | "mastra-code" | "mastra code" => Some(Agent::Mastracode),
         "opencode" | "open-code" => Some(Agent::OpenCode),
         "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
         "kimi" | "kimi-code" | "kimi code" => Some(Agent::Kimi),
@@ -238,6 +246,7 @@ pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> 
         (source, agent_label),
         ("herdr:pi", "pi")
             | ("herdr:omp", "omp")
+            | ("herdr:mastracode", "mastracode")
             | ("herdr:hermes", "hermes")
             | ("herdr:opencode", "opencode")
             | ("herdr:kilo", "kilo")
@@ -467,7 +476,31 @@ fn agent_name_from_path_token(token: &str) -> Option<String> {
     }
 
     agent_name_from_basename(path_basename(trimmed))
+        .or_else(|| agent_name_from_known_package_path(trimmed))
         .or_else(|| resolved_agent_name_from_path_token(trimmed))
+}
+
+fn agent_name_from_known_package_path(path: &str) -> Option<String> {
+    let components: Vec<String> = path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .map(normalized_agent_lookup_name)
+        .collect();
+
+    for window in components.windows(5) {
+        if window
+            == [
+                "node_modules",
+                "@earendil-works",
+                "pi-coding-agent",
+                "dist",
+                "cli",
+            ]
+        {
+            return Some(agent_label(Agent::Pi).to_string());
+        }
+    }
+    None
 }
 
 fn resolved_agent_name_from_path_token(token: &str) -> Option<String> {
@@ -592,6 +625,9 @@ mod tests {
         assert_eq!(identify_agent("agy"), Some(Agent::Antigravity));
         assert_eq!(identify_agent("antigravity-cli"), Some(Agent::Antigravity));
         assert_eq!(identify_agent("cline"), Some(Agent::Cline));
+        assert_eq!(identify_agent("omp"), Some(Agent::Omp));
+        assert_eq!(identify_agent("mastracode"), Some(Agent::Mastracode));
+        assert_eq!(identify_agent("mastra-code"), Some(Agent::Mastracode));
         assert_eq!(identify_agent("opencode"), Some(Agent::OpenCode));
         assert_eq!(identify_agent("opencode.exe"), Some(Agent::OpenCode));
         assert_eq!(identify_agent("kimi"), Some(Agent::Kimi));
@@ -616,6 +652,9 @@ mod tests {
         assert_eq!(parse_agent_label("devin-cli"), Some(Agent::Devin));
         assert_eq!(parse_agent_label("agy"), Some(Agent::Antigravity));
         assert_eq!(parse_agent_label("antigravity"), Some(Agent::Antigravity));
+        assert_eq!(parse_agent_label("omp"), Some(Agent::Omp));
+        assert_eq!(parse_agent_label("mastracode"), Some(Agent::Mastracode));
+        assert_eq!(parse_agent_label("mastra code"), Some(Agent::Mastracode));
         assert_eq!(parse_agent_label("opencode.exe"), Some(Agent::OpenCode));
         assert_eq!(parse_agent_label("copilot"), Some(Agent::GithubCopilot));
         assert_eq!(parse_agent_label("kimi-code"), Some(Agent::Kimi));
@@ -637,10 +676,21 @@ mod tests {
         assert_eq!(agent_label(Agent::OpenCode), "opencode");
         assert_eq!(agent_label(Agent::Devin), "devin");
         assert_eq!(agent_label(Agent::Antigravity), "agy");
+        assert_eq!(agent_label(Agent::Omp), "omp");
+        assert_eq!(agent_label(Agent::Mastracode), "mastracode");
         assert_eq!(agent_label(Agent::Kiro), "kiro");
         assert_eq!(agent_label(Agent::Grok), "grok");
         assert_eq!(agent_label(Agent::Hermes), "hermes");
         assert_eq!(agent_label(Agent::Kilo), "kilo");
+    }
+
+    #[test]
+    fn mastracode_is_hook_authority_without_screen_manifest() {
+        assert!(full_lifecycle_hook_authority(
+            "herdr:mastracode",
+            "mastracode"
+        ));
+        assert!(!Agent::SCREEN_MANIFEST_AGENTS.contains(&Agent::Mastracode));
     }
 
     #[test]
@@ -759,6 +809,60 @@ mod tests {
     }
 
     #[test]
+    fn identify_agent_in_job_detects_bun_wrapped_omp() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "bun",
+                &["bun", "/home/can/.bun/bin/omp"],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Omp, "omp".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_node_wrapped_pi_package_cli() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js",
+                ],
+            )],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Pi, "pi".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_non_cli_pi_package_script() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\scripts\\build.js",
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
+    }
+
+    #[test]
     fn identify_agent_in_job_detects_windows_cmd_wrapped_codex() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 123,
@@ -801,6 +905,28 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Claude, "claude".to_string()))
         );
+    }
+
+    // A plain shell pane launched with herdr's injected prompt integration
+    // must still classify as a shell, not an agent, even though its argv now
+    // carries a -Command payload.
+    #[test]
+    fn identify_agent_in_job_ignores_herdr_powershell_shell_integration_argv() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                1,
+                "powershell.exe",
+                &[
+                    "powershell.exe",
+                    "-NoExit",
+                    "-Command",
+                    crate::pane::WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND,
+                ],
+            )],
+        };
+
+        assert_eq!(identify_agent_in_job(&job), None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub(crate) struct RightClickPassthroughGesture {
     pub pane_info: PaneInfo,
     pub modifiers: KeyModifiers,
 }
-use crate::terminal_theme::TerminalTheme;
+use crate::terminal_theme::{HostAppearance, TerminalTheme};
 use crate::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ use crate::workspace::Workspace;
 
 /// All colors used by the UI. Derived from a base accent color for now,
 /// but structured so a full theme system can replace it later.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // all fields defined for theming — some used later
 pub struct Palette {
     /// Primary accent (highlight, active borders).
@@ -777,6 +777,33 @@ pub enum Mode {
     Navigator,
 }
 
+impl Mode {
+    /// Whether keys in this mode are commands/navigation (an ASCII input source is wanted) rather
+    /// than free text. This is an explicit **allowlist** of the prefix command/navigation realm:
+    /// any mode NOT listed defaults to leaving the user's IME alone (the safe default), so adding a
+    /// new text-entry or overlay mode can never silently force ASCII. Used by
+    /// `sync_prefix_input_source` (gated by `switch_ascii_input_source_in_prefix`) so multi-level
+    /// prefix commands keep ASCII until they return to the terminal.
+    ///
+    /// Known limitation: `Navigator`'s search box is also held on ASCII, since this `Mode`-level
+    /// predicate can't see `search_focused` (non-ASCII filtering there would need a runtime check).
+    pub(crate) fn wants_ascii_input(self) -> bool {
+        matches!(
+            self,
+            Mode::Prefix
+                | Mode::Navigate
+                | Mode::Navigator
+                | Mode::Copy
+                | Mode::Resize
+                | Mode::ConfirmClose
+                | Mode::ConfirmRemoveWorktree
+                | Mode::ContextMenu
+                | Mode::GlobalMenu
+                | Mode::KeybindHelp
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NavigatorTarget {
     Workspace {
@@ -841,11 +868,11 @@ pub(crate) enum CopyModeSelection {
     Linewise { anchor_row: u32 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AgentPanelScope {
-    CurrentWorkspace,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentPanelSort {
     #[default]
-    AllWorkspaces,
+    Spaces,
+    Priority,
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1014,16 @@ impl SelectionListState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ThemeRuntimeConfig {
+    pub manual_name: String,
+    pub dark_name: String,
+    pub light_name: String,
+    pub auto_switch: bool,
+    pub custom: Option<crate::config::CustomThemeColors>,
+    pub legacy_accent: Option<String>,
+}
+
 pub struct SettingsState {
     /// Which section tab is active.
     pub section: SettingsSection,
@@ -1018,6 +1055,7 @@ pub(crate) enum DragTarget {
         path: Vec<bool>,
         direction: Direction,
         area: Rect,
+        grab_offset: u16,
     },
     PaneScrollbar {
         pane_id: crate::layout::PaneId,
@@ -1388,9 +1426,11 @@ pub struct AppState {
     /// (wasm-ui v3 §7.2). `compute_view` shrinks a collapsed surface's reserve
     /// to a single row so panes reclaim the space. Pure data, not persisted.
     pub collapsed_surfaces: std::collections::HashSet<herdr_ui_plugin_api::UiSurface>,
+    pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
-    pub agent_panel_scope: AgentPanelScope,
+    pub agent_panel_sort: AgentPanelSort,
+    pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
@@ -1400,7 +1440,10 @@ pub struct AppState {
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
+    pub pane_borders: bool,
+    pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    pub hide_tab_bar_when_single_tab: bool,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1433,6 +1476,12 @@ pub struct AppState {
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
     pub theme_name: String,
+    /// Runtime theme configuration used to resolve manual and auto-switch palettes.
+    pub theme_runtime: ThemeRuntimeConfig,
+    /// Last known foreground host terminal appearance.
+    pub host_terminal_appearance: Option<HostAppearance>,
+    /// True when the foreground host explicitly reported appearance via Mode 2031.
+    pub host_terminal_appearance_explicit: bool,
     /// Settings panel state.
     pub settings: SettingsState,
     /// Cached integration recommendations for onboarding/settings UI.
@@ -1753,8 +1802,10 @@ impl AppState {
             sidebar_collapsed: false,
             usage_strip_enabled: true,
             collapsed_surfaces: std::collections::HashSet::new(),
+            sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
+            agent_panel_sort: AgentPanelSort::Spaces,
+            next_agent_state_change_seq: 0,
             mouse_capture: true,
             right_click_passthrough_modifiers: None,
             right_click_passthrough: None,
@@ -1762,7 +1813,10 @@ impl AppState {
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             prompt_new_tab_name: true,
+            pane_borders: true,
+            pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
+            hide_tab_bar_when_single_tab: false,
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
@@ -1785,6 +1839,16 @@ impl AppState {
             spinner_tick: 0,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
+            theme_runtime: ThemeRuntimeConfig {
+                manual_name: "catppuccin".to_string(),
+                dark_name: "catppuccin".to_string(),
+                light_name: "catppuccin-latte".to_string(),
+                auto_switch: false,
+                custom: None,
+                legacy_accent: None,
+            },
+            host_terminal_appearance: None,
+            host_terminal_appearance_explicit: false,
             settings: SettingsState {
                 section: SettingsSection::Theme,
                 list: SelectionListState::new(0),

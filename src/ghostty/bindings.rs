@@ -2638,6 +2638,12 @@ pub const GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES: GhosttyTermi
 pub const GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_APC_MAX_BYTES_KITTY: GhosttyTerminalOption =
     20;
 
+pub const GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_FILE: GhosttyTerminalData =
+    27;
+pub const GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_TEMP_FILE:
+    GhosttyTerminalData = 28;
+pub const GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_MEDIUM_SHARED_MEM:
+    GhosttyTerminalData = 29;
 pub const GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS: GhosttyTerminalData = 30;
 
 pub type GhosttySysOption = ::std::os::raw::c_uint;
@@ -2693,6 +2699,8 @@ pub const GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR:
     GhosttyKittyGraphicsImageData = 7;
 pub const GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN:
     GhosttyKittyGraphicsImageData = 8;
+pub const GhosttyKittyGraphicsImageData_GHOSTTY_KITTY_IMAGE_DATA_TRANSMIT_TIME_NS:
+    GhosttyKittyGraphicsImageData = 9;
 
 pub type GhosttyKittyImageFormat = ::std::os::raw::c_uint;
 pub const GhosttyKittyImageFormat_GHOSTTY_KITTY_IMAGE_FORMAT_RGB: GhosttyKittyImageFormat = 0;
