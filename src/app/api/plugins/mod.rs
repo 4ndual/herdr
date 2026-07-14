@@ -246,9 +246,9 @@ impl App {
             | Some(crate::app::state::ContextMenuKind::GitWorkspace { ws_idx, .. }) => {
                 self.plugin_context_for_workspace(ws_idx, "context_menu")
             }
-            Some(crate::app::state::ContextMenuKind::Pane { ws_idx, pane_id, .. }) => {
-                self.plugin_context_for_pane(ws_idx, pane_id, "context_menu")
-            }
+            Some(crate::app::state::ContextMenuKind::Pane {
+                ws_idx, pane_id, ..
+            }) => self.plugin_context_for_pane(ws_idx, pane_id, "context_menu"),
             Some(crate::app::state::ContextMenuKind::Tab { ws_idx, tab_idx }) => {
                 let mut context = self.plugin_context_for_workspace(ws_idx, "context_menu");
                 context.tab_id = self.public_tab_id(ws_idx, tab_idx);
@@ -893,7 +893,10 @@ command = ["echo", "ok"]
                 source: None,
             }),
         });
-        assert!(result.contains("plugin_linked"), "expected plugin_linked: {result}");
+        assert!(
+            result.contains("plugin_linked"),
+            "expected plugin_linked: {result}"
+        );
 
         let plugin = app
             .state
@@ -901,8 +904,14 @@ command = ["echo", "ok"]
             .get("example.relink")
             .expect("plugin should remain linked");
         assert_eq!(plugin.plugin_root, canonical_path_string(&root_b));
-        assert_eq!(std::fs::read_to_string(config_dir.join("settings.json")).unwrap(), "{\"theme\":\"custom\"}");
-        assert_eq!(std::fs::read_to_string(state_dir.join("cache.json")).unwrap(), "{\"seen\":1}");
+        assert_eq!(
+            std::fs::read_to_string(config_dir.join("settings.json")).unwrap(),
+            "{\"theme\":\"custom\"}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("cache.json")).unwrap(),
+            "{\"seen\":1}"
+        );
 
         let _ = std::fs::remove_dir_all(&config_dir);
         let _ = std::fs::remove_dir_all(&state_dir);
@@ -1649,7 +1658,10 @@ command = ["sh", "-c", "sleep 1"]
         assert_eq!(log.action_id.as_deref(), Some("bootstrap"));
         assert_eq!(context.workspace_id.as_deref(), Some("1"));
         assert_eq!(context.invocation_source.as_deref(), Some("test"));
-        assert_eq!(context.plugin_payload_json.as_deref(), Some("{\"hello\":true}"));
+        assert_eq!(
+            context.plugin_payload_json.as_deref(),
+            Some("{\"hello\":true}")
+        );
         assert_eq!(
             context.correlation_id.as_deref(),
             Some("external-correlation")
@@ -2670,7 +2682,10 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_PAYLOAD_JSON\" > {}"]
         while !capture.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(std::fs::read_to_string(&capture).unwrap(), "{\"pane\":true}");
+        assert_eq!(
+            std::fs::read_to_string(&capture).unwrap(),
+            "{\"pane\":true}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

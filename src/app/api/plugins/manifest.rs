@@ -1,8 +1,8 @@
 use crate::api::schema::{
     InstalledPluginInfo, PluginHotReloadMode, PluginManifestAction, PluginManifestBuild,
     PluginManifestEventHook, PluginManifestLinkHandler, PluginManifestPane, PluginManifestUiModule,
-    PluginPanePlacement, PluginPlatform, PluginSourceInfo, PluginSourceKind,
-    PluginUiCapability, PluginUiModuleKind, PluginUiSurface,
+    PluginPanePlacement, PluginPlatform, PluginSourceInfo, PluginSourceKind, PluginUiCapability,
+    PluginUiModuleKind, PluginUiSurface,
 };
 
 const PLUGIN_ID_MAX_CHARS: usize = 120;
@@ -484,8 +484,12 @@ fn normalize_manifest_pane(
 fn normalize_manifest_ui_module(
     module: RawPluginManifestUiModule,
 ) -> Result<PluginManifestUiModule, (&'static str, String)> {
-    let id = normalize_action_id(&module.id)
-        .ok_or_else(|| ("invalid_plugin_ui_module_id", "invalid ui module id".to_string()))?;
+    let id = normalize_action_id(&module.id).ok_or_else(|| {
+        (
+            "invalid_plugin_ui_module_id",
+            "invalid ui module id".to_string(),
+        )
+    })?;
     let title = non_empty_trimmed(
         &module.title,
         "invalid_plugin_ui_module_title",
@@ -822,7 +826,14 @@ mod tests {
 
     #[test]
     fn ui_input_file_rejects_path_traversal_and_separators() {
-        for bad in ["../escape.json", "sub/dir.json", "..", ".", "a\\b.json", "   "] {
+        for bad in [
+            "../escape.json",
+            "sub/dir.json",
+            "..",
+            ".",
+            "a\\b.json",
+            "   ",
+        ] {
             let err = normalize_manifest_ui_module(ui_module_with_input_file(bad))
                 .expect_err("traversal/separator names must be rejected");
             assert_eq!(err.0, "invalid_plugin_ui_input_file");

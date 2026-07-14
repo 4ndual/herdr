@@ -296,6 +296,7 @@ impl App {
         // data so an idle, agent-less herdr does no per-second work (TC13).
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::usage_host::tick(self);
+            crate::goal_host::tick(self);
             let changed_ui_modules = self.ui_plugins.detect_changed_modules();
             let changed_reload = if changed_ui_modules.is_empty() {
                 false

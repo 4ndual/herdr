@@ -103,6 +103,16 @@ const COLLAPSED_WIDTH: u16 = 4;
 // fixed band.
 const USAGE_STRIP_HEIGHT: u16 = 7;
 
+// feat/native-dashes: right-panel (goal-dash) carve width bounds, revived from
+// the pre-purge goal panel (f4fd766^ src/ui.rs). The panel auto-sizes to a
+// quarter of the terminal width, clamped to this range; panes keep a 24-col
+// minimum beside it.
+const GOAL_PANEL_MIN_WIDTH: u16 = 28;
+const GOAL_PANEL_MAX_WIDTH: u16 = 56;
+// wasm-ui v3 §7.2: a runtime-collapsed right panel keeps a slim clickable handle
+// column (an expand affordance stays reachable) and gives the rest to panes.
+const GOAL_PANEL_COLLAPSED_WIDTH: u16 = 3;
+
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -248,10 +258,36 @@ fn compute_view_internal(
         } else {
             (terminal_area, Rect::default())
         };
-    // The right-panel surface has no active host consumer in wave 1 (goal-dash
-    // core is removed; plugin-driven docks are wave 2), so it is never carved —
-    // the surface rect function still resolves it (dormant at 0×0).
-    let right_panel_rect = Rect::default();
+    // feat/native-dashes: carve the right panel (goal-dash) out of the terminal
+    // area when a ui-plugin module actually declares the RightPanel surface AND
+    // currently renders a non-empty layer there — mirrors how the usage strip
+    // carve above is gated on live content, so an idle layout keeps every column
+    // for panes. A runtime-collapsed panel (RightPanel in `collapsed_surfaces`)
+    // keeps only a slim clickable handle column; the full width reuses the
+    // pre-purge goal panel sizing (f4fd766^ src/ui.rs).
+    let right_panel_has_content = app.ui_surface_layers.iter().any(|entry| {
+        entry.layer.surface == herdr_ui_plugin_api::UiSurface::RightPanel
+            && !entry.layer.nodes.is_empty()
+    });
+    let right_panel_collapsed = app
+        .collapsed_surfaces
+        .contains(&herdr_ui_plugin_api::UiSurface::RightPanel);
+    let (terminal_area, right_panel_rect) = if right_panel_has_content
+        && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
+    {
+        let panel_w = if right_panel_collapsed {
+            GOAL_PANEL_COLLAPSED_WIDTH
+        } else {
+            (terminal_area.width / 4)
+                .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
+                .min(terminal_area.width.saturating_sub(24))
+        };
+        let [panes, panel] = Layout::horizontal([Constraint::Min(24), Constraint::Length(panel_w)])
+            .areas(terminal_area);
+        (panes, panel)
+    } else {
+        (terminal_area, Rect::default())
+    };
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
@@ -1195,6 +1231,88 @@ mod tests {
             .remove(&herdr_ui_plugin_api::UiSurface::UsageStrip);
         compute_view(&mut app, Rect::new(0, 0, 80, 24));
         assert_eq!(app.view.usage_strip_rect.height, USAGE_STRIP_HEIGHT);
+    }
+
+    /// A single non-empty RightPanel layer registers a right-panel `UiSurfaceLayer`
+    /// for the carve tests below, mirroring the guest's goal-dash layer.
+    fn right_panel_layer(nodes: Vec<UiNode>) -> crate::ui_plugins::UiSurfaceLayer {
+        crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "builtin.goal-dash".into(),
+            module_id: "goal".into(),
+            negotiated_version: 3,
+            layer: UiLayer {
+                surface: UiSurface::RightPanel,
+                z_index: 1,
+                consumes_mouse: true,
+                nodes,
+                hits: Vec::new(),
+                data: None,
+            },
+        }
+    }
+
+    fn goal_line_node() -> UiNode {
+        UiNode::Line {
+            spans: vec![UiTextSpan {
+                text: "MAIN goal".into(),
+                role: Some("accent".into()),
+                bold: false,
+                underline: false,
+                italic: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn compute_view_carves_right_panel_only_for_a_nonempty_declared_layer() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        // No module renders RightPanel → dormant (0×0), every column goes to panes.
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+
+        // A declared-but-empty RightPanel layer still carves nothing.
+        app.ui_surface_layers = vec![right_panel_layer(Vec::new())];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+
+        // A non-empty RightPanel layer carves the full panel: auto-width in the
+        // revived [MIN, MAX] range, spanning the pane band's full height.
+        app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
+        assert!(app.view.right_panel_rect.width <= GOAL_PANEL_MAX_WIDTH);
+        assert!(app.view.right_panel_rect.height > 0);
+    }
+
+    #[test]
+    fn compute_view_collapsed_right_panel_keeps_slim_handle_column() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        let expanded_w = app.view.right_panel_rect.width;
+        assert!(expanded_w > GOAL_PANEL_COLLAPSED_WIDTH);
+
+        // wasm-ui v3 §7.2: collapsing keeps a slim clickable handle column and
+        // gives the reclaimed columns back to the pane area.
+        app.collapsed_surfaces
+            .insert(herdr_ui_plugin_api::UiSurface::RightPanel);
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, GOAL_PANEL_COLLAPSED_WIDTH);
+
+        app.collapsed_surfaces
+            .remove(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, expanded_w);
     }
 
     #[test]

@@ -3593,6 +3593,7 @@ impl HeadlessServer {
             && now >= self.app.next_dash_tick
         {
             crate::usage_host::tick(&mut self.app);
+            crate::goal_host::tick(&mut self.app);
             // feat/native-dashes: mirror the ui-plugin hot-reload + tick dispatch
             // from the direct-mode `App::handle_scheduled_tasks` loop. The server
             // owns the UiPluginManager, so without this the mtime-poll reload and

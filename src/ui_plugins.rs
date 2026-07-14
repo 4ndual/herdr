@@ -169,6 +169,15 @@ impl PluginRuntime {
     fn new() -> Result<Self, String> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
+        // fork(wave-1): wasmtime's default disk cache. Every server boot (and
+        // every test-spawned server) compiles the same bundled dashboard wasm;
+        // the cross-process cache turns repeat compiles into a deserialize.
+        // With two bundled modules, N concurrent test servers otherwise contend
+        // on 2N cranelift compiles and starve past request timeouts. Cache
+        // config failure is non-fatal — compiles just stay uncached.
+        if let Err(err) = config.cache_config_load_default() {
+            tracing::warn!(error = %err, "wasm ui plugin compilation cache disabled");
+        }
         let engine =
             Engine::new(&config).map_err(|err| format!("failed to build wasm ui engine: {err}"))?;
         let ticker = EpochTicker::spawn(&engine);

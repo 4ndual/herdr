@@ -3,17 +3,9 @@
 version = 4
 
 [[package]]
-name = "dash-common"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "herdr-ui-plugin-api"
 version = "0.1.0"
 dependencies = [
- "dash-common",
  "serde",
  "serde_json",
 ]

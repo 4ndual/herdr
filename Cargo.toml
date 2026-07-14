@@ -17,6 +17,8 @@ bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 crossterm = "0.29"
 ctrlc = "3"
+goal-dash-core = { path = "crates/goal-dash-core" }
+goal-dash-model = { path = "crates/goal-dash-model" }
 herdr-ui-plugin-api = { path = "crates/herdr-ui-plugin-api" }
 interprocess = "2.4.2"
 libc = "0.2"
@@ -51,5 +53,5 @@ windows-sys = { version = "0.61.2", features = [
 wat = "1"
 
 [workspace]
-members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/herdr-ui-plugin-api"]
+members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api"]
 resolver = "2"

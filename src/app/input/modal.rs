@@ -867,13 +867,12 @@ pub(super) fn apply_context_menu_action(
         _ => {
             if let Some(plugin_item) = plugin_item {
                 if let Some((plugin_id, action_id)) = plugin_action_parts(&plugin_item.id) {
-                    state.pending_plugin_action_invocation = Some(
-                        crate::app::state::PendingPluginActionInvocation {
+                    state.pending_plugin_action_invocation =
+                        Some(crate::app::state::PendingPluginActionInvocation {
                             plugin_id: plugin_id.to_string(),
                             action_id: action_id.to_string(),
                             context_menu_kind: Some(menu.kind),
-                        },
-                    );
+                        });
                     state.mode = Mode::Terminal;
                 } else {
                     leave_modal(state);

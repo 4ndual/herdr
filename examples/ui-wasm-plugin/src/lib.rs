@@ -23,6 +23,10 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 static REQUESTED_INITIAL: AtomicBool = AtomicBool::new(false);
 static STRIP_COLLAPSED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_WORKSPACE_HINT: Mutex<Option<String>> = Mutex::new(None);
+/// Absolute (x, y) origin of the usage strip, from the layout blob's frozen
+/// `usage_dash_area` key (spec §7). Declared hit-rects are matched in absolute
+/// screen coordinates (host hit-testing), so strip hits must carry this offset.
+static STRIP_ORIGIN: Mutex<Option<(u16, u16)>> = Mutex::new(None);
 static WORKSPACES_LINE: Mutex<Option<String>> = Mutex::new(None);
 static PANES_LINE: Mutex<Option<String>> = Mutex::new(None);
 static SPLIT_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -59,6 +63,10 @@ enum V3Event {
 #[derive(Debug, Deserialize)]
 struct ActionEvent {
     action_id: String,
+    /// spec §4: the host routes an `Action` for BOTH left_down and left_up of
+    /// one physical click — a guest reacting to both runs everything twice.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +183,7 @@ fn handle_frame(frame: &UiFrameContext) -> UiUpdateV3 {
             .lock()
             .expect("layout hint mutex poisoned") = Some(hint);
     }
+    *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") = usage_strip_origin(frame);
 
     let mut effects = Vec::new();
     if !REQUESTED_INITIAL.swap(true, Ordering::SeqCst) {
@@ -184,6 +193,10 @@ fn handle_frame(frame: &UiFrameContext) -> UiUpdateV3 {
 }
 
 fn handle_action(action: &ActionEvent) -> UiUpdateV3 {
+    // Act on press only; the matching left_up would double-run every handler.
+    if action.kind.as_deref() != Some("left_down") {
+        return render_update(Vec::new());
+    }
     match action.action_id.as_str() {
         "demo:increment" => {
             COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -290,6 +303,15 @@ fn active_workspace_hint(frame: &UiFrameContext) -> Option<String> {
         .map(str::to_string)
 }
 
+fn usage_strip_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
+    let raw = frame.host.env.get("HERDR_LAYOUT_JSON")?;
+    let value: Value = serde_json::from_str(raw).ok()?;
+    let area = value.get("usage_dash_area")?;
+    let x = area.get("x").and_then(Value::as_u64)?;
+    let y = area.get("y").and_then(Value::as_u64)?;
+    Some((x as u16, y as u16))
+}
+
 fn summarize_workspaces(response: Option<&Value>) -> String {
     let items = response
         .and_then(|v| v.get("workspaces"))
@@ -340,7 +362,7 @@ fn summarize_panes(response: Option<&Value>) -> String {
 fn render_update(effects: Vec<HostEffectV3>) -> UiUpdateV3 {
     UiUpdateV3 {
         scope: "partial",
-        layers: vec![header_layer(), right_panel_layer()],
+        layers: vec![header_layer(), right_panel_layer(), strip_controls_layer()],
         effects,
     }
 }
@@ -493,6 +515,66 @@ fn right_panel_layer() -> UiLayer {
         z_index: 12,
         consumes_mouse: false,
         nodes,
+        hits,
+        data: None,
+    }
+}
+
+/// Interactive demo controls painted ON the usage strip itself (row 0, high
+/// z-index so it wins its cells over the usage dash). Row 0 stays visible when
+/// the strip collapses to a single row, so the expand button remains clickable.
+fn strip_controls_layer() -> UiLayer {
+    let mut spans = Vec::new();
+    let mut hits = Vec::new();
+    let mut col = 0u16;
+
+    push_gap(&mut spans, &mut col, " ");
+    let strip_label = if STRIP_COLLAPSED.load(Ordering::SeqCst) {
+        "[\u{25B2} expand strip]"
+    } else {
+        "[\u{25BC} collapse strip]"
+    };
+    push_button(
+        &mut spans,
+        &mut hits,
+        &mut col,
+        0,
+        strip_label,
+        "demo:toggle_strip",
+        "teal",
+    );
+    push_gap(&mut spans, &mut col, "  ");
+    let count = COUNTER.load(Ordering::SeqCst);
+    push_button(
+        &mut spans,
+        &mut hits,
+        &mut col,
+        0,
+        &format!("[count: {count} +]"),
+        "demo:increment",
+        "accent",
+    );
+    push_gap(&mut spans, &mut col, "  ");
+    push_button(&mut spans, &mut hits, &mut col, 0, "[party]", "demo:party", "mauve");
+
+    // Hit-testing is absolute (screen coordinates); nodes are strip-relative.
+    // Without a known origin yet (no frame received), declare no hits rather
+    // than clickable rects at the wrong position.
+    match *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") {
+        Some((ox, oy)) => {
+            for hit in &mut hits {
+                hit.x = hit.x.saturating_add(ox);
+                hit.y = hit.y.saturating_add(oy);
+            }
+        }
+        None => hits.clear(),
+    }
+
+    UiLayer {
+        surface: UiSurface::UsageStrip,
+        z_index: 50,
+        consumes_mouse: false,
+        nodes: vec![UiNode::Line { spans }],
         hits,
         data: None,
     }

@@ -57,6 +57,15 @@ const MAX_UI_INPUT_BYTES: u64 = 64 * 1024;
 const USAGE_DASH_PLUGIN_ID: &str = "builtin.usage-dash";
 const USAGE_DASH_INPUT_FILE: &str = "usage_input.json";
 
+/// Plugin id and `ui_input_file` name for the interim host-side goal writer
+/// (mirrors the usage pair above). The filename MUST equal `ui_input_file` in
+/// plugins/goal-dash-ui's manifest, and the id MUST equal the id the goal module
+/// registers under, so the generic reader resolves the same
+/// `HERDR_PLUGIN_STATE_DIR` file. This whole writer relocates into the goal-dash
+/// plugin's own collector process in wave 2 (see [`crate::goal_host`]).
+const GOAL_DASH_PLUGIN_ID: &str = "builtin.goal-dash";
+const GOAL_DASH_INPUT_FILE: &str = "goal_input.json";
+
 /// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
 /// side): write a sibling temp file then rename it into place, so item B's
 /// mtime-cached reader never observes a torn file. Creates `state_dir` when
@@ -188,6 +197,10 @@ pub struct App {
     /// last frame's hit-rects) and the latest resolved snapshot.
     pub(crate) usage_view: usage_dash_core::UsageView,
     pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
+    /// Native goal-panel core backing the WASM goal-dash plugin. The host ticks
+    /// it (~1 Hz) and projects it into the plugin input file; see
+    /// [`crate::goal_host`]. Not pinned to a session — it adopts the focused one.
+    pub(crate) goal_dash: goal_dash_core::App,
     /// Registered hot-reloadable UI plugin modules discovered from the plugin registry.
     pub(crate) ui_plugins: crate::ui_plugins::UiPluginManager,
     pub(crate) last_ui_plugin_focus: Option<herdr_ui_plugin_api::FocusInput>,
@@ -750,6 +763,7 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             usage_view: usage_dash_core::UsageView::default(),
             usage_snapshot: None,
+            goal_dash: goal_dash_core::App::new(None),
             ui_plugins,
             last_ui_plugin_focus: None,
             ui_input_cache: HashMap::new(),
@@ -2033,6 +2047,43 @@ impl App {
         }
     }
 
+    /// Serialize the live goal core into its wasm-safe per-frame render model
+    /// ([`goal_dash_model::GoalRenderModel`]) for the goal WASM plugin. All
+    /// chrono/filesystem-derived labels are precomputed by `build_render_model`
+    /// (the guest can't reach a clock or the disk).
+    fn goal_render_input_json(&self) -> Option<String> {
+        match serde_json::to_string(&self.goal_dash.build_render_model()) {
+            Ok(json) => Some(json),
+            // Surface the failure: a silently skipped write leaves the panel
+            // permanently empty with no trace (serde_json rejects e.g. NaN).
+            Err(err) => {
+                tracing::warn!(error = %err, "goal render model failed to serialize; goal_input.json not written");
+                None
+            }
+        }
+    }
+
+    /// Interim writer (mirrors [`Self::write_usage_input_file`]): serialize the
+    /// live goal render model and atomically write it to the goal-dash module's
+    /// state dir as `goal_input.json`, where the generic `ui_input_file` reader
+    /// surfaces it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the
+    /// dash tick (~1 Hz) from [`crate::goal_host::tick`]. A failed write is
+    /// logged and swallowed so it never stalls or panics the render loop. This
+    /// relocates into the goal-dash plugin's own collector process in wave 2.
+    pub(crate) fn write_goal_input_file(&self) {
+        let Some(json) = self.goal_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(GOAL_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, GOAL_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = GOAL_DASH_PLUGIN_ID,
+                "failed to write goal input file for the goal-dash plugin"
+            );
+        }
+    }
+
     pub(crate) fn apply_ui_plugin_notifications(&mut self) {
         for message in self.ui_plugins.take_pending_notifications() {
             let previous_toast = self.state.toast.clone();
@@ -2716,6 +2767,55 @@ mod tests {
         let parsed: usage_dash_core::model::UsageRenderInput =
             serde_json::from_str(&surfaced).expect("surfaced bytes parse as the guest wire type");
         assert_eq!(parsed.stats_shown, app.usage_view.stats_shown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goal_input_written_atomically_is_surfaced_by_generic_reader() {
+        // Goal-dash host path (mirrors the usage test): the interim writer
+        // serializes the live goal render model and writes it to the module's
+        // state dir; the generic ui_input_file reader must surface the exact
+        // bytes the guest will parse (injected as HERDR_PLUGIN_UI_INPUT_JSON).
+        let app = test_app();
+        let json = app
+            .goal_render_input_json()
+            .expect("goal render model serializes");
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-goal-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        write_ui_input_atomic(&dir, GOAL_DASH_INPUT_FILE, &json).expect("atomic write succeeds");
+        assert!(
+            !dir.join(format!(
+                ".{GOAL_DASH_INPUT_FILE}.{}.tmp",
+                std::process::id()
+            ))
+            .exists(),
+            "the temp file is renamed into place, never left behind"
+        );
+
+        let mut cache = HashMap::new();
+        let surfaced = read_ui_input_blob(
+            &dir,
+            GOAL_DASH_INPUT_FILE,
+            (GOAL_DASH_PLUGIN_ID.to_string(), "goal".to_string()),
+            &mut cache,
+        )
+        .expect("generic reader surfaces the written file");
+        assert_eq!(surfaced, json, "reader returns the exact written bytes");
+
+        let parsed: goal_dash_model::GoalRenderModel =
+            serde_json::from_str(&surfaced).expect("surfaced bytes parse as the guest wire type");
+        assert_eq!(
+            parsed.has_session,
+            app.goal_dash.build_render_model().has_session
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

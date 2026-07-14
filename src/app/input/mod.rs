@@ -250,7 +250,21 @@ impl App {
         // feat/native-dashes: the usage strip and goal panel are herdr UI
         // regions, not panes — route mouse landing on them to the cores before
         // any pane/sidebar handling.
-        if crate::usage_host::route_mouse(self, mouse) {
+        //
+        // fork(wave-1): cells where a v3 module declared a `UiHitRect` are owned
+        // by that module (spec §4) and must reach the `ui_plugin_hit_at` Action
+        // routing further down — the legacy usage-core shim only swallows strip
+        // events nobody claimed. v2 declared hits (usage-dash's own controls)
+        // still resolve through the shim via `usage_view.hits`.
+        let v3_owned_cell = crate::ui::ui_plugin_hit_at(
+            &self.state,
+            crate::ui::ui_plugin_frame_area(&self.state),
+            mouse.column,
+            mouse.row,
+        )
+        .and_then(|hit| hit.declared_hit_owner)
+        .is_some_and(|(_, _, negotiated_version)| negotiated_version == 3);
+        if !v3_owned_cell && crate::usage_host::route_mouse(self, mouse) {
             self.request_render();
             return;
         }

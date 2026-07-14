@@ -29,9 +29,9 @@ fn bundled_ui_plugin_dirs() -> Vec<PathBuf> {
         Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins"),
     };
-    // The usage strip is the one bundled UI plugin today. Add more dirs here as
-    // additional bundled dashboards ship; the merge logic below is generic.
-    vec![root.join("usage-dash-ui")]
+    // Add more dirs here as additional bundled dashboards ship; the merge
+    // logic below is generic.
+    vec![root.join("usage-dash-ui"), root.join("goal-dash-ui")]
 }
 
 /// Auto-link every bundled UI plugin into `installed`, upgrading any stale
@@ -86,6 +86,30 @@ mod tests {
         assert!(module
             .surfaces
             .contains(&crate::api::schema::PluginUiSurface::UsageStrip));
+    }
+
+    /// Fresh session: the bundled goal-dash manifest auto-links at the shipped
+    /// api_version (3) on the right-panel surface with the generic
+    /// `ui_input_file` transport wired.
+    #[test]
+    fn bundled_goal_dash_auto_links_into_empty_registry() {
+        let mut installed = InstalledPluginRegistry::new();
+        merge_bundled_ui_plugins(&mut installed);
+
+        let plugin = installed
+            .get("builtin.goal-dash")
+            .expect("bundled goal-dash auto-linked");
+        assert!(plugin.enabled);
+        let module = plugin
+            .ui_modules
+            .iter()
+            .find(|m| m.id == "goal")
+            .expect("goal ui module");
+        assert_eq!(module.api_version, 3);
+        assert_eq!(module.ui_input_file.as_deref(), Some("goal_input.json"));
+        assert!(module
+            .surfaces
+            .contains(&crate::api::schema::PluginUiSurface::RightPanel));
     }
 
     /// Legacy registry: a persisted pre-purge entry (older api_version, no
