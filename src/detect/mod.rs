@@ -164,6 +164,13 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
         "hermes" | "hermes-agent" => Some(Agent::Hermes),
         "kilo" | "kilo-code" | "kilo code" => Some(Agent::Kilo),
         "qodercli" | "qoderclicn" | "qoder" | "qodercn" => Some(Agent::Qodercli),
+        // fork(wave-1): the local claude-project-router (~/.local/bin/claude)
+        // execs project-named hardlinks of the Claude Code binary
+        // (claude-meta, claude-brain, claude-y7, …) so Activity Monitor shows
+        // per-project names. Map any remaining `claude-*` process name back to
+        // Claude so process identification — and with it screen-manifest
+        // detection — keeps working for those panes.
+        name if name.starts_with("claude-") => Some(Agent::Claude),
         _ => None,
     }
 }
@@ -616,6 +623,9 @@ mod tests {
         assert_eq!(identify_agent("pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("claude"), Some(Agent::Claude));
         assert_eq!(identify_agent("claude-code"), Some(Agent::Claude));
+        // fork(wave-1): project-router hardlink names resolve to Claude
+        assert_eq!(identify_agent("claude-meta"), Some(Agent::Claude));
+        assert_eq!(identify_agent("claude-brain"), Some(Agent::Claude));
         assert_eq!(identify_agent("codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("gemini"), Some(Agent::Gemini));
         assert_eq!(identify_agent("cursor"), Some(Agent::Cursor));
