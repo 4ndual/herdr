@@ -276,7 +276,7 @@ pub struct PluginManifestLinkHandler {
     pub platforms: Option<Vec<PluginPlatform>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginManifestUiModule {
     pub id: String,
     pub title: String,
@@ -303,14 +303,14 @@ pub struct PluginManifestUiModule {
     pub ui_input_file: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginUiModuleKind {
     #[default]
     Wasm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginHotReloadMode {
     Off,
@@ -318,7 +318,7 @@ pub enum PluginHotReloadMode {
     On,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginUiSurface {
     Header,
@@ -332,7 +332,7 @@ pub enum PluginUiSurface {
     UsageStrip,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginUiCapability {
     FocusedSession,

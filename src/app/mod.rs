@@ -334,6 +334,8 @@ fn host_abs_time(epoch: i64, weekly: bool) -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
 fn background_update_check_enabled(no_session: bool, check_enabled: bool) -> bool {
     auto_updates_enabled(no_session) && check_enabled
 }
@@ -3003,6 +3005,8 @@ mod tests {
         assert!(!value["usage_dash_area"].is_null());
         assert_eq!(value["client"]["is_foreground"], true);
         assert!(value["client"]["pinned_to"].is_null());
+    }
+
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
