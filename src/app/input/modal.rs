@@ -2007,6 +2007,7 @@ mod tests {
         app.state.selected = 1;
         app.state.mode = Mode::ContextMenu;
         let menu = ContextMenuState {
+            plugin_items: Vec::new(),
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
@@ -2038,6 +2039,7 @@ mod tests {
         app.state.mode = Mode::ContextMenu;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let mut menu = ContextMenuState {
+            plugin_items: Vec::new(),
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
                 tab_idx: 0,

@@ -2944,6 +2944,7 @@ mod tests {
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(ContextMenuState {
+            plugin_items: Vec::new(),
             kind: ContextMenuKind::Workspace { ws_idx: 1 },
             x: 2,
             y: 2,
