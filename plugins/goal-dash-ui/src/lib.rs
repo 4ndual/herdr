@@ -103,6 +103,12 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     // carves when this layer already has nodes. Emit an invisible placeholder
     // line to request the carve; the next frame arrives with a real rect.
     // (A zero rect is NOT the collapsed handle — don't latch COLLAPSED here.)
+    // Only request the carve when a session is focused: an idle layout keeps
+    // every column for panes (and startup diagnostics stay fully visible on
+    // small clients).
+    if (area.width == 0 || area.height == 0) && !model.has_session {
+        return UiUpdate::default();
+    }
     if area.width == 0 || area.height == 0 {
         return UiUpdate {
             layers: vec![UiLayer {
