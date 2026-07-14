@@ -6945,6 +6945,8 @@ next_tab = ""
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        server.app.state.usage_strip_enabled = false;
 
         server.clients.insert(
             1,

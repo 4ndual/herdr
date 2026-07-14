@@ -1205,6 +1205,8 @@ mod tests {
     #[test]
     fn hide_tab_bar_when_single_tab_toggles_geometry_with_tab_count() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.hide_tab_bar_when_single_tab = true;
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1239,6 +1241,8 @@ mod tests {
     #[tokio::test]
     async fn hide_tab_bar_when_single_tab_resizes_background_tabs_per_workspace() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.hide_tab_bar_when_single_tab = true;
 
         let mut one_tab_workspace = Workspace::test_new("one");
@@ -1480,6 +1484,8 @@ mod tests {
     #[test]
     fn hidden_collapsed_sidebar_uses_full_width_terminal_area() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.sidebar_collapsed = true;
         app.sidebar_collapsed_mode = crate::config::SidebarCollapsedModeConfig::Hidden;
         app.workspaces = vec![Workspace::test_new("one")];

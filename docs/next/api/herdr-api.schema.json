@@ -2757,6 +2757,12 @@
                 "null"
               ]
             },
+            "plugin_payload_json": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -6150,6 +6156,12 @@
                 "kind": "local"
               }
             },
+            "ui_modules": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginManifestUiModule"
+              },
+              "type": "array"
+            },
             "version": {
               "type": "string"
             },
@@ -7188,6 +7200,13 @@
           ],
           "type": "string"
         },
+        "PluginHotReloadMode": {
+          "enum": [
+            "off",
+            "on"
+          ],
+          "type": "string"
+        },
         "PluginInvocationContext": {
           "properties": {
             "clicked_url": {
@@ -7237,6 +7256,12 @@
               ]
             },
             "link_handler_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plugin_payload_json": {
               "type": [
                 "string",
                 "null"
@@ -7457,6 +7482,73 @@
           ],
           "type": "object"
         },
+        "PluginManifestUiModule": {
+          "properties": {
+            "api_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "capabilities": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginUiCapability"
+              },
+              "type": "array"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hot_reload": {
+              "$ref": "#/schemas/success_response/$defs/PluginHotReloadMode",
+              "default": "on"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/PluginUiModuleKind",
+              "default": "wasm"
+            },
+            "module": {
+              "type": "string"
+            },
+            "platforms": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginPlatform"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "surfaces": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginUiSurface"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": "string"
+            },
+            "ui_input_file": {
+              "description": "Optional single path segment (no separators, no `..`) naming a file under\nthis module's `HERDR_PLUGIN_STATE_DIR`. When declared, the host reads the\nfile each frame (size-capped, mtime-cached) and injects its contents as\n`HERDR_PLUGIN_UI_INPUT_JSON` in the module's frame env (spec §7.1). The\nplugin's own process side writes the file; the host never interprets it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "api_version",
+            "module"
+          ],
+          "type": "object"
+        },
         "PluginPaneInfo": {
           "properties": {
             "entrypoint": {
@@ -7552,6 +7644,68 @@
             "github"
           ],
           "type": "string"
+        },
+        "PluginUiCapability": {
+          "oneOf": [
+            {
+              "enum": [
+                "focused_session",
+                "theme_read",
+                "layout_read",
+                "mouse_all",
+                "keyboard_input",
+                "context_menu_augment",
+                "clipboard_write",
+                "pane_input",
+                "toasts",
+                "open_plugin_panes",
+                "plugin_actions"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "api_read",
+              "description": "API v3 (§5.3): read-only socket API methods via `HostEffect::Api`.",
+              "type": "string"
+            },
+            {
+              "const": "api_write",
+              "description": "API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.",
+              "type": "string"
+            },
+            {
+              "const": "api_input",
+              "description": "API v3 (§5.3): text/keystroke-injecting socket API methods via\n`HostEffect::Api` (`pane.send_text`, `agent.send`).",
+              "type": "string"
+            }
+          ]
+        },
+        "PluginUiModuleKind": {
+          "enum": [
+            "wasm"
+          ],
+          "type": "string"
+        },
+        "PluginUiSurface": {
+          "oneOf": [
+            {
+              "enum": [
+                "header",
+                "footer",
+                "tab_bar",
+                "sidebar",
+                "right_panel",
+                "overlay",
+                "context_menu"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "usage_strip",
+              "description": "The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.",
+              "type": "string"
+            }
+          ]
         },
         "ReadFormat": {
           "enum": [
