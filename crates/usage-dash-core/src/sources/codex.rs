@@ -131,8 +131,10 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
                 out.total_tokens = Some(t);
             }
             if let Some(rl) = p.get("rate_limits") {
-                out.primary = rl_window(rl.get("primary"));
-                out.secondary = rl_window(rl.get("secondary"));
+                let (five, week) =
+                    assign_windows(rl_window(rl.get("primary")), rl_window(rl.get("secondary")));
+                out.primary = five;
+                out.secondary = week;
                 if let Some(pl) = rl.get("plan_type").and_then(|x| x.as_str()) {
                     out.plan = Some(pl.to_string());
                 }
@@ -142,19 +144,95 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
     out
 }
 
-fn rl_window(v: Option<&serde_json::Value>) -> Window {
+/// Parse one rollout rate-limit entry into a window plus its declared length in
+/// minutes (rollout events name it `window_minutes`).
+fn rl_window(v: Option<&serde_json::Value>) -> (Window, Option<u64>) {
     let v = match v {
         Some(v) => v,
-        None => return Window::default(),
+        None => return (Window::default(), None),
     };
-    Window {
+    let window = Window {
         used_pct: v
             .get("used_percent")
             .and_then(|x| x.as_f64())
             .map(|f| f as f32),
         resets_at: v.get("resets_at").and_then(|x| x.as_i64()),
         shared: false,
+    };
+    let mins = v.get("window_minutes").and_then(|x| x.as_u64());
+    (window, mins)
+}
+
+/// Assign two rate-limit windows to `(five_hour, weekly)` buckets by their
+/// declared window LENGTH, not by position. A window <= 6h (360 min) is the
+/// rolling 5h bucket; a longer window (~weekly, 10080 min) is the weekly bucket.
+///
+/// This matters because some plans (e.g. `prolite`) expose only a single weekly
+/// window and report it as `primary` — a naive primary→5h mapping would show a
+/// weekly quota as a 5h one and leave weekly blank. When neither window declares
+/// a length we can't reason about it, so we fall back to positional
+/// (primary→5h, secondary→weekly) to preserve historical behavior.
+pub(crate) fn assign_windows(
+    primary: (Window, Option<u64>),
+    secondary: (Window, Option<u64>),
+) -> (Window, Window) {
+    let (pw, pmin) = primary;
+    let (sw, smin) = secondary;
+    if pmin.is_none() && smin.is_none() {
+        return (pw, sw);
     }
+    let mut five_hour = Window::default();
+    let mut weekly = Window::default();
+    for (w, mins) in [(pw, pmin), (sw, smin)] {
+        if w.used_pct.is_none() && w.resets_at.is_none() {
+            continue;
+        }
+        match mins {
+            Some(m) if m <= 360 => five_hour = w,
+            _ => weekly = w, // longer window, or unknown length → weekly
+        }
+    }
+    (five_hour, weekly)
+}
+
+fn model_catalog_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join(".codex/ccr-model-catalog.json")
+}
+
+/// Context window for a CCR/Codex model id from `~/.codex/ccr-model-catalog.json`.
+/// `None` when the catalog is missing or has no matching model.
+pub fn ctx_window_from_catalog(model_id: &str) -> Option<u64> {
+    let raw = std::fs::read_to_string(model_catalog_path()).ok()?;
+    ctx_window_from_catalog_str(&raw, model_id)
+}
+
+/// Pure catalog lookup. Each entry's `slug` looks like `"Codex Plan/gpt-5.6-sol"`;
+/// we strip the optional `"Codex Plan/"` prefix from BOTH the catalog slug and
+/// the requested id, then compare, so a bare `gpt-5.6-sol` matches its entry.
+pub fn ctx_window_from_catalog_str(raw: &str, model_id: &str) -> Option<u64> {
+    let want = strip_codex_plan_prefix(model_id);
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let models = v.get("models")?.as_array()?;
+    for m in models {
+        let slug = match m
+            .get("slug")
+            .or_else(|| m.get("display_name"))
+            .and_then(|x| x.as_str())
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        if strip_codex_plan_prefix(slug) == want {
+            return m.get("context_window").and_then(|x| x.as_u64());
+        }
+    }
+    None
+}
+
+/// Drop the CCR `"Codex Plan/"` catalog namespace prefix if present.
+pub fn strip_codex_plan_prefix(id: &str) -> &str {
+    id.strip_prefix("Codex Plan/").unwrap_or(id)
 }
 
 /// Build a snapshot for the focused Codex session (matched by cwd).
@@ -239,6 +317,84 @@ mod tests {
         assert_eq!(p.secondary.used_pct, Some(96.0));
         assert_eq!(p.secondary.resets_at, Some(1781861649));
         assert_eq!(p.plan.as_deref(), Some("prolite"));
+    }
+
+    // prolite exposes only a weekly window, reported as `primary` with a 10080-min
+    // length. It must land in `weekly`, never `five_hour`.
+    const PROLITE_ROLLOUT: &str = r#"{"type":"session_meta","payload":{"cwd":"/tmp/p"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":128000,"total_token_usage":{"total_tokens":42}},"rate_limits":{"primary":{"used_percent":11.0,"window_minutes":10080,"resets_at":1784489140},"secondary":null,"plan_type":"prolite"}}}"#;
+
+    #[test]
+    fn prolite_weekly_primary_maps_to_weekly() {
+        let p = parse_rollout(PROLITE_ROLLOUT);
+        // The single 10080-min window is weekly; there is no 5h bucket.
+        assert!(p.primary.used_pct.is_none()); // five_hour
+        assert_eq!(p.secondary.used_pct, Some(11.0)); // weekly
+    }
+
+    #[test]
+    fn assign_windows_maps_by_length_not_position() {
+        let five = (
+            Window {
+                used_pct: Some(5.0),
+                resets_at: Some(1),
+                shared: false,
+            },
+            Some(300),
+        );
+        let week = (
+            Window {
+                used_pct: Some(90.0),
+                resets_at: Some(2),
+                shared: false,
+            },
+            Some(10080),
+        );
+        // Even if the weekly window arrives as `primary`, it stays weekly.
+        let (h5, wk) = assign_windows(week.clone(), five.clone());
+        assert_eq!(h5.used_pct, Some(5.0));
+        assert_eq!(wk.used_pct, Some(90.0));
+    }
+
+    #[test]
+    fn assign_windows_falls_back_to_positional_without_lengths() {
+        let a = (
+            Window {
+                used_pct: Some(3.0),
+                resets_at: None,
+                shared: false,
+            },
+            None,
+        );
+        let b = (
+            Window {
+                used_pct: Some(4.0),
+                resets_at: None,
+                shared: false,
+            },
+            None,
+        );
+        let (h5, wk) = assign_windows(a, b);
+        assert_eq!(h5.used_pct, Some(3.0));
+        assert_eq!(wk.used_pct, Some(4.0));
+    }
+
+    #[test]
+    fn catalog_lookup_strips_codex_plan_prefix() {
+        let raw = r#"{"models":[
+            {"slug":"Codex Plan/gpt-5.6-sol","context_window":128000},
+            {"slug":"Codex Plan/gpt-5.5","context_window":1050000},
+            {"slug":"Claude Plan/claude-opus-4-8","context_window":1000000}]}"#;
+        // Bare session id matches the "Codex Plan/"-prefixed slug.
+        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-5.6-sol"), Some(128000));
+        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-5.5"), Some(1050000));
+        // A prefixed id also matches.
+        assert_eq!(
+            ctx_window_from_catalog_str(raw, "Codex Plan/gpt-5.6-sol"),
+            Some(128000)
+        );
+        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-9.9-none"), None);
     }
 
     #[test]

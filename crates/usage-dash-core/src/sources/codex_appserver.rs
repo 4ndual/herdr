@@ -150,20 +150,23 @@ fn run_protocol(child: &mut std::process::Child) -> Option<String> {
 }
 
 /// Pure parser over the `result` object of `account/rateLimits/read`.
-/// Maps `rateLimits.primary` → 5h and `rateLimits.secondary` → weekly.
+/// Assigns `rateLimits.primary`/`secondary` to 5h/weekly by window LENGTH (see
+/// [`codex::assign_windows`]) — a plan may report its only weekly window as
+/// `primary`, so a positional map would misfile it.
 pub fn parse(raw: &str) -> Option<(Window, Window, Option<String>)> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let rl = v.get("rateLimits")?;
     let primary = win(rl.get("primary"));
     let secondary = win(rl.get("secondary"));
-    if primary.used_pct.is_none() && secondary.used_pct.is_none() {
+    if primary.0.used_pct.is_none() && secondary.0.used_pct.is_none() {
         return None;
     }
+    let (five_hour, weekly) = crate::sources::codex::assign_windows(primary, secondary);
     let plan = rl
         .get("planType")
         .and_then(|x| x.as_str())
         .map(str::to_string);
-    Some((primary, secondary, plan))
+    Some((five_hour, weekly, plan))
 }
 
 /// Pick the per-model rate-limit bucket whose `limitName` self-describes
@@ -188,12 +191,14 @@ pub fn parse_for_model(raw: &str, model: Option<&str>) -> Option<(Window, Window
             if name.map(normalize_model).as_deref() == Some(want.as_str()) {
                 let primary = win(bucket.get("primary"));
                 let secondary = win(bucket.get("secondary"));
-                if primary.used_pct.is_some() || secondary.used_pct.is_some() {
+                if primary.0.used_pct.is_some() || secondary.0.used_pct.is_some() {
+                    let (five_hour, weekly) =
+                        crate::sources::codex::assign_windows(primary, secondary);
                     let plan = bucket
                         .get("planType")
                         .and_then(|x| x.as_str())
                         .map(str::to_string);
-                    return Some((primary, secondary, plan));
+                    return Some((five_hour, weekly, plan));
                 }
             }
         }
@@ -212,12 +217,14 @@ fn normalize_model(s: &str) -> String {
         .collect()
 }
 
-fn win(v: Option<&serde_json::Value>) -> Window {
+/// Parse one app-server rate-limit entry into a window plus its declared length
+/// in minutes (the app-server names it `windowDurationMins`).
+fn win(v: Option<&serde_json::Value>) -> (Window, Option<u64>) {
     let v = match v {
         Some(serde_json::Value::Object(_)) => v.unwrap(),
-        _ => return Window::default(),
+        _ => return (Window::default(), None),
     };
-    Window {
+    let window = Window {
         // app-server reports usedPercent as an integer; accept float too.
         used_pct: v
             .get("usedPercent")
@@ -225,7 +232,9 @@ fn win(v: Option<&serde_json::Value>) -> Window {
             .map(|f| f as f32),
         resets_at: v.get("resetsAt").and_then(|x| x.as_i64()),
         shared: false,
-    }
+    };
+    let mins = v.get("windowDurationMins").and_then(|x| x.as_u64());
+    (window, mins)
 }
 
 #[cfg(test)]
@@ -247,6 +256,20 @@ mod tests {
         assert_eq!(s.resets_at, Some(1781861650));
         assert_eq!(plan.as_deref(), Some("prolite"));
         assert!(!p.shared && !s.shared);
+    }
+
+    #[test]
+    fn prolite_weekly_primary_maps_to_weekly() {
+        // prolite: the only window is weekly, reported as `primary` (10080 min);
+        // `secondary` is null. It must land in weekly, leaving 5h empty.
+        let raw = r#"{"rateLimits":{"limitId":"codex","limitName":null,
+            "primary":{"usedPercent":11,"windowDurationMins":10080,"resetsAt":1784489140},
+            "secondary":null,"planType":"prolite"}}"#;
+        let (five, weekly, plan) = parse(raw).unwrap();
+        assert!(five.used_pct.is_none());
+        assert_eq!(weekly.used_pct, Some(11.0));
+        assert_eq!(weekly.resets_at, Some(1784489140));
+        assert_eq!(plan.as_deref(), Some("prolite"));
     }
 
     #[test]
