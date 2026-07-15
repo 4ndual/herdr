@@ -106,6 +106,25 @@ pub fn parse_transcript(content: &str) -> Transcript {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // fork(wave-2): a `/compact` writes a `compact_boundary` system entry
+        // immediately, carrying the post-compaction context size in
+        // `compactMetadata.postTokens` (both manual and auto triggers). Because
+        // lines are processed in order, setting `ctx_tokens` here and letting a
+        // LATER assistant `usage` overwrite it yields the right precedence: while
+        // no assistant turn has happened since compaction the boundary's
+        // postTokens is current; the next turn's usage naturally takes over.
+        // postTokens is small and never feeds `max_ctx_tokens` (window inference).
+        if v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary")
+        {
+            if let Some(post) = v
+                .pointer("/compactMetadata/postTokens")
+                .and_then(|x| x.as_u64())
+            {
+                out.ctx_tokens = Some(post);
+            }
+            continue;
+        }
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
@@ -516,6 +535,41 @@ mod tests {
         let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
         // ordering: model · mode · @subagent
         assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · thinking · @probe1"));
+    }
+
+    // fork(wave-2): real-shaped compact_boundary system entry (manual /compact).
+    const COMPACT_BOUNDARY: &str = r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","compactMetadata":{"trigger":"manual","preTokens":59698,"postTokens":4982,"cumulativeDroppedTokens":54716},"uuid":"81618df8","timestamp":"2026-07-15T23:48:27.257Z"}"#;
+
+    #[test]
+    fn compact_boundary_after_last_assistant_uses_post_tokens() {
+        // assistant turn, then a /compact with no assistant turn since -> ctx = postTokens.
+        let transcript = format!(
+            "{}\n{}",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":59000,"cache_creation_input_tokens":688,"output_tokens":50}}}"#,
+            COMPACT_BOUNDARY
+        );
+        let t = parse_transcript(&transcript);
+        assert_eq!(t.ctx_tokens, Some(4982)); // postTokens, not the pre-compact 59698
+        // window inference still sees the pre-compact peak.
+        assert_eq!(t.max_ctx_tokens, 59698);
+    }
+
+    #[test]
+    fn assistant_turn_after_compact_boundary_takes_over() {
+        // a turn AFTER the boundary -> its usage is current, boundary is stale.
+        let transcript = format!(
+            "{}\n{}",
+            COMPACT_BOUNDARY,
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":5,"cache_read_input_tokens":7000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#
+        );
+        let t = parse_transcript(&transcript);
+        assert_eq!(t.ctx_tokens, Some(7005)); // the post-boundary turn's context
+    }
+
+    #[test]
+    fn no_compact_boundary_leaves_ctx_from_last_assistant() {
+        let t = parse_transcript(TRANSCRIPT);
+        assert_eq!(t.ctx_tokens, Some(154055)); // unchanged behavior
     }
 
     #[test]
