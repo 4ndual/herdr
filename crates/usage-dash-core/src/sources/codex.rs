@@ -81,6 +81,9 @@ pub fn latest_rollout_for_cwd(cwd: &str) -> Option<PathBuf> {
 #[derive(Debug, Default, Clone)]
 pub struct CodexParsed {
     pub model: Option<String>,
+    // fork(wave-2): reasoning effort from the LAST turn_context payload (top-level
+    // `effort`, e.g. "low"/"medium"/"high" — the codex TUI shows "gpt-5.6-sol low").
+    pub effort: Option<String>,
     pub ctx_window: Option<u64>,
     pub total_tokens: Option<u64>,
     pub primary: Window,   // 5h
@@ -111,6 +114,13 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
                 .and_then(|x| x.as_str())
             {
                 out.model = Some(m.to_string());
+            }
+            // fork(wave-2): reasoning effort rides the same turn_context; last wins.
+            if let Some(e) = payload
+                .and_then(|p| p.get("effort"))
+                .and_then(|x| x.as_str())
+            {
+                out.effort = Some(e.to_string());
             }
         }
         if top_type == "token_count" || payload_type == "token_count" {
@@ -249,6 +259,11 @@ pub fn snapshot_for_cwd(cwd: &str) -> Option<UsageSnapshot> {
     let mut s = UsageSnapshot::empty(Cli::Codex);
     let model = p.model.clone();
     s.model = p.model;
+    // fork(wave-2): append reasoning effort to the model display (e.g.
+    // `gpt-5.6-sol · low`). Absent effort leaves the model string untouched.
+    if let (Some(m), Some(e)) = (s.model.as_ref(), p.effort.as_ref()) {
+        s.model = Some(format!("{m} · {e}"));
+    }
     s.ctx_window = p.ctx_window;
     s.ctx_used_tokens = p.total_tokens;
     // Context/model come from this session's rollout, but the rate limits are
@@ -323,6 +338,26 @@ mod tests {
         assert_eq!(p.secondary.used_pct, Some(96.0));
         assert_eq!(p.secondary.resets_at, Some(1781861649));
         assert_eq!(p.plan.as_deref(), Some("prolite"));
+    }
+
+    // fork(wave-2): real-shaped turn_context carrying top-level `effort` alongside
+    // `model` (mirrors ~/.codex/sessions rollouts). Last turn_context wins.
+    const EFFORT_ROLLOUT: &str = r#"{"type":"session_meta","payload":{"cwd":"/tmp/p"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","personality":"pragmatic","effort":"low","summary":"auto"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol","personality":"pragmatic","effort":"medium","summary":"auto"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":128000,"total_token_usage":{"total_tokens":42}},"rate_limits":{"primary":{"used_percent":11.0,"window_minutes":10080,"resets_at":1784489140},"secondary":null,"plan_type":"prolite"}}}"#;
+
+    #[test]
+    fn parse_takes_last_effort_from_turn_context() {
+        let p = parse_rollout(EFFORT_ROLLOUT);
+        assert_eq!(p.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(p.effort.as_deref(), Some("medium")); // last turn_context wins
+    }
+
+    #[test]
+    fn parse_effort_absent_leaves_none() {
+        let p = parse_rollout(ROLLOUT); // no `effort` in these turn_contexts
+        assert!(p.effort.is_none());
     }
 
     // prolite exposes only a weekly window, reported as `primary` with a 10080-min

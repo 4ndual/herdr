@@ -81,6 +81,20 @@ pub struct Transcript {
     pub model: Option<String>,
     pub ctx_tokens: Option<u64>, // current context = last assistant prompt size
     pub max_ctx_tokens: u64,     // largest seen this session (for window inference)
+    // fork(wave-2): true when the LAST assistant message carried a `thinking`
+    // content block (extended thinking on). No level is recorded in transcripts,
+    // so this is a plain on/off signal rendered as the " · thinking" suffix.
+    pub thinking: bool,
+}
+
+/// fork(wave-2): the model-display suffix for a thread's reasoning/thinking mode.
+/// Empty when thinking is off, so callers can append it unconditionally.
+fn thinking_suffix(thinking: bool) -> &'static str {
+    if thinking {
+        " · thinking"
+    } else {
+        ""
+    }
 }
 
 /// Scan a transcript for the LAST assistant message's model + context size.
@@ -114,6 +128,16 @@ pub fn parse_transcript(content: &str) -> Transcript {
         if let Some(m) = msg.get("model").and_then(|x| x.as_str()) {
             out.model = Some(m.to_string());
         }
+        // fork(wave-2): last assistant message wins — a plain tool-use continuation
+        // with no thinking block clears the flag, matching the visible thread state.
+        out.thinking = msg
+            .get("content")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            })
+            .unwrap_or(false);
     }
     out
 }
@@ -198,11 +222,13 @@ pub fn snapshot_for_sid_with_subagent(
     let window = window_for(&model_id, t.max_ctx_tokens);
     s.model = t.model.as_deref().map(|id| {
         let name = model_display(id);
-        if window == WINDOW_1M {
+        let base = if window == WINDOW_1M {
             format!("{name} (1M context)")
         } else {
             name
-        }
+        };
+        // fork(wave-2): model · mode (e.g. `Opus 4.8 (1M context) · thinking`).
+        format!("{base}{}", thinking_suffix(t.thinking))
     });
     s.ctx_used_tokens = t.ctx_tokens;
     s.ctx_window = Some(window);
@@ -252,6 +278,8 @@ struct SubagentResolved {
     ctx_tokens: Option<u64>,
     max_ctx_tokens: u64,
     meta_alias: String,
+    // fork(wave-2): the subagent's own thinking state (its transcript tail).
+    thinking: bool,
 }
 
 /// fork(wave-1): find the subagent named `name` next to the main transcript
@@ -304,22 +332,24 @@ fn resolve_subagent(main_transcript: &Path, name: &str) -> Option<SubagentResolv
         "{}.jsonl",
         meta_str.strip_suffix(".meta.json").unwrap_or(&meta_str)
     ));
-    let (model_id, ctx_tokens, max_ctx_tokens) = match std::fs::read_to_string(&jsonl) {
+    let (model_id, ctx_tokens, max_ctx_tokens, thinking) = match std::fs::read_to_string(&jsonl) {
         Ok(content) => {
             let t = parse_transcript(&content);
             (
                 t.model.unwrap_or_default(),
                 t.ctx_tokens,
                 t.max_ctx_tokens,
+                t.thinking,
             )
         }
-        Err(_) => (String::new(), None, 0),
+        Err(_) => (String::new(), None, 0, false),
     };
     Some(SubagentResolved {
         model_id,
         ctx_tokens,
         max_ctx_tokens,
         meta_alias,
+        thinking,
     })
 }
 
@@ -347,7 +377,10 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
             }
             None => s.ctx_approx = true,
         }
-        s.model = Some(format!("{stripped} · @{name}"));
+        s.model = Some(format!(
+            "{stripped}{} · @{name}",
+            thinking_suffix(r.thinking)
+        ));
     } else {
         let window = window_for(&display_id, r.max_ctx_tokens);
         s.ctx_window = Some(window);
@@ -358,7 +391,11 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
         } else {
             name_disp
         };
-        s.model = Some(format!("{with_win} · @{name}"));
+        // fork(wave-2): model · mode · @subagent.
+        s.model = Some(format!(
+            "{with_win}{} · @{name}",
+            thinking_suffix(r.thinking)
+        ));
     }
     if r.ctx_tokens.is_some() {
         s.ctx_used_tokens = r.ctx_tokens;
@@ -382,7 +419,9 @@ fn gpt_snapshot_for_sid(content: &str, path: &Path, t: &Transcript) -> Option<Us
     // GPT turns report input/output tokens with cache_* always 0, so the existing
     // context sum (input + cache_read + cache_creation) is exactly the input size.
     s.ctx_used_tokens = t.ctx_tokens;
-    s.model = Some(model_id.clone());
+    // fork(wave-2): mode suffix for consistency; cx-routed GPT transcripts don't
+    // carry thinking blocks, so this is a no-op in practice.
+    s.model = Some(format!("{model_id}{}", thinking_suffix(t.thinking)));
     s.fill_ctx_pct();
     s.source_age_secs = util::file_age_secs(path);
 
@@ -430,6 +469,53 @@ mod tests {
         assert_eq!(t.ctx_tokens, Some(154055));
         // max over session: first message 60+38634+85989 = 124683 < 154055
         assert_eq!(t.max_ctx_tokens, 154055);
+    }
+
+    // fork(wave-2): real-shaped assistant message carrying a thinking content
+    // block (keys: type/thinking/signature) followed by text, then a plain
+    // tool-use continuation with no thinking block.
+    const THINKING_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","content":[{"type":"thinking","thinking":"let me plan","signature":"EtwHCpMBCA8YAipA"},{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"cache_read_input_tokens":90000,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
+
+    #[test]
+    fn parse_detects_thinking_block_on_last_assistant() {
+        let t = parse_transcript(THINKING_TRANSCRIPT);
+        assert!(t.thinking);
+    }
+
+    #[test]
+    fn parse_thinking_false_when_last_assistant_has_no_thinking_block() {
+        // last assistant is a plain tool-use continuation -> thinking clears.
+        let transcript = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","content":[{"type":"thinking","thinking":"x","signature":"s"}],"usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"usage":{"input_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":0,"output_tokens":1}}}"#;
+        let t = parse_transcript(transcript);
+        assert!(!t.thinking);
+    }
+
+    #[test]
+    fn thinking_suffix_appended_to_model_display() {
+        let h = TempHome::new("thinking-main");
+        let sid = "sid-think";
+        h.write(
+            &format!(".claude/projects/-tmp-proj/{sid}.jsonl"),
+            THINKING_TRANSCRIPT,
+        );
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        let s = snapshot_for_sid(sid).expect("snapshot");
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8 · thinking"));
+    }
+
+    #[test]
+    fn subagent_thinking_orders_model_mode_then_marker() {
+        let h = TempHome::new("sub-think");
+        let sid = "sid-sub-think";
+        let meta = r#"{"agentType":"probe1","name":"probe1","model":"sonnet"}"#;
+        // subagent's own tail has a thinking block.
+        let sub = r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[{"type":"thinking","thinking":"y","signature":"s"},{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"cache_read_input_tokens":12000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#;
+        write_subagent_session(&h, sid, meta, sub);
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
+        // ordering: model · mode · @subagent
+        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · thinking · @probe1"));
     }
 
     #[test]
