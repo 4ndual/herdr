@@ -18,17 +18,30 @@ use std::sync::OnceLock;
 /// name. The agent-tray list (`⏺ main` / `◯ probe1`) is deliberately NOT used —
 /// it is present whether or not a subview is open. Pure over the screen text so
 /// it is unit-testable without a PTY.
+///
+/// fork(wave-2): Claude Code v2.1.210 dropped the `Message @<name>…` prompt and
+/// the `Viewing @<name>` banner from the subagent view; the only remaining
+/// marker is a full-width box-drawing separator line embedding the name, e.g.
+/// `───────────────────── @probe-demo ──`. Match that per-line separator FIRST,
+/// keeping the two legacy prompts as fallbacks for older Claude Code builds.
 pub fn parse_subagent_marker(screen: &str) -> Option<String> {
+    // `─{3,} @<name> ─+` is the v2.1.210 subagent-view header separator. Anchored
+    // per line (`(?m)`) so an in-transcript chat line mentioning `@foo` — which is
+    // not a `─`-bounded separator — can never match.
+    static SEPARATOR: OnceLock<regex::Regex> = OnceLock::new();
     // `Message @<name>…` is the stable bottom-chrome prompt while viewing a
     // subagent; `Viewing @<name>` is the top banner used as a secondary signal.
     static MESSAGE: OnceLock<regex::Regex> = OnceLock::new();
     static VIEWING: OnceLock<regex::Regex> = OnceLock::new();
+    let separator = SEPARATOR
+        .get_or_init(|| regex::Regex::new(r"(?m)^─{3,}\s*@([A-Za-z0-9_-]+)\s*─+\s*$").unwrap());
     let message = MESSAGE
         .get_or_init(|| regex::Regex::new(r"Message @([A-Za-z0-9_-]+)\s*(?:…|\.\.\.)").unwrap());
     let viewing =
         VIEWING.get_or_init(|| regex::Regex::new(r"Viewing @([A-Za-z0-9_-]+)").unwrap());
-    message
+    separator
         .captures(screen)
+        .or_else(|| message.captures(screen))
         .or_else(|| viewing.captures(screen))
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
@@ -149,6 +162,23 @@ mod tests {
         // No Message prompt, only the Viewing banner present.
         let screen = "Viewing @helper · esc to return\nbody text";
         assert_eq!(parse_subagent_marker(screen).as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn subagent_marker_extracts_from_v2_210_separator_header() {
+        // fork(wave-2): verbatim bottom-buffer separator captured live from a
+        // Claude Code v2.1.210 pane viewing @probe-demo (no Message/Viewing chrome).
+        let screen = "some transcript body\n\
+                      ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── @probe-demo ──\n";
+        assert_eq!(parse_subagent_marker(screen).as_deref(), Some("probe-demo"));
+    }
+
+    #[test]
+    fn subagent_marker_separator_ignores_chat_mention_and_manage_row() {
+        // A chat line mentioning @foo is NOT a `─`-bounded separator.
+        assert_eq!(parse_subagent_marker("please ask @foo to review this\n"), None);
+        // The manage-subagents list row is not a separator either.
+        assert_eq!(parse_subagent_marker("❯ ⏺ probe-demo  running · 12s\n"), None);
     }
 
     #[test]
