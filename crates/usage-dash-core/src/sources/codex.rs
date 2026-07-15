@@ -124,8 +124,14 @@ pub fn parse_rollout(content: &str) -> CodexParsed {
             {
                 out.ctx_window = Some(w);
             }
+            // fork(wave-1): `total_token_usage` accumulates over the whole
+            // session (tens of millions of tokens on long sessions — rendered
+            // as a >5000% ctx bar). The CURRENT context is `last_token_usage`
+            // (the final turn's prompt+completion); fall back to the cumulative
+            // counter only for old rollouts that predate that field.
             if let Some(t) = p
-                .pointer("/info/total_token_usage/total_tokens")
+                .pointer("/info/last_token_usage/total_tokens")
+                .or_else(|| p.pointer("/info/total_token_usage/total_tokens"))
                 .and_then(|x| x.as_u64())
             {
                 out.total_tokens = Some(t);
@@ -324,6 +330,18 @@ mod tests {
     const PROLITE_ROLLOUT: &str = r#"{"type":"session_meta","payload":{"cwd":"/tmp/p"}}
 {"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
 {"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":128000,"total_token_usage":{"total_tokens":42}},"rate_limits":{"primary":{"used_percent":11.0,"window_minutes":10080,"resets_at":1784489140},"secondary":null,"plan_type":"prolite"}}}"#;
+
+    // Long sessions accumulate tens of millions of tokens in `total_token_usage`
+    // (rendered as a >5000% ctx bar). The current context is `last_token_usage`.
+    const LONG_SESSION_ROLLOUT: &str = r#"{"type":"session_meta","payload":{"cwd":"/tmp/p"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"model_context_window":258400,"total_token_usage":{"total_tokens":14150856},"last_token_usage":{"total_tokens":186669}},"rate_limits":{"primary":{"used_percent":10.0,"window_minutes":10080,"resets_at":1784489140},"secondary":null,"plan_type":"prolite"}}}"#;
+
+    #[test]
+    fn ctx_uses_last_token_usage_not_cumulative_total() {
+        let p = parse_rollout(LONG_SESSION_ROLLOUT);
+        assert_eq!(p.total_tokens, Some(186_669), "current context, not the 14.2M cumulative");
+        assert_eq!(p.ctx_window, Some(258_400));
+    }
 
     #[test]
     fn prolite_weekly_primary_maps_to_weekly() {
