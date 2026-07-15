@@ -736,6 +736,23 @@ mod tests {
     }
 
     #[test]
+    fn identify_agent_in_job_detects_project_router_hardlink() {
+        // fork(wave-1): claude-project-router execs claude-meta/claude-brain
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 93234,
+            processes: vec![foreground_process(
+                93234,
+                "claude-meta",
+                &["/Users/andual/.local/bin/claude-meta", "--resume", "x"],
+            )],
+        };
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Claude, "claude-meta".to_string()))
+        );
+    }
+
+    #[test]
     fn identify_agent_in_job_prefers_recognized_process_group_leader() {
         let job = crate::platform::ForegroundJob {
             process_group_id: 42,
