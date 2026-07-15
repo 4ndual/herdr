@@ -29,3 +29,9 @@ capabilities = ["layout_read", "focused_session"]
 # host writes it today (interim, relocating to a plugin collector in D/E); the
 # generic machinery neither parses nor understands the contents.
 ui_input_file = "usage_input.json"
+# fork(wave-2): the host runs this out-of-process collector once per dashboard
+# tick to produce the snapshot inside usage_input.json, so collection logic
+# hot-reloads (rebuild the bin) with no host rebuild. argv[0] is resolved against
+# plugin_root; the bin lands in the ROOT workspace target dir (this plugin is a
+# nested wasm workspace, so ../../target escapes it to <repo>/target).
+collector = ["../../target/release/usage-dash-collector"]

@@ -301,6 +301,17 @@ pub struct PluginManifestUiModule {
     /// plugin's own process side writes the file; the host never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_input_file: Option<String>,
+    /// fork(wave-2): optional argv naming a command the host executes on each
+    /// dashboard tick to PRODUCE this module's snapshot out-of-process, so
+    /// collection logic hot-reloads (rebuild the bin) without a host rebuild.
+    /// Relative `argv[0]` is resolved against `plugin_root` at exec time. The
+    /// host gates and spawns it exactly like a plugin `event`/`action` command
+    /// (same executor path); the child receives `HERDR_PLUGIN_STATE_DIR` and
+    /// `HERDR_FOCUS_JSON`, and answers on stdout with the sticky snapshot
+    /// protocol (`{"outcome":"replace","snapshot":{…}}` | `{"outcome":"keep"}`
+    /// | `{"outcome":"clear"}`). Only meaningful together with `ui_input_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

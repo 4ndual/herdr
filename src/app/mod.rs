@@ -55,7 +55,7 @@ const MAX_UI_INPUT_BYTES: u64 = 64 * 1024;
 /// item B's generic reader resolves the same `HERDR_PLUGIN_STATE_DIR` file. This
 /// whole writer relocates into the usage-dash plugin's own collector process in
 /// items D/E — it is the last usage-specific code path in core after item C.
-const USAGE_DASH_PLUGIN_ID: &str = "builtin.usage-dash";
+pub(crate) const USAGE_DASH_PLUGIN_ID: &str = "builtin.usage-dash";
 const USAGE_DASH_INPUT_FILE: &str = "usage_input.json";
 
 /// Plugin id and `ui_input_file` name for the interim host-side goal writer
@@ -198,6 +198,13 @@ pub struct App {
     /// last frame's hit-rects) and the latest resolved snapshot.
     pub(crate) usage_view: usage_dash_core::UsageView,
     pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
+    /// fork(wave-2): module keys (see [`crate::plugin_collector::module_key`])
+    /// whose out-of-process collector run is currently in flight, so the host
+    /// launches at most one process per module per tick.
+    pub(crate) collectors_in_flight: std::collections::HashSet<String>,
+    /// fork(wave-2): last distinct failure reason per collector module key, so a
+    /// repeated failure is warned about only once (until it changes or recovers).
+    pub(crate) collector_last_error: std::collections::HashMap<String, String>,
     /// Native goal-panel core backing the WASM goal-dash plugin. The host ticks
     /// it (~1 Hz) and projects it into the plugin input file; see
     /// [`crate::goal_host`]. Not pinned to a session — it adopts the focused one.
@@ -850,6 +857,8 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             usage_view: usage_dash_core::UsageView::default(),
             usage_snapshot: None,
+            collectors_in_flight: std::collections::HashSet::new(),
+            collector_last_error: std::collections::HashMap::new(),
             goal_dash: goal_dash_core::App::new(None),
             ui_plugins,
             last_ui_plugin_focus: None,

@@ -86,6 +86,12 @@ mod tests {
         assert!(module
             .surfaces
             .contains(&crate::api::schema::PluginUiSurface::UsageStrip));
+        // fork(wave-2): the shipped manifest declares the out-of-process
+        // collector, so the field flows through the loader into the registry.
+        assert_eq!(
+            module.collector.as_deref(),
+            Some(["../../target/release/usage-dash-collector".to_string()].as_slice())
+        );
     }
 
     /// Fresh session: the bundled goal-dash manifest auto-links at the shipped

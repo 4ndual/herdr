@@ -1,0 +1,23 @@
+# fork(wave-2): out-of-process usage-dash collector. A member of the ROOT herdr
+# workspace (not the sibling wasm `usage-dash-ui` nested workspace) so it builds
+# into `<workspace>/target/release/usage-dash-collector`, which the plugin
+# manifest's `collector` argv points at via a plugin-root-relative path.
+[package]
+name = "usage-dash-collector"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "hot-reloadable out-of-process collector that produces the usage-dash snapshot"
+publish = false
+# Override directory-based workspace discovery: the parent `usage-dash-ui` dir is
+# itself a (wasm) workspace root, so pin membership to the repo-root workspace.
+workspace = "../../.."
+
+[[bin]]
+name = "usage-dash-collector"
+path = "src/main.rs"
+
+[dependencies]
+usage-dash-core = { path = "../../../crates/usage-dash-core" }
+herdr-ui-plugin-api = { path = "../../../crates/herdr-ui-plugin-api" }
+serde_json = "1"

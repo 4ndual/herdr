@@ -7495,6 +7495,16 @@
               },
               "type": "array"
             },
+            "collector": {
+              "description": "fork(wave-2): optional argv naming a command the host executes on each\ndashboard tick to PRODUCE this module's snapshot out-of-process, so\ncollection logic hot-reloads (rebuild the bin) without a host rebuild.\nRelative `argv[0]` is resolved against `plugin_root` at exec time. The\nhost gates and spawns it exactly like a plugin `event`/`action` command\n(same executor path); the child receives `HERDR_PLUGIN_STATE_DIR` and\n`HERDR_FOCUS_JSON`, and answers on stdout with the sticky snapshot\nprotocol (`{\"outcome\":\"replace\",\"snapshot\":{…}}` | `{\"outcome\":\"keep\"}`\n| `{\"outcome\":\"clear\"}`). Only meaningful together with `ui_input_file`.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "description": {
               "type": [
                 "string",

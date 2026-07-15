@@ -1307,6 +1307,7 @@ mod tests {
                     PluginUiCapability::MouseAll,
                 ],
                 ui_input_file: None,
+                collector: None,
             }],
             link_handlers: vec![],
             source: Default::default(),

@@ -139,6 +139,44 @@ impl App {
             return;
         }
 
+        if let AppEvent::CollectorFinished {
+            plugin_id,
+            module_id,
+            result,
+        } = ev
+        {
+            // fork(wave-2): generic collector bookkeeping — always clear the
+            // in-flight marker, then apply the outcome (usage-dash is the only
+            // module wired to a host snapshot today). Failures keep the previous
+            // snapshot and warn only once per distinct reason.
+            let key = crate::plugin_collector::module_key(&plugin_id, &module_id);
+            self.collectors_in_flight.remove(&key);
+            let apply_result = match &result {
+                Ok(outcome) if plugin_id == super::USAGE_DASH_PLUGIN_ID => {
+                    crate::usage_host::apply_collector_outcome(self, outcome)
+                }
+                Ok(_) => Ok(()),
+                Err(message) => Err(message.clone()),
+            };
+            match apply_result {
+                Ok(()) => {
+                    self.collector_last_error.remove(&key);
+                }
+                Err(message) => {
+                    if self.collector_last_error.get(&key) != Some(&message) {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            module_id = %module_id,
+                            error = %message,
+                            "ui-plugin collector run failed; keeping previous snapshot"
+                        );
+                        self.collector_last_error.insert(key, message);
+                    }
+                }
+            }
+            return;
+        }
+
         if let AppEvent::WorktreeAddFinished(result) = ev {
             self.handle_worktree_add_finished(*result);
             return;

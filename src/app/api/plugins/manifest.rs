@@ -104,6 +104,9 @@ struct RawPluginManifestUiModule {
     capabilities: Vec<PluginUiCapability>,
     #[serde(default)]
     ui_input_file: Option<String>,
+    // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
+    #[serde(default)]
+    collector: Option<Vec<String>>,
 }
 
 /// Raw string platform value from the manifest, validated before conversion.
@@ -521,6 +524,13 @@ fn normalize_manifest_ui_module(
         Some(name) => Some(normalize_ui_input_file(&name)?),
         None => None,
     };
+    // fork(wave-2): a declared collector is an argv the host will execute, so it
+    // is normalized through the same non-empty-argv check as event/action/pane
+    // commands (`normalize_command`), keeping the gate identical.
+    let collector = match module.collector {
+        Some(command) => Some(normalize_command(command)?),
+        None => None,
+    };
     Ok(PluginManifestUiModule {
         id,
         title,
@@ -533,6 +543,7 @@ fn normalize_manifest_ui_module(
         surfaces: module.surfaces,
         capabilities: module.capabilities,
         ui_input_file,
+        collector,
     })
 }
 
@@ -745,6 +756,7 @@ mod tests {
             surfaces: vec![PluginUiSurface::RightPanel],
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
+            collector: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
@@ -761,6 +773,7 @@ mod tests {
             surfaces: vec![],
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
+            collector: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_surfaces");
@@ -791,6 +804,7 @@ mod tests {
                 PluginUiCapability::ContextMenuAugment,
             ],
             ui_input_file: None,
+            collector: None,
         })
         .unwrap();
         assert_eq!(module.id, "goal-ui");
@@ -814,6 +828,7 @@ mod tests {
             surfaces: vec![PluginUiSurface::UsageStrip],
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: Some(name.into()),
+            collector: None,
         }
     }
 
@@ -838,5 +853,40 @@ mod tests {
                 .expect_err("traversal/separator names must be rejected");
             assert_eq!(err.0, "invalid_plugin_ui_input_file");
         }
+    }
+
+    // fork(wave-2): collector argv parsing.
+    #[test]
+    fn collector_argv_parses_and_round_trips() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec![
+            "../../target/release/usage-dash-collector".into(),
+            "--once".into(),
+        ]);
+        let module = normalize_manifest_ui_module(raw).expect("collector argv is accepted");
+        assert_eq!(
+            module.collector.as_deref(),
+            Some(
+                [
+                    "../../target/release/usage-dash-collector".to_string(),
+                    "--once".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn collector_empty_argv_is_rejected_like_other_commands() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec![]);
+        let err = normalize_manifest_ui_module(raw).expect_err("empty collector argv is rejected");
+        assert_eq!(err.0, "invalid_plugin_command");
+
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec!["".into()]);
+        let err =
+            normalize_manifest_ui_module(raw).expect_err("blank collector argv0 is rejected");
+        assert_eq!(err.0, "invalid_plugin_command");
     }
 }

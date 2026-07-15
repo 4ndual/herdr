@@ -78,6 +78,7 @@ mod logging;
 mod pane;
 mod persist;
 mod platform;
+mod plugin_collector;
 mod plugin_command;
 mod plugin_focus;
 mod plugin_paths;
