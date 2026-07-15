@@ -111,10 +111,18 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
     match focus.agent {
         AgentKind::None => RefreshOutcome::Clear,
         AgentKind::Claude => match focus.session_id.as_deref() {
-            Some(sid) if !sid.is_empty() => match sources::claude::snapshot_for_sid(sid) {
-                Some(s) => RefreshOutcome::Replace(Box::new(s)),
-                None => RefreshOutcome::KeepPrevious,
-            },
+            // fork(wave-1): when the focused Claude pane is viewing a subagent,
+            // `focus.subagent` is its name; the source overrides model + context
+            // with that subagent's, keeping the account's plan-quota rows.
+            Some(sid) if !sid.is_empty() => {
+                match sources::claude::snapshot_for_sid_with_subagent(
+                    sid,
+                    focus.subagent.as_deref(),
+                ) {
+                    Some(s) => RefreshOutcome::Replace(Box::new(s)),
+                    None => RefreshOutcome::KeepPrevious,
+                }
+            }
             _ => RefreshOutcome::KeepPrevious,
         },
         AgentKind::Codex => match focus.cwd.as_deref() {

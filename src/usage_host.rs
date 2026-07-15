@@ -35,7 +35,16 @@ use crate::app::App;
 /// (~1 Hz) from the main loop, applying the sticky semantics
 /// ([`RefreshOutcome`]) — replace, keep, or clear the stored snapshot.
 pub fn tick(app: &mut App) {
-    let focus = crate::plugin_focus::focus_input(&app.state);
+    let mut focus = crate::plugin_focus::focus_input(&app.state);
+    // fork(wave-1): a Claude pane may be VIEWING one of its subagents. That is a
+    // live screen-chrome fact (not in pure `AppState`), so we read the focused
+    // pane's runtime detection text here — the same bottom-of-buffer snapshot the
+    // agent detector consumes (`herdr agent read <pane> --source detection`) — and
+    // parse the `Message @<name>…` / `Viewing @<name>` marker. Only meaningful for
+    // Claude; other agents have no subagent view.
+    if focus.agent == herdr_ui_plugin_api::AgentKind::Claude {
+        focus.subagent = focused_subagent(app);
+    }
     match usage_dash_core::refresh(focus) {
         RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(*snap),
         RefreshOutcome::Clear => app.usage_snapshot = None,
@@ -49,6 +58,18 @@ pub fn tick(app: &mut App) {
     // periodic plugin hook to drive it). The wave-2 purity path is a
     // plugin-owned collector subscribing to the socket API (events.subscribe).
     app.write_usage_input_file();
+}
+
+/// fork(wave-1): resolve the subagent the focused pane is currently viewing by
+/// reading its runtime detection text (bottom-of-buffer chrome) and parsing the
+/// subagent-view marker. Returns `None` when nothing is focused, the runtime is
+/// gone, or no marker is present. Read-only over the terminal runtime.
+fn focused_subagent(app: &App) -> Option<String> {
+    let ws = app.state.workspaces.get(app.state.active?)?;
+    let pane_id = ws.focused_pane_id()?;
+    let terminal_id = ws.terminal_id(pane_id)?;
+    let runtime = app.terminal_runtimes.get(terminal_id)?;
+    crate::plugin_focus::parse_subagent_marker(&runtime.detection_text())
 }
 
 /// Is `(col, row)` inside a non-empty rect?

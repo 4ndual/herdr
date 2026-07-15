@@ -36,6 +36,13 @@ pub struct FocusInput {
     /// True when the focused pane is a plugin surface/self — the host asks the
     /// plugin to keep its previous snapshot (sticky, no flicker).
     pub is_self_focus: bool,
+    /// fork(wave-1): name of the subagent the focused Claude pane is currently
+    /// VIEWING (Claude Code's "Viewing @<name>" / "Message @<name>…" subview),
+    /// with the leading `@` stripped. `Some` only when the focused agent is
+    /// Claude and its bottom-screen chrome shows the subagent-view marker; the
+    /// usage source then reports that subagent's model + context instead of the
+    /// main session's (plan-quota rows stay the account's — same plan).
+    pub subagent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

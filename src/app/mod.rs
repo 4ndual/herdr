@@ -2716,6 +2716,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/tmp/repo")),
                 agent: herdr_ui_plugin_api::AgentKind::Claude,
                 is_self_focus: false,
+                subagent: None,
             },
             None,
             None,

@@ -9,6 +9,30 @@ use crate::agent_resume::AgentSessionRefKind;
 use crate::app::AppState;
 use crate::detect::{parse_agent_label, Agent};
 use herdr_ui_plugin_api::{AgentKind, FocusInput};
+use std::sync::OnceLock;
+
+/// fork(wave-1): extract the name of the subagent a Claude pane is currently
+/// VIEWING from its bottom-screen chrome, `@` stripped. Claude Code's subagent
+/// view shows a `❯ Message @<name>…` prompt (the ellipsis is U+2026 or `...`)
+/// and a `Viewing @<name> · esc to return` banner; either marker resolves the
+/// name. The agent-tray list (`⏺ main` / `◯ probe1`) is deliberately NOT used —
+/// it is present whether or not a subview is open. Pure over the screen text so
+/// it is unit-testable without a PTY.
+pub fn parse_subagent_marker(screen: &str) -> Option<String> {
+    // `Message @<name>…` is the stable bottom-chrome prompt while viewing a
+    // subagent; `Viewing @<name>` is the top banner used as a secondary signal.
+    static MESSAGE: OnceLock<regex::Regex> = OnceLock::new();
+    static VIEWING: OnceLock<regex::Regex> = OnceLock::new();
+    let message = MESSAGE
+        .get_or_init(|| regex::Regex::new(r"Message @([A-Za-z0-9_-]+)\s*(?:…|\.\.\.)").unwrap());
+    let viewing =
+        VIEWING.get_or_init(|| regex::Regex::new(r"Viewing @([A-Za-z0-9_-]+)").unwrap());
+    message
+        .captures(screen)
+        .or_else(|| viewing.captures(screen))
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
 
 /// Map herdr's detected agent to the bridge-facing [`AgentKind`]. Agents the
 /// bridge doesn't model collapse to [`AgentKind::None`] (treated as a plain
@@ -82,6 +106,11 @@ pub fn focus_input(state: &AppState) -> FocusInput {
         // Set true only when a plugin surface itself holds focus; wired when
         // input routing lands. Until then a pane is always focused.
         is_self_focus: false,
+        // fork(wave-1): the subagent view is a live screen-chrome fact not held
+        // in pure `AppState`, so `focus_input` leaves this `None`; the usage host
+        // tick fills it from the focused pane's runtime detection text (which is
+        // only reachable there). See `usage_host::tick`.
+        subagent: None,
     }
 }
 
@@ -97,6 +126,36 @@ mod tests {
         assert_eq!(map_agent(Agent::Pi), AgentKind::Pi);
         assert_eq!(map_agent(Agent::Gemini), AgentKind::None);
         assert_eq!(map_agent(Agent::Cursor), AgentKind::None);
+    }
+
+    #[test]
+    fn subagent_marker_extracts_from_message_prompt_with_ellipsis() {
+        // Real bottom chrome while viewing @probe1 (ellipsis is U+2026).
+        let screen = "Viewing @probe1 · esc to return\n\
+                      some transcript body\n\
+                      ❯ Message @probe1…\n\
+                      ─────────── @probe1 ──────────";
+        assert_eq!(parse_subagent_marker(screen).as_deref(), Some("probe1"));
+    }
+
+    #[test]
+    fn subagent_marker_accepts_ascii_ellipsis_and_hyphenated_names() {
+        let screen = "❯ Message @my-sub_2...";
+        assert_eq!(parse_subagent_marker(screen).as_deref(), Some("my-sub_2"));
+    }
+
+    #[test]
+    fn subagent_marker_falls_back_to_viewing_banner() {
+        // No Message prompt, only the Viewing banner present.
+        let screen = "Viewing @helper · esc to return\nbody text";
+        assert_eq!(parse_subagent_marker(screen).as_deref(), Some("helper"));
+    }
+
+    #[test]
+    fn subagent_marker_absent_when_not_viewing() {
+        // Bare prompt + agent tray (tray alone must NOT trigger a match).
+        let screen = "⏺ main\n◯ probe1  idle\n❯ ";
+        assert_eq!(parse_subagent_marker(screen), None);
     }
 
     #[test]

@@ -165,6 +165,19 @@ fn window_for(model_id: &str, observed_max: u64) -> u64 {
 }
 
 pub fn snapshot_for_sid(sid: &str) -> Option<UsageSnapshot> {
+    snapshot_for_sid_with_subagent(sid, None)
+}
+
+/// fork(wave-1): like [`snapshot_for_sid`], but when `subagent` is `Some(name)`
+/// the focused Claude pane is VIEWING that subagent — override the snapshot's
+/// model + context with the subagent's own (resolved from the sibling
+/// `<sid>/subagents/` transcripts), while keeping the account's plan-quota rows
+/// (5h / weekly / today) and per-session state/stats from the MAIN session. A
+/// missing/unmatched subagent falls back silently to the main-session snapshot.
+pub fn snapshot_for_sid_with_subagent(
+    sid: &str,
+    subagent: Option<&str>,
+) -> Option<UsageSnapshot> {
     let path = transcript_for_sid(sid)?;
     let content = std::fs::read_to_string(&path).ok()?;
     let t = parse_transcript(&content);
@@ -174,7 +187,11 @@ pub fn snapshot_for_sid(sid: &str) -> Option<UsageSnapshot> {
     // the Codex plan — never Anthropic. The LAST assistant model decides: if the
     // user flipped back to a claude-* model, the session stays Claude.
     if t.model.as_deref().map(is_gpt_model).unwrap_or(false) {
-        return gpt_snapshot_for_sid(&content, &path, &t);
+        let mut s = gpt_snapshot_for_sid(&content, &path, &t)?;
+        if let Some(name) = subagent {
+            apply_subagent_override(&mut s, &path, name);
+        }
+        return Some(s);
     }
 
     let mut s = UsageSnapshot::empty(Cli::Claude);
@@ -217,7 +234,136 @@ pub fn snapshot_for_sid(sid: &str) -> Option<UsageSnapshot> {
             s.daily_used_pct = Some(budget::daily_delta("claude", &util::today_local(), wkp));
         }
     }
+
+    // fork(wave-1): quota rows above stay the account's; only model + context are
+    // swapped to the viewed subagent's.
+    if let Some(name) = subagent {
+        apply_subagent_override(&mut s, &path, name);
+    }
     Some(s)
+}
+
+/// fork(wave-1): resolved facts about the subagent a pane is viewing: its real
+/// model id + context from the LAST assistant record of its own transcript, plus
+/// the `.meta.json` `model` alias as a display fallback when the transcript has
+/// no assistant record yet.
+struct SubagentResolved {
+    model_id: String,
+    ctx_tokens: Option<u64>,
+    max_ctx_tokens: u64,
+    meta_alias: String,
+}
+
+/// fork(wave-1): find the subagent named `name` next to the main transcript
+/// (`<proj>/<sid>/subagents/*.meta.json` whose `name` field == `name`, newest
+/// mtime wins — filenames like `agent-aprobe1-<hex>` are NOT reliable), then read
+/// its sibling `.jsonl` tail for the real model + context. Returns `None` when
+/// the dir or a matching agent is absent.
+fn resolve_subagent(main_transcript: &Path, name: &str) -> Option<SubagentResolved> {
+    // `<proj>/<sid>.jsonl` -> `<proj>/<sid>/subagents`.
+    let subdir = main_transcript.with_extension("").join("subagents");
+    let mut best: Option<(std::time::SystemTime, PathBuf, String)> = None;
+    for entry in std::fs::read_dir(&subdir).ok()?.flatten() {
+        let meta_path = entry.path();
+        let is_meta = meta_path
+            .to_str()
+            .map(|s| s.ends_with(".meta.json"))
+            .unwrap_or(false);
+        if !is_meta {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&meta_path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("name").and_then(|x| x.as_str()) != Some(name) {
+            continue;
+        }
+        let alias = v
+            .get("model")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mt = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().map(|(b, _, _)| mt > *b).unwrap_or(true) {
+            best = Some((mt, meta_path, alias));
+        }
+    }
+    let (_, meta_path, meta_alias) = best?;
+
+    // Sibling transcript: `agent-<slug>-<hex>.meta.json` -> `.jsonl`.
+    let meta_str = meta_path.to_string_lossy();
+    let jsonl = PathBuf::from(format!(
+        "{}.jsonl",
+        meta_str.strip_suffix(".meta.json").unwrap_or(&meta_str)
+    ));
+    let (model_id, ctx_tokens, max_ctx_tokens) = match std::fs::read_to_string(&jsonl) {
+        Ok(content) => {
+            let t = parse_transcript(&content);
+            (
+                t.model.unwrap_or_default(),
+                t.ctx_tokens,
+                t.max_ctx_tokens,
+            )
+        }
+        Err(_) => (String::new(), None, 0),
+    };
+    Some(SubagentResolved {
+        model_id,
+        ctx_tokens,
+        max_ctx_tokens,
+        meta_alias,
+    })
+}
+
+/// fork(wave-1): override a main-session snapshot's model + context in place with
+/// the viewed subagent's, appending ` · @<name>` to the model display. Quota rows,
+/// state, and stats are left untouched (same plan account). A subagent running a
+/// GPT model via CCR gets the same catalog-based window as [`gpt_snapshot_for_sid`].
+fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: &str) {
+    let Some(r) = resolve_subagent(main_transcript, name) else {
+        return; // no matching subagent files -> silent fallback to main session
+    };
+    // Prefer the transcript's real model id; fall back to the meta.json alias.
+    let display_id = if r.model_id.is_empty() {
+        r.meta_alias.clone()
+    } else {
+        r.model_id.clone()
+    };
+
+    if is_gpt_model(&display_id) {
+        let stripped = crate::sources::codex::strip_codex_plan_prefix(&display_id).to_string();
+        match crate::sources::codex::ctx_window_from_catalog(&stripped) {
+            Some(w) => {
+                s.ctx_window = Some(w);
+                s.ctx_approx = false;
+            }
+            None => s.ctx_approx = true,
+        }
+        s.model = Some(format!("{stripped} · @{name}"));
+    } else {
+        let window = window_for(&display_id, r.max_ctx_tokens);
+        s.ctx_window = Some(window);
+        s.ctx_approx = false;
+        let name_disp = model_display(&display_id);
+        let with_win = if window == WINDOW_1M {
+            format!("{name_disp} (1M context)")
+        } else {
+            name_disp
+        };
+        s.model = Some(format!("{with_win} · @{name}"));
+    }
+    if r.ctx_tokens.is_some() {
+        s.ctx_used_tokens = r.ctx_tokens;
+    }
+    s.fill_ctx_pct();
 }
 
 /// Build a Codex-attributed snapshot for a cx session. Context/model/stats/state
@@ -434,5 +580,133 @@ mod tests {
         );
         let s = snapshot_for_sid(sid).expect("snapshot");
         assert_eq!(s.cli, Cli::Claude); // claude last turn → Anthropic identity
+    }
+
+    // ---- fork(wave-1): subagent-view override fixtures ----
+
+    const ANTHROPIC_CACHE: &str = r#"{"five_hour":{"utilization":10.0,"resets_at":"2026-07-15T12:00:00+00:00"},"seven_day":{"utilization":20.0,"resets_at":"2026-07-20T00:00:00+00:00"}}"#;
+
+    const MAIN_TRANSCRIPT: &str = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":90000,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
+
+    // A subagent whose jsonl reports a different model + smaller context than main.
+    const SUB_TRANSCRIPT: &str = r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":5,"cache_read_input_tokens":12000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#;
+
+    // filename slug ('aprobe1') deliberately differs from the meta `name` ('probe1').
+    fn write_subagent_session(h: &TempHome, sid: &str, meta: &str, jsonl: &str) {
+        let proj = "-Users-andual-Projects-herdr";
+        h.write(&format!(".claude/projects/{proj}/{sid}.jsonl"), MAIN_TRANSCRIPT);
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.meta.json"),
+            meta,
+        );
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.jsonl"),
+            jsonl,
+        );
+    }
+
+    #[test]
+    fn subagent_resolves_by_meta_name_not_filename_and_overrides_ctx_and_model() {
+        let h = TempHome::new("sub-name");
+        let sid = "80430a4e-a993-4076-96cf-2e625a3efdde";
+        let meta = r#"{"agentType":"probe1","name":"probe1","model":"opus[1m]","teamName":"session-80430a4e"}"#;
+        write_subagent_session(&h, sid, meta, SUB_TRANSCRIPT);
+
+        // Match by meta `name` ("probe1"), though the filename slug is "aprobe1".
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
+        assert_eq!(s.cli, Cli::Claude); // stays the account's plan
+        // ctx swapped to the subagent's tail: 5 + 12000 + 0 = 12005 (main was 90010).
+        assert_eq!(s.ctx_used_tokens, Some(12005));
+        // model swapped to the subagent's real model id, with the @name marker.
+        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · @probe1"));
+        // account plan-quota rows still come from the MAIN session path.
+        assert_eq!(s.weekly.used_pct, Some(20.0));
+        assert_eq!(s.five_hour.used_pct, Some(10.0));
+    }
+
+    #[test]
+    fn subagent_falls_back_to_meta_alias_when_jsonl_has_no_assistant_record() {
+        let h = TempHome::new("sub-alias");
+        let sid = "sid-alias";
+        let meta = r#"{"agentType":"probe1","name":"probe1","model":"opus[1m]"}"#;
+        // jsonl present but no assistant turn yet.
+        write_subagent_session(&h, sid, meta, r#"{"type":"user","message":{"role":"user"}}"#);
+        // 1M enabled on the account so the opus alias infers the 1M window.
+        h.write(".claude/settings.json", r#"{"model":"opus[1m]"}"#);
+
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
+        // alias "opus[1m]" -> model_display passthrough + @name; window inferred 1M (contains "opus").
+        assert_eq!(s.model.as_deref(), Some("opus[1m] (1M context) · @probe1"));
+        assert_eq!(s.ctx_window, Some(WINDOW_1M));
+    }
+
+    #[test]
+    fn missing_subagent_falls_back_to_main_session() {
+        let h = TempHome::new("sub-missing");
+        let sid = "sid-missing";
+        let meta = r#"{"name":"probe1","model":"opus[1m]"}"#;
+        write_subagent_session(&h, sid, meta, SUB_TRANSCRIPT);
+
+        // Viewing a name that has no meta.json -> silent fallback to main.
+        let s = snapshot_for_sid_with_subagent(sid, Some("ghost")).expect("snapshot");
+        assert_eq!(s.ctx_used_tokens, Some(90010)); // main transcript tail
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8")); // main model, no @marker
+    }
+
+    #[test]
+    fn no_subagent_arg_is_plain_main_session() {
+        let h = TempHome::new("sub-none");
+        let sid = "sid-none";
+        let meta = r#"{"name":"probe1","model":"opus[1m]"}"#;
+        write_subagent_session(&h, sid, meta, SUB_TRANSCRIPT);
+
+        let s = snapshot_for_sid_with_subagent(sid, None).expect("snapshot");
+        assert_eq!(s.ctx_used_tokens, Some(90010));
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+    }
+
+    #[test]
+    fn newest_meta_wins_on_duplicate_names() {
+        let h = TempHome::new("sub-dup");
+        let sid = "sid-dup";
+        let proj = "-Users-andual-Projects-herdr";
+        h.write(&format!(".claude/projects/{proj}/{sid}.jsonl"), MAIN_TRANSCRIPT);
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        // Two agents both named "probe1"; the newer one's jsonl must win.
+        let older = h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-old-1111.meta.json"),
+            r#"{"name":"probe1","model":"opus[1m]"}"#,
+        );
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-old-1111.jsonl"),
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+        );
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-new-2222.meta.json"),
+            r#"{"name":"probe1","model":"sonnet"}"#,
+        );
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}/subagents/agent-new-2222.jsonl"),
+            SUB_TRANSCRIPT,
+        );
+        // Make the "new" meta newest, the older one older (mtime is the tiebreak).
+        let now = std::time::SystemTime::now();
+        set_mtime(&older, now - std::time::Duration::from_secs(100));
+        set_mtime(
+            &h.dir.join(format!(
+                ".claude/projects/{proj}/{sid}/subagents/agent-new-2222.meta.json"
+            )),
+            now,
+        );
+
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
+        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · @probe1")); // newer agent
+        assert_eq!(s.ctx_used_tokens, Some(12005));
+    }
+
+    fn set_mtime(path: &Path, t: std::time::SystemTime) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
     }
 }

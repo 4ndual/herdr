@@ -1823,6 +1823,7 @@ mod handle_tests {
             cwd: Some(PathBuf::from("/tmp")),
             agent: herdr_ui_plugin_api::AgentKind::Pi,
             is_self_focus: false,
+            subagent: None,
         };
         app.infer_node(Node::Main);
         let fx = app.take_effects();
