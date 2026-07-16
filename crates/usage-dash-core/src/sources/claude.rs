@@ -144,21 +144,38 @@ pub fn parse_transcript(content: &str) -> Transcript {
             out.ctx_tokens = Some(ctx);
             out.max_ctx_tokens = out.max_ctx_tokens.max(ctx);
         }
-        if let Some(m) = msg.get("model").and_then(|x| x.as_str()) {
+        // fork(wave-2): Claude Code writes synthetic assistant entries (model
+        // "<synthetic>", zero usage) while initializing or as error placeholders.
+        // Only a REAL model id updates the model + thinking flag, so a subagent
+        // whose tail is still just a synthetic entry yields no model (callers fall
+        // back to the meta.json alias) rather than rendering "<synthetic>". The
+        // `ctx`/`max` update above is unaffected — synthetic entries have zero
+        // usage and never overwrite a real context size.
+        if let Some(m) = msg
+            .get("model")
+            .and_then(|x| x.as_str())
+            .filter(|m| is_real_model(m))
+        {
             out.model = Some(m.to_string());
+            // last real assistant message wins — a plain tool-use continuation
+            // with no thinking block clears the flag, matching the visible state.
+            out.thinking = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+                })
+                .unwrap_or(false);
         }
-        // fork(wave-2): last assistant message wins — a plain tool-use continuation
-        // with no thinking block clears the flag, matching the visible thread state.
-        out.thinking = msg
-            .get("content")
-            .and_then(|c| c.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
-            })
-            .unwrap_or(false);
     }
     out
+}
+
+/// fork(wave-2): a real model id — anything not empty and not a Claude Code
+/// synthetic placeholder (`<synthetic>` and any other `<…>`-wrapped sentinel).
+fn is_real_model(m: &str) -> bool {
+    !m.is_empty() && !(m.starts_with('<') && m.ends_with('>'))
 }
 
 /// Friendly model name from the raw API id. Unknown ids pass through.
@@ -168,6 +185,12 @@ pub fn model_display(id: &str) -> String {
         "claude-opus-4-7" => "Opus 4.7".into(),
         "claude-sonnet-4-6" => "Sonnet 4.6".into(),
         "claude-haiku-4-5" | "claude-haiku-4-5-20251001" => "Haiku 4.5".into(),
+        // fork(wave-2): bare subagent spawn aliases (`.meta.json` `model` field)
+        // used as a display fallback when the subagent tail has no real-model
+        // assistant entry yet. `opus[1m]` and other variants stay passthrough.
+        "opus" => "Opus 4.8".into(),
+        "sonnet" => "Sonnet 4.6".into(),
+        "haiku" => "Haiku 4.5".into(),
         other => other.to_string(),
     }
 }
@@ -442,6 +465,12 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
     } else {
         r.model_id.clone()
     };
+    // fork(wave-2): no real model AND no meta alias (a subagent whose tail is only
+    // a synthetic placeholder and whose meta omits `model`) -> keep the
+    // main-session model rather than rendering an empty/placeholder display.
+    if display_id.is_empty() {
+        return;
+    }
 
     if is_gpt_model(&display_id) {
         let stripped = crate::sources::codex::strip_codex_plan_prefix(&display_id).to_string();
@@ -904,6 +933,69 @@ mod tests {
     fn set_mtime(path: &Path, t: std::time::SystemTime) {
         let f = std::fs::File::options().write(true).open(path).unwrap();
         f.set_modified(t).unwrap();
+    }
+
+    // ---- fork(wave-2): synthetic-entry skip in the subagent tail ----
+
+    // Real Claude Code shape: a synthetic assistant placeholder (model
+    // "<synthetic>", zero usage) — written while initializing / as an error stub.
+    const SYNTHETIC_ENTRY: &str = r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"(no content)"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+
+    #[test]
+    fn parse_skips_synthetic_model_keeping_last_real() {
+        // real haiku turn, then a synthetic placeholder -> model stays the real id.
+        let transcript = format!(
+            "{}\n{}",
+            r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"cache_read_input_tokens":8000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#,
+            SYNTHETIC_ENTRY
+        );
+        let t = parse_transcript(&transcript);
+        assert_eq!(t.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(t.ctx_tokens, Some(8005)); // synthetic zero-usage never overwrote
+    }
+
+    #[test]
+    fn parse_only_synthetic_yields_no_model() {
+        let t = parse_transcript(SYNTHETIC_ENTRY);
+        assert!(t.model.is_none());
+    }
+
+    #[test]
+    fn subagent_tail_real_after_synthetic_uses_real_model() {
+        let h = TempHome::new("sub-synth-real");
+        let sid = "sid-synth-real";
+        let meta = r#"{"agentType":"general-purpose","name":"probe-view","model":"haiku"}"#;
+        let sub = format!(
+            "{}\n{}",
+            r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5,"cache_read_input_tokens":8000,"cache_creation_input_tokens":0,"output_tokens":20}}}"#,
+            SYNTHETIC_ENTRY
+        );
+        write_subagent_session(&h, sid, meta, &sub);
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe-view")).expect("snapshot");
+        assert_eq!(s.model.as_deref(), Some("Haiku 4.5 · @probe-view"));
+    }
+
+    #[test]
+    fn subagent_tail_only_synthetic_falls_back_to_meta_alias() {
+        let h = TempHome::new("sub-synth-alias");
+        let sid = "sid-synth-alias";
+        // meta alias "sonnet"; tail is ONLY a synthetic entry (no real model yet).
+        let meta = r#"{"agentType":"general-purpose","name":"probe-view","model":"sonnet"}"#;
+        write_subagent_session(&h, sid, meta, SYNTHETIC_ENTRY);
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe-view")).expect("snapshot");
+        // never "<synthetic>": prettified alias fallback.
+        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · @probe-view"));
+    }
+
+    #[test]
+    fn subagent_only_synthetic_and_no_alias_keeps_main_model() {
+        let h = TempHome::new("sub-synth-none");
+        let sid = "sid-synth-none";
+        // no `model` in meta AND tail only synthetic -> keep the main-session model.
+        let meta = r#"{"agentType":"general-purpose","name":"probe-view"}"#;
+        write_subagent_session(&h, sid, meta, SYNTHETIC_ENTRY);
+        let s = snapshot_for_sid_with_subagent(sid, Some("probe-view")).expect("snapshot");
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8")); // main model, unchanged
     }
 
     // ---- fork(wave-2): sid-miss cwd fallback across both roots ----
