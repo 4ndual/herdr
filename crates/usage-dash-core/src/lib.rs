@@ -110,21 +110,25 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
     }
     match focus.agent {
         AgentKind::None => RefreshOutcome::Clear,
-        AgentKind::Claude => match focus.session_id.as_deref() {
+        AgentKind::Claude => {
             // fork(wave-1): when the focused Claude pane is viewing a subagent,
             // `focus.subagent` is its name; the source overrides model + context
             // with that subagent's, keeping the account's plan-quota rows.
-            Some(sid) if !sid.is_empty() => {
-                match sources::claude::snapshot_for_sid_with_subagent(
-                    sid,
-                    focus.subagent.as_deref(),
-                ) {
-                    Some(s) => RefreshOutcome::Replace(Box::new(s)),
-                    None => RefreshOutcome::KeepPrevious,
-                }
+            // fork(wave-2): resolve by session id first, but fall back to the
+            // newest transcript for the focused cwd across both roots when the
+            // reported sid has no transcript on disk (herdr can report a sid that
+            // never got a file), so a live cx pane isn't stuck on a stale snapshot.
+            let sid = focus.session_id.as_deref().filter(|s| !s.is_empty());
+            let cwd = focus.cwd.as_deref().map(|c| c.to_string_lossy().into_owned());
+            match sources::claude::snapshot_for_focus(
+                sid,
+                cwd.as_deref(),
+                focus.subagent.as_deref(),
+            ) {
+                Some(s) => RefreshOutcome::Replace(Box::new(s)),
+                None => RefreshOutcome::KeepPrevious,
             }
-            _ => RefreshOutcome::KeepPrevious,
-        },
+        }
         AgentKind::Codex => match focus.cwd.as_deref() {
             Some(cwd) => match sources::codex::snapshot_for_cwd(&cwd.to_string_lossy()) {
                 Some(s) => RefreshOutcome::Replace(Box::new(s)),

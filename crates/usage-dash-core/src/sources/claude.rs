@@ -222,7 +222,63 @@ pub fn snapshot_for_sid_with_subagent(
     subagent: Option<&str>,
 ) -> Option<UsageSnapshot> {
     let path = transcript_for_sid(sid)?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    snapshot_from_transcript(&path, subagent)
+}
+
+/// fork(wave-2): the newest transcript for `cwd`'s Claude project dir across
+/// EVERY root (native `~/.claude/projects` + each CCR profile mirror), by mtime.
+/// Claude Code names a project dir by mapping each non-alphanumeric char of the
+/// cwd to `-` (no run collapsing, no wrapping), e.g. `/Users/andual` ->
+/// `-Users-andual` — distinct from pi's `--…--` scheme, so it is computed here.
+fn latest_transcript_for_cwd(cwd: &str) -> Option<PathBuf> {
+    let slug: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for root in projects_roots() {
+        let dir = root.join(&slug);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let mt = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
+                    best = Some((mt, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// fork(wave-2): resolve the focused Claude pane's transcript, then build its
+/// snapshot. The reported session id is authoritative when its `<sid>.jsonl`
+/// exists (scanned across both roots by [`transcript_for_sid`]); on a sid MISS —
+/// herdr can report a session id that never got a transcript on disk — fall back
+/// to the newest transcript for the focused `cwd` across BOTH roots. The chosen
+/// transcript then flows through the normal gpt-vs-claude attribution below, so a
+/// cx (router) transcript correctly resolves to Codex rather than sticking on a
+/// stale Anthropic snapshot.
+pub fn snapshot_for_focus(
+    sid: Option<&str>,
+    cwd: Option<&str>,
+    subagent: Option<&str>,
+) -> Option<UsageSnapshot> {
+    let path = sid
+        .and_then(transcript_for_sid)
+        .or_else(|| cwd.and_then(latest_transcript_for_cwd))?;
+    snapshot_from_transcript(&path, subagent)
+}
+
+/// Build a Claude/cx snapshot from an already-resolved transcript path.
+fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<UsageSnapshot> {
+    let content = std::fs::read_to_string(path).ok()?;
     let t = parse_transcript(&content);
     let model_id = t.model.clone().unwrap_or_default();
 
@@ -230,9 +286,9 @@ pub fn snapshot_for_sid_with_subagent(
     // the Codex plan — never Anthropic. The LAST assistant model decides: if the
     // user flipped back to a claude-* model, the session stays Claude.
     if t.model.as_deref().map(is_gpt_model).unwrap_or(false) {
-        let mut s = gpt_snapshot_for_sid(&content, &path, &t)?;
+        let mut s = gpt_snapshot_for_sid(&content, path, &t)?;
         if let Some(name) = subagent {
-            apply_subagent_override(&mut s, &path, name);
+            apply_subagent_override(&mut s, path, name);
         }
         return Some(s);
     }
@@ -252,7 +308,7 @@ pub fn snapshot_for_sid_with_subagent(
     s.ctx_used_tokens = t.ctx_tokens;
     s.ctx_window = Some(window);
     s.fill_ctx_pct();
-    s.source_age_secs = util::file_age_secs(&path);
+    s.source_age_secs = util::file_age_secs(path);
 
     // main-thread state, inferred from the same transcript (no extra read).
     let (st, note) = crate::state::infer_claude(&content, s.source_age_secs);
@@ -269,7 +325,7 @@ pub fn snapshot_for_sid_with_subagent(
     };
 
     // Per-session STATS (incremental — folds only bytes appended since last tick).
-    s.stats = crate::stats::session_stats(&path.to_string_lossy(), &path);
+    s.stats = crate::stats::session_stats(&path.to_string_lossy(), path);
 
     // 5h / weekly limits straight from Anthropic's usage API (account-global).
     if let Some((h5, wk)) = anthropic_usage::windows() {
@@ -283,7 +339,7 @@ pub fn snapshot_for_sid_with_subagent(
     // fork(wave-1): quota rows above stay the account's; only model + context are
     // swapped to the viewed subagent's.
     if let Some(name) = subagent {
-        apply_subagent_override(&mut s, &path, name);
+        apply_subagent_override(&mut s, path, name);
     }
     Some(s)
 }
@@ -848,5 +904,87 @@ mod tests {
     fn set_mtime(path: &Path, t: std::time::SystemTime) {
         let f = std::fs::File::options().write(true).open(path).unwrap();
         f.set_modified(t).unwrap();
+    }
+
+    // ---- fork(wave-2): sid-miss cwd fallback across both roots ----
+
+    const CLAUDE_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
+{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":40000,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
+
+    // cwd `/Users/andual` -> Claude project slug `-Users-andual` (each
+    // non-alphanumeric char mapped to `-`).
+    const PROJ_SLUG: &str = "-Users-andual";
+
+    #[test]
+    fn sid_miss_falls_back_to_newest_cwd_transcript_router_wins() {
+        let h = TempHome::new("fallback-router");
+        // Older native ~/.claude transcript (claude model) …
+        let native = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-native.jsonl"),
+            CLAUDE_TRANSCRIPT,
+        );
+        // … and a NEWER router-tree transcript (gpt model) for the same cwd.
+        let router = h.write(
+            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
+            GPT_TRANSCRIPT,
+        );
+        h.write(".codex/ccr-model-catalog.json", CATALOG);
+        h.write(".codex/dash2_ratelimits.json", RATELIMITS);
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        let now = std::time::SystemTime::now();
+        set_mtime(&native, now - std::time::Duration::from_secs(600));
+        set_mtime(&router, now);
+
+        // Reported sid has no transcript on disk -> cwd fallback picks newest.
+        let s = snapshot_for_focus(Some("00000000-missing"), Some("/Users/andual"), None)
+            .expect("fallback snapshot");
+        assert_eq!(s.cli, Cli::Codex); // router transcript -> Codex attribution
+        assert_eq!(s.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn sid_miss_falls_back_to_newest_cwd_transcript_native_wins() {
+        let h = TempHome::new("fallback-native");
+        let native = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-native.jsonl"),
+            CLAUDE_TRANSCRIPT,
+        );
+        let router = h.write(
+            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
+            GPT_TRANSCRIPT,
+        );
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        let now = std::time::SystemTime::now();
+        // This time the native transcript is the newest.
+        set_mtime(&router, now - std::time::Duration::from_secs(600));
+        set_mtime(&native, now);
+
+        let s = snapshot_for_focus(Some("00000000-missing"), Some("/Users/andual"), None)
+            .expect("fallback snapshot");
+        assert_eq!(s.cli, Cli::Claude);
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+    }
+
+    #[test]
+    fn exact_sid_match_beats_cwd_fallback() {
+        let h = TempHome::new("sid-priority");
+        let sid = "12345678-real";
+        // The real sid transcript is a claude model in the native root …
+        h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/{sid}.jsonl"),
+            CLAUDE_TRANSCRIPT,
+        );
+        // … while a NEWER router transcript for the same cwd exists but must be
+        // ignored because the sid resolves.
+        let router = h.write(
+            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
+            GPT_TRANSCRIPT,
+        );
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        set_mtime(&router, std::time::SystemTime::now());
+
+        let s = snapshot_for_focus(Some(sid), Some("/Users/andual"), None).expect("snapshot");
+        assert_eq!(s.cli, Cli::Claude); // exact sid wins over newer cwd candidate
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
     }
 }
