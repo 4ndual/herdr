@@ -3877,6 +3877,11 @@ impl HeadlessServer {
         {
             crate::usage_host::tick(&mut self.app);
             crate::goal_host::tick(&mut self.app);
+            // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
+            // capabilities, ui_input_file, collector argv) before the wasm
+            // mtime watch, so a manifest change re-syncs the manager the same
+            // tick its metadata is read for frame dispatch.
+            self.app.hot_reload_ui_plugin_manifests();
             // feat/native-dashes: mirror the ui-plugin hot-reload + tick dispatch
             // from the direct-mode `App::handle_scheduled_tasks` loop. The server
             // owns the UiPluginManager, so without this the mtime-poll reload and

@@ -56,6 +56,9 @@ impl App {
             }
             return encode_error(id, "plugin_registry_save_failed", err.to_string());
         }
+        // fork(wave-2): mount the newly linked plugin's UI modules on the running
+        // manager so they render without a server restart.
+        self.resync_ui_plugins_after_lifecycle_change();
         encode_success(id, ResponseResult::PluginLinked { plugin })
     }
 
@@ -110,6 +113,11 @@ impl App {
                 }
                 return encode_error(id, "plugin_registry_save_failed", err.to_string());
             }
+        }
+        if removed {
+            // fork(wave-2): unmount the unlinked plugin's UI modules from the
+            // running manager so its overlays disappear without a restart.
+            self.resync_ui_plugins_after_lifecycle_change();
         }
         encode_success(id, ResponseResult::PluginUnlinked { plugin_id, removed })
     }
@@ -629,6 +637,9 @@ impl App {
         let Some(plugin) = self.state.installed_plugins.get(&plugin_id).cloned() else {
             return encode_error(id, "plugin_not_found", "plugin not found");
         };
+        // fork(wave-2): apply the enable/disable to the running UiPluginManager so
+        // a toggled plugin's UI modules load/unload without a server restart.
+        self.resync_ui_plugins_after_lifecycle_change();
         if enabled {
             encode_success(id, ResponseResult::PluginEnabled { plugin })
         } else {

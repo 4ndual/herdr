@@ -1843,6 +1843,79 @@ impl App {
         self.sync_usage_view_hits_from_layers();
     }
 
+    /// fork(wave-2): re-sync the live `UiPluginManager` against the installed-plugins
+    /// registry after a lifecycle change (enable / disable / link / unlink) so it
+    /// applies without a server restart. Reconciles modules, drops per-module
+    /// collector bookkeeping for anything removed (so a later re-enable starts
+    /// clean), and refreshes derived render state so stale overlays clear on the
+    /// next frame.
+    pub(crate) fn resync_ui_plugins_after_lifecycle_change(&mut self) {
+        let removed = self.ui_plugins.sync_to_registry(&self.state.installed_plugins);
+        for (plugin_id, module_id) in &removed {
+            let key = crate::plugin_collector::module_key(plugin_id, module_id);
+            self.collectors_in_flight.remove(&key);
+        }
+        self.refresh_ui_plugin_state_from_manager();
+    }
+
+    /// fork(wave-2): hot-apply `herdr-plugin.toml` edits to a running server. For
+    /// each manifest whose mtime advanced, re-parse it; on success replace that
+    /// plugin's registry entry (preserving its enabled + source state) and re-sync
+    /// the manager so new surfaces / capabilities / `ui_input_file` / collector argv
+    /// take effect on the next tick; on parse failure keep the last-good entry and
+    /// toast once (the mtime is already advanced, so a broken manifest never
+    /// re-fires). Returns true if any manifest was successfully re-applied.
+    pub(crate) fn hot_reload_ui_plugin_manifests(&mut self) -> bool {
+        let changed = self.ui_plugins.detect_changed_manifests();
+        if changed.is_empty() {
+            return false;
+        }
+        let mut applied = false;
+        for manifest_path in changed {
+            let manifest_str = manifest_path.display().to_string();
+            let affected: Vec<(String, bool, crate::api::schema::PluginSourceInfo)> = self
+                .state
+                .installed_plugins
+                .values()
+                .filter(|plugin| std::path::PathBuf::from(&plugin.manifest_path) == manifest_path)
+                .map(|plugin| (plugin.plugin_id.clone(), plugin.enabled, plugin.source.clone()))
+                .collect();
+            for (plugin_id, enabled, source) in affected {
+                match crate::app::api::plugins::load_plugin_manifest(&manifest_str, enabled) {
+                    Ok(mut info) => {
+                        info.source = source;
+                        // A manifest whose `id` changed re-keys the entry; drop the
+                        // stale key so the registry never carries a ghost plugin.
+                        if info.plugin_id != plugin_id {
+                            self.state.installed_plugins.remove(&plugin_id);
+                        }
+                        self.state
+                            .installed_plugins
+                            .insert(info.plugin_id.clone(), info);
+                        applied = true;
+                    }
+                    Err((code, message)) => {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            manifest = %manifest_str,
+                            code,
+                            error = %message,
+                            "ui plugin manifest reload failed; keeping last-good"
+                        );
+                        self.ui_plugins.push_notification(format!(
+                            "ui plugin {plugin_id} manifest reload failed: {message}"
+                        ));
+                    }
+                }
+            }
+        }
+        if applied {
+            self.resync_ui_plugins_after_lifecycle_change();
+        }
+        self.apply_ui_plugin_notifications();
+        applied
+    }
+
     /// feat/native-dashes: the usage strip is rendered by the WASM plugin, which
     /// returns its clickable hit-rects (expand/stats toggles) on the UsageStrip
     /// layer. Mirror them onto `usage_view.hits` so `usage_host::route_mouse` resolves
@@ -2678,6 +2751,112 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    // fork(wave-2): materialize a plugin (valid manifest + static-update wasm) in a
+    // fresh temp dir so the manifest hot-reload / lifecycle tests exercise the real
+    // parse + instantiate path (no mocking).
+    fn write_plugin_dir(surfaces: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-app-plugin-hot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        let json = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"hi","role":"accent"}]}]}]}"#;
+        let data = json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            "(module (memory (export \"memory\") 1) (data (i32.const 0) \"{data}\") (func (export \"herdr_ui_api_version\") (result i32) i32.const 2) (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0) (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {}) )",
+            json.len()
+        );
+        std::fs::write(root.join("dist/dash.wasm"), wat::parse_str(&wat).unwrap()).unwrap();
+        write_plugin_manifest(&root, surfaces);
+        root
+    }
+
+    fn write_plugin_manifest(root: &std::path::Path, surfaces: &str) {
+        let toml = format!(
+            "id = \"example.dash\"\nname = \"Dash\"\nversion = \"0.1.0\"\nmin_herdr_version = \"{}\"\n\n[[ui_modules]]\nid = \"dash\"\ntitle = \"Dash\"\napi_version = 2\nmodule = \"dist/dash.wasm\"\nsurfaces = [{surfaces}]\n",
+            crate::build_info::BASE_VERSION
+        );
+        std::fs::write(root.join("herdr-plugin.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn resync_clears_collector_bookkeeping_for_removed_module() {
+        let root = write_plugin_dir("\"header\"");
+        let manifest = root.join("herdr-plugin.toml").display().to_string();
+        let info = crate::app::api::plugins::load_plugin_manifest(&manifest, true).unwrap();
+        let mut app = test_app();
+        app.state
+            .installed_plugins
+            .insert(info.plugin_id.clone(), info);
+        app.resync_ui_plugins_after_lifecycle_change();
+        let has_dash =
+            |app: &App| app.ui_plugins.all().iter().any(|m| m.plugin_id == "example.dash");
+        assert!(has_dash(&app));
+
+        // A collector is mid-flight for this module.
+        let key = crate::plugin_collector::module_key("example.dash", "dash");
+        app.collectors_in_flight.insert(key.clone());
+
+        // Disable the plugin and re-sync: the module (and its in-flight
+        // bookkeeping) is dropped so a later re-enable starts clean.
+        app.state
+            .installed_plugins
+            .get_mut("example.dash")
+            .unwrap()
+            .enabled = false;
+        app.resync_ui_plugins_after_lifecycle_change();
+        assert!(!has_dash(&app));
+        assert!(!app.collectors_in_flight.contains(&key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hot_reload_applies_manifest_edit_and_keeps_last_good_on_parse_error() {
+        let root = write_plugin_dir("\"header\"");
+        let manifest = root.join("herdr-plugin.toml").display().to_string();
+        let info = crate::app::api::plugins::load_plugin_manifest(&manifest, true).unwrap();
+        let mut app = test_app();
+        app.state
+            .installed_plugins
+            .insert(info.plugin_id.clone(), info);
+        app.resync_ui_plugins_after_lifecycle_change();
+        use crate::api::schema::PluginUiSurface;
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 0);
+
+        // Edit the manifest to declare a new surface; the hot-reload applies it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_plugin_manifest(&root, "\"header\", \"footer\"");
+        assert!(app.hot_reload_ui_plugin_manifests());
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 1);
+        assert_eq!(
+            app.state.installed_plugins["example.dash"].ui_modules[0].surfaces,
+            vec![PluginUiSurface::Header, PluginUiSurface::Footer]
+        );
+
+        // A subsequent BROKEN manifest keeps the last-good metadata and toasts.
+        app.state.toast = None;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(root.join("herdr-plugin.toml"), "this is = = not toml").unwrap();
+        assert!(!app.hot_reload_ui_plugin_manifests());
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 1);
+        assert!(app
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.title.contains("manifest reload failed")));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

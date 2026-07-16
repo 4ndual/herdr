@@ -315,6 +315,11 @@ impl App {
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::usage_host::tick(self);
             crate::goal_host::tick(self);
+            // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
+            // capabilities, ui_input_file, collector argv) before the wasm
+            // mtime watch, so a manifest change re-syncs the manager the same
+            // tick its metadata is read for frame dispatch.
+            self.hot_reload_ui_plugin_manifests();
             let changed_ui_modules = self.ui_plugins.detect_changed_modules();
             let changed_reload = if changed_ui_modules.is_empty() {
                 false

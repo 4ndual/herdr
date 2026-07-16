@@ -98,6 +98,10 @@ pub(crate) struct UiPluginManager {
     modules: Vec<RegisteredUiModule>,
     by_surface: HashMap<PluginUiSurface, Vec<usize>>,
     mtimes: HashMap<PathBuf, SystemTime>,
+    // fork(wave-2): per-`herdr-plugin.toml` mtime, so a manifest edit hot-applies
+    // its module metadata (surfaces/capabilities/ui_input_file/collector argv)
+    // without a server restart, mirroring the `.wasm` mtime watch in `mtimes`.
+    manifest_mtimes: HashMap<PathBuf, SystemTime>,
     loaded_updates: HashMap<(String, String), UiUpdate>,
     last_errors: HashMap<(String, String), String>,
     pending_effects: Vec<HostEffect>,
@@ -237,6 +241,12 @@ impl PluginRuntime {
     /// also discards the guest's persisted state.
     fn invalidate(&mut self, module: &RegisteredUiModule) {
         self.instances.remove(&module_key(module));
+    }
+
+    // fork(wave-2): drop a cached instance by key alone, for the lifecycle re-sync
+    // path where a removed module is no longer held as a `RegisteredUiModule`.
+    fn invalidate_key(&mut self, key: &(String, String)) {
+        self.instances.remove(key);
     }
 
     fn reload_static(&mut self, module: &RegisteredUiModule) -> Result<(UiUpdate, u32), String> {
@@ -410,6 +420,7 @@ impl UiPluginManager {
             modules: Vec::new(),
             by_surface: HashMap::new(),
             mtimes: HashMap::new(),
+            manifest_mtimes: HashMap::new(),
             loaded_updates: HashMap::new(),
             last_errors: HashMap::new(),
             pending_effects: Vec::new(),
@@ -417,15 +428,51 @@ impl UiPluginManager {
             pending_api_effects: Vec::new(),
             runtime,
         };
+        // Boot is just a sync against an empty registry: every enabled module is
+        // "new" and gets instantiated, mtimes seeded, layers cached.
+        manager.sync_to_registry(plugins);
+        manager
+    }
+
+    /// fork(wave-2): reconcile the live module registry against the current
+    /// installed-plugins registry after a lifecycle change (enable / disable /
+    /// link / unlink) so it applies to a running server without a restart.
+    ///
+    /// - modules of disabled/unlinked plugins are removed: their cached layers,
+    ///   error state, wasm instance, and mtime entries are dropped so overlays
+    ///   disappear on the next frame;
+    /// - modules of newly enabled/linked plugins are added and instantiated
+    ///   lazily (identical to boot);
+    /// - kept modules preserve their live instance + guest state, and only their
+    ///   manifest-derived metadata (title, surfaces, capabilities, `ui_input_file`,
+    ///   hot-reload mode) is refreshed. A kept key whose `module` path changed is
+    ///   treated as a fresh module (instance invalidated, re-instantiated).
+    ///
+    /// Returns the `(plugin_id, module_id)` keys that were removed so the caller
+    /// can drop per-module bookkeeping (e.g. `collectors_in_flight`).
+    pub(crate) fn sync_to_registry(
+        &mut self,
+        plugins: &HashMap<String, InstalledPluginInfo>,
+    ) -> Vec<(String, String)> {
+        // Rebuild `modules`/`by_surface`/`mtimes` from scratch in deterministic
+        // order (plugin_id asc, then each plugin's `ui_modules` vec order), reusing
+        // the instances + cached updates of modules that survive the change.
+        let old_modules = std::mem::take(&mut self.modules);
+        let old_mtimes = std::mem::take(&mut self.mtimes);
+        self.by_surface.clear();
+        self.manifest_mtimes.clear();
 
         let mut plugin_list = plugins.values().collect::<Vec<_>>();
         plugin_list.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+
+        let mut new_modules: Vec<RegisteredUiModule> = Vec::new();
         for plugin in plugin_list {
             if !plugin.enabled {
                 continue;
             }
             let root = Path::new(&plugin.plugin_root);
             let manifest_path = PathBuf::from(&plugin.manifest_path);
+            self.track_manifest_mtime(&manifest_path);
             for module in &plugin.ui_modules {
                 let mut registered = RegisteredUiModule {
                     plugin_id: plugin.plugin_id.clone(),
@@ -440,38 +487,122 @@ impl UiPluginManager {
                     requested_capabilities: module.capabilities.clone(),
                     ui_input_file: module.ui_input_file.clone(),
                 };
-                let idx = manager.modules.len();
-                for surface in &registered.surfaces {
-                    manager.by_surface.entry(*surface).or_default().push(idx);
-                }
-                if let Ok(meta) = std::fs::metadata(&registered.module_path) {
+                let key = module_key(&registered);
+                if let Some(mtime) = old_mtimes.get(&registered.module_path).copied() {
+                    self.mtimes.insert(registered.module_path.clone(), mtime);
+                } else if let Ok(meta) = std::fs::metadata(&registered.module_path) {
                     if let Ok(mtime) = meta.modified() {
-                        manager.mtimes.insert(registered.module_path.clone(), mtime);
+                        self.mtimes.insert(registered.module_path.clone(), mtime);
                     }
                 }
-                match manager.load_module_static(&registered) {
-                    Ok((update, negotiated_version)) => {
-                        registered.negotiated_version = negotiated_version;
-                        manager
-                            .loaded_updates
-                            .insert(module_key(&registered), update);
+
+                let kept = old_modules
+                    .iter()
+                    .find(|old| module_key(old) == key)
+                    .filter(|old| old.module_path == registered.module_path);
+                if let Some(old) = kept {
+                    // Preserve the negotiated version + live instance + cached
+                    // update (guest state survives a metadata-only refresh).
+                    registered.negotiated_version = old.negotiated_version;
+                } else {
+                    // New module, or a kept key whose wasm path moved: drop any
+                    // stale instance/cache for this key and instantiate fresh.
+                    self.loaded_updates.remove(&key);
+                    if let Some(runtime) = self.runtime.as_mut() {
+                        runtime.invalidate_key(&key);
                     }
-                    Err(err) => {
-                        tracing::warn!(
-                            plugin_id = %registered.plugin_id,
-                            module_id = %registered.module_id,
-                            module_path = %registered.module_path.display(),
-                            error = %err,
-                            "failed to load ui plugin module"
-                        );
-                        manager.last_errors.insert(module_key(&registered), err);
+                    match self.load_module_static(&registered) {
+                        Ok((update, negotiated_version)) => {
+                            registered.negotiated_version = negotiated_version;
+                            self.loaded_updates.insert(key.clone(), update);
+                            self.last_errors.remove(&key);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                plugin_id = %registered.plugin_id,
+                                module_id = %registered.module_id,
+                                module_path = %registered.module_path.display(),
+                                error = %err,
+                                "failed to load ui plugin module"
+                            );
+                            self.last_errors.insert(key.clone(), err);
+                        }
                     }
                 }
-                manager.modules.push(registered);
+                new_modules.push(registered);
             }
         }
 
-        manager
+        // Rebuild the surface index over the final module vec.
+        for (idx, module) in new_modules.iter().enumerate() {
+            for surface in &module.surfaces {
+                self.by_surface.entry(*surface).or_default().push(idx);
+            }
+        }
+
+        // Drop every trace of modules that are no longer present: their layers
+        // (so overlays disappear next frame), error state, and wasm instance.
+        let desired: std::collections::HashSet<(String, String)> =
+            new_modules.iter().map(module_key).collect();
+        let mut removed = Vec::new();
+        for old in &old_modules {
+            let key = module_key(old);
+            if desired.contains(&key) {
+                continue;
+            }
+            removed.push(key.clone());
+            self.loaded_updates.remove(&key);
+            self.last_errors.remove(&key);
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.invalidate_key(&key);
+            }
+        }
+
+        self.modules = new_modules;
+        removed
+    }
+
+    fn track_manifest_mtime(&mut self, manifest_path: &Path) {
+        if self.manifest_mtimes.contains_key(manifest_path) {
+            return;
+        }
+        if let Ok(meta) = std::fs::metadata(manifest_path) {
+            if let Ok(mtime) = meta.modified() {
+                self.manifest_mtimes
+                    .insert(manifest_path.to_path_buf(), mtime);
+            }
+        }
+    }
+
+    /// fork(wave-2): manifest paths whose `herdr-plugin.toml` mtime advanced since
+    /// the last check, deduplicated (modules of one plugin share a manifest). The
+    /// stored mtime is advanced here so one edit is reported exactly once — a
+    /// manifest that then fails to parse does not re-fire every tick. The caller
+    /// re-parses each path and re-syncs the registry.
+    pub(crate) fn detect_changed_manifests(&mut self) -> Vec<PathBuf> {
+        let mut changed = Vec::new();
+        let paths: Vec<PathBuf> = self.manifest_mtimes.keys().cloned().collect();
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            let old = self.manifest_mtimes.get(&path).copied();
+            if old.is_none() || old.is_some_and(|old| old < mtime) {
+                self.manifest_mtimes.insert(path.clone(), mtime);
+                changed.push(path);
+            }
+        }
+        changed
+    }
+
+    /// fork(wave-2): queue a host-side toast (e.g. "manifest reload failed"),
+    /// flushed through the same `apply_ui_plugin_notifications` path as guest
+    /// reload notices.
+    pub(crate) fn push_notification(&mut self, message: String) {
+        self.pending_notifications.push(message);
     }
 
     /// Build (if needed) the live instance for `module` and read its initial
@@ -2235,5 +2366,119 @@ mod tests {
             panic!("expected line node, got {:?}", layers.first());
         };
         spans[0].text.clone()
+    }
+
+    // fork(wave-2): a plugin backed by a real static-update wasm module on disk,
+    // rooted at a fresh temp dir, so the lifecycle re-sync tests exercise actual
+    // instantiation/teardown (no mocking).
+    fn plugin_on_disk(header_text: &str) -> (std::path::PathBuf, InstalledPluginInfo) {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-ui-plugin-sync-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        let json = format!(
+            r#"{{"layers":[{{"surface":"header","nodes":[{{"kind":"line","spans":[{{"text":"{header_text}","role":"accent"}}]}}]}}]}}"#
+        );
+        write_static_wasm(&root.join("dist/goal-ui.wasm"), &json);
+        let mut plugin = sample_plugin();
+        plugin.plugin_root = root.display().to_string();
+        plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
+        // The disk module only declares Header (ContextMenu from sample_plugin has
+        // no menu layer in this static update), keep surfaces truthful.
+        plugin.ui_modules[0].surfaces = vec![PluginUiSurface::Header];
+        (root, plugin)
+    }
+
+    #[test]
+    fn sync_to_registry_adds_removes_and_re_enables_modules() {
+        let (root, plugin) = plugin_on_disk("Enabled");
+        let key = (plugin.plugin_id.clone(), plugin.ui_modules[0].id.clone());
+        let mut registry = HashMap::from([(plugin.plugin_id.clone(), plugin.clone())]);
+        let mut manager = UiPluginManager::from_installed_plugins(&registry);
+
+        // Enabled at boot: one module, one rendered header layer, cached update.
+        assert_eq!(manager.all().len(), 1);
+        assert_eq!(manager.surface_layers().len(), 1);
+        assert!(manager.loaded_updates.contains_key(&key));
+        assert_eq!(manager.for_surface(PluginUiSurface::Header).len(), 1);
+
+        // Disable -> module removed, layers dropped, cache/instance gone, key
+        // reported as removed.
+        registry.get_mut(&plugin.plugin_id).unwrap().enabled = false;
+        let removed = manager.sync_to_registry(&registry);
+        assert_eq!(removed, vec![key.clone()]);
+        assert_eq!(manager.all().len(), 0);
+        assert_eq!(manager.surface_layers().len(), 0);
+        assert!(!manager.loaded_updates.contains_key(&key));
+        assert_eq!(manager.for_surface(PluginUiSurface::Header).len(), 0);
+
+        // Re-enable -> module re-instantiated from disk, layer back, nothing
+        // reported removed.
+        registry.get_mut(&plugin.plugin_id).unwrap().enabled = true;
+        let removed = manager.sync_to_registry(&registry);
+        assert!(removed.is_empty());
+        assert_eq!(manager.all().len(), 1);
+        assert_eq!(first_layer_text(&manager), "Enabled");
+        assert!(manager.loaded_updates.contains_key(&key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_to_registry_refreshes_kept_module_metadata_without_reinstantiating() {
+        let (root, plugin) = plugin_on_disk("Kept");
+        let key = (plugin.plugin_id.clone(), plugin.ui_modules[0].id.clone());
+        let mut registry = HashMap::from([(plugin.plugin_id.clone(), plugin.clone())]);
+        let mut manager = UiPluginManager::from_installed_plugins(&registry);
+        assert!(manager.loaded_updates.contains_key(&key));
+        assert!(manager.all()[0].ui_input_file.is_none());
+
+        // Change metadata only (same wasm path): add a surface + ui_input_file.
+        {
+            let module = &mut registry.get_mut(&plugin.plugin_id).unwrap().ui_modules[0];
+            module.surfaces = vec![PluginUiSurface::Header, PluginUiSurface::Footer];
+            module.ui_input_file = Some("input.json".into());
+        }
+        let removed = manager.sync_to_registry(&registry);
+        assert!(removed.is_empty());
+        // Metadata refreshed on the kept module.
+        assert_eq!(
+            manager.all()[0].surfaces,
+            vec![PluginUiSurface::Header, PluginUiSurface::Footer]
+        );
+        assert_eq!(manager.all()[0].ui_input_file.as_deref(), Some("input.json"));
+        assert_eq!(manager.for_surface(PluginUiSurface::Footer).len(), 1);
+        // The live instance + cached update survived (guest state preserved).
+        assert!(manager.loaded_updates.contains_key(&key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detect_changed_manifests_reports_edits_once() {
+        let (root, plugin) = plugin_on_disk("Manifest");
+        let manifest_path = std::path::PathBuf::from(&plugin.manifest_path);
+        // Seed an initial manifest file so an mtime is tracked at sync time.
+        std::fs::write(&manifest_path, "id = \"example.goal-ui\"\n").unwrap();
+        let registry = HashMap::from([(plugin.plugin_id.clone(), plugin.clone())]);
+        let mut manager = UiPluginManager::from_installed_plugins(&registry);
+
+        // No change yet.
+        assert!(manager.detect_changed_manifests().is_empty());
+
+        // Advance the manifest mtime (same sleep+rewrite technique as the wasm
+        // hot-reload tests); the change is reported exactly once.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&manifest_path, "id = \"example.goal-ui\"\nname = \"x\"\n").unwrap();
+        let changed = manager.detect_changed_manifests();
+        assert_eq!(changed, vec![manifest_path.clone()]);
+        assert!(manager.detect_changed_manifests().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
