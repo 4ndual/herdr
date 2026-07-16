@@ -1,0 +1,37 @@
+id = "builtin.button-dash"
+name = "Button Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Clickable quick-reference of keyboard-shortcut actions in the bottom dash (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+# restart-hr: fully kill & relaunch this herdr instance, restoring the session.
+# The host runs actions with cwd = plugin_root and the server's full env inherited
+# (HERDR_PLUGIN_ROOT + the server's own HERDR_SESSION / XDG_CONFIG_HOME, verified
+# in src/app/api/plugins/runtime.rs — no env_clear). The script resolves WHICH
+# instance to restart from that inherited HERDR_SESSION + XDG_CONFIG_HOME, so no
+# instance arg is needed here. `nohup ... &` detaches it so it survives the
+# server process it is about to kill (the script also self-detaches internally;
+# macOS has no `setsid`, so we rely on nohup + the script's own re-exec). The
+# script itself is owned by the restart-button agent at scripts/restart-herdr.sh.
+[[actions]]
+id = "restart-hr"
+title = "Restart hr"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/restart-herdr.sh\" >/dev/null 2>&1 &"]
+
+[[ui_modules]]
+id = "button-ui"
+title = "Button Dash"
+description = "Data-driven clickable shortcut buttons rendered on the bottom usage strip"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/herdr_button_dash_ui.wasm"
+hot_reload = "on"
+surfaces = ["usage_strip"]
+capabilities = ["layout_read", "toasts", "api_read", "api_write"]
