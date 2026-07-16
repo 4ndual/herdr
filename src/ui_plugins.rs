@@ -746,6 +746,15 @@ impl UiPluginManager {
                 .layers
                 .iter()
                 .filter(|layer| layer.surface != UiSurface::ContextMenu)
+                // fork(wave-2): the manifest's `surfaces` list is the gate — a
+                // guest layer on an undeclared surface never renders, so a
+                // hot-reloaded surfaces edit takes visual effect immediately.
+                .filter(|layer| {
+                    module
+                        .surfaces
+                        .iter()
+                        .any(|declared| map_surface(*declared) == layer.surface)
+                })
                 .cloned()
             {
                 layers.push(UiSurfaceLayer {
@@ -2478,6 +2487,46 @@ mod tests {
         let changed = manager.detect_changed_manifests();
         assert_eq!(changed, vec![manifest_path.clone()]);
         assert!(manager.detect_changed_manifests().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn surface_layers_gated_by_declared_manifest_surfaces() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-ui-plugin-surface-gate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        // The guest emits header + footer layers, but the manifest only
+        // declares header: the footer layer must never render.
+        let json = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"H","role":"accent"}]}]},{"surface":"footer","nodes":[{"kind":"line","spans":[{"text":"F","role":"accent"}]}]}]}"#;
+        write_static_wasm(&root.join("dist/goal-ui.wasm"), json);
+
+        let mut plugin = sample_plugin();
+        plugin.plugin_root = root.display().to_string();
+        plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
+        plugin.ui_modules[0].surfaces = vec![PluginUiSurface::Header];
+        let mut manager = UiPluginManager::from_installed_plugins(&HashMap::from([(
+            plugin.plugin_id.clone(),
+            plugin.clone(),
+        )]));
+        let layers = manager.surface_layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].layer.surface, UiSurface::Header);
+
+        // A re-synced surfaces edit (manifest hot-reload path) takes effect on
+        // the kept module without reloading the guest.
+        plugin.ui_modules[0].surfaces = vec![PluginUiSurface::Footer];
+        let registry = HashMap::from([(plugin.plugin_id.clone(), plugin)]);
+        manager.sync_to_registry(&registry);
+        let layers = manager.surface_layers();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].layer.surface, UiSurface::Footer);
 
         let _ = std::fs::remove_dir_all(root);
     }
