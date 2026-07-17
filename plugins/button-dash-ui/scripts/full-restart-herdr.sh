@@ -145,18 +145,31 @@ collect_subtree() {
 }
 
 # Roots to reap: the server subtree, and every tmux-host pane subtree.
+# PRESERVE the tmux pane pids themselves — those are the thin self-healing
+# launcher-loop shells (a few MB). Killing them would tear down the tmux
+# session and strand an attached terminal; instead we kill everything BELOW
+# them (the herdr client, server, Claude Code, node — the actual RAM), then let
+# each launcher shell relaunch herdr in place via the restart sentinel. The RAM
+# hog is the agent stack, never the launcher shell or tmux.
 ROOTS=()
 [[ -n "$SERVER_PID" ]] && ROOTS+=("$SERVER_PID")
+PRESERVE=()   # launcher-loop shells to keep alive so they self-heal in place
 if [[ -n "$TMUX_HOST" ]]; then
   while read -r ppid; do
-    [[ -n "$ppid" ]] && ROOTS+=("$ppid")
+    [[ -n "$ppid" ]] && { ROOTS+=("$ppid"); PRESERVE+=("$ppid"); }
   done < <(tmux list-panes -t "$TMUX_HOST" -F '#{pane_pid}' 2>/dev/null)
 fi
+
+# Membership set for O(1) preserve lookups (bash 3.2 safe: pids are ints).
+preserve_mark=()
+for p in "${PRESERVE[@]:-}"; do [[ -n "$p" ]] && preserve_mark[$p]=1; done
 
 VICTIMS=()
 if ((${#ROOTS[@]})); then
   while read -r p; do
-    [[ -n "$p" ]] && VICTIMS+=("$p")
+    [[ -z "$p" ]] && continue
+    [[ -n "${preserve_mark[$p]:-}" ]] && continue   # keep the launcher shell
+    VICTIMS+=("$p")
   done < <(collect_subtree "${ROOTS[@]}" | sort -un)
 fi
 
@@ -172,17 +185,23 @@ for p in "${VICTIMS[@]}"; do
 done
 log "reclaimable RSS (sum, before): $((BEFORE_RSS_KB/1024)) MB across ${#VICTIMS[@]} procs"
 
+# Drop the restart sentinel BEFORE killing, so the preserved launcher shells
+# relaunch herdr in place when their client dies (same mechanism as the soft
+# restart). Shared path with restart-herdr.sh and the launcher.
+SENTINEL="$XDG_STATE/herdr/.restart-request-$SESSION"
+mkdir -p "$XDG_STATE/herdr" 2>/dev/null
+: > "$SENTINEL" 2>/dev/null && log "sentinel dropped: $SENTINEL" || log "WARN: could not write sentinel $SENTINEL"
+
 # ---------------------------------------------------------------------------
-# 3. Hard kill the whole subtree, tmux session, and server — then verify gone.
+# 3. Hard kill the whole subtree (server + agent stack) — then verify gone.
+#    The tmux host session and its launcher shells are intentionally KEPT so
+#    they self-heal in place; we never kill the tmux session here.
 # ---------------------------------------------------------------------------
 # TERM the whole subtree first (children before roots is not required — a fresh
 # reap of any survivors follows), give it a moment, then KILL survivors.
 if ((${#VICTIMS[@]})); then
   kill -TERM "${VICTIMS[@]}" 2>/dev/null
 fi
-
-# Kill the tmux host session (drops the old client + panes).
-tmux kill-session -t "$TMUX_HOST" 2>/dev/null && log "killed old tmux session $TMUX_HOST"
 
 # Graceful window for the subtree to exit.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -202,12 +221,25 @@ for p in "${VICTIMS[@]}"; do
   fi
 done
 
-# Sweep any straggler still bound to this instance's socket.
+# Sweep any straggler still bound to the socket — but ONLY known-old holders
+# (the old server or a subtree victim). A preserved launcher shell may already
+# have self-healed a FRESH server onto this socket; that new pid must NOT be
+# killed. So we only re-kill pids that were part of the old world.
+old_mark=()
+for p in "${VICTIMS[@]:-}"; do [[ -n "$p" ]] && old_mark[$p]=1; done
+[[ -n "${SERVER_PID:-}" ]] && old_mark[$SERVER_PID]=1
 for _ in 1 2 3 4 5; do
   STRAG="$(lsof -t "$SOCK" 2>/dev/null)"
   [[ -z "$STRAG" ]] && break
-  log "straggler on socket: $STRAG — killing"
-  kill -9 $STRAG 2>/dev/null
+  killed_any=0
+  for sp in $STRAG; do
+    if [[ -n "${old_mark[$sp]:-}" ]]; then
+      log "old straggler on socket: $sp — killing"
+      kill -9 "$sp" 2>/dev/null
+      killed_any=1
+    fi
+  done
+  [[ "$killed_any" == 0 ]] && break   # only a fresh self-healed server remains
   sleep 0.3
 done
 
@@ -238,23 +270,45 @@ fi
 log "old instance is fully down"
 
 # ---------------------------------------------------------------------------
-# 4. Relaunch FRESH on same binary + session + XDG roots.
+# 4. Wait for a preserved launcher shell to relaunch the server IN PLACE.
 # ---------------------------------------------------------------------------
+# The sentinel is dropped and the agent stack is dead; each preserved launcher
+# shell's `herdr` client exited, so its loop relaunches herdr in its own pty
+# and the first one back brings the server up — the user's real terminal
+# repaints itself, no detached tmux.
+NEW_PID=""
+for _ in $(seq 1 48); do   # ~12s: client exit + settle(0.5) + fresh server boot
+  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+
+if [[ -n "$NEW_PID" ]]; then
+  # Do NOT remove the sentinel (TTL-aged): let every preserved launcher shell
+  # relaunch, not just the race winner.
+  log "FULL RESTART OK (self-healed in place): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Last-resort fallback: nothing self-healed (e.g. no tmux host / all shells
+#    were killed anyway). Relaunch into a detached tmux so the instance recovers.
+# ---------------------------------------------------------------------------
+log "no launcher shell self-healed within timeout — falling back to detached tmux relaunch"
 LAUNCHER="$HOME/.local/bin/$SESSION"
 if [[ -x "$LAUNCHER" ]]; then
   LAUNCH_CMD="$LAUNCHER"
-  log "relaunch via launcher: $LAUNCHER"
+  log "fallback relaunch via launcher: $LAUNCHER"
 else
   LAUNCH_CMD="env XDG_CONFIG_HOME=$CFG XDG_STATE_HOME=$XDG_STATE XDG_DATA_HOME=$XDG_DATA HERDR_SESSION=$SESSION $BIN --session $SESSION"
-  log "relaunch via reconstructed exec line"
+  log "fallback relaunch via reconstructed exec line"
 fi
 
+tmux kill-session -t "$TMUX_HOST" 2>/dev/null
 tmux new-session -d -s "$TMUX_HOST" -x "$GEOM_X" -y "$GEOM_Y" "$LAUNCH_CMD"
 
-# ---------------------------------------------------------------------------
-# 5. Wait for the fresh server to come up on the socket.
-# ---------------------------------------------------------------------------
-NEW_PID=""
 for _ in $(seq 1 40); do
   NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
@@ -264,7 +318,7 @@ for _ in $(seq 1 40); do
 done
 
 if [[ -n "$NEW_PID" ]]; then
-  log "FULL RESTART OK: new server pid $NEW_PID (old was ${SERVER_PID:-none})"
+  log "FULL RESTART OK (detached-tmux fallback): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
   exit 0
 else
   log "ERROR: new server did not come up on $SOCK"
