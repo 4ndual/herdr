@@ -276,6 +276,7 @@ mod tests {
             module: "dash.wasm".to_string(),
             hot_reload: PluginHotReloadMode::Off,
             surfaces: vec![PluginUiSurface::UsageStrip, PluginUiSurface::Header],
+            placement: None,
             capabilities: vec![
                 PluginUiCapability::ApiRead,
                 PluginUiCapability::ApiWrite,

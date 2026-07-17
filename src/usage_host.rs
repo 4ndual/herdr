@@ -195,6 +195,7 @@ mod tests {
             module: "dist/usage.wasm".into(),
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::UsageStrip],
+            placement: None,
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: ui_input_file.map(str::to_string),
             collector,

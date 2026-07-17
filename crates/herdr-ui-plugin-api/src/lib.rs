@@ -58,10 +58,14 @@ pub enum UiSurface {
     /// The multi-row usage dashboard strip (maps to the host's `usage_dash_area`).
     /// Added in API v2 for the WASM usage-dash module.
     UsageStrip,
-    /// A secondary dash slot carved beside the usage strip in the same bottom
-    /// band (maps to the host's `bottom_dash_area`). Distinct rect + hits from
-    /// `UsageStrip`, so a plugin here never overlaps or steals usage-dash input.
-    BottomDash,
+    /// A generic, plugin-placed panel. Its rect is NOT a hardcoded per-variant
+    /// match: the host lays it out from the DATA in the module's manifest
+    /// `placement` spec (region/align/size/min_peer/z), so adding, moving, or
+    /// resizing a panel is pure manifest hot-reload with no host rebuild. The
+    /// host publishes each resolved panel rect (keyed by `plugin_id:module_id`)
+    /// in the layout blob's `panel_areas`, and delivers it as the surface's
+    /// frame `rect`, so the guest offsets its absolute hit-rects from it.
+    Panel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -100,6 +100,11 @@ struct RawPluginManifestUiModule {
     hot_reload: PluginHotReloadMode,
     #[serde(default)]
     surfaces: Vec<PluginUiSurface>,
+    // Data-driven placement for the `panel` surface; validated only at layout
+    // time (host clamps/parses region/align/size/min_peer), so it needs no
+    // normalization here.
+    #[serde(default)]
+    placement: Option<crate::api::schema::PluginPanelPlacement>,
     #[serde(default)]
     capabilities: Vec<PluginUiCapability>,
     #[serde(default)]
@@ -541,6 +546,7 @@ fn normalize_manifest_ui_module(
         module: module_path,
         hot_reload: module.hot_reload,
         surfaces: module.surfaces,
+        placement: module.placement,
         capabilities: module.capabilities,
         ui_input_file,
         collector,
@@ -754,6 +760,7 @@ mod tests {
             module: "dist/goal.wasm".into(),
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::RightPanel],
+            placement: None,
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
             collector: None,
@@ -771,6 +778,7 @@ mod tests {
             module: "dist/goal.wasm".into(),
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![],
+            placement: None,
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
             collector: None,
@@ -798,6 +806,7 @@ mod tests {
                 PluginUiSurface::Overlay,
                 PluginUiSurface::ContextMenu,
             ],
+            placement: None,
             capabilities: vec![
                 PluginUiCapability::FocusedSession,
                 PluginUiCapability::MouseAll,
@@ -826,6 +835,7 @@ mod tests {
             module: "dist/usage.wasm".into(),
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::UsageStrip],
+            placement: None,
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: Some(name.into()),
             collector: None,

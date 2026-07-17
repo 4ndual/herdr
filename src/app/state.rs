@@ -751,11 +751,35 @@ pub struct ViewState {
     /// plugin-driven dock lands.
     pub usage_strip_rect: Rect,
     pub right_panel_rect: Rect,
-    /// A secondary dash slot carved from the RIGHT of the usage-strip band when a
-    /// plugin declares the `BottomDash` surface and renders content. Sits beside
-    /// (never over) `usage_strip_rect`, with its own hit-rects, so it never
-    /// steals usage-dash or pane input. Empty when no bottom-dash content.
-    pub bottom_dash_rect: Rect,
+    /// Resolved rects for each plugin `Panel` surface, keyed by owning module
+    /// identity, computed by the generic panel layout in `compute_view` from the
+    /// module's manifest `placement` DATA. Each rect is disjoint from the pane
+    /// area and from other panels (edge/band regions carve; free overlays sit
+    /// inside the pane area), so a panel gets its own hit-rects and never steals
+    /// usage-dash or pane input. Empty vec when no panel module renders content.
+    pub panel_rects: Vec<PanelRect>,
+}
+
+/// One resolved plugin `Panel` rect, tagged with the owning module identity so
+/// hit-testing, rendering, frame dispatch, and the layout blob can each look up
+/// the geometry for a specific `(plugin_id, module_id)` panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelRect {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub rect: Rect,
+}
+
+impl ViewState {
+    /// The resolved rect for the given module's `Panel` surface, or an empty
+    /// `Rect` when no panel is currently carved for it (no content / no slot).
+    pub fn panel_rect(&self, plugin_id: &str, module_id: &str) -> Rect {
+        self.panel_rects
+            .iter()
+            .find(|p| p.plugin_id == plugin_id && p.module_id == module_id)
+            .map(|p| p.rect)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1779,7 +1803,7 @@ impl AppState {
                 split_borders: Vec::new(),
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
-                bottom_dash_rect: Rect::default(),
+                panel_rects: Vec::new(),
             },
             drag: None,
             workspace_press: None,

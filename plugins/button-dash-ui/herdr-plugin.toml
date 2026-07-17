@@ -44,8 +44,23 @@ kind = "wasm"
 api_version = 3
 module = "target/wasm32-unknown-unknown/release/herdr_button_dash_ui.wasm"
 hot_reload = "on"
-# Render in the dedicated bottom-dash slot BESIDE the usage strip (its own rect
-# + hit-rects), never stacked on the usage_strip surface — that stacking caused
-# visual overlap and stole usage-dash / model input.
-surfaces = ["bottom_dash"]
+# Generic, data-driven placement: render in a slot carved from the usage band
+# (its own rect + hit-rects), never stacked on the usage_strip surface. WHERE it
+# renders is pure manifest DATA now — edit the `[ui_modules.placement]` table
+# below and the panel moves/resizes on the next tick with NO host rebuild.
+surfaces = ["panel"]
 capabilities = ["layout_read", "toasts", "api_read", "api_write"]
+
+# Placement spec (see .local/prd/generic-plugin-panel-placement.md):
+#   region   = bottom_band | left | right | top | bottom | free
+#   align    = start | center | end   (side within bottom_band / anchor for free)
+#   size     = "auto" | "<cells>" | "<pct>%"   (extent along the carved axis)
+#   min_peer = cells the peer region always keeps (so the usage dash stays usable)
+# This reproduces the old BottomDash result exactly: a snug slot on the RIGHT of
+# the usage band, leaving the usage dash at least 24 columns.
+[ui_modules.placement]
+region = "bottom_band"
+align = "end"
+size = "auto"
+min_peer = 24
+z = 50

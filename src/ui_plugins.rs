@@ -32,6 +32,10 @@ pub(crate) struct RegisteredUiModule {
     pub negotiated_version: u32,
     pub hot_reload: PluginHotReloadMode,
     pub surfaces: Vec<PluginUiSurface>,
+    /// Data-driven placement for this module's `Panel` surface (manifest DATA).
+    /// The host's generic panel layout reads it; a manifest edit hot-applies a
+    /// move/resize with no host rebuild. `None` → free-overlay default.
+    pub placement: Option<crate::api::schema::PluginPanelPlacement>,
     pub requested_capabilities: Vec<crate::api::schema::PluginUiCapability>,
     /// Manifest `ui_input_file` (spec §7.1): a state-dir filename whose contents
     /// the host surfaces as `HERDR_PLUGIN_UI_INPUT_JSON` each frame. `None` when
@@ -49,6 +53,11 @@ pub(crate) struct UiSurfaceLayer {
     pub plugin_id: String,
     pub module_id: String,
     pub negotiated_version: u32,
+    /// Owning module's `Panel` placement spec, carried onto every layer so the
+    /// host's generic panel layout (in `compute_view`) can carve/position the
+    /// rect from DATA without reaching back into `UiPluginManager`. `None` for
+    /// non-panel layers and for panel modules that declared no placement.
+    pub placement: Option<crate::api::schema::PluginPanelPlacement>,
     pub layer: UiLayer,
 }
 
@@ -484,6 +493,7 @@ impl UiPluginManager {
                     negotiated_version: module.api_version,
                     hot_reload: module.hot_reload,
                     surfaces: module.surfaces.clone(),
+                    placement: module.placement.clone(),
                     requested_capabilities: module.capabilities.clone(),
                     ui_input_file: module.ui_input_file.clone(),
                 };
@@ -761,6 +771,7 @@ impl UiPluginManager {
                     plugin_id: module.plugin_id.clone(),
                     module_id: module.module_id.clone(),
                     negotiated_version: module.negotiated_version,
+                    placement: module.placement.clone(),
                     layer,
                 });
             }
@@ -1335,7 +1346,7 @@ fn map_surface(surface: PluginUiSurface) -> UiSurface {
         PluginUiSurface::Overlay => UiSurface::Overlay,
         PluginUiSurface::ContextMenu => UiSurface::ContextMenu,
         PluginUiSurface::UsageStrip => UiSurface::UsageStrip,
-        PluginUiSurface::BottomDash => UiSurface::BottomDash,
+        PluginUiSurface::Panel => UiSurface::Panel,
     }
 }
 
@@ -1380,6 +1391,7 @@ mod tests {
             negotiated_version: 3,
             hot_reload: PluginHotReloadMode::On,
             surfaces: vec![PluginUiSurface::RightPanel],
+            placement: None,
             requested_capabilities: Vec::new(),
             ui_input_file: None,
         };
@@ -1443,6 +1455,7 @@ mod tests {
                 module: "dist/goal-ui.wasm".into(),
                 hot_reload: PluginHotReloadMode::On,
                 surfaces: vec![PluginUiSurface::Header, PluginUiSurface::ContextMenu],
+                placement: None,
                 capabilities: vec![
                     PluginUiCapability::FocusedSession,
                     PluginUiCapability::MouseAll,
@@ -2461,7 +2474,10 @@ mod tests {
             manager.all()[0].surfaces,
             vec![PluginUiSurface::Header, PluginUiSurface::Footer]
         );
-        assert_eq!(manager.all()[0].ui_input_file.as_deref(), Some("input.json"));
+        assert_eq!(
+            manager.all()[0].ui_input_file.as_deref(),
+            Some("input.json")
+        );
         assert_eq!(manager.for_surface(PluginUiSurface::Footer).len(), 1);
         // The live instance + cached update survived (guest state preserved).
         assert!(manager.loaded_updates.contains_key(&key));

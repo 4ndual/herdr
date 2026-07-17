@@ -1,6 +1,7 @@
 //! Button-dash guest: a data-driven, clickable quick-reference of
-//! keyboard-shortcut actions rendered in the bottom-dash slot beside the usage
-//! strip.
+//! keyboard-shortcut actions rendered in a generic plugin `Panel` whose position
+//! is pure manifest DATA (`[ui_modules.placement]`), docked beside the usage
+//! strip by default.
 //!
 //! Each entry in [`BUTTONS`] is one row of data — no rendering code changes to
 //! add a button: append a [`ButtonDef`] here and declare a matching
@@ -10,10 +11,10 @@
 //! This crate mirrors the v3 guest ABI of `examples/ui-wasm-plugin`
 //! (`crates/herdr-ui-plugin-api` is still v2 on the wire, so the v3-only wire
 //! types are defined locally here). Hit-testing is absolute (screen
-//! coordinates), so panel-relative rects are offset by the origin the host
-//! publishes in the layout blob's `bottom_dash_area` key — this plugin renders
-//! in the dedicated bottom-dash slot BESIDE the usage strip (its own rect), not
-//! stacked on the usage strip.
+//! coordinates), so panel-relative rects are offset by the panel origin the host
+//! resolves from the manifest placement and delivers as the frame `rect` — the
+//! guest never needs to know WHERE it is docked, so moving/resizing the panel is
+//! a pure manifest edit with no guest OR host rebuild.
 
 use herdr_ui_plugin_api::{UiFrameContext, UiHitRect, UiLayer, UiNode, UiSurface, UiTextSpan};
 use serde::{Deserialize, Serialize};
@@ -57,7 +58,8 @@ static BUTTONS: &[ButtonDef] = &[
         id: "full-restart",
         label: "Full restart",
         shortcut: "\u{2303}\u{2325}\u{21E7}X", // ⌃⌥⇧X
-        description: "Hard kill tmux + Claude Code + server (reclaim all RAM), relaunch fresh & resume",
+        description:
+            "Hard kill tmux + Claude Code + server (reclaim all RAM), relaunch fresh & resume",
         action_id: "full-restart",
     },
 ];
@@ -71,9 +73,10 @@ const ACTION_TOGGLE_LIST: &str = "button-dash:toggle_list";
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Whether the expandable full list (label + shortcut + description) is shown.
 static LIST_EXPANDED: AtomicBool = AtomicBool::new(false);
-/// Absolute (x, y) origin of the bottom-dash slot, from the layout blob's
-/// `bottom_dash_area` key. Declared hit-rects are matched in absolute screen
-/// coordinates (host hit-testing), so panel hits must carry this offset.
+/// Absolute (x, y) origin of this module's `Panel` rect, taken from the frame
+/// `rect` the host resolves from the manifest placement. Declared hit-rects are
+/// matched in absolute screen coordinates (host hit-testing), so panel hits must
+/// carry this offset.
 static STRIP_ORIGIN: Mutex<Option<(u16, u16)>> = Mutex::new(None);
 
 // ── v3 wire types (local; see module doc comment) ────────────────────────────
@@ -200,7 +203,7 @@ fn handle_event(event: &V3Event) -> UiUpdateV3 {
 }
 
 fn handle_frame(frame: &UiFrameContext) -> UiUpdateV3 {
-    *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") = bottom_dash_origin(frame);
+    *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") = panel_origin(frame);
     render_update(Vec::new())
 }
 
@@ -233,13 +236,16 @@ fn handle_action(action: &ActionEvent) -> UiUpdateV3 {
     render_update(Vec::new())
 }
 
-fn bottom_dash_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
-    let raw = frame.host.env.get("HERDR_LAYOUT_JSON")?;
-    let value: Value = serde_json::from_str(raw).ok()?;
-    let area = value.get("bottom_dash_area")?;
-    let x = area.get("x").and_then(Value::as_u64)?;
-    let y = area.get("y").and_then(Value::as_u64)?;
-    Some((x as u16, y as u16))
+/// Absolute origin of this module's generic `Panel` rect. The host resolves the
+/// panel's placement (from the manifest `[ui_modules.placement]` DATA) and hands
+/// the resolved rect back as the frame's `rect`, so the guest is agnostic of
+/// WHERE it renders — it just offsets its absolute hit-rects by `rect` origin.
+/// A zero-sized rect (no slot carved yet) yields `None`.
+fn panel_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
+    if frame.rect.width == 0 || frame.rect.height == 0 {
+        return None;
+    }
+    Some((frame.rect.x, frame.rect.y))
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -330,7 +336,7 @@ fn button_dash_layer() -> UiLayer {
     }
 
     UiLayer {
-        surface: UiSurface::BottomDash,
+        surface: UiSurface::Panel,
         z_index: 50,
         consumes_mouse: false,
         nodes,

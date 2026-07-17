@@ -158,10 +158,12 @@ impl AppState {
                 {
                     if negotiated_version == 3 {
                         if let Some(kind) = ui_action_kind_for_crossterm(mouse.kind) {
-                            let rect = crate::ui::ui_plugin_surface_rect(
+                            let rect = crate::ui::ui_plugin_owner_surface_rect(
                                 self,
                                 crate::ui::ui_plugin_frame_area(self),
                                 hit.surface,
+                                &plugin_id,
+                                &module_id,
                             );
                             self.pending_plugin_ui_action =
                                 Some(crate::app::state::PendingPluginUiAction {
@@ -2443,6 +2445,7 @@ mod tests {
             plugin_id: "example.ui-wasm".into(),
             module_id: "overlay".into(),
             negotiated_version: 2,
+            placement: None,
             layer: herdr_ui_plugin_api::UiLayer {
                 surface: herdr_ui_plugin_api::UiSurface::Overlay,
                 z_index: 50,
@@ -2479,6 +2482,7 @@ mod tests {
             plugin_id: "example.ui-wasm".into(),
             module_id: "header".into(),
             negotiated_version: 2,
+            placement: None,
             layer: herdr_ui_plugin_api::UiLayer {
                 surface: herdr_ui_plugin_api::UiSurface::Header,
                 z_index: 1,
@@ -2522,6 +2526,7 @@ mod tests {
             plugin_id: "example.ui-wasm".into(),
             module_id: "header".into(),
             negotiated_version: 3,
+            placement: None,
             layer: herdr_ui_plugin_api::UiLayer {
                 surface: herdr_ui_plugin_api::UiSurface::Header,
                 z_index: 1,
@@ -2577,6 +2582,7 @@ mod tests {
             plugin_id: "example.ui-wasm".into(),
             module_id: "header".into(),
             negotiated_version: 2,
+            placement: None,
             layer: herdr_ui_plugin_api::UiLayer {
                 surface: herdr_ui_plugin_api::UiSurface::Header,
                 z_index: 1,

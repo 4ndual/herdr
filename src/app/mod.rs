@@ -711,7 +711,7 @@ impl App {
                 split_borders: Vec::new(),
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
-                bottom_dash_rect: Rect::default(),
+                panel_rects: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -2022,14 +2022,19 @@ impl App {
                     crate::api::schema::PluginUiSurface::UsageStrip => {
                         herdr_ui_plugin_api::UiSurface::UsageStrip
                     }
-                    crate::api::schema::PluginUiSurface::BottomDash => {
-                        herdr_ui_plugin_api::UiSurface::BottomDash
+                    crate::api::schema::PluginUiSurface::Panel => {
+                        herdr_ui_plugin_api::UiSurface::Panel
                     }
                 };
-                let rect = crate::ui::ui_plugin_surface_rect(
+                // Identity-aware so the generic `Panel` surface resolves to THIS
+                // module's placement rect; the guest reads `frame.rect` as its
+                // absolute origin, keeping it agnostic of any layout-blob key.
+                let rect = crate::ui::ui_plugin_owner_surface_rect(
                     &self.state,
                     crate::ui::ui_plugin_frame_area(&self.state),
                     surface,
+                    &plugin_id,
+                    &module_id,
                 );
                 if surface == herdr_ui_plugin_api::UiSurface::UsageStrip {
                     tracing::info!(
@@ -2125,9 +2130,11 @@ impl App {
             // though the host rects were renamed to generic surface geometry.
             "usage_dash_area": area_or_null(self.state.view.usage_strip_rect),
             "goal_dash_area": area_or_null(self.state.view.right_panel_rect),
-            // Secondary dash slot beside the usage strip; the bottom-dash guest
-            // offsets its hit-rects by this origin (null when no slot is carved).
-            "bottom_dash_area": area_or_null(self.state.view.bottom_dash_rect),
+            // Generic per-module panel geometry, keyed by `plugin_id:module_id`.
+            // A panel guest can read its own rect here for absolute hit-offset,
+            // though it can equivalently just use its frame `rect` (same value).
+            // Empty object when no panel is currently carved.
+            "panel_areas": self.ui_plugin_panel_areas(),
             "client": {
                 "is_foreground": true,
                 "width": client_width,
@@ -2136,6 +2143,26 @@ impl App {
             },
         });
         serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Generic per-module panel geometry for the layout blob's `panel_areas`
+    /// key: a `{ "plugin_id:module_id": {x,y,w,h} }` object over every currently
+    /// carved plugin `Panel` rect. Zero-sized rects are omitted. This is the
+    /// data-driven successor to the old fixed `bottom_dash_area` key — no panel
+    /// position is hardcoded here.
+    fn ui_plugin_panel_areas(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for panel in &self.state.view.panel_rects {
+            let rect = panel.rect;
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            map.insert(
+                format!("{}:{}", panel.plugin_id, panel.module_id),
+                serde_json::json!({"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height}),
+            );
+        }
+        serde_json::Value::Object(map)
     }
 
     pub(crate) fn build_ui_plugin_frame_env(

@@ -292,6 +292,11 @@ pub struct PluginManifestUiModule {
     pub hot_reload: PluginHotReloadMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub surfaces: Vec<PluginUiSurface>,
+    /// Data-driven placement for this module's `Panel` surface. Only consulted
+    /// when the module declares the `panel` surface; ignored otherwise. `None`
+    /// falls back to the `PluginPanelPlacement` default (free overlay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PluginPanelPlacement>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<PluginUiCapability>,
     /// Optional single path segment (no separators, no `..`) naming a file under
@@ -341,8 +346,71 @@ pub enum PluginUiSurface {
     ContextMenu,
     /// The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.
     UsageStrip,
-    /// A secondary dash slot beside the usage strip (host `bottom_dash_rect`).
-    BottomDash,
+    /// A generic, plugin-placed panel whose rect the host lays out from the
+    /// module manifest `placement` spec (region/align/size/min_peer/z) rather
+    /// than a hardcoded per-variant match. Adding/moving/resizing a panel is a
+    /// pure manifest edit (hot-reload), no host rebuild.
+    Panel,
+}
+
+/// Data-driven placement for a `Panel` surface (schema mirror of the host's
+/// generic panel layout). Every field is manifest DATA, so a plugin controls
+/// where it renders with no host/enum change. Defaults reproduce a free overlay
+/// with a snug (content-sized) box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PluginPanelPlacement {
+    /// Which region the panel occupies / carves from.
+    #[serde(default)]
+    pub region: PluginPanelRegion,
+    /// Where the panel sits along the carve axis of its region. Meaningful for
+    /// `bottom_band` (which side of the usage band) and `free` (anchor within
+    /// the pane area); edge regions (`left`/`right`/`top`/`bottom`) already
+    /// encode their edge.
+    #[serde(default)]
+    pub align: PluginPanelAlign,
+    /// Extent along the carved dimension: `"auto"` (snug to content, default),
+    /// a cell count (`"30"`), or a percent of the available span (`"30%"`).
+    /// Parsed host-side; unparseable values fall back to `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Cells (columns for vertical bands, rows for horizontal bands) the peer
+    /// region keeps: the panel is only carved when the peer keeps at least this
+    /// much, so a secondary panel never squeezes the primary content unreadable.
+    #[serde(default = "default_panel_min_peer")]
+    pub min_peer: u16,
+    /// Draw/hit z-order among panels and other layers (higher is on top).
+    #[serde(default)]
+    pub z: i16,
+}
+
+fn default_panel_min_peer() -> u16 {
+    24
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPanelRegion {
+    /// Share the usage-strip band: carve a slot beside the usage dash (its own
+    /// rect + hit-rects). This is what button-dash uses.
+    BottomBand,
+    /// Carve a column band from the left/right of the pane area (panes shrink).
+    Left,
+    Right,
+    /// Carve a row band from the top/bottom of the pane area (panes shrink).
+    Top,
+    Bottom,
+    /// Overlay the pane area without carving; anchored by `align`.
+    #[default]
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPanelAlign {
+    #[default]
+    Start,
+    Center,
+    End,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

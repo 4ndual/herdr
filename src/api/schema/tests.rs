@@ -829,6 +829,7 @@ fn plugin_link_list_unlink_round_trip() {
                 PluginUiSurface::Overlay,
                 PluginUiSurface::ContextMenu,
             ],
+            placement: None,
             capabilities: vec![
                 PluginUiCapability::FocusedSession,
                 PluginUiCapability::MouseAll,
