@@ -119,9 +119,12 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
 
     let argv = match (source, agent, session_ref.kind) {
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
+            // cmix(cx-resume-lineage): route claude resumes through the cx-resume
+            // dispatcher so cx-origin sessions come back UP as cx (gateway + GPT
+            // models, correct CLAUDE_CONFIG_DIR); daily sessions fall through to
+            // plain claude untouched. See cmix/scripts/patch-herdr-cx-resume.mjs.
             vec![
-                "claude".into(),
-                "--resume".into(),
+                "cx-resume".into(),
                 session_ref.value.clone(),
             ]
         }
@@ -270,7 +273,7 @@ mod tests {
             )
             .unwrap()
             .argv,
-            vec!["claude", "--resume", "claude-session"]
+            vec!["cx-resume", "claude-session"]
         );
         assert_eq!(
             plan(
