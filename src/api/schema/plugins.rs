@@ -341,6 +341,8 @@ pub enum PluginUiSurface {
     ContextMenu,
     /// The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.
     UsageStrip,
+    /// A secondary dash slot beside the usage strip (host `bottom_dash_rect`).
+    BottomDash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

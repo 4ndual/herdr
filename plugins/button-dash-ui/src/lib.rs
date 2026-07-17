@@ -1,5 +1,6 @@
 //! Button-dash guest: a data-driven, clickable quick-reference of
-//! keyboard-shortcut actions rendered on the bottom usage strip.
+//! keyboard-shortcut actions rendered in the bottom-dash slot beside the usage
+//! strip.
 //!
 //! Each entry in [`BUTTONS`] is one row of data — no rendering code changes to
 //! add a button: append a [`ButtonDef`] here and declare a matching
@@ -9,8 +10,10 @@
 //! This crate mirrors the v3 guest ABI of `examples/ui-wasm-plugin`
 //! (`crates/herdr-ui-plugin-api` is still v2 on the wire, so the v3-only wire
 //! types are defined locally here). Hit-testing is absolute (screen
-//! coordinates), so strip-relative rects are offset by the strip origin the
-//! host publishes in the layout blob's `usage_dash_area` key.
+//! coordinates), so panel-relative rects are offset by the origin the host
+//! publishes in the layout blob's `bottom_dash_area` key — this plugin renders
+//! in the dedicated bottom-dash slot BESIDE the usage strip (its own rect), not
+//! stacked on the usage strip.
 
 use herdr_ui_plugin_api::{UiFrameContext, UiHitRect, UiLayer, UiNode, UiSurface, UiTextSpan};
 use serde::{Deserialize, Serialize};
@@ -42,13 +45,22 @@ struct ButtonDef {
     action_id: &'static str,
 }
 
-static BUTTONS: &[ButtonDef] = &[ButtonDef {
-    id: "restart-hr",
-    label: "Restart hr",
-    shortcut: "\u{2303}\u{2325}X", // ⌃⌥X
-    description: "Fully kill & relaunch this herdr instance, restoring the session",
-    action_id: "restart-hr",
-}];
+static BUTTONS: &[ButtonDef] = &[
+    ButtonDef {
+        id: "restart-hr",
+        label: "Restart hr",
+        shortcut: "\u{2303}\u{2325}X", // ⌃⌥X
+        description: "Fully kill & relaunch this herdr instance, restoring the session",
+        action_id: "restart-hr",
+    },
+    ButtonDef {
+        id: "full-restart",
+        label: "Full restart",
+        shortcut: "\u{2303}\u{2325}\u{21E7}X", // ⌃⌥⇧X
+        description: "Hard kill tmux + Claude Code + server (reclaim all RAM), relaunch fresh & resume",
+        action_id: "full-restart",
+    },
+];
 
 // Action id for the built-in expand/collapse toggle (not a manifest action; the
 // guest handles it internally, so it never reaches plugin.action.invoke).
@@ -59,9 +71,9 @@ const ACTION_TOGGLE_LIST: &str = "button-dash:toggle_list";
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Whether the expandable full list (label + shortcut + description) is shown.
 static LIST_EXPANDED: AtomicBool = AtomicBool::new(false);
-/// Absolute (x, y) origin of the usage strip, from the layout blob's
-/// `usage_dash_area` key. Declared hit-rects are matched in absolute screen
-/// coordinates (host hit-testing), so strip hits must carry this offset.
+/// Absolute (x, y) origin of the bottom-dash slot, from the layout blob's
+/// `bottom_dash_area` key. Declared hit-rects are matched in absolute screen
+/// coordinates (host hit-testing), so panel hits must carry this offset.
 static STRIP_ORIGIN: Mutex<Option<(u16, u16)>> = Mutex::new(None);
 
 // ── v3 wire types (local; see module doc comment) ────────────────────────────
@@ -188,7 +200,7 @@ fn handle_event(event: &V3Event) -> UiUpdateV3 {
 }
 
 fn handle_frame(frame: &UiFrameContext) -> UiUpdateV3 {
-    *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") = usage_strip_origin(frame);
+    *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") = bottom_dash_origin(frame);
     render_update(Vec::new())
 }
 
@@ -221,10 +233,10 @@ fn handle_action(action: &ActionEvent) -> UiUpdateV3 {
     render_update(Vec::new())
 }
 
-fn usage_strip_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
+fn bottom_dash_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
     let raw = frame.host.env.get("HERDR_LAYOUT_JSON")?;
     let value: Value = serde_json::from_str(raw).ok()?;
-    let area = value.get("usage_dash_area")?;
+    let area = value.get("bottom_dash_area")?;
     let x = area.get("x").and_then(Value::as_u64)?;
     let y = area.get("y").and_then(Value::as_u64)?;
     Some((x as u16, y as u16))
@@ -240,7 +252,7 @@ fn render_update(effects: Vec<HostEffectV3>) -> UiUpdateV3 {
     }
 }
 
-/// Renders the button dash on the usage strip: row 0 is the compact clickable
+/// Renders the button dash in the bottom-dash slot: row 0 is the compact clickable
 /// strip (each button shows label + shortcut, plus a list toggle); when
 /// expanded, rows 1..N list every button's label, shortcut, and description.
 fn button_dash_layer() -> UiLayer {
@@ -318,7 +330,7 @@ fn button_dash_layer() -> UiLayer {
     }
 
     UiLayer {
-        surface: UiSurface::UsageStrip,
+        surface: UiSurface::BottomDash,
         z_index: 50,
         consumes_mouse: false,
         nodes,

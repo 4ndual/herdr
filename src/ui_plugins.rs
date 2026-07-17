@@ -1335,6 +1335,7 @@ fn map_surface(surface: PluginUiSurface) -> UiSurface {
         PluginUiSurface::Overlay => UiSurface::Overlay,
         PluginUiSurface::ContextMenu => UiSurface::ContextMenu,
         PluginUiSurface::UsageStrip => UiSurface::UsageStrip,
+        PluginUiSurface::BottomDash => UiSurface::BottomDash,
     }
 }
 

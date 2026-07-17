@@ -711,6 +711,7 @@ impl App {
                 split_borders: Vec::new(),
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
+                bottom_dash_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,
@@ -2021,6 +2022,9 @@ impl App {
                     crate::api::schema::PluginUiSurface::UsageStrip => {
                         herdr_ui_plugin_api::UiSurface::UsageStrip
                     }
+                    crate::api::schema::PluginUiSurface::BottomDash => {
+                        herdr_ui_plugin_api::UiSurface::BottomDash
+                    }
                 };
                 let rect = crate::ui::ui_plugin_surface_rect(
                     &self.state,
@@ -2121,6 +2125,9 @@ impl App {
             // though the host rects were renamed to generic surface geometry.
             "usage_dash_area": area_or_null(self.state.view.usage_strip_rect),
             "goal_dash_area": area_or_null(self.state.view.right_panel_rect),
+            // Secondary dash slot beside the usage strip; the bottom-dash guest
+            // offsets its hit-rects by this origin (null when no slot is carved).
+            "bottom_dash_area": area_or_null(self.state.view.bottom_dash_rect),
             "client": {
                 "is_foreground": true,
                 "width": client_width,

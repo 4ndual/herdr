@@ -25,13 +25,27 @@ title = "Restart hr"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/restart-herdr.sh\" >/dev/null 2>&1 &"]
 
+# full-restart: HARD restart — kill tmux + Claude Code + server (reclaim all RAM)
+# and relaunch fresh, resuming the session. Same detach model as the soft button
+# (nohup + the script's own guarded re-exec; macOS has no `setsid`). The script is
+# owned by the full-restart agent at scripts/full-restart-herdr.sh and resolves
+# WHICH instance from the inherited HERDR_SESSION + XDG_CONFIG_HOME.
+[[actions]]
+id = "full-restart"
+title = "Full restart"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/full-restart-herdr.sh\" >/dev/null 2>&1 &"]
+
 [[ui_modules]]
 id = "button-ui"
 title = "Button Dash"
-description = "Data-driven clickable shortcut buttons rendered on the bottom usage strip"
+description = "Data-driven clickable shortcut buttons rendered in the bottom-dash slot beside the usage strip"
 kind = "wasm"
 api_version = 3
 module = "target/wasm32-unknown-unknown/release/herdr_button_dash_ui.wasm"
 hot_reload = "on"
-surfaces = ["usage_strip"]
+# Render in the dedicated bottom-dash slot BESIDE the usage strip (its own rect
+# + hit-rects), never stacked on the usage_strip surface — that stacking caused
+# visual overlap and stole usage-dash / model input.
+surfaces = ["bottom_dash"]
 capabilities = ["layout_read", "toasts", "api_read", "api_write"]

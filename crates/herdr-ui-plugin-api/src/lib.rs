@@ -58,6 +58,10 @@ pub enum UiSurface {
     /// The multi-row usage dashboard strip (maps to the host's `usage_dash_area`).
     /// Added in API v2 for the WASM usage-dash module.
     UsageStrip,
+    /// A secondary dash slot carved beside the usage strip in the same bottom
+    /// band (maps to the host's `bottom_dash_area`). Distinct rect + hits from
+    /// `UsageStrip`, so a plugin here never overlaps or steals usage-dash input.
+    BottomDash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

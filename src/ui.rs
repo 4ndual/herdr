@@ -114,6 +114,11 @@ const GOAL_PANEL_MAX_WIDTH: u16 = 56;
 // column (an expand affordance stays reachable) and gives the rest to panes.
 const GOAL_PANEL_COLLAPSED_WIDTH: u16 = 3;
 
+// feat/native-dashes: the bottom-dash slot is carved from the right of the usage
+// band only when the usage dash keeps at least this many columns, so the primary
+// usage dash is never squeezed unreadable by a secondary bottom dash.
+const BOTTOM_DASH_MIN_USAGE_WIDTH: u16 = 24;
+
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -322,6 +327,30 @@ fn compute_view_internal(
         (terminal_area, Rect::default())
     };
 
+    // feat/native-dashes: carve a secondary bottom-dash slot out of the RIGHT of
+    // the usage strip band when a plugin declares the BottomDash surface AND
+    // renders non-empty content — mirrors the right-panel carve, gated on live
+    // content so an idle layout leaves the whole strip to the usage dash. The
+    // slot is snug (widest bottom-dash line, clamped), so the usage dash keeps
+    // the rest of the band. A distinct rect means the bottom dash gets its own
+    // hit-rects and never overlaps or steals usage-dash / pane input.
+    let (usage_strip_rect, bottom_dash_rect) = if usage_strip_rect.width > 0 {
+        let want = bottom_dash_content_width(app);
+        // Leave the usage dash a usable minimum; only carve when it fits.
+        let max_slot = usage_strip_rect.width.saturating_sub(BOTTOM_DASH_MIN_USAGE_WIDTH);
+        let slot_w = want.min(max_slot);
+        if want > 0 && slot_w > 0 {
+            let [usage, dash] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(slot_w)])
+                    .areas(usage_strip_rect);
+            (usage, dash)
+        } else {
+            (usage_strip_rect, Rect::default())
+        }
+    } else {
+        (usage_strip_rect, Rect::default())
+    };
+
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
         let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
@@ -409,7 +438,39 @@ fn compute_view_internal(
         split_borders,
         usage_strip_rect,
         right_panel_rect,
+        bottom_dash_rect,
     };
+}
+
+/// Widest rendered line (in cells) across the BottomDash surface layer's nodes,
+/// used to size the bottom-dash slot snugly. Zero when no BottomDash layer has
+/// content, which keeps the whole usage band for the usage dash.
+fn bottom_dash_content_width(app: &AppState) -> u16 {
+    app.ui_surface_layers
+        .iter()
+        .filter(|entry| entry.layer.surface == UiSurface::BottomDash)
+        .flat_map(|entry| entry.layer.nodes.iter())
+        .map(ui_node_line_width)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Cell width of a single node's line (span text char counts). Only Line/Status
+/// nodes carry inline text in the bottom dash; other node kinds contribute 0.
+fn ui_node_line_width(node: &UiNode) -> u16 {
+    let span_w = |spans: &[UiTextSpan]| -> u16 {
+        spans
+            .iter()
+            .map(|s| s.text.chars().count() as u16)
+            .fold(0u16, |acc, w| acc.saturating_add(w))
+    };
+    match node {
+        UiNode::Line { spans } => span_w(spans),
+        UiNode::Status { left, right } => span_w(left)
+            .saturating_add(1)
+            .saturating_add(span_w(right)),
+        _ => 0,
+    }
 }
 
 fn compute_mobile_view(
@@ -481,6 +542,7 @@ fn compute_mobile_view(
         split_borders,
         usage_strip_rect: Rect::default(),
         right_panel_rect: Rect::default(),
+        bottom_dash_rect: Rect::default(),
     };
 }
 
@@ -586,6 +648,7 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
         UiSurface::Sidebar => app.view.sidebar_rect,
         UiSurface::RightPanel => app.view.right_panel_rect,
         UiSurface::UsageStrip => app.view.usage_strip_rect,
+        UiSurface::BottomDash => app.view.bottom_dash_rect,
         UiSurface::Overlay => app.view.terminal_area,
         UiSurface::ContextMenu => frame_area,
     }
@@ -689,6 +752,7 @@ pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
         app.view.mobile_header_rect,
         app.view.right_panel_rect,
         app.view.usage_strip_rect,
+        app.view.bottom_dash_rect,
     ];
     let mut min_x = u16::MAX;
     let mut min_y = u16::MAX;
@@ -2004,6 +2068,102 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("WASM HEADER"));
         assert!(rendered.contains("WASM FOOTER"));
+    }
+
+    fn bottom_dash_layer(text: &str) -> crate::ui_plugins::UiSurfaceLayer {
+        crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "builtin.button-dash".into(),
+            module_id: "button-ui".into(),
+            negotiated_version: 3,
+            layer: UiLayer {
+                surface: UiSurface::BottomDash,
+                z_index: 50,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: text.into(),
+                        role: Some("accent".into()),
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
+                }],
+                hits: Vec::new(),
+                data: None,
+            },
+        }
+    }
+
+    fn app_with_usage_strip() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.usage_strip_enabled = true;
+        app
+    }
+
+    #[test]
+    fn bottom_dash_carves_a_disjoint_slot_beside_usage_strip() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![bottom_dash_layer("[Restart hr]  [x]")];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+
+        let usage = app.view.usage_strip_rect;
+        let dash = app.view.bottom_dash_rect;
+        assert!(usage.width > 0, "usage strip should be carved");
+        assert!(dash.width > 0, "bottom dash should be carved when content exists");
+        // Same bottom band (y/height), side by side, no horizontal overlap.
+        assert_eq!(usage.y, dash.y);
+        assert_eq!(usage.height, dash.height);
+        assert_eq!(usage.x + usage.width, dash.x, "dash sits flush right of usage");
+        assert!(dash.x >= usage.x + usage.width, "no overlap with usage strip");
+        // Snug to content width ("[Restart hr]  [x]" = 17 cells).
+        assert_eq!(dash.width, 17);
+    }
+
+    #[test]
+    fn no_bottom_dash_slot_without_content() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = Vec::new();
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        assert!(app.view.usage_strip_rect.width > 0);
+        assert_eq!(app.view.bottom_dash_rect, Rect::default());
+    }
+
+    #[test]
+    fn bottom_dash_hit_is_disjoint_from_usage_strip_rect() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![bottom_dash_layer("[go]")];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        let dash = app.view.bottom_dash_rect;
+        let usage = app.view.usage_strip_rect;
+        assert!(dash.width > 0);
+
+        // The real guest offsets its hit-rects by the slot origin (host
+        // hit-testing is absolute). Mirror that: declare a hit at the slot's
+        // absolute origin, then re-run hit resolution against the laid-out view.
+        app.ui_surface_layers[0].layer.hits = vec![herdr_ui_plugin_api::UiHitRect {
+            x: dash.x,
+            y: dash.y,
+            width: 4,
+            height: 1,
+            action_id: "go".into(),
+        }];
+        let frame_area = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(&app, frame_area, dash.x, dash.y).expect("bottom-dash hit");
+        assert_eq!(hit.action_id.as_deref(), Some("go"));
+        assert_eq!(hit.surface, UiSurface::BottomDash);
+        // A click inside the usage strip must NOT resolve to the bottom-dash action.
+        let in_usage = ui_plugin_hit_at(&app, frame_area, usage.x, usage.y);
+        assert!(
+            in_usage
+                .as_ref()
+                .map(|h| h.surface != UiSurface::BottomDash)
+                .unwrap_or(true),
+            "usage-strip click must not hit the bottom dash"
+        );
     }
 
     #[test]

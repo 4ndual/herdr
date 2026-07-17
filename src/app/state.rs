@@ -751,6 +751,11 @@ pub struct ViewState {
     /// plugin-driven dock lands.
     pub usage_strip_rect: Rect,
     pub right_panel_rect: Rect,
+    /// A secondary dash slot carved from the RIGHT of the usage-strip band when a
+    /// plugin declares the `BottomDash` surface and renders content. Sits beside
+    /// (never over) `usage_strip_rect`, with its own hit-rects, so it never
+    /// steals usage-dash or pane input. Empty when no bottom-dash content.
+    pub bottom_dash_rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1774,6 +1779,7 @@ impl AppState {
                 split_borders: Vec::new(),
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
+                bottom_dash_rect: Rect::default(),
             },
             drag: None,
             workspace_press: None,
