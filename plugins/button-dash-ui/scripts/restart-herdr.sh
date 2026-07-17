@@ -113,6 +113,17 @@ log "xdg: config=$CFG state=$XDG_STATE data=$XDG_DATA"
 log "tmux host: $TMUX_HOST  geom=${GEOM_X}x${GEOM_Y}"
 
 # ---------------------------------------------------------------------------
+# 2.5 Drop the restart sentinel BEFORE killing the server.
+# ---------------------------------------------------------------------------
+# The launcher (~/.local/bin/<session>) runs the client in a self-healing loop:
+# when the client exits and finds a FRESH sentinel, it relaunches herdr in its
+# OWN pty (repaints in place). Touching it before the kill guarantees every
+# attached client sees it on exit, so no terminal is left on "server closed".
+SENTINEL="$XDG_STATE/herdr/.restart-request-$SESSION"
+mkdir -p "$XDG_STATE/herdr" 2>/dev/null
+: > "$SENTINEL" 2>/dev/null && log "sentinel dropped: $SENTINEL" || log "WARN: could not write sentinel $SENTINEL"
+
+# ---------------------------------------------------------------------------
 # 3. Fully kill the old instance and verify it is gone (no leak/zombie).
 # ---------------------------------------------------------------------------
 if [[ -n "$SERVER_PID" ]]; then
@@ -128,8 +139,11 @@ if [[ -n "$SERVER_PID" ]]; then
   fi
 fi
 
-# Kill the old tmux host session (drops the old client).
-tmux kill-session -t "$TMUX_HOST" 2>/dev/null && log "killed old tmux session $TMUX_HOST"
+# NOTE: we intentionally DO NOT kill the tmux host session here. Each attached
+# client (tmux pane OR a direct terminal like Ghostty) exits when the server
+# dies and its self-healing launcher relaunches herdr in place. Killing the
+# tmux session would drop an attached client onto a dead shell — the exact bug
+# this restart flow is fixing.
 
 # Sweep any straggler process still bound to this instance's socket.
 for _ in 1 2 3 4 5; do
@@ -148,25 +162,49 @@ fi
 log "old instance is down"
 
 # ---------------------------------------------------------------------------
-# 4. Relaunch FRESH on same binary + session + XDG roots.
+# 4. Wait for a self-healing client to relaunch the server IN PLACE.
 # ---------------------------------------------------------------------------
-# Prefer the user's launcher if one exists (day-to-day path for `hr`); it sets
-# the exact same XDG roots/session. Otherwise reconstruct the exec line.
+# With the sentinel dropped and the server dead, every attached client's
+# launcher loop relaunches herdr in its own pty and the first one back brings
+# the server up. We just wait for that to happen — no external relaunch, so the
+# user's real terminal (Ghostty/tmux) repaints itself.
+NEW_PID=""
+for _ in $(seq 1 48); do   # ~12s: client exit + settle(0.5) + fresh server boot
+  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
+    break
+  fi
+  sleep 0.25
+done
+
+if [[ -n "$NEW_PID" ]]; then
+  # Do NOT remove the sentinel here: with several clients attached, one wins the
+  # race and brings the server up first, but the OTHERS (incl. the user's
+  # visible terminal) may not have exited yet. Removing it now would make the
+  # losers find no sentinel and drop to a dead shell. Let it age out via TTL so
+  # EVERY attached client relaunches in place.
+  log "RESTART OK (self-healed in place): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Last-resort fallback: no attached client self-healed (e.g. the server was
+#    running headless with nothing attached). Relaunch into a detached tmux so
+#    the instance at least recovers; the user can `tmux attach -t <host>`.
+# ---------------------------------------------------------------------------
+log "no client self-healed within timeout — falling back to detached tmux relaunch"
 LAUNCHER="$HOME/.local/bin/$SESSION"
 if [[ -x "$LAUNCHER" ]]; then
   LAUNCH_CMD="$LAUNCHER"
-  log "relaunch via launcher: $LAUNCHER"
+  log "fallback relaunch via launcher: $LAUNCHER"
 else
   LAUNCH_CMD="env XDG_CONFIG_HOME=$CFG XDG_STATE_HOME=$XDG_STATE XDG_DATA_HOME=$XDG_DATA HERDR_SESSION=$SESSION $BIN --session $SESSION"
-  log "relaunch via reconstructed exec line"
+  log "fallback relaunch via reconstructed exec line"
 fi
 
+tmux kill-session -t "$TMUX_HOST" 2>/dev/null
 tmux new-session -d -s "$TMUX_HOST" -x "$GEOM_X" -y "$GEOM_Y" "$LAUNCH_CMD"
 
-# ---------------------------------------------------------------------------
-# 5. Wait for the fresh server to come up on the socket.
-# ---------------------------------------------------------------------------
-NEW_PID=""
 for _ in $(seq 1 40); do
   NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
@@ -176,7 +214,7 @@ for _ in $(seq 1 40); do
 done
 
 if [[ -n "$NEW_PID" ]]; then
-  log "RESTART OK: new server pid $NEW_PID (old was ${SERVER_PID:-none})"
+  log "RESTART OK (detached-tmux fallback): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
   exit 0
 else
   log "ERROR: new server did not come up on $SOCK"
