@@ -1194,6 +1194,28 @@ impl App {
                 self.focus_tab_idx_via_api(tab_idx);
                 open_rename_active_tab(&mut self.state, false);
             }
+            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+                // Same fork-the-focused-pane request as the TUI apply path
+                // (`apply_context_menu_action`); the outer loop dispatches it.
+                if let Some(pane_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tabs.get(tab_idx))
+                    .map(|tab| tab.layout.focused())
+                {
+                    self.state.request_plugin_action =
+                        Some(crate::app::state::PluginActionRequest {
+                            plugin_id: "builtin.button-dash".to_string(),
+                            action_id: "fork".to_string(),
+                            ws_idx,
+                            pane_id,
+                        });
+                } else {
+                    tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+                }
+                leave_modal(&mut self.state);
+            }
             (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);

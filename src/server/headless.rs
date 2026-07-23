@@ -711,6 +711,7 @@ impl HeadlessServer {
         }
 
         if let Some(request) = self.app.state.request_plugin_action.take() {
+            tracing::info!(plugin_id = %request.plugin_id, action_id = %request.action_id, "dispatching ui-requested plugin action");
             self.app.dispatch_requested_plugin_action(request);
             needs_render = true;
             crate::render_prof::event("full_render_cause.deferred_plugin_action");
