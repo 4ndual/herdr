@@ -557,6 +557,13 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.deferred_worktree_dialog");
             }
 
+            if let Some(request) = self.app.state.request_plugin_action.take() {
+                self.app.dispatch_requested_plugin_action(request);
+                needs_render = true;
+                needs_full_render = true;
+                crate::render_prof::event("full_render_cause.deferred_plugin_action");
+            }
+
             if self.app.state.request_submit_worktree_create {
                 self.app.state.request_submit_worktree_create = false;
                 self.app.start_worktree_add();

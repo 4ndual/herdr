@@ -1124,7 +1124,7 @@ impl ContextMenuState {
                 "Open worktree...",
                 "Collapse",
             ],
-            ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
+            ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Fork", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 source_pane_id: Some(_),
@@ -1260,6 +1260,19 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// Request to invoke a plugin action, scoped to a specific pane.
+///
+/// Set by UI interactions (such as the tab context menu) that need to run a
+/// plugin action through the App/plugin-runtime layer, which is not reachable
+/// from pure `AppState`. The outer App/event loop takes this and dispatches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginActionRequest {
+    pub plugin_id: String,
+    pub action_id: String,
+    pub ws_idx: usize,
+    pub pane_id: PaneId,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1286,6 +1299,9 @@ pub struct AppState {
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
+    /// Set when a UI interaction (e.g. the tab context menu "Fork" item) asks
+    /// the outer App/event loop to invoke a plugin action for a specific pane.
+    pub request_plugin_action: Option<PluginActionRequest>,
     pub request_submit_worktree_create: bool,
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
@@ -1637,6 +1653,7 @@ impl AppState {
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
+            request_plugin_action: None,
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
