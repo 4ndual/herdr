@@ -28,6 +28,13 @@ export interface ResumeRef {
 /**
  * One rendered result row. Ago fields are pre-formatted compact strings
  * ("2h", "3d", "5w") so the TUI renders one line without doing time math.
+ *
+ * DEGRADATION SENTINEL (canonical contract, agreed across W1/W2/W3): a section
+ * may yield a status/degradation line as a ResultLine with `sessionId === ""`
+ * (empty `shortId`, empty `resumeRef` fields), carrying the human message in
+ * `snippet` (e.g. "gpt: press Tab to search deeper", "similar: no local model").
+ * Renderers MUST display such rows but MUST skip them in keyboard/mouse
+ * selection — they are never resumable. Use `isSentinel(line)` to test.
  */
 export interface ResultLine {
   /** Matched text, truncated by the searcher to a sane width; TUI truncates further to pane width. */
@@ -42,6 +49,24 @@ export interface ResultLine {
   /** Ago since session created (first line mtime/timestamp). Empty string if unknown. */
   createdAgo: string;
   resumeRef: ResumeRef;
+}
+
+/** True if a ResultLine is a degradation/status sentinel (not selectable). */
+export function isSentinel(line: ResultLine): boolean {
+  return line.sessionId === "";
+}
+
+/** Build a degradation/status sentinel ResultLine carrying `message` in snippet. */
+export function sentinelLine(message: string): ResultLine {
+  return {
+    snippet: message,
+    sessionId: "",
+    shortId: "",
+    lastUserAgo: "",
+    lastAgentAgo: "",
+    createdAgo: "",
+    resumeRef: { sessionId: "", jsonlPath: "", origin: "daily", cwd: "" },
+  };
 }
 
 /**
