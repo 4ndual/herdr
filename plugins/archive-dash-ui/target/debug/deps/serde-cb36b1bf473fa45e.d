@@ -1,0 +1,14 @@
+/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/deps/serde-cb36b1bf473fa45e.d: /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/build/serde-d7af9f7189517044/out/private.rs
+
+/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/deps/libserde-cb36b1bf473fa45e.rlib: /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/build/serde-d7af9f7189517044/out/private.rs
+
+/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/deps/libserde-cb36b1bf473fa45e.rmeta: /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/build/serde-d7af9f7189517044/out/private.rs
+
+/Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/andual/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/build/serde-d7af9f7189517044/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/debug/build/serde-d7af9f7189517044/out
