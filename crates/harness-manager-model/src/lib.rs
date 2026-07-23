@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Live-state color of a row's leading dot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RowState {
     /// Enabled and idle (green).
@@ -17,11 +17,12 @@ pub enum RowState {
     /// Disabled / deferred / archived (dim).
     Off,
     /// No live-state concept for this row (no dot).
+    #[default]
     None,
 }
 
 /// One row in a harness-manager section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HarnessRow {
     /// Stable routing key (`"ctx:<n>"`, `"hook:<n>"`, `"mcp:<n>"`, `"plugin:<n>"`,
     /// `"skill:<n>"`) the host parses back out of a clicked `action_id` to find
@@ -47,6 +48,43 @@ pub struct HarnessRow {
     /// Extra indentation level (context tree children render indented).
     #[serde(default)]
     pub indent: u8,
+    /// Optional group this row belongs to (e.g. a hook event name like
+    /// "PreToolUse"). Rows sharing a `group` are emitted contiguously so the UI
+    /// can render one group header with the rows nested beneath it. `None` = the
+    /// row stands alone. Backward-compatible: absent in old inputs.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Tokens this row currently occupies in the live context window (loaded at
+    /// conversation start). `None` when the row costs nothing now (e.g. a skill
+    /// body that only loads on invoke) or when the cost is not determinable.
+    #[serde(default)]
+    pub tok_loaded: Option<u32>,
+    /// Tokens this row would cost if invoked / recalled / fully loaded (e.g. a
+    /// skill's SKILL.md body, a memory file recalled on demand). `None` when not
+    /// applicable or not determinable.
+    #[serde(default)]
+    pub tok_full: Option<u32>,
+    /// Short provenance for the token numbers — a measured real source, e.g.
+    /// "desc 412B", "SKILL.md 8.1KB", "transcript usage", "calibrated est", or
+    /// "not determinable". Empty hides it. Never a fabricated number's excuse.
+    #[serde(default)]
+    pub tok_src: Option<String>,
+    /// When this row's context cost is incurred: "start" | "on-invoke" |
+    /// "on-recall" | "on-spawn" | "deferred" | "evicted". `None` when it has no
+    /// load event.
+    #[serde(default)]
+    pub load_when: Option<String>,
+    /// For on-demand items (skill invoked, memory recalled, file read): a short
+    /// human string for WHEN it last loaded this session (transcript timestamp,
+    /// `HH:MM`). `None` for start-loaded or never-loaded rows.
+    #[serde(default)]
+    pub loaded_at: Option<String>,
+    /// Config scope the item comes from: "global" (loads in every session —
+    /// user-level settings/skills/agents/global CLAUDE.md) vs "session"
+    /// (project files, this session's recalled memories / read files). `None`
+    /// when scope has no meaning for the row.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// A titled section (Context, Session, Hooks, MCPs, Plugins, Skills).
@@ -56,6 +94,17 @@ pub struct HarnessSection {
     /// Right-aligned section summary (e.g. totals). May be empty.
     #[serde(default)]
     pub summary: String,
+    /// Header aggregate string computed host-side (e.g. "x214 · 8.6s" for hooks,
+    /// "12.4KB ~3.4k tok" for context, "1.2GB · 34% cpu" for the process tree).
+    /// Distinct from `summary`: `agg` is the dense computed rollup the UI shows
+    /// next to the section title; `summary` stays the simple count. Empty when
+    /// there is nothing to aggregate. Backward-compatible.
+    #[serde(default)]
+    pub agg: Option<String>,
+    /// Whether the UI should render this section collapsed by default (e.g. a
+    /// long low-signal catalog). `false` = expanded. Backward-compatible.
+    #[serde(default)]
+    pub collapsed_default: bool,
     pub rows: Vec<HarnessRow>,
 }
 
@@ -86,15 +135,24 @@ mod tests {
             sections: vec![HarnessSection {
                 title: "HOOKS".to_string(),
                 summary: "7".to_string(),
+                agg: Some("x214 · 8.6s".to_string()),
+                collapsed_default: false,
                 rows: vec![HarnessRow {
                     key: "hook:0".to_string(),
-                    label: "PreToolUse pkg-guard".to_string(),
+                    label: "pkg-guard".to_string(),
                     meta: "x41 avg 180ms".to_string(),
                     state: RowState::Idle,
                     tooltip: "runs before every Bash call".to_string(),
                     openable: true,
                     can_disable: true,
                     indent: 0,
+                    group: Some("PreToolUse".to_string()),
+                    tok_loaded: None,
+                    tok_full: None,
+                    tok_src: Some("not determinable".to_string()),
+                    load_when: None,
+                    loaded_at: None,
+                    scope: Some("global".to_string()),
                 }],
             }],
         };

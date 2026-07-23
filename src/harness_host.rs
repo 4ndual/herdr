@@ -30,6 +30,27 @@ const FULL_RESCAN_TICKS: u32 = 5;
 const ACTIVE_WINDOW: Duration = Duration::from_secs(2);
 /// Hard cap on rows per section so the model stays under the 64 KiB input cap.
 const MAX_ROWS: usize = 12;
+/// Row cap for the process tree: the SUM in the SESSION aggregate covers the
+/// whole tree, but only this many individual descendant rows are emitted.
+const MAX_PROC_ROWS: usize = 15;
+
+/// Chars-per-token ratio used for every context-size estimate here. Phase-3 R7
+/// calibration measured this against real `/context` category totals for two
+/// live Claude Code sessions (fable-5). The two cleanly-attributable anchors —
+/// skill descriptions (59 skills, 7.6k `/context` tokens) and custom-agent
+/// descriptions (6 agents, 308 tokens) — both land at ~3.0 chars/tok: at 3.0 the
+/// panel reads skills within +1.7% and agents within +2.3% of `/context`. (The
+/// CLAUDE.md memory anchor implies a denser ~2.8 but its `/context` file set is
+/// ambiguous, so the reliable description anchors win.) Tune this single
+/// constant so all estimates move together; do not scatter `/ 4` divides.
+const CHARS_PER_TOKEN: f64 = 3.0;
+
+/// Estimate tokens from a byte length via [`CHARS_PER_TOKEN`]. Markdown/context
+/// files are mostly ASCII, so byte length ≈ char length — accurate enough for a
+/// budget readout and calibratable through the one ratio constant.
+fn estimate_tokens(bytes: usize) -> u32 {
+    (bytes as f64 / CHARS_PER_TOKEN).ceil() as u32
+}
 
 // ── Collector cache ────────────────────────────────────────────────────────
 
@@ -44,15 +65,52 @@ struct HookStat {
     last_seen: Option<Instant>,
 }
 
+/// One in-session file/memory read observed in the transcript, with enough to
+/// bill it honestly (R9), timestamp it (R11), and evict it (R12).
+#[derive(Default, Clone)]
+struct CtxRead {
+    /// Recorded content length from the attachment (0 if the attachment carried
+    /// no inline content — the collector then stats the real path).
+    bytes: usize,
+    /// Monotonic event index at load time; `<= last_compaction_seq` ⇒ evicted.
+    seq: u64,
+    /// Load timestamp ("HH:MM"), empty if the line had none.
+    at: String,
+}
+
 #[derive(Default)]
 struct JsonlStats {
     hooks: HashMap<String, HookStat>,
     mcp_calls: HashMap<String, u64>,
     skill_calls: HashMap<String, u64>,
+    /// Last (seq, "HH:MM") a skill was invoked — for loaded_at + eviction.
+    skill_last: HashMap<String, (u64, String)>,
     tool_errors: u64,
-    ctx_files: HashMap<String, usize>,
+    /// In-session reads keyed by path (replaces the old bytes-only map).
+    ctx_reads: HashMap<String, CtxRead>,
     in_tokens: u64,
     out_tokens: u64,
+    /// Monotonic transcript-event counter (drives eviction ordering).
+    seq: u64,
+    /// Number of compaction boundaries seen, and the seq/time of the last one.
+    compaction_count: u64,
+    last_compaction_seq: u64,
+    last_compaction_at: String,
+    // ── Measured start-of-conversation context costs (R6 provenance) ─────────
+    // These come straight from the transcript's own bookkeeping attachments, so
+    // the token numbers are measured bytes of what Claude Code actually loaded,
+    // not a guess.
+    /// Bytes of the `skill_listing` attachment: the skill catalog (name +
+    /// description lines) injected into the system prompt at conversation start.
+    skill_listing_bytes: usize,
+    /// server name → bytes of its `mcp_instructions_delta` block loaded at start.
+    mcp_instr_bytes: HashMap<String, usize>,
+    /// Deferred tool NAMES currently in context (they cost only their name line,
+    /// not a full schema, until fetched). Kept to bill each MCP its share.
+    deferred_names: Vec<String>,
+    /// agent type → bytes of its `agent_listing_delta` description line loaded
+    /// at start.
+    agent_desc_bytes: HashMap<String, usize>,
 }
 
 /// A hook entry resolved from a settings file, addressable for disable edits.
@@ -66,6 +124,16 @@ struct HookEntry {
     name: String,
     command: String,
     script: Option<PathBuf>,
+}
+
+/// A user skill: its catalog name, `SKILL.md` path, and the measured byte
+/// length of its frontmatter `description` (the part injected into the system
+/// prompt at conversation start; the body loads only on invoke).
+#[derive(Clone)]
+struct SkillEntry {
+    name: String,
+    path: PathBuf,
+    desc_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -88,8 +156,19 @@ struct HarnessCache {
     hooks: Vec<HookEntry>,
     mcps: Vec<McpEntry>,
     plugins: Vec<String>,
-    skills: Vec<(String, PathBuf)>,
+    skills: Vec<SkillEntry>,
+    /// Custom agent types: (name, definition .md path). From `~/.claude/agents`.
+    agents: Vec<(String, PathBuf)>,
+    /// Individual memory files under the session project's `memory/` dir (each
+    /// loads on-recall, not at start — only MEMORY.md is loaded at start).
+    mem_files: Vec<PathBuf>,
+    /// Resolved memory index path (`MEMORY.md`) for the session, if present.
+    mem_index: Option<PathBuf>,
     profile: Option<String>,
+    /// R10: human one-line hook explanations keyed by hook display name, loaded
+    /// from `<plugin_state>/hook-descriptions.json`. Empty ⇒ tooltips fall back
+    /// to the raw command. Reloaded on the config rescan.
+    hook_descriptions: HashMap<String, String>,
     /// Which agent CLI drives the focused session: "claude", "cx" (Claude Code
     /// routed through the CCR gateway), "codex", "pi", or "terminal". Derived on
     /// the full rescan (cx vs claude comes from which projects root the resolved
@@ -97,6 +176,20 @@ struct HarnessCache {
     /// "claude".
     agent_kind: String,
     session_lines: Vec<(String, String, String, u8)>, // (label, meta, tooltip, indent)
+    /// R14: whether the panel was visibly expanded on the previous tick (drives
+    /// the refresh-on-open force + the lazy/hidden cadence).
+    was_visible: bool,
+    /// R14: consecutive hidden ticks skipped since the last hidden refresh.
+    hidden_skips: u32,
+    /// R15: the last JSON written, so an unchanged model skips the file write
+    /// entirely (unchanged input file = zero guest work).
+    last_written: Option<String>,
+    /// R15: mtime signature of the config inputs, so `full_rescan` re-parses
+    /// settings/skills/agents only when one actually changed.
+    config_sig: u64,
+    /// SESSION header aggregate: total RAM + CPU over the WHOLE process tree
+    /// (e.g. "1.2GB rss · 34% cpu · 22 procs · gpu n/det"). Empty until resolved.
+    session_agg: String,
 }
 
 /// App-derived, per-tick facts the pure `refresh`/`full_rescan` path cannot get
@@ -127,17 +220,64 @@ struct TmuxAttach {
 
 static CACHE: Mutex<Option<HarnessCache>> = Mutex::new(None);
 
+/// R14: how many ~1 Hz ticks to skip between refreshes while the panel is
+/// hidden. ~15 ticks ≈ 15 s: just enough that the rail icon state stays sane.
+const HIDDEN_TICKS: u32 = 15;
+
+/// R14: is the harness panel currently expanded (a carved rect wider than the
+/// slim collapsed handle)? The host tracks carved panel rects per plugin; a
+/// width <= 3 is the collapsed handle (see `render_handle`).
+fn harness_panel_visible(app: &App) -> bool {
+    app.state.view.panel_rects.iter().any(|p| {
+        p.plugin_id == crate::app::HARNESS_PLUGIN_ID
+            && p.rect.width > 3
+            && p.rect.height > 1
+    })
+}
+
 /// Republish the harness render input from the focused Claude pane. Called on
 /// the dash tick (~1 Hz) next to [`crate::historial_host::tick`].
+///
+/// R14 adaptive cadence: refresh at the full ~1 Hz only while the panel is
+/// visibly expanded; when hidden, do the expensive work at most every
+/// [`HIDDEN_TICKS`] ticks — but always force one refresh on the hidden→visible
+/// transition so the first open frame is never stale. R15: skip the file write
+/// entirely when the rendered model is byte-identical to what was last written.
 pub fn tick(app: &mut App) {
-    let focus = crate::plugin_focus::focus_input(&app.state);
+    let visible = harness_panel_visible(app);
+    // Decide (cheaply, before the costly env probe) whether to work this tick.
+    let do_work = {
+        let mut guard = match CACHE.lock() {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::warn!(error = %err, "harness cache mutex poisoned; skipping tick");
+                return;
+            }
+        };
+        let cache = guard.get_or_insert_with(HarnessCache::default);
+        let became_visible = visible && !cache.was_visible;
+        cache.was_visible = visible;
+        if visible || became_visible {
+            cache.hidden_skips = 0;
+            true
+        } else if cache.hidden_skips + 1 >= HIDDEN_TICKS {
+            cache.hidden_skips = 0;
+            true
+        } else {
+            cache.hidden_skips += 1;
+            false
+        }
+    };
+    if !do_work {
+        return;
+    }
     // Resolve the app-derived session facts (live agent pid, herdr pane id and
     // attach command, any inner tmux) the same way `handle_pane_process_info`
-    // reaches the pane's foreground job, before locking the cache. This works in
-    // the headless server tick path too, since that is where this tick runs for
-    // client/server mode.
+    // reaches the pane's foreground job. Only on a working tick, so a hidden
+    // panel does no process probing.
+    let focus = crate::plugin_focus::focus_input(&app.state);
     let env = resolve_session_env(app);
-    let json = {
+    let to_write = {
         let mut guard = match CACHE.lock() {
             Ok(g) => g,
             Err(err) => {
@@ -147,9 +287,17 @@ pub fn tick(app: &mut App) {
         };
         let cache = guard.get_or_insert_with(HarnessCache::default);
         refresh(cache, &focus, &env);
-        render_json(cache)
+        match render_json(cache) {
+            // R15: unchanged model ⇒ don't rewrite the input file (zero guest work).
+            Some(json) if cache.last_written.as_deref() == Some(json.as_str()) => None,
+            Some(json) => {
+                cache.last_written = Some(json.clone());
+                Some(json)
+            }
+            None => None,
+        }
     };
-    if let Some(json) = json {
+    if let Some(json) = to_write {
         app.write_harness_input_file(&json);
     }
 }
@@ -276,10 +424,61 @@ fn refresh(
     if let Some(path) = cache.transcript.clone() {
         scan_jsonl(cache, &path);
     }
+    // R15: the config scan (settings/hooks/skills/agents/memory/ctx) is expensive
+    // but rarely changes, so run it on the slow cadence AND only re-parse when a
+    // cheap mtime signature moved. The process/RAM rollup is cheap and must
+    // update at 1 Hz, so it runs every working tick.
     if cache.tick % FULL_RESCAN_TICKS == 0 {
-        full_rescan(cache, &sid, &cwd, env);
+        let sig = config_signature(&cwd);
+        if sig != cache.config_sig || cache.ctx_paths.is_empty() {
+            cache.config_sig = sig;
+            full_rescan(cache, &sid, &cwd);
+        } else {
+            // Config unchanged: still refresh agent_kind cheaply (transcript-derived).
+            refresh_agent_kind(cache);
+        }
     }
+    refresh_session_lines(cache, &sid, env);
     cache.tick = cache.tick.wrapping_add(1);
+}
+
+/// Cheap mtime signature over the config inputs (R15): re-parse only on change.
+/// Combines mtimes of the settings files, `~/.claude.json`, the hook-descriptions
+/// map, and the skills/agents/memory directory listings. Content edits inside a
+/// skill/agent body are billed by re-stat at render time, so they need not force
+/// a config re-parse.
+fn config_signature(cwd: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let home = home_dir();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mtime = |p: &Path| -> u64 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let enc: String = cwd
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    for p in [
+        home.join(".claude/settings.json"),
+        home.join(".claude/settings.local.json"),
+        home.join(".claude.json"),
+        home.join(".claude/skills"),
+        home.join(".claude/agents"),
+        home.join(format!(".claude/projects/{enc}/memory")),
+        crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
+            .join("hook-descriptions.json"),
+        PathBuf::from(cwd).join(".claude/settings.json"),
+        PathBuf::from(cwd).join(".claude/settings.local.json"),
+        PathBuf::from(cwd).join("CLAUDE.md"),
+    ] {
+        mtime(&p).hash(&mut h);
+    }
+    h.finish()
 }
 
 // ── Transcript scanning (incremental) ──────────────────────────────────────
@@ -321,7 +520,34 @@ fn scan_jsonl(cache: &mut HarnessCache, path: &Path) {
     }
 }
 
+/// Convert an ISO-8601 transcript timestamp ("2026-07-23T18:46:42.086Z") to a
+/// short local-ish "HH:MM" for display. Returns empty on any parse miss (the UI
+/// simply omits the marker then).
+fn short_time(ts: &str) -> String {
+    // The transcript uses UTC "…THH:MM:SS…Z"; show HH:MM as-is (UTC). A precise
+    // local conversion would need a tz dependency we deliberately avoid here.
+    ts.split_once('T')
+        .and_then(|(_, t)| t.get(..5))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
+    stats.seq += 1;
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .map(short_time)
+        .unwrap_or_default();
+    // R12: a compaction boundary summarizes and drops prior conversation reads.
+    if v.get("type").and_then(|t| t.as_str()) == Some("system")
+        && v.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary")
+    {
+        stats.compaction_count += 1;
+        stats.last_compaction_seq = stats.seq;
+        stats.last_compaction_at = ts.clone();
+        return;
+    }
     match v.get("type").and_then(|t| t.as_str()) {
         Some("attachment") => {
             let Some(a) = v.get("attachment") else { return };
@@ -362,7 +588,10 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                             .and_then(|c| c.as_str())
                             .map(|c| c.len())
                             .unwrap_or(0);
-                        stats.ctx_files.insert(name.to_string(), len);
+                        stats.ctx_reads.insert(
+                            name.to_string(),
+                            CtxRead { bytes: len, seq: stats.seq, at: ts.clone() },
+                        );
                     }
                 }
                 Some("nested_memory") => {
@@ -372,7 +601,54 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                             .and_then(|c| c.as_str())
                             .map(|c| c.len())
                             .unwrap_or(0);
-                        stats.ctx_files.insert(name.to_string(), len);
+                        stats.ctx_reads.insert(
+                            name.to_string(),
+                            CtxRead { bytes: len, seq: stats.seq, at: ts.clone() },
+                        );
+                    }
+                }
+                Some("skill_listing") => {
+                    // The whole skill catalog (name + description per skill) is
+                    // injected at conversation start; its byte length is the
+                    // measured loaded cost of "skills in context".
+                    if let Some(c) = a.get("content").and_then(|c| c.as_str()) {
+                        stats.skill_listing_bytes = c.len();
+                    }
+                }
+                Some("mcp_instructions_delta") => {
+                    // Per-server instruction blocks loaded at start; measure each.
+                    if let (Some(names), Some(blocks)) = (
+                        a.get("addedNames").and_then(|n| n.as_array()),
+                        a.get("addedBlocks").and_then(|b| b.as_array()),
+                    ) {
+                        for (n, b) in names.iter().zip(blocks.iter()) {
+                            if let (Some(name), Some(block)) = (n.as_str(), b.as_str()) {
+                                stats.mcp_instr_bytes.insert(name.to_string(), block.len());
+                            }
+                        }
+                    }
+                }
+                Some("deferred_tools_delta") => {
+                    if let Some(added) = a.get("addedNames").and_then(|n| n.as_array()) {
+                        for n in added {
+                            if let Some(name) = n.as_str() {
+                                stats.deferred_names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                Some("agent_listing_delta") => {
+                    // addedTypes[i] pairs with addedLines[i] (the description line
+                    // loaded into the system prompt at start).
+                    if let (Some(types), Some(lines)) = (
+                        a.get("addedTypes").and_then(|t| t.as_array()),
+                        a.get("addedLines").and_then(|l| l.as_array()),
+                    ) {
+                        for (t, l) in types.iter().zip(lines.iter()) {
+                            if let (Some(ty), Some(line)) = (t.as_str(), l.as_str()) {
+                                stats.agent_desc_bytes.insert(ty.to_string(), line.len());
+                            }
+                        }
                     }
                 }
                 Some("invoked_skills") => {
@@ -380,6 +656,9 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                         for s in skills {
                             if let Some(name) = s.get("name").and_then(|n| n.as_str()) {
                                 *stats.skill_calls.entry(name.to_string()).or_default() += 1;
+                                stats
+                                    .skill_last
+                                    .insert(name.to_string(), (stats.seq, ts.clone()));
                             }
                         }
                     }
@@ -412,6 +691,9 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                         .and_then(|s| s.as_str())
                     {
                         *stats.skill_calls.entry(skill.to_string()).or_default() += 1;
+                        stats
+                            .skill_last
+                            .insert(skill.to_string(), (stats.seq, ts.clone()));
                     }
                 }
             }
@@ -491,6 +773,29 @@ fn hook_script_path(command: &str) -> Option<PathBuf> {
         .find(|p| p.is_absolute() && p.is_file())
 }
 
+/// Read a single scalar field from a markdown file's leading YAML frontmatter
+/// (`--- … ---`). Returns the trimmed value, or `None` if absent. Used for a
+/// skill's `description` and an agent's `name`/`description`. Best-effort: only
+/// handles the flat `key: value` shape these files use.
+fn frontmatter_field(path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    let prefix = format!("{key}:");
+    for line in lines {
+        let t = line.trim();
+        if t == "---" {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix(&prefix) {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
 fn collect_hooks_from(file: &Path, out: &mut Vec<HookEntry>) {
     let Some(root) = read_json(file) else { return };
     let Some(events) = root.get("hooks").and_then(|h| h.as_object()) else {
@@ -530,6 +835,78 @@ fn collect_hooks_from(file: &Path, out: &mut Vec<HookEntry>) {
     }
 }
 
+/// One row of the `ps -axo pid=,ppid=,%cpu=,rss=,command=` snapshot.
+struct ProcInfo {
+    ppid: u32,
+    cpu: f64,
+    rss_kb: u64,
+    command: String,
+}
+
+/// Parse the `ps` snapshot into a pid → [`ProcInfo`] map. Malformed lines are
+/// skipped rather than panicking (no `unwrap`).
+fn parse_ps(ps: &str) -> HashMap<u32, ProcInfo> {
+    let mut map = HashMap::new();
+    for line in ps.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid), Some(cpu), Some(rss)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        map.insert(
+            pid,
+            ProcInfo {
+                ppid,
+                cpu: cpu.parse().unwrap_or(0.0),
+                rss_kb: rss.parse().unwrap_or(0),
+                command: it.collect::<Vec<_>>().join(" "),
+            },
+        );
+    }
+    map
+}
+
+/// Return `(pid, depth)` for `root` and every descendant, breadth-first, so the
+/// caller can sum resources over the whole tree and indent per depth. `root` is
+/// depth 0. Bounded by the snapshot size; cycles (shouldn't happen in a real
+/// process table) are broken by a visited set.
+fn descendant_tree(procs: &HashMap<u32, ProcInfo>, root: u32) -> Vec<(u32, usize)> {
+    let mut out = vec![(root, 0usize)];
+    let mut visited = std::collections::HashSet::from([root]);
+    let mut i = 0;
+    while i < out.len() {
+        let (parent, depth) = out[i];
+        i += 1;
+        // Deterministic order: children sorted by pid.
+        let mut kids: Vec<u32> = procs
+            .iter()
+            .filter(|(pid, p)| p.ppid == parent && !visited.contains(pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        kids.sort_unstable();
+        for k in kids {
+            if visited.insert(k) {
+                out.push((k, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Format a kilobyte count as MB or GB.
+fn fmt_mb(kb: u64) -> String {
+    let mb = kb as f64 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.1}GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0}MB")
+    }
+}
+
 fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
     out.status
@@ -537,20 +914,25 @@ fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, env: &SessionEnv) {
-    let home = home_dir();
-
-    // Which agent drives this session. The target is only ever set for a Claude
-    // pane (see `refresh`), so the split is claude vs cx: a cx session (Claude
-    // Code routed through the CCR gateway) writes its transcript under
-    // `~/.claude-code-router/profiles/<p>/claude/projects/…` rather than
-    // `~/.claude/projects/…`, so the resolved transcript path tells them apart.
+/// Derive which CLI drives the session from the resolved transcript path: a cx
+/// session (Claude Code via the CCR gateway) writes under
+/// `~/.claude-code-router/profiles/…`, plain Claude under `~/.claude/projects/…`.
+/// Cheap; safe to call every tick without a full config re-parse.
+fn refresh_agent_kind(cache: &mut HarnessCache) {
     cache.agent_kind = match &cache.transcript {
         Some(p) if p.to_string_lossy().contains(".claude-code-router/profiles/") => "cx",
         _ => "claude",
     }
     .to_string();
-    let agent_kind = cache.agent_kind.clone();
+}
+
+/// Re-parse the config inputs (settings/hooks/mcps/plugins/skills/agents/ctx/
+/// memory). Expensive but mtime-gated by the caller (R15). Does NOT build the
+/// process/session lines — those run every tick via [`refresh_session_lines`].
+fn full_rescan(cache: &mut HarnessCache, _sid: &str, cwd: &str) {
+    let home = home_dir();
+
+    refresh_agent_kind(cache);
 
     // Context file candidates: static harness inputs that exist on disk.
     cache.ctx_paths.clear();
@@ -578,6 +960,20 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, env: &SessionEnv)
     let proj = PathBuf::from(cwd);
     collect_hooks_from(&proj.join(".claude/settings.json"), &mut cache.hooks);
     collect_hooks_from(&proj.join(".claude/settings.local.json"), &mut cache.hooks);
+
+    // R10: human hook descriptions (authored map; falls back to command).
+    cache.hook_descriptions.clear();
+    let desc_file = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
+        .join("hook-descriptions.json");
+    if let Some(map) = read_json(&desc_file).and_then(|v| v.as_object().cloned()) {
+        for (k, v) in map {
+            if let Some(s) = v.as_str() {
+                if !k.starts_with('_') {
+                    cache.hook_descriptions.insert(k, s.to_string());
+                }
+            }
+        }
+    }
 
     // ccp profile.
     cache.profile = read_json(&home.join(".claude/settings.json"))
@@ -632,13 +1028,67 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, env: &SessionEnv)
             let p = e.path();
             if p.is_dir() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                cache.skills.push((name, p.join("SKILL.md")));
+                let skill_md = p.join("SKILL.md");
+                let desc_bytes = frontmatter_field(&skill_md, "description")
+                    .map(|d| d.len())
+                    .unwrap_or(0);
+                cache.skills.push(SkillEntry {
+                    name,
+                    path: skill_md,
+                    desc_bytes,
+                });
             }
         }
-        cache.skills.sort();
+        cache.skills.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
-    // Session / process lines.
+    // Custom agent types (`~/.claude/agents/*.md`). Each definition's frontmatter
+    // description loads into the system prompt at start; the body loads on spawn.
+    cache.agents.clear();
+    if let Ok(entries) = std::fs::read_dir(home.join(".claude/agents")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                let name = frontmatter_field(&p, "name")
+                    .unwrap_or_else(|| basename(&p).trim_end_matches(".md").to_string());
+                cache.agents.push((name, p));
+            }
+        }
+        cache.agents.sort();
+    }
+
+    // Memory files for the session's project encoding: MEMORY.md is the index
+    // loaded at start; each sibling file loads on-recall.
+    cache.mem_files.clear();
+    cache.mem_index = None;
+    let mem_dir = home.join(format!(".claude/projects/{enc}/memory"));
+    let mem_index = mem_dir.join("MEMORY.md");
+    if mem_index.is_file() {
+        cache.mem_index = Some(mem_index.clone());
+    }
+    if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("md")
+                && p.file_name().and_then(|f| f.to_str()) != Some("MEMORY.md")
+            {
+                cache.mem_files.push(p);
+            }
+        }
+        cache.mem_files.sort();
+    }
+}
+
+/// Rebuild the SESSION section's process/attach lines and the whole-tree RAM/CPU
+/// aggregate. Runs EVERY working tick (cheap: one `ps` snapshot + string work)
+/// so RAM/CPU update at ~1 Hz while the panel is open (R14/R15). Reads the
+/// agent_kind/profile the config scan already cached.
+fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) {
+    let agent_kind = if cache.agent_kind.is_empty() {
+        "claude".to_string()
+    } else {
+        cache.agent_kind.clone()
+    };
     cache.session_lines.clear();
     let sid8: String = sid.chars().take(8).collect();
     cache.session_lines.push((
@@ -671,58 +1121,74 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, env: &SessionEnv)
             0,
         ));
     }
-    // Claude process: match the session id in a command line. On a match we also
-    // emit one indented row per child process (up to 5), mirroring the parent's
-    // pid/cpu/rss and carrying the full command line in the tooltip.
+    // Claude process tree: resolve the root pid, then walk the FULL descendant
+    // tree (recursive ppid descent over one `ps` snapshot) so the SESSION
+    // aggregate reflects every worker/tool subprocess, not just depth-1 children.
+    cache.session_agg.clear();
     let mut proc_line = ("process: n/det".to_string(), String::new(),
         format!("no {agent_kind} process with this session id in its command line (fresh sessions may not carry --resume)"), 0u8);
     let mut child_lines: Vec<(String, String, String, u8)> = Vec::new();
     if let Some(ps) = run_capture("ps", &["-axo", "pid=,ppid=,%cpu=,rss=,command="]) {
-        let rows: Vec<&str> = ps.lines().collect();
-        // Prefer the pid herdr resolved from the pane's foreground job (works
-        // for fresh sessions with no --resume in argv); fall back to the sid
-        // grep for older/resumed sessions that carry it.
-        let by_pid = env.agent_pid.and_then(|pid| {
-            let pidstr = pid.to_string();
-            rows.iter()
-                .find(|l| l.split_whitespace().next() == Some(pidstr.as_str()))
-        });
-        if let Some(line) = by_pid.or_else(|| rows.iter().find(|l| l.contains(sid))) {
-            let mut it = line.split_whitespace();
-            let pid = it.next().unwrap_or("?").to_string();
-            let _ppid = it.next();
-            let cpu = it.next().unwrap_or("?").to_string();
-            let rss_kb: u64 = it.next().and_then(|r| r.parse().ok()).unwrap_or(0);
-            let children: Vec<&&str> = rows
-                .iter()
-                .filter(|l| l.split_whitespace().nth(1) == Some(pid.as_str()))
-                .collect();
-            proc_line = (
-                format!("{agent_kind} pid {pid}"),
-                format!("{cpu}% {}MB +{}", rss_kb / 1024, children.len()),
-                format!("cpu {cpu}% · rss {}MB · {} child procs", rss_kb / 1024, children.len()),
-                0,
+        let procs = parse_ps(&ps);
+        // Prefer the pid herdr resolved from the pane's foreground job; fall back
+        // to the sid grep for older/resumed sessions that carry it in argv.
+        let root_pid = env
+            .agent_pid
+            .filter(|p| procs.contains_key(p))
+            .or_else(|| {
+                procs
+                    .iter()
+                    .find(|(_, p)| p.command.contains(sid))
+                    .map(|(pid, _)| *pid)
+            });
+        if let Some(root_pid) = root_pid {
+            // Whole-tree rollup (breadth-first over ppid links).
+            let tree = descendant_tree(&procs, root_pid);
+            let mut total_cpu = 0.0f64;
+            let mut total_rss_kb: u64 = 0;
+            for (pid, depth) in &tree {
+                if let Some(p) = procs.get(pid) {
+                    total_cpu += p.cpu;
+                    total_rss_kb += p.rss_kb;
+                    let _ = depth;
+                }
+            }
+            let n = tree.len();
+            cache.session_agg = format!(
+                "{} rss · {:.0}% cpu · {n} procs · gpu n/det",
+                fmt_mb(total_rss_kb),
+                total_cpu
             );
-            for child in children.iter().take(5) {
-                let mut cit = child.split_whitespace();
-                let cpid = cit.next().unwrap_or("?").to_string();
-                let _cppid = cit.next();
-                let ccpu = cit.next().unwrap_or("?").to_string();
-                let crss_kb: u64 = cit.next().and_then(|r| r.parse().ok()).unwrap_or(0);
-                let command: String = cit.collect::<Vec<_>>().join(" ");
-                let base = command
-                    .split_whitespace()
-                    .next()
-                    .map(|t| Path::new(t))
-                    .map(basename)
-                    .unwrap_or_else(|| "?".to_string());
-                let cmd_trunc: String = command.chars().take(200).collect();
-                child_lines.push((
-                    format!("└ {base}"),
-                    format!("{cpid} {ccpu}% {}MB", crss_kb / 1024),
-                    format!("cmd: {cmd_trunc}"),
-                    1,
-                ));
+            if let Some(root) = procs.get(&root_pid) {
+                proc_line = (
+                    format!("{agent_kind} pid {root_pid}"),
+                    format!("{:.0}% {} +{}", root.cpu, fmt_mb(root.rss_kb), n.saturating_sub(1)),
+                    format!(
+                        "cpu {:.0}% · rss {} · {} descendant procs (whole-tree sum in header)\nrss overstates real memory on macOS (shared pages counted per-process)",
+                        root.cpu, fmt_mb(root.rss_kb), n.saturating_sub(1)
+                    ),
+                    0,
+                );
+            }
+            // Per-descendant rows (skip the root itself), capped; the SUM above
+            // still covers every process even past the cap.
+            for (pid, depth) in tree.iter().filter(|(p, _)| *p != root_pid).take(MAX_PROC_ROWS) {
+                if let Some(p) = procs.get(pid) {
+                    let base = p
+                        .command
+                        .split_whitespace()
+                        .next()
+                        .map(Path::new)
+                        .map(basename)
+                        .unwrap_or_else(|| "?".to_string());
+                    let cmd_trunc: String = p.command.chars().take(200).collect();
+                    child_lines.push((
+                        format!("└ {base}"),
+                        format!("{pid} {:.0}% {}", p.cpu, fmt_mb(p.rss_kb)),
+                        format!("cmd: {cmd_trunc}"),
+                        (*depth as u8).min(4).max(1),
+                    ));
+                }
             }
         }
     }
@@ -774,14 +1240,15 @@ fn fmt_bytes(n: usize) -> String {
     }
 }
 
-fn fmt_tokens_approx(bytes: usize) -> String {
-    let tok = bytes / 4;
+/// Format a raw token count for display.
+fn fmt_tokens(tok: u32) -> String {
     if tok >= 1000 {
         format!("~{:.1}k tok", tok as f64 / 1000.0)
     } else {
         format!("~{tok} tok")
     }
 }
+
 
 fn basename(p: &Path) -> String {
     p.file_name()
@@ -820,6 +1287,7 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
         sections.push(mcps_section(cache));
         sections.push(plugins_section(cache));
         sections.push(skills_section(cache));
+        sections.push(agents_section(cache));
     }
     let model = HarnessRenderModel { target, sections };
     match serde_json::to_string(&model) {
@@ -831,43 +1299,172 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
     }
 }
 
+/// Config scope of a context path: user-level `~/.claude` files load in EVERY
+/// session ("global"); a per-project memory dir or a project file is "session".
+fn ctx_scope(path: &Path, home: &Path) -> &'static str {
+    if path.starts_with(home.join(".claude/projects")) {
+        "session" // per-project memory
+    } else if path.starts_with(home.join(".claude")) {
+        "global"
+    } else {
+        "session"
+    }
+}
+
 fn context_section(cache: &HarnessCache) -> HarnessSection {
+    let home = home_dir();
     let mut rows = Vec::new();
-    let mut total = 0usize;
+    let mut loaded_tok = 0u32; // tokens occupying context NOW.
     for (i, path) in cache.ctx_paths.iter().take(MAX_ROWS).enumerate() {
         let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
-        total += bytes;
+        let tok = estimate_tokens(bytes);
+        loaded_tok += tok;
+        let scope = ctx_scope(path, &home);
         rows.push(HarnessRow {
             key: format!("ctx:{i}"),
             label: display_path(path),
-            meta: format!("{} {}", fmt_bytes(bytes), fmt_tokens_approx(bytes)),
+            meta: format!("{} {}", fmt_bytes(bytes), fmt_tokens(tok)),
             state: RowState::None,
-            tooltip: format!("{}\nclick to open in a pane", display_path(path)),
+            tooltip: format!(
+                "{}\nloaded at start ({scope}) · {} measured on disk\nclick to open in a pane",
+                display_path(path),
+                fmt_bytes(bytes)
+            ),
             openable: true,
             can_disable: false,
             indent: 0,
+            group: Some("persistent".to_string()),
+            tok_loaded: Some(tok),
+            tok_full: Some(tok),
+            tok_src: Some(format!("file {}", fmt_bytes(bytes))),
+            load_when: Some("start".to_string()),
+            scope: Some(scope.to_string()),
+            ..Default::default()
         });
     }
-    // Files the transcript itself reports as loaded (Read/nested_memory).
-    let mut seen: Vec<(&String, &usize)> = cache.stats.ctx_files.iter().collect();
-    seen.sort_by(|a, b| b.1.cmp(a.1));
-    for (name, len) in seen.into_iter().take(MAX_ROWS.saturating_sub(rows.len())) {
-        total += *len;
-        let idx = cache.ctx_paths.len() + rows.len();
+    // Memory index MEMORY.md loads at start; individual memory files load
+    // on-recall (grouped under CONTEXT so the UI can nest them).
+    if let Some(idx) = &cache.mem_index {
+        let bytes = std::fs::metadata(idx).map(|m| m.len() as usize).unwrap_or(0);
+        let tok = estimate_tokens(bytes);
+        loaded_tok += tok;
         rows.push(HarnessRow {
-            key: format!("ctx:{idx}"),
-            label: basename(Path::new(name)),
-            meta: format!("{} {}", fmt_bytes(*len), fmt_tokens_approx(*len)),
+            key: "memidx:0".to_string(),
+            label: "MEMORY.md (index)".to_string(),
+            meta: format!("{} {}", fmt_bytes(bytes), fmt_tokens(tok)),
             state: RowState::None,
-            tooltip: format!("{name}\nloaded in-session (content-length proxy)"),
+            tooltip: format!(
+                "{}\nmemory index loaded at start · {} measured on disk\nclick to open",
+                display_path(idx),
+                fmt_bytes(bytes)
+            ),
+            openable: true,
+            can_disable: false,
+            indent: 0,
+            group: Some("memory".to_string()),
+            tok_loaded: Some(tok),
+            tok_full: Some(tok),
+            tok_src: Some(format!("MEMORY.md {}", fmt_bytes(bytes))),
+            load_when: Some("start".to_string()),
+            scope: Some("session".to_string()),
+            ..Default::default()
+        });
+    }
+    for (j, mp) in cache.mem_files.iter().take(MAX_ROWS).enumerate() {
+        let bytes = std::fs::metadata(mp).map(|m| m.len() as usize).unwrap_or(0);
+        let tok = estimate_tokens(bytes);
+        rows.push(HarnessRow {
+            key: format!("mem:{j}"),
+            label: basename(mp).trim_end_matches(".md").to_string(),
+            meta: format!("{} {}", fmt_bytes(bytes), fmt_tokens(tok)),
+            state: RowState::Off,
+            tooltip: format!(
+                "{}\nnot in context now — loads on-recall if referenced · {} on disk\nclick to open",
+                display_path(mp),
+                fmt_bytes(bytes)
+            ),
+            openable: true,
+            can_disable: false,
+            indent: 1,
+            group: Some("memory".to_string()),
+            tok_loaded: None,
+            tok_full: Some(tok),
+            tok_src: Some(format!("file {}", fmt_bytes(bytes))),
+            load_when: Some("on-recall".to_string()),
+            scope: Some("session".to_string()),
+            ..Default::default()
+        });
+    }
+    // Files the transcript reports as read this session (R9: never a fake 0 —
+    // use the recorded content length, else stat the real path, else "n/det";
+    // R11 loaded_at; R12 eviction after a compaction boundary).
+    let compacted = cache.stats.last_compaction_seq > 0;
+    let mut seen: Vec<(&String, &CtxRead)> = cache.stats.ctx_reads.iter().collect();
+    seen.sort_by(|a, b| b.1.seq.cmp(&a.1.seq)); // most-recent first
+    for (name, read) in seen.into_iter().take(MAX_ROWS.saturating_sub(rows.len())) {
+        // Real byte count: recorded content length wins; else stat the path.
+        let disk = std::fs::metadata(Path::new(name)).ok().map(|m| m.len() as usize);
+        let bytes: Option<usize> = if read.bytes > 0 {
+            Some(read.bytes)
+        } else {
+            disk.filter(|b| *b > 0)
+        };
+        let evicted = compacted && read.seq <= cache.stats.last_compaction_seq;
+        let (meta, tok_full, tok_src) = match bytes {
+            Some(b) => (
+                format!("{} {}", fmt_bytes(b), fmt_tokens(estimate_tokens(b))),
+                Some(estimate_tokens(b)),
+                Some(format!(
+                    "{} {}",
+                    if read.bytes > 0 { "transcript" } else { "disk" },
+                    fmt_bytes(b)
+                )),
+            ),
+            None => ("n/det".to_string(), None, Some("not determinable".to_string())),
+        };
+        let mut tooltip = format!("{name}\nread this session");
+        if !read.at.is_empty() {
+            tooltip.push_str(&format!(" at {}", read.at));
+        }
+        if evicted {
+            tooltip.push_str(&format!(
+                "\nEVICTED by compaction at {} — no longer verbatim in context",
+                cache.stats.last_compaction_at
+            ));
+        }
+        rows.push(HarnessRow {
+            key: format!("ctxr:{name}"),
+            label: basename(Path::new(name)),
+            meta,
+            state: if evicted { RowState::Off } else { RowState::None },
+            tooltip,
             openable: false,
             can_disable: false,
             indent: 1,
+            group: Some("session reads".to_string()),
+            tok_full,
+            tok_src,
+            load_when: Some(if evicted { "evicted" } else { "on-recall" }.to_string()),
+            loaded_at: (!read.at.is_empty()).then(|| read.at.clone()),
+            scope: Some("session".to_string()),
+            ..Default::default()
         });
     }
+    // R12: surface compaction so evicted rows have context.
+    let agg = if cache.stats.compaction_count > 0 {
+        format!(
+            "{} loaded · {}× compacted",
+            fmt_tokens(loaded_tok),
+            cache.stats.compaction_count
+        )
+    } else {
+        format!("{} loaded", fmt_tokens(loaded_tok))
+    };
     HarnessSection {
         title: "CONTEXT".to_string(),
-        summary: fmt_tokens_approx(total),
+        summary: fmt_tokens(loaded_tok),
+        agg: Some(agg),
+        collapsed_default: false,
         rows,
     }
 }
@@ -886,6 +1483,7 @@ fn session_section(cache: &HarnessCache) -> HarnessSection {
             openable: false,
             can_disable: false,
             indent: *indent,
+            ..Default::default()
         })
         .collect();
     HarnessSection {
@@ -895,6 +1493,8 @@ fn session_section(cache: &HarnessCache) -> HarnessSection {
             cache.stats.in_tokens / 1000,
             cache.stats.out_tokens / 1000
         ),
+        agg: (!cache.session_agg.is_empty()).then(|| cache.session_agg.clone()),
+        collapsed_default: false,
         rows,
     }
 }
@@ -920,59 +1520,110 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
         .chain(cache.hooks.iter().enumerate().filter(|(_, e)| !is_project(e)))
         .collect();
     for (i, entry) in ordered {
-        // Transcript hook names look like "PreToolUse:Bash" or "UserPromptSubmit";
-        // match stats by event prefix + command-derived name when possible.
-        let stat = cache
-            .stats
-            .hooks
-            .iter()
-            .find(|(k, _)| k.starts_with(&entry.event))
-            .map(|(_, s)| s);
-        let (count, meta, errs, timing) = match stat {
-            Some(s) => {
-                let count = if s.count > 0 { s.count } else { s.ctx_count };
-                let avg = if s.count > 0 { s.total_ms / s.count } else { 0 };
-                let last = s.last_ms;
-                let mut meta = format!("x{count} {avg}ms/{last}ms");
-                if s.err_count > 0 {
-                    meta.push_str(&format!(" !{}", s.err_count));
-                }
-                (count, meta, (s.err_count, s.err_ms), (avg, last))
+        // Transcript hook attachments are keyed at EVENT granularity (multiple
+        // hooks on one event are indistinguishable there), so attribute the
+        // aggregate of every stat for this event to the event GROUP. R3 grouping
+        // makes this correct by design: the number belongs to the group header,
+        // not to a single hook's row. `agg_event_stat` sums the event's stats.
+        let ev = agg_event_stat(&cache.stats, &entry.event);
+        let meta = if ev.count > 0 {
+            let avg = ev.total_ms / ev.count;
+            let mut m = format!("x{} {avg}ms/{}ms", ev.count, ev.last_ms);
+            if ev.err_count > 0 {
+                m.push_str(&format!(" !{}", ev.err_count));
             }
-            None => (0, "x0".to_string(), (0, 0), (0, 0)),
+            m
+        } else {
+            "x0".to_string()
         };
-        let active = stat
-            .and_then(|s| s.last_seen)
+        let active = ev
+            .last_seen
             .map(|t| t.elapsed() < ACTIVE_WINDOW)
             .unwrap_or(false);
-        let scope = if entry.file.starts_with(home_dir()) {
-            "user"
-        } else {
-            "project"
-        };
+        let user_scope = entry.file.starts_with(home_dir());
+        let scope = if user_scope { "user" } else { "project" };
+        // R10: human explanation if authored, else the raw command as fallback.
+        let human = cache
+            .hook_descriptions
+            .get(&entry.name)
+            .cloned()
+            .unwrap_or_else(|| format!("cmd: {}", entry.command));
         let mut tooltip = format!(
-            "{} ({})\nevent {} · matcher \"{}\"\ncmd: {}\nfired x{count} this session · avg {}ms · last {}ms · errors {} ({}ms lost)\ntoken cost: not determinable\nright-click to disable",
-            entry.name, scope, entry.event, entry.matcher, entry.command, timing.0, timing.1, errs.0, errs.1
+            "{} ({})\n{}\nevent {} · matcher \"{}\"\nevent fired x{} this session · avg {}ms · last {}ms · errors {} ({}ms lost)\ncounts are per-event group (transcript gives event-level granularity)\ntoken cost: not determinable\nright-click to disable",
+            entry.name, scope, human, entry.event, entry.matcher,
+            ev.count, if ev.count>0 {ev.total_ms/ev.count} else {0}, ev.last_ms, ev.err_count, ev.err_ms
         );
         if entry.script.is_some() {
             tooltip.push_str("\nclick opens the hook script");
         }
         rows.push(HarnessRow {
             key: format!("hook:{i}"),
-            label: format!("{} {}", entry.event, entry.name),
+            label: entry.name.clone(),
             meta,
             state: if active { RowState::Active } else { RowState::Idle },
             tooltip,
             openable: entry.script.is_some(),
             can_disable: true,
             indent: 0,
+            group: Some(entry.event.clone()),
+            tok_loaded: None,
+            tok_full: None,
+            tok_src: Some("not determinable".to_string()),
+            // A user-level hook runs in every session (global); a project hook is
+            // scoped to this repo (session).
+            scope: Some(if user_scope { "global" } else { "session" }.to_string()),
+            ..Default::default()
         });
     }
     rows.truncate(MAX_ROWS * 2);
+    // Header aggregate: total hook calls + total wall time across the session.
+    let mut total_calls = 0u64;
+    let mut total_ms = 0u64;
+    for s in cache.stats.hooks.values() {
+        total_calls += s.count;
+        total_ms += s.total_ms;
+    }
     HarnessSection {
         title: "HOOKS".to_string(),
         summary: format!("{}", cache.hooks.len()),
+        agg: Some(format!("x{total_calls} · {}", fmt_ms(total_ms))),
+        collapsed_default: false,
         rows,
+    }
+}
+
+/// Sum every recorded [`HookStat`] whose transcript key belongs to `event`
+/// (keys look like "PreToolUse" or "PreToolUse:Bash"), collapsing the
+/// event-level transcript granularity into one aggregate for the event group.
+fn agg_event_stat(stats: &JsonlStats, event: &str) -> HookStat {
+    let mut agg = HookStat::default();
+    for (k, s) in &stats.hooks {
+        if k == event || k.starts_with(&format!("{event}:")) {
+            let count = if s.count > 0 { s.count } else { s.ctx_count };
+            agg.count += count;
+            agg.total_ms += s.total_ms;
+            agg.err_count += s.err_count;
+            agg.err_ms += s.err_ms;
+            if s.last_ms != 0 {
+                agg.last_ms = s.last_ms;
+            }
+            if let Some(t) = s.last_seen {
+                agg.last_seen = Some(match agg.last_seen {
+                    Some(prev) if prev > t => prev,
+                    _ => t,
+                });
+            }
+        }
+    }
+    agg
+}
+
+/// Format milliseconds as "8.6s" for large totals, "820ms" otherwise.
+fn fmt_ms(ms: u64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
     }
 }
 
@@ -984,17 +1635,40 @@ fn mcps_section(cache: &HarnessCache) -> HarnessSection {
             Some(_) => "project",
             None => "global",
         };
+        // Measured start-of-conversation cost: this server's instruction block
+        // plus its deferred tool NAME lines (schemas cost nothing until fetched).
+        let instr_bytes = mcp_instr_bytes_for(&cache.stats, &entry.name);
+        let (defer_bytes, defer_n) = deferred_bytes_for(&cache.stats, &entry.name);
+        let (tok_loaded, tok_src, meta_tok) = if instr_bytes > 0 || defer_n > 0 {
+            let t = estimate_tokens(instr_bytes + defer_bytes);
+            (
+                Some(t),
+                Some(format!(
+                    "instr {} + {defer_n} deferred names",
+                    fmt_bytes(instr_bytes)
+                )),
+                fmt_tokens(t),
+            )
+        } else {
+            (None, Some("not determinable".to_string()), String::new())
+        };
         rows.push(HarnessRow {
             key: format!("mcp:{i}"),
             label: entry.name.clone(),
-            meta: format!("x{calls}"),
+            meta: format!("x{calls} {meta_tok}").trim().to_string(),
             state: if calls > 0 { RowState::Idle } else { RowState::Off },
             tooltip: format!(
-                "MCP server ({scope} scope)\ncalls this session: {calls}\ntoken cost: not determinable\nright-click to disable"
+                "MCP server ({scope} scope)\ncalls this session: {calls}\nloaded now: instructions {} + {defer_n} deferred tool names (schemas load on ToolSearch)\nright-click to disable",
+                fmt_bytes(instr_bytes)
             ),
             openable: false,
             can_disable: true,
             indent: 0,
+            tok_loaded,
+            tok_full: None,
+            tok_src,
+            load_when: Some("start".to_string()),
+            ..Default::default()
         });
     }
     // MCP servers observed in the transcript but not in this cwd's config
@@ -1012,13 +1686,45 @@ fn mcps_section(cache: &HarnessCache) -> HarnessSection {
             openable: false,
             can_disable: false,
             indent: 0,
+            tok_src: Some("not determinable".to_string()),
+            ..Default::default()
         });
     }
+    // Header aggregate: total MCP calls + total measured instruction bytes loaded.
+    let total_calls: u64 = cache.stats.mcp_calls.values().sum();
+    let instr_tok: u32 = cache
+        .stats
+        .mcp_instr_bytes
+        .values()
+        .map(|b| estimate_tokens(*b))
+        .sum();
     HarnessSection {
         title: "MCPS".to_string(),
         summary: format!("{}", rows.len()),
+        agg: Some(format!("x{total_calls} · {} instr", fmt_tokens(instr_tok))),
+        collapsed_default: false,
         rows,
     }
+}
+
+/// Bytes of the `mcp_instructions_delta` block for `server` (0 if none observed).
+fn mcp_instr_bytes_for(stats: &JsonlStats, server: &str) -> usize {
+    stats.mcp_instr_bytes.get(server).copied().unwrap_or(0)
+}
+
+/// Total bytes and count of deferred tool NAMES that belong to `server`
+/// (`mcp__<server>__*`). These names occupy context now; their schemas do not.
+fn deferred_bytes_for(stats: &JsonlStats, server: &str) -> (usize, usize) {
+    let prefix = format!("mcp__{server}__");
+    let mut bytes = 0;
+    let mut n = 0;
+    for name in &stats.deferred_names {
+        if name.starts_with(&prefix) {
+            bytes += name.len();
+            n += 1;
+        }
+    }
+    (bytes, n)
 }
 
 fn plugins_section(cache: &HarnessCache) -> HarnessSection {
@@ -1034,16 +1740,25 @@ fn plugins_section(cache: &HarnessCache) -> HarnessSection {
                 label: name.clone(),
                 meta: String::new(),
                 state: if off { RowState::Off } else { RowState::Idle },
-                tooltip: "claude code plugin (enabledPlugins in ~/.claude/settings.json)\nright-click to disable".to_string(),
+                tooltip: "claude code plugin (enabledPlugins in ~/.claude/settings.json)\ncontext cost folds into the skills/agents/MCP it registers (not separable per plugin)\nright-click to disable".to_string(),
                 openable: false,
                 can_disable: !off,
                 indent: 0,
+                tok_src: Some("not determinable".to_string()),
+                ..Default::default()
             }
         })
         .collect();
+    let enabled = cache
+        .plugins
+        .iter()
+        .filter(|n| !n.ends_with(" (off)"))
+        .count();
     HarnessSection {
         title: "PLUGINS".to_string(),
         summary: format!("{}", cache.plugins.len()),
+        agg: Some(format!("{enabled} enabled")),
+        collapsed_default: false,
         rows,
     }
 }
@@ -1051,31 +1766,130 @@ fn plugins_section(cache: &HarnessCache) -> HarnessSection {
 fn skills_section(cache: &HarnessCache) -> HarnessSection {
     let mut rows: Vec<HarnessRow> = Vec::new();
     // Invoked skills first (with counts), then the rest of the catalog.
-    let mut entries: Vec<(usize, &(String, PathBuf), u64)> = cache
+    let mut entries: Vec<(usize, &SkillEntry, u64)> = cache
         .skills
         .iter()
         .enumerate()
-        .map(|(i, e)| (i, e, cache.stats.skill_calls.get(&e.0).copied().unwrap_or(0)))
+        .map(|(i, e)| (i, e, cache.stats.skill_calls.get(&e.name).copied().unwrap_or(0)))
         .collect();
-    entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.1 .0.cmp(&b.1 .0)));
-    for (i, (name, path), calls) in entries.into_iter().take(MAX_ROWS) {
+    entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.name.cmp(&b.1.name)));
+    let compacted = cache.stats.last_compaction_seq > 0;
+    for (i, skill, calls) in entries.into_iter().take(MAX_ROWS) {
+        // tok_loaded: this skill's name + description line, injected into the
+        // system prompt at conversation start (measured from SKILL.md
+        // frontmatter). tok_full: the whole SKILL.md body, loaded only on invoke.
+        let desc_tok = estimate_tokens(skill.desc_bytes);
+        let body_bytes = std::fs::metadata(&skill.path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let body_tok = estimate_tokens(body_bytes);
+        // R11 loaded_at / R12 eviction from the last invoke.
+        let last = cache.stats.skill_last.get(&skill.name);
+        let loaded_at = last.map(|(_, at)| at.clone()).filter(|s| !s.is_empty());
+        let evicted =
+            compacted && last.map(|(seq, _)| *seq <= cache.stats.last_compaction_seq).unwrap_or(false);
+        let mut tooltip = format!(
+            "{}\ninvoked x{calls} this session\nloaded now: {} (description in catalog, loads every session)\nif invoked: +{} (SKILL.md body, {} on disk)\nskills load on demand — no disable (archive the skill dir instead)\nclick opens SKILL.md",
+            display_path(&skill.path), fmt_tokens(desc_tok), fmt_tokens(body_tok), fmt_bytes(body_bytes)
+        );
+        if let Some(at) = &loaded_at {
+            tooltip.push_str(&format!("\nlast invoked at {at}"));
+        }
+        if evicted {
+            tooltip.push_str(&format!(
+                "\nits body was summarized away at compaction {}",
+                cache.stats.last_compaction_at
+            ));
+        }
         rows.push(HarnessRow {
             key: format!("skill:{i}"),
-            label: name.clone(),
-            meta: if calls > 0 { format!("x{calls}") } else { String::new() },
+            label: skill.name.clone(),
+            meta: if calls > 0 {
+                format!("x{calls} {}", fmt_tokens(desc_tok))
+            } else {
+                fmt_tokens(desc_tok)
+            },
             state: if calls > 0 { RowState::Idle } else { RowState::Off },
+            tooltip,
+            openable: skill.path.is_file(),
+            can_disable: false,
+            indent: 0,
+            tok_loaded: Some(desc_tok),
+            tok_full: Some(body_tok),
+            tok_src: Some(format!("desc {}B · body {}", skill.desc_bytes, fmt_bytes(body_bytes))),
+            load_when: Some(if evicted { "evicted" } else { "on-invoke" }.to_string()),
+            loaded_at,
+            scope: Some("global".to_string()),
+            ..Default::default()
+        });
+    }
+    // Header aggregate: invoked count + the whole catalog's loaded-description
+    // cost (measured from the transcript's skill_listing when present, else the
+    // sum of per-skill description bytes).
+    let invoked = cache
+        .skills
+        .iter()
+        .filter(|s| cache.stats.skill_calls.get(&s.name).copied().unwrap_or(0) > 0)
+        .count();
+    let listing_tok = if cache.stats.skill_listing_bytes > 0 {
+        estimate_tokens(cache.stats.skill_listing_bytes)
+    } else {
+        estimate_tokens(cache.skills.iter().map(|s| s.desc_bytes).sum())
+    };
+    HarnessSection {
+        title: "SKILLS".to_string(),
+        summary: format!("{}", cache.skills.len()),
+        agg: Some(format!("{invoked} used · {} loaded", fmt_tokens(listing_tok))),
+        collapsed_default: false,
+        rows,
+    }
+}
+
+fn agents_section(cache: &HarnessCache) -> HarnessSection {
+    let mut rows: Vec<HarnessRow> = Vec::new();
+    let mut loaded_tok = 0u32;
+    for (i, (name, path)) in cache.agents.iter().take(MAX_ROWS).enumerate() {
+        // Description loads at start (measured from the transcript's
+        // agent_listing when present, else the frontmatter description on disk);
+        // the full definition body loads on spawn.
+        let desc_bytes = cache
+            .stats
+            .agent_desc_bytes
+            .get(name)
+            .copied()
+            .or_else(|| frontmatter_field(path, "description").map(|d| d.len()))
+            .unwrap_or(0);
+        let desc_tok = estimate_tokens(desc_bytes);
+        loaded_tok += desc_tok;
+        let body_bytes = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let body_tok = estimate_tokens(body_bytes);
+        rows.push(HarnessRow {
+            key: format!("agent:{i}"),
+            label: name.clone(),
+            meta: fmt_tokens(desc_tok),
+            state: RowState::Idle,
             tooltip: format!(
-                "{}\ninvoked x{calls} this session\ntoken cost: not determinable\nskills load on demand — no disable (archive the skill dir instead)\nclick opens SKILL.md",
-                display_path(path)
+                "{}\nloaded now: {} (agent description in the type listing)\nif spawned: +{} (definition body, {} on disk)\nclick opens the agent .md",
+                display_path(path), fmt_tokens(desc_tok), fmt_tokens(body_tok), fmt_bytes(body_bytes)
             ),
             openable: path.is_file(),
             can_disable: false,
             indent: 0,
+            tok_loaded: Some(desc_tok),
+            tok_full: Some(body_tok),
+            tok_src: Some(format!("desc {desc_bytes}B · body {}", fmt_bytes(body_bytes))),
+            load_when: Some("on-spawn".to_string()),
+            scope: Some("global".to_string()),
+            ..Default::default()
         });
     }
     HarnessSection {
-        title: "SKILLS".to_string(),
-        summary: format!("{}", cache.skills.len()),
+        title: "AGENTS".to_string(),
+        summary: format!("{}", cache.agents.len()),
+        agg: Some(format!("{} loaded", fmt_tokens(loaded_tok))),
+        collapsed_default: false,
         rows,
     }
 }
@@ -1101,6 +1915,13 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
             let i: usize = idx.parse().ok()?;
             cache.ctx_paths.get(i).cloned().map(ResolvedAction::Open)
         }
+        (HarnessActionKind::Open, "memidx") => {
+            cache.mem_index.clone().map(ResolvedAction::Open)
+        }
+        (HarnessActionKind::Open, "mem") => {
+            let i: usize = idx.parse().ok()?;
+            cache.mem_files.get(i).cloned().map(ResolvedAction::Open)
+        }
         (HarnessActionKind::Open, "hook") => {
             let i: usize = idx.parse().ok()?;
             cache
@@ -1113,6 +1934,13 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
             let i: usize = idx.parse().ok()?;
             cache
                 .skills
+                .get(i)
+                .map(|s| ResolvedAction::Open(s.path.clone()))
+        }
+        (HarnessActionKind::Open, "agent") => {
+            let i: usize = idx.parse().ok()?;
+            cache
+                .agents
                 .get(i)
                 .map(|(_, p)| ResolvedAction::Open(p.clone()))
         }
@@ -1229,9 +2057,14 @@ impl App {
                 };
                 if let Some(cache) = guard.as_mut() {
                     if let Some((sid, cwd)) = cache.target.clone() {
-                        full_rescan(cache, &sid, &cwd, &env);
+                        cache.config_sig = config_signature(&cwd);
+                        full_rescan(cache, &sid, &cwd);
+                        refresh_session_lines(cache, &sid, &env);
                     }
-                    render_json(cache)
+                    // Force the write path (bypass R15 skip) by clearing the cache.
+                    let json = render_json(cache);
+                    cache.last_written = json.clone();
+                    json
                 } else {
                     None
                 }
@@ -1506,6 +2339,118 @@ mod tests {
         assert_eq!(s.count, 1);
         assert_eq!(s.err_count, 1);
         assert_eq!(s.err_ms, 40);
+    }
+
+    #[test]
+    fn estimate_tokens_uses_ratio() {
+        // 30 chars / 3.0 = 10 tokens exactly.
+        assert_eq!(estimate_tokens(30), 10);
+        assert_eq!(estimate_tokens(0), 0);
+        // Rounds up (ceil) so a nonzero source never reads as 0 tokens.
+        assert_eq!(estimate_tokens(1), 1);
+    }
+
+    #[test]
+    fn descendant_tree_walks_full_depth() {
+        // 1 → 2 → 4, and 1 → 3. Root 1 yields all four, depths 0/1/1/2.
+        let ps = "1 0 1.0 100 root\n2 1 2.0 200 child\n3 1 0.5 50 child2\n4 2 3.0 300 grandchild\n99 98 0.0 10 unrelated";
+        let procs = parse_ps(ps);
+        let tree = descendant_tree(&procs, 1);
+        let pids: Vec<u32> = tree.iter().map(|(p, _)| *p).collect();
+        assert_eq!(pids, vec![1, 2, 3, 4]);
+        let total_rss: u64 = tree.iter().filter_map(|(p, _)| procs.get(p)).map(|p| p.rss_kb).sum();
+        assert_eq!(total_rss, 650);
+        // Depth of the grandchild is 2.
+        assert_eq!(tree.iter().find(|(p, _)| *p == 4).map(|(_, d)| *d), Some(2));
+    }
+
+    #[test]
+    fn agg_event_stat_sums_event_granularity() {
+        let mut stats = JsonlStats::default();
+        for (k, ms) in [("PreToolUse", 40u64), ("PreToolUse:Bash", 60), ("Stop", 10)] {
+            let s = stats.hooks.entry(k.to_string()).or_default();
+            s.count = 1;
+            s.total_ms = ms;
+            s.last_ms = ms;
+        }
+        let agg = agg_event_stat(&stats, "PreToolUse");
+        assert_eq!(agg.count, 2);
+        assert_eq!(agg.total_ms, 100);
+        // The unrelated "Stop" event is not folded in.
+        assert_eq!(agg_event_stat(&stats, "Stop").count, 1);
+    }
+
+    #[test]
+    fn ingest_measures_start_context_attachments() {
+        let mut stats = JsonlStats::default();
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"attachment","attachment":{
+                "type":"skill_listing","content":"abcdef"}}),
+        );
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"attachment","attachment":{
+                "type":"mcp_instructions_delta",
+                "addedNames":["srv"],"addedBlocks":["0123456789"]}}),
+        );
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"attachment","attachment":{
+                "type":"deferred_tools_delta",
+                "addedNames":["mcp__srv__foo","WebFetch"]}}),
+        );
+        assert_eq!(stats.skill_listing_bytes, 6);
+        assert_eq!(stats.mcp_instr_bytes.get("srv"), Some(&10));
+        let (bytes, n) = deferred_bytes_for(&stats, "srv");
+        assert_eq!((bytes, n), ("mcp__srv__foo".len(), 1));
+    }
+
+    #[test]
+    fn short_time_extracts_hhmm() {
+        assert_eq!(short_time("2026-07-23T18:46:42.086Z"), "18:46");
+        assert_eq!(short_time("garbage"), "");
+    }
+
+    #[test]
+    fn compaction_boundary_marks_prior_reads_evicted() {
+        let mut stats = JsonlStats::default();
+        // A read before the boundary, then a compaction, then a read after.
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"attachment","timestamp":"2026-01-01T09:00:00Z",
+                "attachment":{"type":"file","filename":"/a.txt","content":"hello"}}),
+        );
+        let before_seq = stats.ctx_reads["/a.txt"].seq;
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"system","subtype":"compact_boundary",
+                "timestamp":"2026-01-01T10:00:00Z"}),
+        );
+        ingest_line(
+            &mut stats,
+            &serde_json::json!({"type":"attachment","timestamp":"2026-01-01T11:00:00Z",
+                "attachment":{"type":"file","filename":"/b.txt","content":"world"}}),
+        );
+        assert_eq!(stats.compaction_count, 1);
+        assert_eq!(stats.last_compaction_at, "10:00");
+        // /a.txt read before the boundary is evicted; /b.txt after is live.
+        assert!(before_seq <= stats.last_compaction_seq);
+        assert!(stats.ctx_reads["/b.txt"].seq > stats.last_compaction_seq);
+        assert_eq!(stats.ctx_reads["/a.txt"].at, "09:00");
+    }
+
+    #[test]
+    fn frontmatter_field_reads_description() {
+        let dir = std::env::temp_dir().join(format!("harness-fm-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("SKILL.md");
+        std::fs::write(&f, "---\nname: foo\ndescription: does a thing\n---\nbody\n")
+            .expect("write");
+        assert_eq!(frontmatter_field(&f, "description").as_deref(), Some("does a thing"));
+        assert_eq!(frontmatter_field(&f, "name").as_deref(), Some("foo"));
+        assert_eq!(frontmatter_field(&f, "missing"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
