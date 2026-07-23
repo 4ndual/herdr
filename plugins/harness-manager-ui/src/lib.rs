@@ -28,6 +28,15 @@ static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// `handle_frame` so host state always wins.
 static COLLAPSED: AtomicBool = AtomicBool::new(false);
 
+/// Per-section collapsed state, keyed by section TITLE so it survives row
+/// churn and model refreshes (R14). A title present here renders that section
+/// collapsed (header + aggregate only). Toggled by clicking a section header;
+/// cleared only on target change.
+static COLLAPSED_SECTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Section titles whose `collapsed_default` has already been applied once, so a
+/// user expand is not undone by the default on the next refresh.
+static SEEDED_SECTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Most recent render model, cached so a raw mouse `Move` (which carries no
 /// input) can re-render the hover tooltip against the same rows.
 static MODEL: Mutex<Option<HarnessRenderModel>> = Mutex::new(None);
@@ -145,10 +154,21 @@ fn line_at(
     (idx < lines).then_some(idx)
 }
 
+/// Snapshot of the collapsed section titles for passing into the pure renderer.
+fn collapsed_snapshot() -> Vec<String> {
+    COLLAPSED_SECTIONS
+        .lock()
+        .expect("collapsed mutex poisoned")
+        .clone()
+}
+
 /// Clamp the raw scroll offset to the clipped range for the current model/area.
 fn clamped_scroll(model: &HarnessRenderModel, height: u16) -> usize {
     let visible = (height as usize).saturating_sub(2);
-    let max_scroll = render::body_lines(model).len().saturating_sub(visible);
+    let collapsed = collapsed_snapshot();
+    let max_scroll = render::body_lines(model, &collapsed)
+        .len()
+        .saturating_sub(visible);
     SCROLL.load(Ordering::SeqCst).min(max_scroll)
 }
 
@@ -164,8 +184,9 @@ fn render_from_cache() -> Option<UiUpdate> {
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
     let menu = MENU.lock().expect("menu mutex poisoned").clone();
     let scroll = clamped_scroll(model, height);
+    let collapsed = collapsed_snapshot();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, menu.as_ref(), scroll);
+    let hits = render::render(model, area, &mut buf, hovered, menu.as_ref(), scroll, &collapsed);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -189,7 +210,11 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
                 .as_ref()
                 .map(|m| {
                     let height = area.map(|(_, _, _, h)| h).unwrap_or(0);
-                    (render::body_lines(m).len(), clamped_scroll(m, height))
+                    let collapsed = collapsed_snapshot();
+                    (
+                        render::body_lines(m, &collapsed).len(),
+                        clamped_scroll(m, height),
+                    )
                 })
                 .unwrap_or((0, 0));
             let next = area.and_then(|a| line_at(a, lines, scroll, mouse.column, mouse.row));
@@ -217,7 +242,10 @@ fn adjust_scroll(delta: isize) {
         .as_ref()
         .map(|m| {
             let visible = (height as usize).saturating_sub(2);
-            render::body_lines(m).len().saturating_sub(visible)
+            let collapsed = collapsed_snapshot();
+            render::body_lines(m, &collapsed)
+                .len()
+                .saturating_sub(visible)
         })
         .unwrap_or(0);
     let cur = SCROLL.load(Ordering::SeqCst) as isize;
@@ -262,19 +290,33 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
         if cached.as_ref() != Some(&model) {
             *MENU.lock().expect("menu mutex poisoned") = None;
         }
-        // A new focused target resets the scroll to the top.
+        // A new focused target resets the scroll to the top AND clears the
+        // per-section collapse/seed state — that state belongs to the previous
+        // target's sections. Refreshes of the SAME target preserve it (R14).
         if target_changed {
             SCROLL.store(0, Ordering::SeqCst);
+            COLLAPSED_SECTIONS
+                .lock()
+                .expect("collapsed mutex poisoned")
+                .clear();
+            SEEDED_SECTIONS
+                .lock()
+                .expect("seeded mutex poisoned")
+                .clear();
         }
         *cached = Some(model.clone());
     }
+    // Apply each section's `collapsed_default` exactly once (first time its
+    // title is seen for this target); a later user toggle is never re-defaulted.
+    seed_collapsed_defaults(&model);
     *AREA.lock().expect("area mutex poisoned") = Some((area.x, area.y, area.width, area.height));
     {
         let mut hov = HOVERED.lock().expect("hover mutex poisoned");
         if let Some(i) = *hov {
             // Hover holds an absolute body-line index; drop it if it no longer
-            // exists in the (possibly shrunk) model.
-            if i >= render::body_lines(&model).len() {
+            // exists in the (possibly shrunk) view.
+            let collapsed = collapsed_snapshot();
+            if i >= render::body_lines(&model, &collapsed).len() {
                 *hov = None;
             }
         }
@@ -309,6 +351,33 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     }
 
     render_from_cache().unwrap_or_default()
+}
+
+/// Apply each section's `collapsed_default` the first time its title is seen
+/// (per target). Idempotent: a title already in `SEEDED_SECTIONS` is skipped, so
+/// a user's later expand/collapse is never overridden by the default (R14).
+fn seed_collapsed_defaults(model: &HarnessRenderModel) {
+    let mut seeded = SEEDED_SECTIONS.lock().expect("seeded mutex poisoned");
+    let mut collapsed = COLLAPSED_SECTIONS.lock().expect("collapsed mutex poisoned");
+    for section in &model.sections {
+        if seeded.iter().any(|t| t == &section.title) {
+            continue;
+        }
+        seeded.push(section.title.clone());
+        if section.collapsed_default && !collapsed.iter().any(|t| t == &section.title) {
+            collapsed.push(section.title.clone());
+        }
+    }
+}
+
+/// Toggle the collapsed state of the section titled `title`.
+fn toggle_section(title: &str) {
+    let mut collapsed = COLLAPSED_SECTIONS.lock().expect("collapsed mutex poisoned");
+    if let Some(pos) = collapsed.iter().position(|t| t == title) {
+        collapsed.remove(pos);
+    } else {
+        collapsed.push(title.to_string());
+    }
 }
 
 /// Extract the row key from a row-region action id (either the openable or the
@@ -358,6 +427,13 @@ fn handle_action(action_id: &str, kind: UiActionKind, row: u16) -> UiUpdate {
         *MENU.lock().expect("menu mutex poisoned") = None;
         return render_from_cache().unwrap_or_default();
     }
+    // Clicking a section header toggles that section collapsed/expanded. The
+    // host does not resolve `harness:section:` ids (see `parse_harness_action`),
+    // so they route here as guest-owned v3 Actions.
+    if let Some(title) = action_id.strip_prefix(render::ACTION_SECTION_PREFIX) {
+        toggle_section(title);
+        return render_from_cache().unwrap_or_default();
+    }
     // Open / disable-option left-clicks are resolved host-side and never reach
     // the guest; the only remaining guest-owned left-click is the collapse
     // toggle.
@@ -381,6 +457,31 @@ fn handle_action(action_id: &str, kind: UiActionKind, row: u16) -> UiUpdate {
 mod tests {
     use super::*;
     use harness_manager_model::{HarnessRow, HarnessSection, RowState};
+
+    /// Tests share the module's global view-state statics (SCROLL, COLLAPSED,
+    /// MODEL, …); serialize every test that drives `handle_event` so parallel
+    /// runs can't interleave frames and flake each other's assertions.
+    static TEST_STATE_GUARD: Mutex<()> = Mutex::new(());
+
+    fn state_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_STATE_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Hermetic start: clear every view-state static so a test never
+        // observes state leaked by whichever test happened to run before it.
+        *MODEL.lock().expect("model mutex poisoned") = None;
+        *MENU.lock().expect("menu mutex poisoned") = None;
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        *AREA.lock().expect("area mutex poisoned") = None;
+        COLLAPSED_SECTIONS
+            .lock()
+            .expect("collapsed mutex poisoned")
+            .clear();
+        SEEDED_SECTIONS.lock().expect("seeded mutex poisoned").clear();
+        COLLAPSED.store(false, Ordering::SeqCst);
+        SCROLL.store(0, Ordering::SeqCst);
+        guard
+    }
 
     fn frame_json(env: &str, width: u16) -> String {
         format!(
@@ -406,6 +507,8 @@ mod tests {
             sections: vec![HarnessSection {
                 title: "HOOKS".to_string(),
                 summary: String::new(),
+                agg: None,
+                collapsed_default: false,
                 rows: vec![HarnessRow {
                     key: "hook:0".to_string(),
                     label: "PreToolUse pkg-guard".to_string(),
@@ -415,6 +518,7 @@ mod tests {
                     openable: true,
                     can_disable: true,
                     indent: 0,
+                    ..Default::default()
                 }],
             }],
         }
@@ -430,6 +534,7 @@ mod tests {
 
     #[test]
     fn renders_right_panel_from_input() {
+        let _state = state_guard();
         let event: UiEvent =
             serde_json::from_str(&frame_json(&model_env(&test_model()), 44)).expect("frame parses");
         let update = handle_event(&event);
@@ -443,6 +548,7 @@ mod tests {
 
     #[test]
     fn right_click_on_row_opens_menu_with_disable_hits() {
+        let _state = state_guard();
         // Seed the model cache with a frame first.
         let frame: UiEvent =
             serde_json::from_str(&frame_json(&model_env(&test_model()), 44)).expect("frame parses");
@@ -472,12 +578,14 @@ mod tests {
 
     #[test]
     fn missing_input_renders_nothing() {
+        let _state = state_guard();
         let event: UiEvent = serde_json::from_str(&frame_json("{}", 44)).expect("frame parses");
         assert!(handle_event(&event).layers.is_empty());
     }
 
     #[test]
     fn toggle_left_down_emits_set_surface_collapsed() {
+        let _state = state_guard();
         let event: UiEvent =
             serde_json::from_str(&action_json(render::ACTION_TOGGLE_PANEL, "left_down", 0))
                 .expect("action parses");
@@ -511,6 +619,7 @@ mod tests {
 
     #[test]
     fn scroll_down_then_reset_on_target_change() {
+        let _state = state_guard();
         let frame: UiEvent =
             serde_json::from_str(&frame_json(&model_env(&test_model()), 44)).expect("frame parses");
         let _ = handle_event(&frame);
@@ -529,6 +638,7 @@ mod tests {
 
     #[test]
     fn reexpand_from_collapsed_handle_resets_scroll_to_top() {
+        let _state = state_guard();
         // Expanded frame seeds the model (target set → SCROLL already 0).
         let expanded =
             serde_json::from_str::<UiEvent>(&frame_json(&model_env(&test_model()), 44))
@@ -550,6 +660,7 @@ mod tests {
 
     #[test]
     fn open_left_down_is_not_handled_by_guest() {
+        let _state = state_guard();
         let event: UiEvent =
             serde_json::from_str(&action_json("harness:open:ctx:0", "left_down", 3))
                 .expect("action parses");
