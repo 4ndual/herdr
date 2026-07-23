@@ -45,9 +45,9 @@ static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
 /// toggled by clicks on `render::ACTION_TOGGLE_TERMINALS`. Guest-persistent in
 /// memory (resets to the default on reload, which is acceptable).
 static SHOW_TERMINALS: AtomicBool = AtomicBool::new(false);
-/// Whether subagent rows are hidden. Default off (show subagents); toggled by
-/// clicks on `render::ACTION_TOGGLE_SUBAGENTS`. Guest-persistent in memory.
-static HIDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
+/// Whether the legend/help overlay is shown. Default off; toggled by clicks on
+/// `render::ACTION_TOGGLE_LEGEND`. Guest-persistent in memory.
+static SHOW_LEGEND: AtomicBool = AtomicBool::new(false);
 /// Monotonic per-agent filter click counter; `AgentFilter::from_index` maps it to
 /// the current selection (all/claude/cx/codex/pi). Advanced by clicks on
 /// `render::ACTION_CYCLE_AGENT`.
@@ -57,8 +57,8 @@ static AGENT_FILTER_INDEX: AtomicUsize = AtomicUsize::new(0);
 fn current_filters() -> RowFilters {
     RowFilters {
         show_terminals: SHOW_TERMINALS.load(Ordering::SeqCst),
-        hide_subagents: HIDE_SUBAGENTS.load(Ordering::SeqCst),
         agent: AgentFilter::from_index(AGENT_FILTER_INDEX.load(Ordering::SeqCst)),
+        show_legend: SHOW_LEGEND.load(Ordering::SeqCst),
     }
 }
 
@@ -304,9 +304,9 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         // there is no carved panel, which never happens on a header click).
         return render_from_cache().unwrap_or_default();
     }
-    if action_id == render::ACTION_TOGGLE_SUBAGENTS {
-        let hide = !HIDE_SUBAGENTS.load(Ordering::SeqCst);
-        HIDE_SUBAGENTS.store(hide, Ordering::SeqCst);
+    if action_id == render::ACTION_TOGGLE_LEGEND {
+        let show = !SHOW_LEGEND.load(Ordering::SeqCst);
+        SHOW_LEGEND.store(show, Ordering::SeqCst);
         *HOVERED.lock().expect("hover mutex poisoned") = None;
         return render_from_cache().unwrap_or_default();
     }
@@ -445,15 +445,15 @@ mod tests {
     }
 
     #[test]
-    fn toggle_subagents_action_flips_state() {
-        let before = HIDE_SUBAGENTS.load(Ordering::SeqCst);
+    fn toggle_legend_action_flips_state() {
+        let before = SHOW_LEGEND.load(Ordering::SeqCst);
         let event: UiEvent =
-            serde_json::from_str(&action_json(render::ACTION_TOGGLE_SUBAGENTS, "left_down"))
+            serde_json::from_str(&action_json(render::ACTION_TOGGLE_LEGEND, "left_down"))
                 .expect("action parses");
         let _ = handle_event(&event);
-        assert_ne!(HIDE_SUBAGENTS.load(Ordering::SeqCst), before);
+        assert_ne!(SHOW_LEGEND.load(Ordering::SeqCst), before);
         let _ = handle_event(&event);
-        assert_eq!(HIDE_SUBAGENTS.load(Ordering::SeqCst), before);
+        assert_eq!(SHOW_LEGEND.load(Ordering::SeqCst), before);
     }
 
     #[test]

@@ -84,8 +84,84 @@ const HISTORIAL_DASH_INPUT_FILE: &str = "historial_input.json";
 pub(crate) const HARNESS_PLUGIN_ID: &str = "builtin.harness-manager";
 const HARNESS_INPUT_FILE: &str = "harness_input.json";
 
-/// How many recent closed panes the historial panel shows (newest first).
-const HISTORIAL_ROW_LIMIT: usize = 10;
+/// How many recent (subagent-excluded, resumable/terminal) closed panes the
+/// historial panel shows (newest first). The panel is content-height sized, so
+/// it draws only as many of these as fit the available screen rows.
+const HISTORIAL_ROW_LIMIT: usize = 40;
+
+/// How many raw log records to scan back through when building the panel model.
+/// Larger than [`HISTORIAL_ROW_LIMIT`] because subagent and non-resumable
+/// records are filtered out after the read, so we need headroom to still surface
+/// a full page of useful rows.
+const HISTORIAL_READ_LIMIT: usize = 400;
+
+/// Project newest-first pane-close `records` into the wasm-safe historial rows
+/// the guest renders. Pure over `(records, now)` so it is unit-testable without a
+/// live log. Applies, in order: subagent exclusion, non-resumable-agent
+/// exclusion, session/pane dedup, and the [`HISTORIAL_ROW_LIMIT`] cap.
+fn build_historial_rows(
+    records: Vec<crate::pane_close_history::PaneCloseRecord>,
+    now: u64,
+) -> Vec<historial_dash_model::HistorialRow> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    records
+        .into_iter()
+        // Subagent runs (TaskCreate / Agent-tool workers, `agent-*.jsonl`) are
+        // pure noise in the historial — excluded at the source, no toggle.
+        .filter(|record| !crate::pane_close_history::is_subagent_record(record))
+        // Drop non-resumable *agent* rows: a claude/cx/codex/pi pane whose
+        // session ref could not be captured can't be resumed or forked, so it is
+        // dead weight. Plain terminals (agent = None) are kept — the `[t]` toggle
+        // governs their visibility in the guest.
+        .filter(|record| record.agent.is_none() || record.restorable())
+        // Deduplicate so the same session (or, for sessionless terminals, the
+        // same pane) appears once — keeping the most-recent record (first seen).
+        .filter(|record| {
+            let dedup_key = record
+                .session_value
+                .clone()
+                .unwrap_or_else(|| format!("pane:{}", record.pane_id));
+            seen.insert(dedup_key)
+        })
+        .take(HISTORIAL_ROW_LIMIT)
+        .map(|record| {
+            let restorable = record.restorable();
+            let is_subagent = crate::pane_close_history::is_subagent_record(&record);
+            // No detected agent -> "terminal" (replaces the old "shell").
+            let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
+            // Pane label only; empty when absent so the guest applies its
+            // first-prompt / folder fallback.
+            let label = record
+                .label
+                .clone()
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_default();
+            // Last 4 chars of the session value (char-safe), empty when none.
+            let sid4 = record
+                .session_value
+                .as_deref()
+                .map(|v| {
+                    let chars: Vec<char> = v.chars().collect();
+                    let start = chars.len().saturating_sub(4);
+                    chars[start..].iter().collect::<String>()
+                })
+                .unwrap_or_default();
+            historial_dash_model::HistorialRow {
+                key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
+                agent,
+                label,
+                sid4,
+                reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
+                cwd: record.cwd,
+                restorable,
+                workspace_name: record.workspace_name.unwrap_or_default(),
+                first_prompt: record.first_prompt.unwrap_or_default(),
+                last_prompt: record.last_prompt.unwrap_or_default(),
+                is_subagent,
+            }
+        })
+        .collect()
+}
 
 /// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
 /// side): write a sibling temp file then rename it into place, so item B's
@@ -2413,57 +2489,10 @@ impl App {
     /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
     fn historial_render_input_json(&self) -> Option<String> {
         let now = crate::pane_close_history::now_unix_ms();
-        // `read_recent` yields newest-first; deduplicate so the same session (or,
-        // for sessionless terminals, the same pane) appears once — keeping the
-        // most-recent record (the first seen). Dedup key is the session value
-        // when present, else the pane id.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let rows = crate::pane_close_history::read_recent(HISTORIAL_ROW_LIMIT)
-            .into_iter()
-            .filter(|record| {
-                let dedup_key = record
-                    .session_value
-                    .clone()
-                    .unwrap_or_else(|| format!("pane:{}", record.pane_id));
-                seen.insert(dedup_key)
-            })
-            .map(|record| {
-                let restorable = record.restorable();
-                let is_subagent = crate::pane_close_history::is_subagent_record(&record);
-                // No detected agent -> "terminal" (replaces the old "shell").
-                let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
-                // Pane label only; empty when absent so the row omits it (the
-                // folder basename is shown separately from the cwd).
-                let label = record
-                    .label
-                    .clone()
-                    .filter(|l| !l.trim().is_empty())
-                    .unwrap_or_default();
-                // Last 4 chars of the session value (char-safe), empty when none.
-                let sid4 = record
-                    .session_value
-                    .as_deref()
-                    .map(|v| {
-                        let chars: Vec<char> = v.chars().collect();
-                        let start = chars.len().saturating_sub(4);
-                        chars[start..].iter().collect::<String>()
-                    })
-                    .unwrap_or_default();
-                historial_dash_model::HistorialRow {
-                    key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
-                    agent,
-                    label,
-                    sid4,
-                    reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
-                    cwd: record.cwd,
-                    restorable,
-                    workspace_name: record.workspace_name.unwrap_or_default(),
-                    first_prompt: record.first_prompt.unwrap_or_default(),
-                    last_prompt: record.last_prompt.unwrap_or_default(),
-                    is_subagent,
-                }
-            })
-            .collect();
+        let rows = build_historial_rows(
+            crate::pane_close_history::read_recent(HISTORIAL_READ_LIMIT),
+            now,
+        );
         let model = historial_dash_model::HistorialRenderModel { rows };
         match serde_json::to_string(&model) {
             Ok(json) => Some(json),
@@ -2906,6 +2935,82 @@ mod tests {
         crate::raw_input::RawInputEvent::Key(
             crate::input::TerminalKey::new(code, modifiers).with_kind(kind),
         )
+    }
+
+    fn historial_record(
+        ts: u64,
+        pane: &str,
+        agent: Option<&str>,
+        session_value: Option<&str>,
+        restorable: bool,
+    ) -> crate::pane_close_history::PaneCloseRecord {
+        // A record is restorable iff it carries source+kind+value; drive that via
+        // the `restorable` flag so tests read intention-first.
+        let (source, kind, value) = if restorable {
+            (
+                Some("herdr:claude".to_string()),
+                Some("id".to_string()),
+                session_value.map(str::to_string),
+            )
+        } else {
+            (None, None, session_value.map(str::to_string))
+        };
+        crate::pane_close_history::PaneCloseRecord {
+            ts_unix_ms: ts,
+            pane_id: pane.to_string(),
+            label: Some("lbl".to_string()),
+            agent: agent.map(str::to_string),
+            session_source: source,
+            session_kind: kind,
+            session_value: value,
+            cwd: "/home/dev/herdr".to_string(),
+            workspace_id: "ws-1".to_string(),
+            workspace_name: Some("herdr".to_string()),
+            first_prompt: None,
+            last_prompt: None,
+        }
+    }
+
+    #[test]
+    fn build_historial_rows_excludes_subagents_and_nonrestorable_agents() {
+        let records = vec![
+            // Newest-first: a real restorable claude session (kept).
+            historial_record(100, "p1", Some("claude"), Some("11112222-aaaa"), true),
+            // A subagent run (agent-* session value) — excluded entirely.
+            historial_record(90, "p2", Some("claude"), Some("agent-deadbeef"), true),
+            // A non-restorable agent row (no session ref) — excluded as noise.
+            historial_record(80, "p3", Some("cx"), None, false),
+            // A plain terminal (no agent) — kept (guest `[t]` toggle governs it).
+            historial_record(70, "p4", None, None, false),
+        ];
+        let rows = build_historial_rows(records, 200);
+        let agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
+        assert_eq!(agents, vec!["claude", "terminal"]);
+        assert!(rows.iter().all(|r| !r.is_subagent));
+    }
+
+    #[test]
+    fn build_historial_rows_dedups_and_caps_at_limit() {
+        let mut records = Vec::new();
+        // Two records for the same session value must collapse to one.
+        records.push(historial_record(1000, "dup", Some("claude"), Some("same-sid"), true));
+        records.push(historial_record(999, "dup", Some("claude"), Some("same-sid"), true));
+        // Then more than HISTORIAL_ROW_LIMIT distinct restorable sessions.
+        for i in 0..(HISTORIAL_ROW_LIMIT + 10) {
+            let sid = format!("sid-{i}");
+            records.push(historial_record(
+                500 - i as u64,
+                &format!("pane-{i}"),
+                Some("claude"),
+                Some(&sid),
+                true,
+            ));
+        }
+        let rows = build_historial_rows(records, 100_000);
+        assert_eq!(rows.len(), HISTORIAL_ROW_LIMIT);
+        // The deduped session appears exactly once.
+        let dup_count = rows.iter().filter(|r| r.sid4 == "-sid").count();
+        assert_eq!(dup_count, 1);
     }
 
     fn release_notes_state() -> state::ReleaseNotesState {

@@ -27,13 +27,14 @@ pub const ACTION_TOGGLE_PANEL: &str = "historial:toggle_panel";
 /// static flag and re-renders on a `left_down` of this id. Not host-intercepted.
 pub const ACTION_TOGGLE_TERMINALS: &str = "historial:toggle_terminals";
 
-/// Hide/show-subagents toggle in the header. Guest-owned like the terminals
-/// toggle: filters out rows whose session is a subagent run.
-pub const ACTION_TOGGLE_SUBAGENTS: &str = "historial:toggle_subagents";
-
 /// Per-agent filter cycle button in the header. Guest-owned: each `left_down`
 /// advances the filter all -> claude -> cx -> codex -> pi -> all.
 pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
+
+/// Legend/help toggle in the header (`[?]`). Guest-owned: each `left_down` flips
+/// an overlay that explains what every header/row glyph does, replacing the list
+/// while shown.
+pub const ACTION_TOGGLE_LEGEND: &str = "historial:toggle_legend";
 
 /// Per-agent-kind filter selected in the header (item: per-agent filter).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -70,6 +71,17 @@ impl AgentFilter {
         }
     }
 
+    /// Human name for this filter, used by the legend overlay.
+    fn label(self) -> &'static str {
+        match self {
+            AgentFilter::All => "all",
+            AgentFilter::Claude => "claude",
+            AgentFilter::Cx => "cx",
+            AgentFilter::Codex => "codex",
+            AgentFilter::Pi => "pi",
+        }
+    }
+
     /// Whether a row with display agent `agent` passes this filter. `All` passes
     /// everything (including terminals); a specific kind matches only that agent.
     fn matches(self, agent: &str) -> bool {
@@ -83,22 +95,20 @@ impl AgentFilter {
     }
 }
 
-/// The composed header filter state: terminals toggle, subagents toggle, and the
-/// per-agent filter. Shared by the renderer and the guest's hover hit-testing so
-/// both agree on which rows are visible.
+/// The composed header state: terminals toggle, the per-agent filter, and the
+/// legend-overlay toggle. Shared by the renderer and the guest's hover
+/// hit-testing so both agree on which rows are visible. (Subagent rows are
+/// excluded at the host source, so there is no subagent toggle here.)
 #[derive(Clone, Copy, Default)]
 pub struct RowFilters {
     pub show_terminals: bool,
-    pub hide_subagents: bool,
     pub agent: AgentFilter,
+    pub show_legend: bool,
 }
 
 impl RowFilters {
     fn keep(&self, row: &historial_dash_model::HistorialRow) -> bool {
         if !self.show_terminals && row.is_terminal() {
-            return false;
-        }
-        if self.hide_subagents && row.is_subagent {
             return false;
         }
         self.agent.matches(&row.agent)
@@ -124,9 +134,8 @@ const DEL_BTN: &str = "[x]";
 /// layout doesn't shift when the state flips).
 const TERM_TOGGLE_ON: &str = "[T]";
 const TERM_TOGGLE_OFF: &str = "[t]";
-/// Subagents-hidden ([S]) / subagents-shown ([s]) toggle glyphs (fixed width).
-const SUBAGENT_TOGGLE_ON: &str = "[S]";
-const SUBAGENT_TOGGLE_OFF: &str = "[s]";
+/// Legend/help toggle glyph (fixed width). Highlighted while the overlay is open.
+const LEGEND_BTN: &str = "[?]";
 
 /// The rows to actually render, honoring the show-terminals toggle: when off
 /// (default), plain terminal/shell rows are filtered out. Shared by the renderer
@@ -191,23 +200,18 @@ fn render_full(
     let width = area.width as usize;
     let mut hits = Vec::new();
 
-    // Row 0: title left; the filter cluster "[agent][s][t] [<]" pinned far right.
-    // Every glyph is fixed 3 cols so the header never shifts as state flips.
+    // Row 0: title left; the cluster "[agent][t][?] [<]" pinned far right. Every
+    // glyph is fixed 3 cols so the header never shifts as state flips.
     let btn_w = COLLAPSE_BTN.width() as u16; // [<]
     let agent_glyph = filters.agent.glyph();
     let agent_w = agent_glyph.width() as u16;
-    let sub_w = SUBAGENT_TOGGLE_ON.width() as u16; // fixed 3
     let term_label = if filters.show_terminals {
         TERM_TOGGLE_ON
     } else {
         TERM_TOGGLE_OFF
     };
     let term_w = term_label.width() as u16;
-    let sub_label = if filters.hide_subagents {
-        SUBAGENT_TOGGLE_ON
-    } else {
-        SUBAGENT_TOGGLE_OFF
-    };
+    let legend_w = LEGEND_BTN.width() as u16;
 
     let mut header = vec![Span::styled(
         PANEL_TITLE,
@@ -216,8 +220,8 @@ fn render_full(
             .add_modifier(Modifier::BOLD),
     )];
     let title_w = PANEL_TITLE.width() as u16;
-    // agent + subagent + terminals + space + collapse.
-    let right_w = agent_w + sub_w + term_w + 1 + btn_w;
+    // agent + terminals + legend + space + collapse.
+    let right_w = agent_w + term_w + legend_w + 1 + btn_w;
     if area.width > title_w + right_w + 1 {
         let pad = area.width - title_w - right_w;
         header.push(Span::raw(" ".repeat(pad as usize)));
@@ -233,17 +237,17 @@ fn render_full(
         }),
     ));
     header.push(Span::styled(
-        sub_label,
-        Style::default().fg(if filters.hide_subagents {
-            Color::Yellow
+        term_label,
+        Style::default().fg(if filters.show_terminals {
+            Color::Green
         } else {
             Color::DarkGray
         }),
     ));
     header.push(Span::styled(
-        term_label,
-        Style::default().fg(if filters.show_terminals {
-            Color::Green
+        LEGEND_BTN,
+        Style::default().fg(if filters.show_legend {
+            Color::Yellow
         } else {
             Color::DarkGray
         }),
@@ -268,7 +272,15 @@ fn render_full(
         height: 1,
         action_id: ACTION_TOGGLE_PANEL.to_string(),
     });
-    let term_x = collapse_x.saturating_sub(1 + term_w);
+    let legend_x = collapse_x.saturating_sub(1 + legend_w);
+    hits.push(UiHitRect {
+        x: legend_x,
+        y: area.y,
+        width: legend_w,
+        height: 1,
+        action_id: ACTION_TOGGLE_LEGEND.to_string(),
+    });
+    let term_x = legend_x.saturating_sub(term_w);
     hits.push(UiHitRect {
         x: term_x,
         y: area.y,
@@ -276,15 +288,7 @@ fn render_full(
         height: 1,
         action_id: ACTION_TOGGLE_TERMINALS.to_string(),
     });
-    let sub_x = term_x.saturating_sub(sub_w);
-    hits.push(UiHitRect {
-        x: sub_x,
-        y: area.y,
-        width: sub_w,
-        height: 1,
-        action_id: ACTION_TOGGLE_SUBAGENTS.to_string(),
-    });
-    let agent_x = sub_x.saturating_sub(agent_w);
+    let agent_x = term_x.saturating_sub(agent_w);
     hits.push(UiHitRect {
         x: agent_x,
         y: area.y,
@@ -294,6 +298,12 @@ fn render_full(
     });
 
     if area.height <= 1 {
+        return hits;
+    }
+
+    // Legend overlay: replace the list with a dense, dim help panel while open.
+    if filters.show_legend {
+        render_legend(model, area, buf, filters.agent);
         return hits;
     }
 
@@ -348,6 +358,70 @@ fn folder_basename(cwd: &str) -> &str {
     match trimmed.rsplit('/').next() {
         Some(name) if !name.is_empty() => name,
         _ => "~",
+    }
+}
+
+/// The display label for a row and whether it is a *fallback* (rendered dim).
+/// Primary is the pane label; when absent (unlabeled/older panes) we fall back to
+/// the first few words of the first prompt, and only as a last resort the cwd
+/// basename — both dimmed to signal they are inferred, not a real pane title.
+fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
+    let label = row.label.trim();
+    if !label.is_empty() {
+        return (label.to_string(), false);
+    }
+    let prompt = row.first_prompt.trim();
+    if !prompt.is_empty() {
+        return (first_words(prompt, 6), true);
+    }
+    (folder_basename(&row.cwd).to_string(), true)
+}
+
+/// First `max` whitespace-separated words of `text`, joined by single spaces.
+fn first_words(text: &str, max: usize) -> String {
+    text.split_whitespace()
+        .take(max)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render the legend overlay (shown while `[?]` is toggled on), describing the
+/// current header/row glyph semantics. Dense and dim; drawn from `area.y + 1`
+/// down, clipped to the panel bottom.
+fn render_legend(
+    model: &HistorialRenderModel,
+    area: Rect,
+    buf: &mut Buffer,
+    agent: AgentFilter,
+) {
+    let _ = model;
+    let dim = Style::default().fg(Color::DarkGray);
+    let lines: Vec<String> = vec![
+        format!("[*] agent filter (now: {})", agent.label()),
+        "    all/claude/cx/codex/pi".to_string(),
+        "[t] show terminal panes".to_string(),
+        "[<] collapse panel".to_string(),
+        "[?] toggle this help".to_string(),
+        "row: agent  label  sid".to_string(),
+        "  click label = resume".to_string(),
+        "  [f] fork into new tab".to_string(),
+        "  [x] delete record".to_string(),
+    ];
+    let bottom = area.y + area.height; // exclusive
+    for (i, text) in lines.into_iter().enumerate() {
+        let y = area.y + 1 + i as u16;
+        if y >= bottom {
+            break;
+        }
+        Paragraph::new(Line::from(Span::styled(text, dim))).render(
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            buf,
+        );
     }
 }
 
@@ -425,28 +499,28 @@ fn render_row(
     let reserved = reltime_w + actions_w + 2;
     let text_budget = (width as u16).saturating_sub(reserved).max(4) as usize;
 
-    // Row text: "<agent> <pane-label?> <sid4?> <folder>". Missing pieces are
-    // skipped so a shell/terminal row reads "terminal <folder>".
+    // Row text: "<agent> <pane-label> <sid4?>". The pane label is the primary
+    // display; when the pane had no title/manual label we fall back (dimmed) to
+    // the first prompt words, or the folder as a last resort. No cwd column.
+    let (label_text, is_fallback) = row_label(row);
     let mut parts: Vec<&str> = vec![row.agent.as_str()];
-    if !row.label.trim().is_empty() {
-        parts.push(row.label.trim());
+    if !label_text.is_empty() {
+        parts.push(label_text.as_str());
     }
     if !row.sid4.is_empty() {
         parts.push(row.sid4.as_str());
     }
-    let folder = folder_basename(&row.cwd);
-    parts.push(folder);
     let label = truncate_to(&parts.join(" "), text_budget);
     let mut spans: Vec<Span> = Vec::new();
     let restore_w = label.width() as u16;
-    spans.push(Span::styled(
-        label,
-        Style::default().fg(if row.restorable {
-            Color::White
-        } else {
-            Color::DarkGray
-        }),
-    ));
+    // Real label on a restorable row = bright; fallback text or non-restorable
+    // rows read dim.
+    let fg = if row.restorable && !is_fallback {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
+    spans.push(Span::styled(label, Style::default().fg(fg)));
 
     // Pad to push reltime + actions to the right edge.
     let used = restore_w + reltime_w + actions_w;
@@ -593,32 +667,29 @@ mod tests {
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.contains(&"historial:toggle_terminals"));
-        assert!(ids.contains(&"historial:toggle_subagents"));
+        assert!(ids.contains(&"historial:toggle_legend"));
         assert!(ids.contains(&"historial:cycle_agent"));
     }
 
     #[test]
-    fn subagent_and_agent_filters_compose() {
-        let mut sub = row("1:w_1_p_1", true);
-        sub.is_subagent = true;
-        sub.agent = "claude".to_string();
+    fn per_agent_filter_selects_matching_rows() {
+        let claude = row("1:w_1_p_1", true);
         let cx = {
             let mut r = row("2:w_1_p_2", true);
             r.agent = "cx".to_string();
             r
         };
         let model = HistorialRenderModel {
-            rows: vec![sub, cx],
+            rows: vec![claude, cx],
         };
-        // Hide subagents: only the cx row remains.
         let f = RowFilters {
-            hide_subagents: true,
+            agent: AgentFilter::Cx,
             ..RowFilters::default()
         };
         let visible = visible_rows(&model, f);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].agent, "cx");
-        // Per-agent filter = claude: only the (subagent) claude row remains.
+
         let f = RowFilters {
             agent: AgentFilter::Claude,
             ..RowFilters::default()
@@ -626,14 +697,38 @@ mod tests {
         let visible = visible_rows(&model, f);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].agent, "claude");
-        // Compose both: claude filter + hide subagents -> nothing (the only claude
-        // row is a subagent).
+    }
+
+    #[test]
+    fn legend_overlay_replaces_list_and_hides_rows() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let area = Rect::new(0, 0, 44, 12);
+        let mut buf = Buffer::empty(area);
         let f = RowFilters {
-            agent: AgentFilter::Claude,
-            hide_subagents: true,
+            show_legend: true,
             ..RowFilters::default()
         };
-        assert!(visible_rows(&model, f).is_empty());
+        let _ = render(&model, area, &mut buf, None, f);
+        let text = buffer_text(&buf);
+        // Legend content is shown; the row's label ("herdr") is not.
+        assert!(text.contains("agent filter"));
+        assert!(text.contains("[f] fork"));
+        assert!(!text.contains("c123"));
+    }
+
+    #[test]
+    fn unlabeled_row_falls_back_to_first_prompt_words() {
+        let mut r = row("1:w_1_p_1", true);
+        r.label = String::new();
+        r.first_prompt = "fix the historial panel please now urgently".to_string();
+        let model = HistorialRenderModel { rows: vec![r] };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let text = buffer_text(&buf);
+        assert!(text.contains("fix the historial"));
     }
 
     fn terminal_row(key: &str) -> HistorialRow {
