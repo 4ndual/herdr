@@ -55,6 +55,17 @@ title = "Fork → workspace"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" workspace >/dev/null 2>&1 &"]
 
+# remote: enable Claude Code Remote Control on the CURRENT pane's LIVE conversation
+# so it can be continued from the phone / claude.ai. For a claude orchestrator it
+# types the `/remote-control` slash command into the running agent; codex/cx/pi
+# panes get a toast (the phone can't bridge into a non-claude orchestrator). See
+# scripts/remote-control.sh. Detached so it outlives the action runner.
+[[actions]]
+id = "remote"
+title = "Remote"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
+
 # draw-screenshot: toggle a BLANK DrawPen live-annotation overlay, then capture
 # the annotated screen and fully close it (see scripts/draw-screenshot.sh). Press
 # once to start drawing on-screen; press again to screenshot + close. Detached so

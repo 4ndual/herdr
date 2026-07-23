@@ -104,6 +104,16 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "remote",
+        label: "Remote",
+        emoji: "\u{1F4F1}",            // 📱
+        shortcut: "\u{2303}\u{2325}R", // ⌃⌥R
+        color: "subtext",
+        description: "Enable Remote Control (/remote-control) to continue this claude session from the phone / claude.ai",
+        action_id: "remote",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "draw-screenshot",
         label: "Draw + shot",
         emoji: "\u{1F58A}\u{FE0F}",    // 🖊️
@@ -732,6 +742,11 @@ mod tests {
     fn fork_buttons_are_registered() {
         assert!(BUTTONS.iter().any(|b| b.action_id == "fork"));
         assert!(BUTTONS.iter().any(|b| b.action_id == "fork-workspace"));
+    }
+
+    #[test]
+    fn remote_button_is_registered() {
+        assert!(BUTTONS.iter().any(|b| b.action_id == "remote"));
     }
 
     #[test]
