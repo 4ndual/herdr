@@ -492,6 +492,7 @@ fn build_right_panel_rail(
 fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
     match plugin_id {
         "builtin.historial-dash" => "\u{1F553}", // 🕓
+        "builtin.harness-manager" => "\u{1F39B}", // 🎛
         "builtin.goal-dash" => "\u{1F3AF}",      // 🎯
         "builtin.usage-dash" => "\u{1F4CA}",     // 📊
         _ => "\u{25A6}",                         // ▦

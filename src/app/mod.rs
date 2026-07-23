@@ -76,6 +76,14 @@ const GOAL_DASH_INPUT_FILE: &str = "goal_input.json";
 pub(crate) const HISTORIAL_DASH_PLUGIN_ID: &str = "builtin.historial-dash";
 const HISTORIAL_DASH_INPUT_FILE: &str = "historial_input.json";
 
+/// Plugin id and `ui_input_file` name for the harness-manager writer (mirrors
+/// the pairs above). The filename MUST equal `ui_input_file` in
+/// plugins/harness-manager-ui's manifest, and the id MUST equal the id the
+/// harness module registers under. Driven each dash tick by
+/// [`crate::harness_host`].
+pub(crate) const HARNESS_PLUGIN_ID: &str = "builtin.harness-manager";
+const HARNESS_INPUT_FILE: &str = "harness_input.json";
+
 /// How many recent closed panes the historial panel shows (newest first).
 const HISTORIAL_ROW_LIMIT: usize = 10;
 
@@ -812,6 +820,7 @@ impl App {
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
             pending_historial_action: None,
+            pending_harness_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
@@ -1860,6 +1869,9 @@ impl App {
         if self.apply_pending_historial_action() {
             acted = true;
         }
+        if self.apply_pending_harness_action() {
+            acted = true;
+        }
         acted
     }
 
@@ -2465,6 +2477,22 @@ impl App {
                 error = %err,
                 plugin_id = HISTORIAL_DASH_PLUGIN_ID,
                 "failed to write historial input file for the historial-dash plugin"
+            );
+        }
+    }
+
+    /// Atomically write the harness-manager render model JSON (built by
+    /// [`crate::harness_host::tick`]) to the harness module's state dir as
+    /// `harness_input.json`, where the generic `ui_input_file` reader surfaces
+    /// it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. A failed write is
+    /// logged and swallowed so it never stalls the render loop.
+    pub(crate) fn write_harness_input_file(&self, json: &str) {
+        let state_dir = crate::plugin_paths::plugin_state_dir(HARNESS_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, HARNESS_INPUT_FILE, json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = HARNESS_PLUGIN_ID,
+                "failed to write harness input file for the harness-manager plugin"
             );
         }
     }

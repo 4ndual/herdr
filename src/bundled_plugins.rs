@@ -35,6 +35,7 @@ fn bundled_ui_plugin_dirs() -> Vec<PathBuf> {
         root.join("usage-dash-ui"),
         root.join("goal-dash-ui"),
         root.join("historial-dash-ui"),
+        root.join("harness-manager-ui"),
     ]
 }
 

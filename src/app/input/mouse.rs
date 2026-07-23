@@ -37,6 +37,29 @@ fn parse_historial_action(action_id: &str) -> Option<crate::app::state::PendingH
     })
 }
 
+/// Parse a harness-manager action id (`harness:<verb>:<key>`) into the host
+/// action it names. Returns `None` for the guest-owned ids (toggle / menu /
+/// `harness:row:` right-click regions) and any non-harness id.
+fn parse_harness_action(action_id: &str) -> Option<crate::app::state::PendingHarnessAction> {
+    use crate::app::state::{HarnessActionKind, PendingHarnessAction};
+    let (kind, key) = if let Some(key) = action_id.strip_prefix("harness:open:") {
+        (HarnessActionKind::Open, key)
+    } else if let Some(key) = action_id.strip_prefix("harness:disable_session:") {
+        (HarnessActionKind::DisableSession, key)
+    } else if let Some(key) = action_id.strip_prefix("harness:disable_profile:") {
+        (HarnessActionKind::DisableProfile, key)
+    } else {
+        return None;
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some(PendingHarnessAction {
+        kind,
+        key: key.to_string(),
+    })
+}
+
 #[cfg(test)]
 use super::WheelRouting;
 use super::{
@@ -175,6 +198,20 @@ impl AppState {
                         .and_then(parse_historial_action)
                     {
                         self.pending_historial_action = Some(action);
+                        return None;
+                    }
+                }
+                // Host-owned harness-manager actions (open / disable): the
+                // harness plugin only DECLARES these hit-rects; the host owns
+                // pane spawning and the Claude settings files. Right-clicks are
+                // NOT intercepted — they route to the guest's disable menu.
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if let Some(action) = hit
+                        .action_id
+                        .as_deref()
+                        .and_then(parse_harness_action)
+                    {
+                        self.pending_harness_action = Some(action);
                         return None;
                     }
                 }

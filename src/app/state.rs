@@ -1205,6 +1205,29 @@ pub struct PendingHistorialAction {
     pub key: String,
 }
 
+/// A host-resolved harness-manager row action (open / disable), queued by
+/// `AppState::handle_mouse` from a click on the harness plugin's declared
+/// hit-rects. The harness plugin is a pure renderer; the HOST owns pane
+/// spawning and the Claude settings files, so it — not the guest — executes
+/// these. `App::apply_pending_harness_action` drains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHarnessAction {
+    pub kind: HarnessActionKind,
+    /// The row's stable key (`"ctx:<n>"` / `"hook:<n>"` / …), the suffix of the
+    /// clicked `harness:<verb>:<key>` action id.
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessActionKind {
+    /// Open the row's file in a new editor tab.
+    Open,
+    /// Disable the entry in the settings file that defines it (session-facing).
+    DisableSession,
+    /// Disable the entry AND its ccp profile source (profile-wide).
+    DisableProfile,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistorialActionKind {
     /// Resume the closed session in a new tab.
@@ -1603,6 +1626,9 @@ pub struct AppState {
     /// A historial row action (restore/fork/delete) recorded by `handle_mouse`,
     /// drained by the runtime layer (`AppState` can't spawn tabs / touch the log).
     pub(crate) pending_historial_action: Option<PendingHistorialAction>,
+    /// A harness-manager row action (open/disable) recorded by `handle_mouse`,
+    /// drained by the runtime layer (`AppState` can't spawn tabs / edit config).
+    pub(crate) pending_harness_action: Option<PendingHarnessAction>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
@@ -2085,6 +2111,7 @@ impl AppState {
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
             pending_historial_action: None,
+            pending_harness_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),
