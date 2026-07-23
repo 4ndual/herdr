@@ -67,6 +67,18 @@ const USAGE_DASH_INPUT_FILE: &str = "usage_input.json";
 const GOAL_DASH_PLUGIN_ID: &str = "builtin.goal-dash";
 const GOAL_DASH_INPUT_FILE: &str = "goal_input.json";
 
+/// Plugin id and `ui_input_file` name for the interim host-side historial writer
+/// (mirrors the usage/goal pairs above). The filename MUST equal `ui_input_file`
+/// in plugins/historial-dash-ui's manifest, and the id MUST equal the id the
+/// historial module registers under, so the generic reader resolves the same
+/// `HERDR_PLUGIN_STATE_DIR` file. Driven each dash tick by
+/// [`crate::historial_host`].
+pub(crate) const HISTORIAL_DASH_PLUGIN_ID: &str = "builtin.historial-dash";
+const HISTORIAL_DASH_INPUT_FILE: &str = "historial_input.json";
+
+/// How many recent closed panes the historial panel shows (newest first).
+const HISTORIAL_ROW_LIMIT: usize = 10;
+
 /// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
 /// side): write a sibling temp file then rename it into place, so item B's
 /// mtime-cached reader never observes a torn file. Creates `state_dir` when
@@ -141,6 +153,17 @@ fn read_ui_input_blob(
     let contents = String::from_utf8_lossy(&buf).into_owned();
     cache.insert(key, (mtime, std::sync::Arc::from(contents.as_str())));
     (!contents.is_empty()).then_some(contents)
+}
+
+/// Fallback historial row label when a closed pane recorded no title: the final
+/// path segment of its cwd, or "shell" when the cwd is empty/root.
+fn historial_label_fallback(cwd: &str) -> String {
+    std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "shell".to_string())
 }
 
 use crossterm::{
@@ -712,6 +735,7 @@ impl App {
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
                 panel_rects: Vec::new(),
+                right_panel_rail_icons: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -740,6 +764,7 @@ impl App {
             sidebar_collapsed: false,
             usage_strip_enabled: config.ui.usage_strip,
             collapsed_surfaces: std::collections::HashSet::new(),
+            active_right_panel: None,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
@@ -796,6 +821,7 @@ impl App {
             ui_surface_layers: Vec::new(),
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
+            pending_historial_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
@@ -1836,6 +1862,9 @@ impl App {
             }
             acted = true;
         }
+        if self.apply_pending_historial_action() {
+            acted = true;
+        }
         acted
     }
 
@@ -2367,6 +2396,63 @@ impl App {
                 error = %err,
                 plugin_id = GOAL_DASH_PLUGIN_ID,
                 "failed to write goal input file for the goal-dash plugin"
+            );
+        }
+    }
+
+    /// Project the recent pane-close log into the wasm-safe historial render
+    /// model. Every display string (agent, label, compact relative time) and the
+    /// per-row restorability is precomputed here host-side, since the historial
+    /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
+    fn historial_render_input_json(&self) -> Option<String> {
+        let now = crate::pane_close_history::now_unix_ms();
+        let rows = crate::pane_close_history::read_recent(HISTORIAL_ROW_LIMIT)
+            .into_iter()
+            .map(|record| {
+                let restorable = record.restorable();
+                let agent = record.agent.clone().unwrap_or_else(|| "shell".to_string());
+                let label = record
+                    .label
+                    .clone()
+                    .filter(|l| !l.trim().is_empty())
+                    .unwrap_or_else(|| historial_label_fallback(&record.cwd));
+                historial_dash_model::HistorialRow {
+                    key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
+                    agent,
+                    label,
+                    reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
+                    cwd: record.cwd,
+                    restorable,
+                }
+            })
+            .collect();
+        let model = historial_dash_model::HistorialRenderModel { rows };
+        match serde_json::to_string(&model) {
+            Ok(json) => Some(json),
+            Err(err) => {
+                tracing::warn!(error = %err, "historial render model failed to serialize; historial_input.json not written");
+                None
+            }
+        }
+    }
+
+    /// Interim writer (mirrors [`Self::write_goal_input_file`]): serialize the
+    /// live historial render model and atomically write it to the historial-dash
+    /// module's state dir as `historial_input.json`, where the generic
+    /// `ui_input_file` reader surfaces it to the guest as
+    /// `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the dash tick (~1 Hz) from
+    /// [`crate::historial_host::tick`]. A failed write is logged and swallowed so
+    /// it never stalls or panics the render loop.
+    pub(crate) fn write_historial_input_file(&self) {
+        let Some(json) = self.historial_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(HISTORIAL_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, HISTORIAL_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = HISTORIAL_DASH_PLUGIN_ID,
+                "failed to write historial input file for the historial-dash plugin"
             );
         }
     }

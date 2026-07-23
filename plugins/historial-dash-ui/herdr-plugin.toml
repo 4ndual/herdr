@@ -1,0 +1,25 @@
+id = "builtin.historial-dash"
+name = "Historial Dashboard"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Recently-closed panes; click to restore or fork the session (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module. Runs in this plugin dir, so the wasm lands at the
+# module path below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "historial"
+title = "Historial Dashboard"
+kind = "wasm"
+# v3: reads the generic HERDR_PLUGIN_UI_INPUT_JSON transport (spec §7.1).
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/historial_dash_ui.wasm"
+hot_reload = "on"
+surfaces = ["right_panel"]
+capabilities = ["layout_read"]
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
+# (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON.
+ui_input_file = "historial_input.json"

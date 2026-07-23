@@ -3877,6 +3877,7 @@ impl HeadlessServer {
         {
             crate::usage_host::tick(&mut self.app);
             crate::goal_host::tick(&mut self.app);
+            crate::historial_host::tick(&mut self.app);
             // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
             // capabilities, ui_input_file, collector argv) before the wasm
             // mtime watch, so a manifest change re-syncs the manager the same

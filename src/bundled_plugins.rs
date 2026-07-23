@@ -31,7 +31,11 @@ fn bundled_ui_plugin_dirs() -> Vec<PathBuf> {
     };
     // Add more dirs here as additional bundled dashboards ship; the merge
     // logic below is generic.
-    vec![root.join("usage-dash-ui"), root.join("goal-dash-ui")]
+    vec![
+        root.join("usage-dash-ui"),
+        root.join("goal-dash-ui"),
+        root.join("historial-dash-ui"),
+    ]
 }
 
 /// Auto-link every bundled UI plugin into `installed`, upgrading any stale

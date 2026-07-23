@@ -758,6 +758,22 @@ pub struct ViewState {
     /// inside the pane area), so a panel gets its own hit-rects and never steals
     /// usage-dash or pane input. Empty vec when no panel module renders content.
     pub panel_rects: Vec<PanelRect>,
+    /// Vertical icon rail for the right-panel plugins, when one or more of them
+    /// renders content and the panel is expanded (not in `collapsed_surfaces`).
+    /// One icon per right-panel plugin; clicking an icon expands that plugin's
+    /// panel (or collapses it when it is already the active one). Empty when no
+    /// right-panel plugin has content or the panel is collapsed to its handle.
+    pub right_panel_rail_icons: Vec<RightPanelRailIcon>,
+}
+
+/// One clickable icon in the right-panel rail: the plugin it selects, its rect,
+/// and whether that plugin is the currently expanded one. Purely TUI-presentation
+/// state (client layer), not a shared runtime fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RightPanelRailIcon {
+    pub plugin_id: String,
+    pub rect: Rect,
+    pub active: bool,
 }
 
 /// One resolved plugin `Panel` rect, tagged with the owning module identity so
@@ -1175,6 +1191,30 @@ pub struct PendingPluginUiAction {
     pub kind: herdr_ui_plugin_api::UiActionKind,
 }
 
+/// A host-resolved historial row action (restore / fork / delete), queued by
+/// `AppState::handle_mouse` from a click on the historial plugin's declared
+/// hit-rects. The historial plugin is a pure renderer; the HOST owns the
+/// pane-close log and the resume machinery, so it — not the guest — executes
+/// these. `App::apply_pending_historial_action` drains it once it has runtime
+/// access to spawn tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHistorialAction {
+    pub kind: HistorialActionKind,
+    /// The row's stable key `"<ts_unix_ms>:<pane_id>"` (the suffix of the clicked
+    /// `historial:<verb>:<key>` action id).
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorialActionKind {
+    /// Resume the closed session in a new tab.
+    Restore,
+    /// Fork (branch) the closed session into a new tab.
+    Fork,
+    /// Delete the row from the pane-close log.
+    Delete,
+}
+
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&str> {
         let mut items = self.builtin_items().iter().copied().collect::<Vec<_>>();
@@ -1455,6 +1495,12 @@ pub struct AppState {
     /// (wasm-ui v3 §7.2). `compute_view` shrinks a collapsed surface's reserve
     /// to a single row so panes reclaim the space. Pure data, not persisted.
     pub collapsed_surfaces: std::collections::HashSet<herdr_ui_plugin_api::UiSurface>,
+    /// Which right-panel plugin is currently expanded in the icon rail (by plugin
+    /// id). At most one right-panel plugin shows its content at a time; the others
+    /// collapse to their rail icon. `None` until the first right-panel plugin with
+    /// content appears, at which point `compute_view` defaults it to the first.
+    /// Pure TUI-presentation state (client layer), not persisted.
+    pub active_right_panel: Option<String>,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
@@ -1538,6 +1584,9 @@ pub struct AppState {
     /// API v3 (§4): a resolved click awaiting `UiEvent::Action` dispatch by
     /// `App` (which owns the runtime `UiPluginManager`).
     pub(crate) pending_plugin_ui_action: Option<PendingPluginUiAction>,
+    /// A historial row action (restore/fork/delete) recorded by `handle_mouse`,
+    /// drained by the runtime layer (`AppState` can't spawn tabs / touch the log).
+    pub(crate) pending_historial_action: Option<PendingHistorialAction>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
@@ -1558,6 +1607,62 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Clear `active_right_panel` if the plugin it names no longer renders content
+    /// (so a rail selection can't point at a vanished plugin). The panel defaults
+    /// to an icon-only rail — nothing is auto-expanded — so a `None` selection is
+    /// left as-is. Called from `compute_view` each frame; pure and unit-tested.
+    pub(crate) fn ensure_active_right_panel(&mut self, rail_plugins: &[String]) {
+        if let Some(active) = self.active_right_panel.as_deref() {
+            if !rail_plugins.iter().any(|p| p == active) {
+                self.active_right_panel = None;
+            }
+        }
+    }
+
+    /// Toggle the right-panel rail selection for `plugin_id`: clicking the icon of
+    /// the already-expanded plugin collapses the panel to its handle; clicking any
+    /// other icon expands that plugin (and un-collapses the panel). Pure and
+    /// unit-tested.
+    pub(crate) fn toggle_right_panel(&mut self, plugin_id: &str) {
+        let collapsed = self
+            .collapsed_surfaces
+            .contains(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        let is_active = self.active_right_panel.as_deref() == Some(plugin_id);
+        if is_active && !collapsed {
+            self.collapsed_surfaces
+                .insert(herdr_ui_plugin_api::UiSurface::RightPanel);
+        } else {
+            self.active_right_panel = Some(plugin_id.to_string());
+            self.collapsed_surfaces
+                .remove(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        }
+    }
+
+    /// Whether the given right-panel plugin is the one currently expanded (so its
+    /// layer should be painted and hit-tested). Others — and every plugin while the
+    /// panel is force-collapsed to its rail — are hidden behind their rail icon.
+    pub(crate) fn right_panel_layer_visible(&self, plugin_id: &str) -> bool {
+        !self
+            .collapsed_surfaces
+            .contains(&herdr_ui_plugin_api::UiSurface::RightPanel)
+            && self.active_right_panel.as_deref() == Some(plugin_id)
+    }
+
+    /// The plugin id of the right-panel rail icon at `(col, row)`, if any. Used by
+    /// the mouse handler to route a rail click to `toggle_right_panel`.
+    pub(crate) fn right_panel_rail_icon_at(&self, col: u16, row: u16) -> Option<String> {
+        self.view
+            .right_panel_rail_icons
+            .iter()
+            .find(|icon| {
+                col >= icon.rect.x
+                    && col < icon.rect.x.saturating_add(icon.rect.width)
+                    && row >= icon.rect.y
+                    && row < icon.rect.y.saturating_add(icon.rect.height)
+            })
+            .map(|icon| icon.plugin_id.clone())
     }
 
     /// Build a pane-close history record for a pane that is about to be torn
@@ -1862,6 +1967,7 @@ impl AppState {
                 usage_strip_rect: Rect::default(),
                 right_panel_rect: Rect::default(),
                 panel_rects: Vec::new(),
+                right_panel_rail_icons: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -1890,6 +1996,7 @@ impl AppState {
             sidebar_collapsed: false,
             usage_strip_enabled: true,
             collapsed_surfaces: std::collections::HashSet::new(),
+            active_right_panel: None,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
@@ -1955,6 +2062,7 @@ impl AppState {
             ui_surface_layers: Vec::new(),
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
+            pending_historial_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),
@@ -2301,6 +2409,65 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn ensure_active_right_panel_only_clears_invalid_never_auto_expands() {
+        let mut state = AppState::test_new();
+        // Nothing auto-expands: a None selection stays None even with content.
+        state.ensure_active_right_panel(&["a".to_string(), "b".to_string()]);
+        assert_eq!(state.active_right_panel, None);
+        // A still-valid selection is kept.
+        state.active_right_panel = Some("b".to_string());
+        state.ensure_active_right_panel(&["a".to_string(), "b".to_string()]);
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        // A selection whose plugin no longer has content is cleared.
+        state.ensure_active_right_panel(&["a".to_string()]);
+        assert_eq!(state.active_right_panel, None);
+    }
+
+    #[test]
+    fn toggle_right_panel_switches_and_collapses() {
+        let mut state = AppState::test_new();
+        let right = herdr_ui_plugin_api::UiSurface::RightPanel;
+        // First click expands that plugin.
+        state.toggle_right_panel("a");
+        assert_eq!(state.active_right_panel.as_deref(), Some("a"));
+        assert!(!state.collapsed_surfaces.contains(&right));
+        assert!(state.right_panel_layer_visible("a"));
+        assert!(!state.right_panel_layer_visible("b"));
+        // Clicking a different plugin's icon switches to it.
+        state.toggle_right_panel("b");
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        assert!(!state.collapsed_surfaces.contains(&right));
+        // Clicking the active plugin's icon collapses the panel to its handle.
+        state.toggle_right_panel("b");
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        assert!(state.collapsed_surfaces.contains(&right));
+        // Clicking it again re-expands.
+        state.toggle_right_panel("b");
+        assert!(!state.collapsed_surfaces.contains(&right));
+    }
+
+    #[test]
+    fn right_panel_rail_icon_at_hits_the_icon_rect() {
+        let mut state = AppState::test_new();
+        state.view.right_panel_rail_icons = vec![
+            RightPanelRailIcon {
+                plugin_id: "a".to_string(),
+                rect: Rect::new(100, 5, 3, 1),
+                active: true,
+            },
+            RightPanelRailIcon {
+                plugin_id: "b".to_string(),
+                rect: Rect::new(100, 6, 3, 1),
+                active: false,
+            },
+        ];
+        assert_eq!(state.right_panel_rail_icon_at(101, 5).as_deref(), Some("a"));
+        assert_eq!(state.right_panel_rail_icon_at(102, 6).as_deref(), Some("b"));
+        assert_eq!(state.right_panel_rail_icon_at(103, 5), None);
+        assert_eq!(state.right_panel_rail_icon_at(101, 7), None);
+    }
 
     #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {

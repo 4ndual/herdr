@@ -112,7 +112,10 @@ const GOAL_PANEL_MIN_WIDTH: u16 = 28;
 const GOAL_PANEL_MAX_WIDTH: u16 = 56;
 // wasm-ui v3 §7.2: a runtime-collapsed right panel keeps a slim clickable handle
 // column (an expand affordance stays reachable) and gives the rest to panes.
-const GOAL_PANEL_COLLAPSED_WIDTH: u16 = 3;
+// Width of the vertical icon rail drawn at the right edge of the expanded right
+// panel: one clickable icon per right-panel plugin, so the user can switch which
+// plugin's panel is expanded (or collapse the active one).
+const RIGHT_PANEL_RAIL_WIDTH: u16 = 3;
 
 // Absolute floor a panel's peer region always keeps along the carve axis, even
 // if a manifest declares a smaller `min_peer` — one column/row is reserved so a
@@ -303,28 +306,56 @@ fn compute_view_internal(
     // for panes. A runtime-collapsed panel (RightPanel in `collapsed_surfaces`)
     // keeps only a slim clickable handle column; the full width reuses the
     // pre-purge goal panel sizing (f4fd766^ src/ui.rs).
-    let right_panel_has_content = app.ui_surface_layers.iter().any(|entry| {
-        entry.layer.surface == herdr_ui_plugin_api::UiSurface::RightPanel
+    // Distinct right-panel plugins that currently render content, in the layout's
+    // deterministic (z desc, plugin asc, module asc) order — one rail icon each.
+    let mut right_panel_plugins: Vec<String> = Vec::new();
+    for entry in app.ui_surface_layers.iter() {
+        if entry.layer.surface == herdr_ui_plugin_api::UiSurface::RightPanel
             && !entry.layer.nodes.is_empty()
-    });
+            && !right_panel_plugins.contains(&entry.plugin_id)
+        {
+            right_panel_plugins.push(entry.plugin_id.clone());
+        }
+    }
+    // Clear a stale selection whose plugin no longer renders content. The panel
+    // starts as an icon-only rail (nothing expanded) and the user clicks an icon
+    // to expand a plugin — so we never auto-expand here (pure, unit-tested).
+    app.ensure_active_right_panel(&right_panel_plugins);
+
+    let right_panel_has_content = !right_panel_plugins.is_empty();
     let right_panel_collapsed = app
         .collapsed_surfaces
         .contains(&herdr_ui_plugin_api::UiSurface::RightPanel);
-    let (terminal_area, right_panel_rect) = if right_panel_has_content
+    // The expanded plugin (if any): a valid selection that isn't force-collapsed.
+    let active_right_panel = app
+        .active_right_panel
+        .as_deref()
+        .filter(|active| !right_panel_collapsed && right_panel_plugins.iter().any(|p| p == active))
+        .map(str::to_string);
+    let (terminal_area, right_panel_rect, right_panel_rail_icons) = if right_panel_has_content
         && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
     {
-        let panel_w = if right_panel_collapsed {
-            GOAL_PANEL_COLLAPSED_WIDTH
-        } else {
+        // The rail is always shown when a right-panel plugin has content; the
+        // content column is carved only when a plugin is expanded.
+        let rail_w = RIGHT_PANEL_RAIL_WIDTH;
+        let content_w = if active_right_panel.is_some() {
             (terminal_area.width / 4)
                 .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
-                .min(terminal_area.width.saturating_sub(24))
+                .min(terminal_area.width.saturating_sub(24 + rail_w))
+        } else {
+            0
         };
-        let [panes, panel] = Layout::horizontal([Constraint::Min(24), Constraint::Length(panel_w)])
-            .areas(terminal_area);
-        (panes, panel)
+        let [panes, content, rail] = Layout::horizontal([
+            Constraint::Min(24),
+            Constraint::Length(content_w),
+            Constraint::Length(rail_w),
+        ])
+        .areas(terminal_area);
+        let icons =
+            build_right_panel_rail(&right_panel_plugins, active_right_panel.as_deref(), rail);
+        (panes, content, icons)
     } else {
-        (terminal_area, Rect::default())
+        (terminal_area, Rect::default(), Vec::new())
     };
 
     // Generic plugin-panel placement: lay out every module that declares the
@@ -426,7 +457,68 @@ fn compute_view_internal(
         usage_strip_rect,
         right_panel_rect,
         panel_rects,
+        right_panel_rail_icons,
     };
+}
+
+/// Build the right-panel rail icons: one clickable 1-row rect per plugin, stacked
+/// from the top of `rail`, tagging which plugin is currently expanded. Empty when
+/// the rail has no room. Pure geometry, unit-tested.
+fn build_right_panel_rail(
+    plugins: &[String],
+    active: Option<&str>,
+    rail: Rect,
+) -> Vec<crate::app::state::RightPanelRailIcon> {
+    if rail.width == 0 || rail.height == 0 {
+        return Vec::new();
+    }
+    let mut icons = Vec::new();
+    for (i, plugin_id) in plugins.iter().enumerate() {
+        let y = rail.y + i as u16;
+        if y >= rail.y + rail.height {
+            break;
+        }
+        icons.push(crate::app::state::RightPanelRailIcon {
+            plugin_id: plugin_id.clone(),
+            rect: Rect::new(rail.x, y, rail.width, 1),
+            active: active == Some(plugin_id.as_str()),
+        });
+    }
+    icons
+}
+
+/// Glyph shown in a right-panel rail icon for a given plugin id. Falls back to a
+/// generic marker for unknown plugins.
+fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
+    match plugin_id {
+        "builtin.historial-dash" => "H",
+        "builtin.goal-dash" => "G",
+        "builtin.usage-dash" => "U",
+        _ => "*",
+    }
+}
+
+/// Draw the right-panel rail (host-owned): a vertical strip of plugin icons, the
+/// active one highlighted. Clicking an icon is routed in `handle_mouse`.
+fn render_right_panel_rail(app: &AppState, frame: &mut Frame) {
+    for icon in &app.view.right_panel_rail_icons {
+        if icon.rect.width == 0 || icon.rect.height == 0 {
+            continue;
+        }
+        let style = if icon.active {
+            Style::default()
+                .fg(app.palette.panel_bg)
+                .bg(app.palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        let glyph = right_panel_rail_glyph(&icon.plugin_id);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {glyph} "), style))),
+            icon.rect,
+        );
+    }
 }
 
 /// Generic plugin-panel layout: resolve a rect for every module that declares
@@ -703,6 +795,7 @@ fn compute_mobile_view(
         usage_strip_rect: Rect::default(),
         right_panel_rect: Rect::default(),
         panel_rects: Vec::new(),
+        right_panel_rail_icons: Vec::new(),
     };
 }
 
@@ -736,6 +829,7 @@ pub fn render_with_runtime_registry(
     }
     render_panes(app, terminal_runtimes, frame, terminal_area);
     render_ui_plugin_layers(app, frame);
+    render_right_panel_rail(app, frame);
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
@@ -976,6 +1070,13 @@ pub(crate) fn ui_plugin_hit_at(
     // topmost layer first.
     for entry in app.ui_surface_layers.iter() {
         let layer = &entry.layer;
+        // Only the expanded right-panel plugin is interactive; the others are
+        // collapsed to their rail icon (routed separately in `handle_mouse`).
+        if layer.surface == UiSurface::RightPanel
+            && !app.right_panel_layer_visible(&entry.plugin_id)
+        {
+            continue;
+        }
         let area = ui_plugin_owner_surface_rect(
             app,
             frame_area,
@@ -1046,6 +1147,13 @@ fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
     // `(z_index desc, plugin_id asc, module_id asc)`); paint bottom-to-top so the
     // topmost layer ends up drawn last (visually on top), so walk it reversed.
     for entry in app.ui_surface_layers.iter().rev() {
+        // Paint only the expanded right-panel plugin; collapsed peers show only
+        // their rail icon (drawn by `render_right_panel_rail`).
+        if entry.layer.surface == UiSurface::RightPanel
+            && !app.right_panel_layer_visible(&entry.plugin_id)
+        {
+            continue;
+        }
         let area = ui_plugin_owner_surface_rect(
             app,
             frame.area(),
@@ -1661,8 +1769,56 @@ mod tests {
         }
     }
 
+    fn historial_right_panel_layer(nodes: Vec<UiNode>) -> crate::ui_plugins::UiSurfaceLayer {
+        let mut layer = right_panel_layer(nodes);
+        layer.plugin_id = "builtin.historial-dash".into();
+        layer.module_id = "historial".into();
+        layer
+    }
+
     #[test]
-    fn compute_view_carves_right_panel_only_for_a_nonempty_declared_layer() {
+    fn compute_view_builds_rail_icons_for_each_right_panel_plugin() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![
+            right_panel_layer(vec![goal_line_node()]),
+            historial_right_panel_layer(vec![goal_line_node()]),
+        ];
+
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+
+        // One rail icon per right-panel plugin; nothing is auto-expanded, so the
+        // panel is an icon-only rail (no content column) and no layer is visible.
+        assert_eq!(app.view.right_panel_rail_icons.len(), 2);
+        assert_eq!(app.active_right_panel, None);
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(!app.view.right_panel_rail_icons.iter().any(|i| i.active));
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.historial-dash"));
+
+        // Clicking an icon expands that plugin: a content column is carved and
+        // only that plugin's layer paints / hit-tests.
+        app.toggle_right_panel("builtin.goal-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
+        assert!(app.right_panel_layer_visible("builtin.goal-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.historial-dash"));
+        // The rail still sits to the right of the content panel.
+        let rail = app.view.right_panel_rail_icons[0].rect;
+        assert!(rail.x >= app.view.right_panel_rect.x + app.view.right_panel_rect.width);
+
+        // Switching the active plugin flips which layer is visible.
+        app.toggle_right_panel("builtin.historial-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.right_panel_layer_visible("builtin.historial-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
+    }
+
+    #[test]
+    fn compute_view_carves_right_panel_content_only_when_a_plugin_is_expanded() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1672,15 +1828,23 @@ mod tests {
         // No module renders RightPanel → dormant (0×0), every column goes to panes.
         compute_view(&mut app, Rect::new(0, 0, 160, 40));
         assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(app.view.right_panel_rail_icons.is_empty());
 
-        // A declared-but-empty RightPanel layer still carves nothing.
+        // A declared-but-empty RightPanel layer carves nothing (no rail either).
         app.ui_surface_layers = vec![right_panel_layer(Vec::new())];
         compute_view(&mut app, Rect::new(0, 0, 160, 40));
         assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(app.view.right_panel_rail_icons.is_empty());
 
-        // A non-empty RightPanel layer carves the full panel: auto-width in the
-        // revived [MIN, MAX] range, spanning the pane band's full height.
+        // A non-empty RightPanel layer shows the rail, but no content column until
+        // the plugin is expanded.
         app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert_eq!(app.view.right_panel_rail_icons.len(), 1);
+
+        // Expanding it carves the content panel: auto-width in the [MIN, MAX] range.
+        app.toggle_right_panel("builtin.goal-dash");
         compute_view(&mut app, Rect::new(0, 0, 160, 40));
         assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
         assert!(app.view.right_panel_rect.width <= GOAL_PANEL_MAX_WIDTH);
@@ -1688,7 +1852,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_view_collapsed_right_panel_keeps_slim_handle_column() {
+    fn compute_view_collapsed_right_panel_falls_back_to_icon_rail() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1696,16 +1860,19 @@ mod tests {
         app.mode = Mode::Terminal;
         app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
 
+        // Expand the plugin, then collapse it: collapsing drops the content column
+        // back to the icon-only rail and returns the columns to the pane area.
+        app.toggle_right_panel("builtin.goal-dash");
         compute_view(&mut app, Rect::new(0, 0, 160, 40));
         let expanded_w = app.view.right_panel_rect.width;
-        assert!(expanded_w > GOAL_PANEL_COLLAPSED_WIDTH);
+        assert!(expanded_w >= GOAL_PANEL_MIN_WIDTH);
 
-        // wasm-ui v3 §7.2: collapsing keeps a slim clickable handle column and
-        // gives the reclaimed columns back to the pane area.
         app.collapsed_surfaces
             .insert(herdr_ui_plugin_api::UiSurface::RightPanel);
         compute_view(&mut app, Rect::new(0, 0, 160, 40));
-        assert_eq!(app.view.right_panel_rect.width, GOAL_PANEL_COLLAPSED_WIDTH);
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert_eq!(app.view.right_panel_rail_icons.len(), 1);
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
 
         app.collapsed_surfaces
             .remove(&herdr_ui_plugin_api::UiSurface::RightPanel);

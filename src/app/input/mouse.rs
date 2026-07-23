@@ -14,6 +14,29 @@ use crate::{
     terminal::TerminalRuntimeRegistry,
 };
 
+/// Parse a historial row action id (`historial:<verb>:<key>`) into the host
+/// action it names. Returns `None` for the guest-owned `historial:toggle_panel`
+/// and any non-historial id.
+fn parse_historial_action(action_id: &str) -> Option<crate::app::state::PendingHistorialAction> {
+    use crate::app::state::{HistorialActionKind, PendingHistorialAction};
+    let (kind, key) = if let Some(key) = action_id.strip_prefix("historial:restore:") {
+        (HistorialActionKind::Restore, key)
+    } else if let Some(key) = action_id.strip_prefix("historial:fork:") {
+        (HistorialActionKind::Fork, key)
+    } else if let Some(key) = action_id.strip_prefix("historial:del:") {
+        (HistorialActionKind::Delete, key)
+    } else {
+        return None;
+    };
+    if key.is_empty() {
+        return None;
+    }
+    Some(PendingHistorialAction {
+        kind,
+        key: key.to_string(),
+    })
+}
+
 #[cfg(test)]
 use super::WheelRouting;
 use super::{
@@ -122,6 +145,18 @@ impl AppState {
             return self.handle_settings_mouse(mouse).map(MouseAction::Settings);
         }
 
+        // Host-owned right-panel rail: a left-click on a rail icon expands that
+        // plugin's panel (or collapses the active one). Checked before plugin
+        // hit-routing so the rail column never leaks clicks to a plugin layer.
+        if self.mode == Mode::Terminal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if let Some(plugin_id) = self.right_panel_rail_icon_at(mouse.column, mouse.row) {
+                self.toggle_right_panel(&plugin_id);
+                return None;
+            }
+        }
+
         if self.mode == Mode::Terminal && !self.ui_surface_layers.is_empty() {
             if let Some(hit) = crate::ui::ui_plugin_hit_at(
                 self,
@@ -129,6 +164,20 @@ impl AppState {
                 mouse.column,
                 mouse.row,
             ) {
+                // Host-owned historial row actions (restore/fork/delete): the
+                // historial plugin only DECLARES these hit-rects; the host owns
+                // the pane-close log and the resume machinery, so intercept them
+                // here before they route to the (ignoring) guest.
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if let Some(action) = hit
+                        .action_id
+                        .as_deref()
+                        .and_then(parse_historial_action)
+                    {
+                        self.pending_historial_action = Some(action);
+                        return None;
+                    }
+                }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if let Some(action_id) = hit.action_id.as_deref() {
                         if let Some((plugin_id, action_id)) = action_id
@@ -1937,6 +1986,27 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    #[test]
+    fn parse_historial_action_routes_verbs_and_ignores_toggle() {
+        use crate::app::state::HistorialActionKind;
+        let restore = super::parse_historial_action("historial:restore:100:w_1_p_2").unwrap();
+        assert_eq!(restore.kind, HistorialActionKind::Restore);
+        assert_eq!(restore.key, "100:w_1_p_2");
+        assert_eq!(
+            super::parse_historial_action("historial:fork:5:p").unwrap().kind,
+            HistorialActionKind::Fork
+        );
+        assert_eq!(
+            super::parse_historial_action("historial:del:5:p").unwrap().kind,
+            HistorialActionKind::Delete
+        );
+        // The guest-owned toggle and unrelated ids are not host actions.
+        assert!(super::parse_historial_action("historial:toggle_panel").is_none());
+        assert!(super::parse_historial_action("plugin:foo:bar").is_none());
+        // A missing key is rejected.
+        assert!(super::parse_historial_action("historial:restore:").is_none());
+    }
 
     fn mark_worktree_space_member(workspace: &mut Workspace, ws_idx: usize, key: &str) {
         workspace.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

@@ -69,6 +69,7 @@ mod events;
 mod ghostty;
 mod goal_host;
 mod handoff_runtime;
+mod historial_host;
 mod input;
 mod integration;
 mod ipc;

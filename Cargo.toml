@@ -29,6 +29,7 @@ ctrlc = "3"
 goal-dash-core = { path = "crates/goal-dash-core" }
 goal-dash-model = { path = "crates/goal-dash-model" }
 herdr-ui-plugin-api = { path = "crates/herdr-ui-plugin-api" }
+historial-dash-model = { path = "crates/historial-dash-model" }
 interprocess = "2.4.2"
 libc = "0.2"
 portable-pty = "=0.9.0"
@@ -71,5 +72,5 @@ windows-sys = { version = "0.61.2", features = [
 wat = "1"
 
 [workspace]
-members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api", "plugins/usage-dash-ui/collector"]
+members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api", "crates/historial-dash-model", "plugins/usage-dash-ui/collector"]
 resolver = "2"

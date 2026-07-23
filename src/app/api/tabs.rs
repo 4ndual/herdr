@@ -127,6 +127,124 @@ impl App {
         }
     }
 
+    /// Drain and apply a pending historial row action (restore / fork / delete)
+    /// recorded by the mouse handler. The historial plugin only declares these
+    /// hit-rects; the host owns the pane-close log and the resume machinery, so it
+    /// resolves the clicked row's key back to its record and acts here. Returns
+    /// true if it acted (the caller should re-render). Lives in the api/tabs
+    /// module so it can reuse the tab-create helpers and stay a clean tab spawn.
+    pub(crate) fn apply_pending_historial_action(&mut self) -> bool {
+        let Some(action) = self.state.pending_historial_action.take() else {
+            return false;
+        };
+        use crate::app::state::HistorialActionKind;
+        // Resolve the source record by its stable "<ts>:<pane_id>" key. Read a
+        // generous window so an older visible row is still found.
+        let record = crate::pane_close_history::read_recent(256)
+            .into_iter()
+            .find(|r| format!("{}:{}", r.ts_unix_ms, r.pane_id) == action.key);
+        let Some(record) = record else {
+            tracing::warn!(key = %action.key, "historial action: source record not found");
+            return false;
+        };
+        match action.kind {
+            HistorialActionKind::Delete => {
+                let removed =
+                    crate::pane_close_history::delete_record(record.ts_unix_ms, &record.pane_id);
+                // Republish immediately so the deleted row disappears this frame
+                // instead of waiting for the next dash tick.
+                self.write_historial_input_file();
+                removed
+            }
+            HistorialActionKind::Restore | HistorialActionKind::Fork => {
+                let argv = if matches!(action.kind, HistorialActionKind::Fork) {
+                    record.fork_argv()
+                } else {
+                    record.resume_plan().map(|plan| plan.argv)
+                };
+                let Some(argv) = argv else {
+                    tracing::warn!(
+                        key = %action.key,
+                        "historial restore: row is not restorable (no resume plan)"
+                    );
+                    return false;
+                };
+                self.spawn_historial_restore_tab(&record, argv)
+            }
+        }
+    }
+
+    /// Spawn a new focused tab in the active workspace running `argv` (a resume /
+    /// fork command) in the closed pane's recorded cwd. Mirrors
+    /// [`Self::handle_tab_create`]'s registration, but runs an explicit argv (the
+    /// resume command) as the tab's process. Returns true on success.
+    fn spawn_historial_restore_tab(
+        &mut self,
+        record: &crate::pane_close_history::PaneCloseRecord,
+        argv: Vec<String>,
+    ) -> bool {
+        let Some(ws_idx) = self.state.active else {
+            tracing::warn!("historial restore: no active workspace");
+            return false;
+        };
+        let cwd = if record.cwd.trim().is_empty() {
+            self.resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
+        } else {
+            PathBuf::from(&record.cwd)
+        };
+        let (rows, cols) = self.state.estimate_pane_size();
+        let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
+        let host_terminal_theme = self.state.host_terminal_theme;
+        let result = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .ok_or_else(|| std::io::Error::other("workspace disappeared"))
+            .and_then(|ws| {
+                ws.create_tab_argv_command(
+                    rows.max(4),
+                    cols.max(10),
+                    cwd,
+                    &argv,
+                    Vec::new(),
+                    scrollback_limit_bytes,
+                    host_terminal_theme,
+                )
+            });
+        match result {
+            Ok((tab_idx, terminal, runtime)) => {
+                self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+                self.state.terminals.insert(terminal.id.clone(), terminal);
+                self.state.remove_alias_shadowed_by_new_pane(
+                    self.state.workspaces[ws_idx].tabs[tab_idx].root_pane,
+                );
+                let label = record
+                    .label
+                    .clone()
+                    .filter(|l| !l.trim().is_empty())
+                    .or_else(|| record.agent.clone())
+                    .unwrap_or_else(|| "restored".to_string());
+                if let Some(tab) = self
+                    .state
+                    .workspaces
+                    .get_mut(ws_idx)
+                    .and_then(|ws| ws.tabs.get_mut(tab_idx))
+                {
+                    tab.set_custom_name(label);
+                }
+                self.state.switch_workspace_tab(ws_idx, tab_idx);
+                self.state.mode = Mode::Terminal;
+                self.schedule_session_save();
+                self.emit_tab_created_events(ws_idx, tab_idx);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "historial restore: tab create failed");
+                false
+            }
+        }
+    }
+
     pub(super) fn handle_tab_focus(&mut self, id: String, target: TabTarget) -> String {
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&target.tab_id) else {
             return tab_not_found(id, &target.tab_id);

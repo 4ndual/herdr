@@ -326,6 +326,7 @@ impl App {
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::usage_host::tick(self);
             crate::goal_host::tick(self);
+            crate::historial_host::tick(self);
             // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
             // capabilities, ui_input_file, collector argv) before the wasm
             // mtime watch, so a manifest change re-syncs the manager the same

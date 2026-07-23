@@ -50,6 +50,57 @@ pub struct PaneCloseRecord {
     pub workspace_id: String,
 }
 
+impl PaneCloseRecord {
+    /// Rebuild the [`crate::agent_resume::AgentResumePlan`] for this closed pane,
+    /// if it carried an official (restorable) agent session. `None` for plain
+    /// shells or non-official sources — such rows render without restore
+    /// affordances.
+    pub fn resume_plan(&self) -> Option<crate::agent_resume::AgentResumePlan> {
+        use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind};
+        let source = self.session_source.as_deref()?;
+        let agent = self.agent.as_deref()?;
+        let kind = match self.session_kind.as_deref()? {
+            "id" => AgentSessionRefKind::Id,
+            "path" => AgentSessionRefKind::Path,
+            _ => return None,
+        };
+        let value = self.session_value.clone()?;
+        crate::agent_resume::plan(source, agent, &AgentSessionRef { kind, value })
+    }
+
+    /// Whether a resume plan can be rebuilt (drives the restore/fork/delete row
+    /// affordances in the historial panel).
+    pub fn restorable(&self) -> bool {
+        self.resume_plan().is_some()
+    }
+
+    /// Argv to FORK (branch) this session into a new tab, transforming the plain
+    /// resume argv per agent. Agents without a known fork flag fall back to the
+    /// resume argv (best-effort continue rather than nothing).
+    pub fn fork_argv(&self) -> Option<Vec<String>> {
+        let plan = self.resume_plan()?;
+        let mut argv = plan.argv;
+        match plan.agent.as_str() {
+            // cx-resume <id> --fork-session
+            "claude" => argv.push("--fork-session".to_string()),
+            // codex resume <id> -> codex fork <id>
+            "codex" => {
+                if argv.get(1).map(|s| s == "resume").unwrap_or(false) {
+                    argv[1] = "fork".to_string();
+                }
+            }
+            // pi --session <path> -> pi --fork <path>
+            "pi" => {
+                if let Some(pos) = argv.iter().position(|s| s == "--session") {
+                    argv[pos] = "--fork".to_string();
+                }
+            }
+            _ => {}
+        }
+        Some(argv)
+    }
+}
+
 /// Absolute path of the history log.
 pub fn history_path() -> PathBuf {
     crate::config::state_dir().join(HISTORY_FILE)
@@ -345,6 +396,55 @@ mod tests {
     }
 
     #[test]
+    fn resume_plan_rebuilds_for_official_agent_session() {
+        let record = sample(1, "p");
+        let plan = record.resume_plan().expect("claude session is restorable");
+        assert_eq!(plan.argv, vec!["cx-resume", "abc-123"]);
+        assert!(record.restorable());
+    }
+
+    #[test]
+    fn resume_plan_absent_without_session_fields() {
+        let mut record = sample(1, "p");
+        record.session_source = None;
+        record.session_kind = None;
+        record.session_value = None;
+        assert!(record.resume_plan().is_none());
+        assert!(!record.restorable());
+    }
+
+    #[test]
+    fn fork_argv_appends_fork_flag_for_claude() {
+        let record = sample(1, "p");
+        assert_eq!(
+            record.fork_argv().expect("forkable"),
+            vec!["cx-resume", "abc-123", "--fork-session"]
+        );
+    }
+
+    #[test]
+    fn fork_argv_transforms_codex_and_pi() {
+        let mut codex = sample(1, "p");
+        codex.session_source = Some("herdr:codex".to_string());
+        codex.agent = Some("codex".to_string());
+        codex.session_value = Some("cx-1".to_string());
+        assert_eq!(
+            codex.fork_argv().expect("forkable"),
+            vec!["codex", "fork", "cx-1"]
+        );
+
+        let mut pi = sample(1, "p");
+        pi.session_source = Some("herdr:pi".to_string());
+        pi.agent = Some("pi".to_string());
+        pi.session_kind = Some("path".to_string());
+        pi.session_value = Some("/tmp/pi-session.jsonl".to_string());
+        assert_eq!(
+            pi.fork_argv().expect("forkable"),
+            vec!["pi", "--fork", "/tmp/pi-session.jsonl"]
+        );
+    }
+
+    #[test]
     fn read_recent_missing_file_is_empty() {
         let path = std::env::temp_dir().join("herdr-pane-hist-does-not-exist.jsonl");
         let _ = std::fs::remove_file(&path);
@@ -357,7 +457,7 @@ mod tests {
         assert_eq!(relative_time(now, now), "just now");
         assert_eq!(relative_time(now - 5_000, now), "just now");
         assert_eq!(relative_time(now - 120_000, now), "2m");
-        assert_eq!(relative_time(now - 3 * 3600_000, now), "3h");
+        assert_eq!(relative_time(now - 3 * 3_600_000, now), "3h");
         assert_eq!(relative_time(now - 2 * 86_400_000, now), "2d");
         // Future timestamp clamps.
         assert_eq!(relative_time(now + 10_000, now), "just now");
