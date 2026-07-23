@@ -54,6 +54,43 @@ fi
 command -v jq >/dev/null 2>&1 || { log "FATAL: jq not found"; exit 3; }
 
 hd() { "$HERDR" "$@"; }
+
+# ---------------------------------------------------------------------------
+# INCIDENT FIX (F6): sweep stale bridge symlinks out of the CCR projects tree.
+# A bridge is only needed transiently while a fork boots; a lingering symlink
+# whose target lives under ~/.claude/projects makes cx-resume mis-dispatch the
+# ORIGINAL daily pane as cx on the next hr restart. Remove every such symlink
+# (optionally keeping $1) on every run.
+# ---------------------------------------------------------------------------
+sweep_stale_bridges() {
+  local keep="${1:-}" root daily p tgt
+  root="${CCR_DIR:-$HOME/.claude-code-router/profiles/default-claude-code/claude}/projects"
+  daily="$HOME/.claude/projects"
+  [[ -d "$root" ]] || return 0
+  while IFS= read -r p; do
+    [[ -z "$p" || "$p" == "$keep" ]] && continue
+    if [[ -L "$p" ]]; then
+      tgt="$(readlink -f "$p" 2>/dev/null || true)"
+      if [[ -z "$tgt" || "$tgt" == "$daily"/* ]]; then
+        rm -f "$p" 2>/dev/null && log "swept stale bridge: $p"
+      fi
+    fi
+  done < <(find "$root" -maxdepth 2 -type l 2>/dev/null)
+}
+
+# Detached reaper: remove bridge symlink $1 once the fork has booted (a real,
+# non-symlink transcript appears there) or after $2 seconds grace.
+reap_bridge() {
+  local bridge="$1" grace="${2:-60}" i
+  ( for ((i=0;i<grace;i++)); do
+      sleep 1
+      [[ -e "$bridge" && ! -L "$bridge" ]] && break
+    done
+    [[ -L "$bridge" ]] && rm -f "$bridge" 2>/dev/null && log "reaped bridge: $bridge"
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
 toast() {
   local title="$1" body="${2:-}"
   log "TOAST: $title — $body"
@@ -125,6 +162,9 @@ DAILY_JSONL="$HOME/.claude/projects/$ENC/$VALUE.jsonl"
 #    * daily: bridge the transcript into the CCR projects dir (symlink; the
 #      original stays read-only) and launch the cx launcher directly.
 # ---------------------------------------------------------------------------
+# De-pollute the CCR tree before every fork (removes prior runs' stale bridges).
+sweep_stale_bridges
+DAILY_BRIDGE=""
 if [[ -f "$CX_JSONL" ]]; then
   FORK_CMD="cx-resume $(printf '%q' "$VALUE") --fork-session"
   log "cx-origin session; forking via cx-resume"
@@ -133,7 +173,7 @@ else
   mkdir -p "$CCR_DIR/projects/$ENC" 2>/dev/null || true
   if [[ ! -e "$CX_JSONL" && -f "$DAILY_JSONL" ]]; then
     ln -s "$DAILY_JSONL" "$CX_JSONL" 2>/dev/null \
-      && log "bridged daily transcript into CCR dir: $CX_JSONL -> $DAILY_JSONL" \
+      && { DAILY_BRIDGE="$CX_JSONL"; log "bridged daily transcript into CCR dir: $CX_JSONL -> $DAILY_JSONL"; } \
       || log "WARN: could not symlink daily transcript into CCR dir"
   fi
   FORK_CMD="cx --resume $(printf '%q' "$VALUE") --fork-session"
@@ -174,5 +214,11 @@ log "destination root pane: $ROOT_PANE"
 
 sleep 0.4
 hd pane run "$ROOT_PANE" "exec $FORK_CMD" >>"$LOG" 2>&1
+# Fork boots in $ROOT_PANE writing a NEW session id; the daily bridge symlink was
+# only needed to let cx FIND the source transcript. Reap it once the fork is up so
+# it never lingers to pollute a later hr restart (F6).
+if [[ -n "$DAILY_BRIDGE" ]]; then
+  reap_bridge "$DAILY_BRIDGE" "${RESUME_PICKER_BRIDGE_GRACE_S:-60}"
+fi
 log "RESUME-IN-CX OK: $VALUE -> $ROOT_PANE"
 exit 0

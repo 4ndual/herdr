@@ -49,6 +49,41 @@ export interface ResultLine {
   /** Ago since session created (first line mtime/timestamp). Empty string if unknown. */
   createdAgo: string;
   resumeRef: ResumeRef;
+  /**
+   * First and last USER prompt of the conversation, so the picker can show a
+   * detail area under the selected row for recognition (F3). Empty when unknown
+   * or for sentinel rows.
+   */
+  firstPrompt: string;
+  lastPrompt: string;
+  /**
+   * Compaction/continuation chain for this conversation (F5). One ResultLine is
+   * the LATEST segment (the resume target); `chain` lists earlier checkpoints /
+   * segments the user can expand (→ / Tab) to recognise the conversation and,
+   * where the runtime allows, resume from that point. Empty for a plain
+   * single-segment session. Ordered newest-first.
+   */
+  chain: ChainSegment[];
+}
+
+/**
+ * One earlier point in a conversation's compaction/continuation chain (F5).
+ * A `checkpoint` is a compact_boundary WITHIN one session id (resuming the id
+ * restores its latest state — the checkpoint is a recognition aid + boundary
+ * marker). A `segment` is a distinct prior session id linked cross-file
+ * (resumable in its own right).
+ */
+export interface ChainSegment {
+  kind: "checkpoint" | "segment";
+  /** Session id to resume for a `segment`; the parent id for a `checkpoint`. */
+  sessionId: string;
+  shortId: string;
+  /** Ago since this checkpoint/segment (e.g. "2h"). */
+  ago: string;
+  /** Human label, e.g. "compacted 59k→3k tokens" or the segment's first prompt. */
+  label: string;
+  /** Resume target for a selectable `segment`; null for an informational checkpoint. */
+  resumeRef: ResumeRef | null;
 }
 
 /** True if a ResultLine is a degradation/status sentinel (not selectable). */
@@ -66,6 +101,9 @@ export function sentinelLine(message: string): ResultLine {
     lastAgentAgo: "",
     createdAgo: "",
     resumeRef: { sessionId: "", jsonlPath: "", origin: "daily", cwd: "" },
+    firstPrompt: "",
+    lastPrompt: "",
+    chain: [],
   };
 }
 
@@ -101,6 +139,31 @@ export interface SessionMeta {
   lastAgentMs: number;
   /** First user prompt / summary line, for similar-index docs and previews. */
   summary: string;
+  /** Last USER prompt text — pairs with `summary` (first prompt) for F3 recognition. */
+  lastPrompt: string;
+  /**
+   * Compaction checkpoints found in this transcript (compact_boundary records),
+   * newest-first. Drives the F5 expand view. Empty for uncompacted sessions.
+   */
+  checkpoints: Checkpoint[];
+  /**
+   * If this transcript continues a prior session id (cross-file resume/fork link),
+   * the parent session id; empty otherwise. Reserved for cross-file chains — the
+   * current Claude Code format compacts in-file, so this is usually empty.
+   */
+  chainParentId: string;
+}
+
+/** A compaction boundary within a single transcript. */
+export interface Checkpoint {
+  /** Epoch ms of the compaction. */
+  ms: number;
+  /** Tokens before compaction (from compactMetadata), 0 if unknown. */
+  preTokens: number;
+  /** Tokens after compaction, 0 if unknown. */
+  postTokens: number;
+  /** "manual" | "auto" | "" — the compaction trigger. */
+  trigger: string;
 }
 
 /**

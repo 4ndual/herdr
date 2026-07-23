@@ -14,7 +14,7 @@ import {
   buildPrompt,
   extractSnippet,
   parseHits,
-  runCx,
+  runCodex,
   searchGpt,
   GPT_TIMEOUT_MS,
 } from "../src/s3-gpt.ts";
@@ -142,11 +142,11 @@ describe("searchGpt (degradation paths)", () => {
   });
 });
 
-describe("runCx (real cheap invocation)", () => {
+describe("runCodex (real cheap invocation via the luna/Codex route)", () => {
   test("returns model text for a trivial prompt", async () => {
-    const out = await runCx("Reply with exactly one word: PONG", new AbortController().signal, GPT_TIMEOUT_MS);
+    const out = await runCodex("Reply with exactly one word: PONG", new AbortController().signal, GPT_TIMEOUT_MS);
     if (out === null) {
-      console.warn("runCx returned null (cx gateway down?) — skipping content assertion");
+      console.warn("runCodex returned null (codex CLI unavailable?) — skipping content assertion");
       return;
     }
     expect(out.toUpperCase()).toContain("PONG");

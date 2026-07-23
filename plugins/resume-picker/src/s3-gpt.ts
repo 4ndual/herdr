@@ -4,7 +4,9 @@
 // when S1+S2 came back empty/weak or the user pressed "search deeper" (Tab).
 // It follows the search-session skill's methodology: cheaply pre-grep a
 // candidate set of transcripts, hand those candidates + the query to a model
-// via ONE non-interactive `cx -p` call, and ask the model to pick the sessions
+// via ONE non-interactive `codex exec` call (the CODEX-backed "luna" route —
+// fast/cheap GPT on the Codex Pro subscription, NOT the Claude subscription),
+// and ask the model to pick the sessions
 // that are genuinely about the query and quote the matching snippet in a strict
 // parseable format. We then map each pick back to a ResultLine using the real
 // session metadata from sessions.ts — never inventing a session.
@@ -14,11 +16,12 @@
 // degradation ResultLine (empty sessionId marks it non-selectable for the TUI).
 // If the AbortSignal fires (the query changed) we stop and yield nothing.
 
-import { readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { readFileSync, rmSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import type { CorpusConfig, ResultLine, ResumeRef, SectionSearcher, SessionMeta } from "./types.ts";
-import { loadConfig, MetaCache } from "./sessions.ts";
+import { loadConfig, MetaCache, buildChain } from "./sessions.ts";
 
 /** Wall-clock budget for the single cx call before we give up. */
 export const GPT_TIMEOUT_MS = 30_000;
@@ -42,6 +45,9 @@ function degraded(message: string): ResultLine {
     lastAgentAgo: "",
     createdAgo: "",
     resumeRef,
+    firstPrompt: "",
+    lastPrompt: "",
+    chain: [],
   };
 }
 
@@ -76,6 +82,9 @@ function metaToResultLine(meta: SessionMeta, snippet: string, now = Date.now()):
     lastAgentAgo: agoFmt(meta.lastAgentMs, now),
     createdAgo: agoFmt(meta.createdMs, now),
     resumeRef,
+    firstPrompt: meta.summary,
+    lastPrompt: meta.lastPrompt,
+    chain: buildChain(meta, now),
   };
 }
 
@@ -285,27 +294,46 @@ export function parseHits(out: string): Hit[] {
 }
 
 /**
- * Run the single cx headless call. Prompt goes via stdin (avoids argv limits and
- * the -p+--system-prompt drop regression). Resolves the raw stdout, or null on
- * timeout / abort / spawn error. cx already defaults to skip-permissions and a
- * one-shot with -p; we pass no system prompt.
+ * Resolve the CODEX_HOME the codex CLI should authenticate against. In
+ * production $HOME is real so `~/.codex` is correct. Tests sandbox $HOME to point
+ * the corpus at fixtures, so honor CODEX_HOME (explicit) or CX_HOME (the real
+ * home, from which we derive `<home>/.codex`).
  */
-export function runCx(prompt: string, signal: AbortSignal, timeoutMs = GPT_TIMEOUT_MS): Promise<string | null> {
+function codexHome(): string | undefined {
+  if (process.env.CODEX_HOME) return process.env.CODEX_HOME;
+  if (process.env.CX_HOME) return join(process.env.CX_HOME, ".codex");
+  return undefined; // inherit — codex defaults to $HOME/.codex
+}
+
+/**
+ * Run the single S3 model call through the CODEX-backed "luna" route — the fast,
+ * cheap GPT worker on the Codex Pro subscription (via the local `codex` CLI),
+ * NOT the Claude subscription. `codex exec` is the non-interactive entry: the
+ * prompt goes on stdin, the model's final answer is written to a temp file via
+ * `--output-last-message` (clean, no event noise), and we read that back.
+ * read-only sandbox + skip-git-repo-check keep it a pure text call that never
+ * runs shell commands. Resolves the model text, or null on timeout/abort/error.
+ */
+export function runCodex(prompt: string, signal: AbortSignal, timeoutMs = GPT_TIMEOUT_MS): Promise<string | null> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve(null);
-    // The cx launcher resolves its node/gateway paths from $HOME. Tests sandbox
-    // $HOME to point the corpus at fixtures, so honor CX_HOME to run cx against
-    // the real home; unset in production, where HOME is already correct.
-    const cxHome = process.env.CX_HOME;
-    const env = cxHome ? { ...process.env, HOME: cxHome } : process.env;
-    const proc = spawn("cx", ["-p"], { stdio: ["pipe", "pipe", "ignore"], env });
-    let out = "";
+    const home = codexHome();
+    const env = home ? { ...process.env, CODEX_HOME: home } : process.env;
+    const lastMsgFile = join(tmpdir(), `resume-picker-s3-${process.pid}-${Date.now()}.txt`);
+    const proc = spawn(
+      "codex",
+      ["exec", "--skip-git-repo-check", "-s", "read-only", "--color", "never", "-o", lastMsgFile, "-"],
+      { stdio: ["pipe", "ignore", "ignore"], env },
+    );
     let done = false;
     const finish = (val: string | null) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
+      try {
+        rmSync(lastMsgFile, { force: true });
+      } catch {}
       resolve(val);
     };
     // Bun/node async spawn ignores an option timeout — kill manually.
@@ -318,9 +346,17 @@ export function runCx(prompt: string, signal: AbortSignal, timeoutMs = GPT_TIMEO
       finish(null);
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    proc.stdout.on("data", (d) => (out += d));
     proc.on("error", () => finish(null));
-    proc.on("close", () => finish(signal.aborted ? null : out));
+    proc.on("close", () => {
+      if (signal.aborted) return finish(null);
+      let text: string | null = null;
+      try {
+        text = readFileSync(lastMsgFile, "utf8");
+      } catch {
+        text = null;
+      }
+      finish(text);
+    });
     proc.stdin.on("error", () => {}); // ignore EPIPE if the child dies early
     proc.stdin.write(prompt);
     proc.stdin.end();
@@ -348,7 +384,7 @@ export const searchGpt: SectionSearcher = async function* (query: string, signal
   }
 
   const prompt = buildPrompt(q, candidates);
-  const out = await runCx(prompt, signal);
+  const out = await runCodex(prompt, signal);
   if (signal.aborted) return; // query changed mid-flight — discard silently
   if (out === null) {
     yield degraded("gpt: timed out");
@@ -373,6 +409,9 @@ export const searchGpt: SectionSearcher = async function* (query: string, signal
   }
   if (yielded === 0) yield degraded("gpt: no relevant sessions");
 };
+
+/** Canonical searcher export the picker's plugin loader binds to (`mod.search`). */
+export const search = searchGpt;
 
 /** Match a possibly-truncated id (model echoing a short form) against candidates. */
 function findByPrefix(byId: Map<string, Candidate>, id: string): Candidate | undefined {

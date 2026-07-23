@@ -8,7 +8,7 @@
 import { readdirSync, statSync, realpathSync, readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
-import type { CorpusConfig, CorpusRoot, SessionMeta, SessionOrigin } from "./types.ts";
+import type { Checkpoint, ChainSegment, CorpusConfig, CorpusRoot, ResultLine, SessionMeta, SessionOrigin } from "./types.ts";
 
 /** Resolve corpus roots + cache dir from env/HOME. CCR dir override honored. */
 export function loadConfig(): CorpusConfig {
@@ -179,6 +179,9 @@ export class MetaCache {
     let lastUserMs = 0;
     let lastAgentMs = 0;
     let summary = "";
+    let lastPrompt = "";
+    let chainParentId = "";
+    const checkpoints: Checkpoint[] = [];
 
     const lines = content.split("\n");
     for (const line of lines) {
@@ -202,6 +205,7 @@ export class MetaCache {
           if (p.role === "user") {
             if (ts) lastUserMs = ts;
             if (!summary && text) summary = text;
+            if (text) lastPrompt = text;
           } else if (p.role === "assistant") {
             if (ts) lastAgentMs = ts;
           }
@@ -213,13 +217,25 @@ export class MetaCache {
       const ts = tsMs(o.timestamp);
       if (ts && !createdMs) createdMs = ts;
       if (!cwd && typeof o.cwd === "string") cwd = o.cwd;
+      // Compaction boundary: one link in the conversation's chain (F5).
+      if (o.type === "system" && o.subtype === "compact_boundary") {
+        const cm = o.compactMetadata ?? {};
+        checkpoints.push({
+          ms: ts || 0,
+          preTokens: Number(cm.preTokens) || 0,
+          postTokens: Number(cm.postTokens) || 0,
+          trigger: typeof cm.trigger === "string" ? cm.trigger : "",
+        });
+        continue;
+      }
       if (o.type === "user" && o.message) {
         // Skip tool-result user turns (they carry toolUseResult, no human text).
         if (!o.toolUseResult) {
-          if (ts) lastUserMs = ts;
-          if (!summary) {
-            const t = claudeText(o.message.content);
-            if (t && !t.startsWith("<")) summary = t;
+          const t = claudeText(o.message.content);
+          if (t && !t.startsWith("<")) {
+            if (ts) lastUserMs = ts;
+            if (!summary) summary = t;
+            lastPrompt = t;
           }
         }
       } else if (o.type === "assistant" && ts) {
@@ -229,6 +245,8 @@ export class MetaCache {
 
     if (!cwd) cwd = dirname(real); // fallback so resume has a cwd to encode
     if (!createdMs) createdMs = birthMs;
+    // Newest-first so the expand view reads latest → oldest.
+    checkpoints.reverse();
 
     return {
       sessionId,
@@ -240,6 +258,9 @@ export class MetaCache {
       lastUserMs,
       lastAgentMs,
       summary: summary.slice(0, 200),
+      lastPrompt: lastPrompt.slice(0, 200),
+      checkpoints,
+      chainParentId,
     };
   }
 }
@@ -269,12 +290,38 @@ export function formatAgo(ms: number, now = Date.now()): string {
 /** Short internal alias for {@link formatAgo}. */
 export const ago = formatAgo;
 
+/**
+ * Compact token count for a checkpoint label: 59605 -> "59k".
+ */
+function tok(n: number): string {
+  if (!n) return "?";
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
+/** Build the F5 chain (expand view) for a session from its compaction checkpoints. */
+export function buildChain(meta: SessionMeta, now = Date.now()): ChainSegment[] {
+  const out: ChainSegment[] = [];
+  for (const cp of meta.checkpoints ?? []) {
+    const trig = cp.trigger ? `${cp.trigger} ` : "";
+    out.push({
+      kind: "checkpoint",
+      sessionId: meta.sessionId,
+      shortId: meta.sessionId.slice(0, 8),
+      ago: ago(cp.ms, now),
+      label: `${trig}compaction ${tok(cp.preTokens)}→${tok(cp.postTokens)} tokens`,
+      resumeRef: null, // resuming the session id restores its latest state
+    });
+  }
+  return out;
+}
+
 /** Build a ResultLine from session metadata + a matched snippet. */
 export function metaToResultLine(
   meta: SessionMeta,
   snippet: string,
   now = Date.now(),
-): import("./types.ts").ResultLine {
+): ResultLine {
   return {
     snippet: snippet.replace(/\s+/g, " ").trim(),
     sessionId: meta.sessionId,
@@ -288,6 +335,9 @@ export function metaToResultLine(
       origin: meta.origin,
       cwd: meta.cwd,
     },
+    firstPrompt: meta.summary,
+    lastPrompt: meta.lastPrompt,
+    chain: buildChain(meta, now),
   };
 }
 

@@ -3,11 +3,13 @@
 // Target <150ms perceived: per-file and global caps keep rg bounded, and we
 // only parse meta for files that matched.
 
-import type { SectionSearcher, ResultLine } from "./types.ts";
+import type { SectionSearcher, ResultLine, SessionMeta } from "./types.ts";
+import { sentinelLine } from "./types.ts";
 import { loadConfig, MetaCache, metaToResultLine } from "./sessions.ts";
 
 const PER_FILE_CAP = 3; // --max-count per file
-const GLOBAL_CAP = 30; // stop after this many result lines
+const SCAN_CAP = 80; // stop scanning rg after this many distinct sessions matched
+const TOP_N = 10; // F2: render only the ~10 most-recent, then a "… N more" line
 const SNIPPET_WIDTH = 120; // chars of context around the match
 
 /**
@@ -52,8 +54,8 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
     }
     signal.addEventListener("abort", onAbort, { once: true });
 
-    const seen = new Set<string>(); // sessionIds already yielded (symlink dedupe)
-    let emitted = 0;
+    const seen = new Set<string>(); // sessionIds already collected (symlink dedupe)
+    const hits: { meta: SessionMeta; snippet: string }[] = [];
     let carry = "";
 
     try {
@@ -80,16 +82,21 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
 
           const path: string = ev.data?.path?.text ?? "";
           if (!path) continue;
+          // Subagent sidechain transcripts carry no user conversation to resume —
+          // skip them so they don't rank in as empty "(no preview)" rows.
+          if (path.includes("/subagents/")) continue;
           const meta = metaCache.getMeta(path);
           if (!meta) continue;
           if (seen.has(meta.sessionId)) continue;
           seen.add(meta.sessionId);
 
           const lineText: string = ev.data?.lines?.text ?? "";
-          const snippet = extractSnippet(lineText, q);
-          yield metaToResultLine(meta, snippet);
+          // F1: never surface a raw JSON transcript line. extractSnippet returns
+          // "" when it can't pull human text; fall back to the session summary.
+          const snippet = extractSnippet(lineText, q) || meta.summary || "(no preview)";
+          hits.push({ meta, snippet });
 
-          if (++emitted >= GLOBAL_CAP) break outer;
+          if (hits.length >= SCAN_CAP) break outer;
         }
       }
     } finally {
@@ -97,6 +104,18 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
       onAbort();
       metaCache.flush();
     }
+    if (signal.aborted) return;
+
+    // F2: rank by recency (last activity) and cap to TOP_N, then a "… N more" line.
+    const recency = (m: SessionMeta) => Math.max(m.lastUserMs, m.lastAgentMs, m.createdMs);
+    hits.sort((a, b) => recency(b.meta) - recency(a.meta));
+    const shown = hits.slice(0, TOP_N);
+    for (const h of shown) {
+      if (signal.aborted) return;
+      yield metaToResultLine(h.meta, h.snippet);
+    }
+    const more = hits.length - shown.length;
+    if (more > 0) yield sentinelLine(`… ${more} more match${more === 1 ? "" : "es"} — refine your query`);
   };
 }
 
@@ -110,10 +129,14 @@ export function extractSnippet(lineText: string, query: string): string {
     const o = JSON.parse(lineText);
     hay = humanText(o);
   } catch {
-    hay = "";
+    // Not JSON (rg matched a bare text line) — use it directly.
+    hay = lineText;
   }
-  if (!hay) hay = lineText;
   hay = hay.replace(/\s+/g, " ").trim();
+  // F1: a matched record with no extractable human text (tool output, metadata,
+  // a summary object) must NOT render as raw JSON. Signal "no snippet" so the
+  // caller substitutes the session summary.
+  if (!hay || /^[[{]/.test(hay)) return "";
 
   const idx = hay.toLowerCase().indexOf(query.toLowerCase());
   if (idx === -1) return hay.slice(0, SNIPPET_WIDTH);
