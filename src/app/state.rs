@@ -1717,6 +1717,11 @@ impl AppState {
             session_value: session.as_ref().map(|info| info.value.clone()),
             cwd: terminal.cwd.display().to_string(),
             workspace_id,
+            workspace_name: Some(ws.display_name()),
+            // Prompts are extracted from the (filesystem) transcript by the
+            // runtime flush path, not here in pure `AppState`.
+            first_prompt: None,
+            last_prompt: None,
         })
     }
 

@@ -155,17 +155,6 @@ fn read_ui_input_blob(
     (!contents.is_empty()).then_some(contents)
 }
 
-/// Fallback historial row label when a closed pane recorded no title: the final
-/// path segment of its cwd, or "shell" when the cwd is empty/root.
-fn historial_label_fallback(cwd: &str) -> String {
-    std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "shell".to_string())
-}
-
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute, terminal,
@@ -2416,19 +2405,36 @@ impl App {
             .into_iter()
             .map(|record| {
                 let restorable = record.restorable();
-                let agent = record.agent.clone().unwrap_or_else(|| "shell".to_string());
+                // No detected agent -> "terminal" (replaces the old "shell").
+                let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
+                // Pane label only; empty when absent so the row omits it (the
+                // folder basename is shown separately from the cwd).
                 let label = record
                     .label
                     .clone()
                     .filter(|l| !l.trim().is_empty())
-                    .unwrap_or_else(|| historial_label_fallback(&record.cwd));
+                    .unwrap_or_default();
+                // Last 4 chars of the session value (char-safe), empty when none.
+                let sid4 = record
+                    .session_value
+                    .as_deref()
+                    .map(|v| {
+                        let chars: Vec<char> = v.chars().collect();
+                        let start = chars.len().saturating_sub(4);
+                        chars[start..].iter().collect::<String>()
+                    })
+                    .unwrap_or_default();
                 historial_dash_model::HistorialRow {
                     key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
                     agent,
                     label,
+                    sid4,
                     reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
                     cwd: record.cwd,
                     restorable,
+                    workspace_name: record.workspace_name.unwrap_or_default(),
+                    first_prompt: record.first_prompt.unwrap_or_default(),
+                    last_prompt: record.last_prompt.unwrap_or_default(),
                 }
             })
             .collect();

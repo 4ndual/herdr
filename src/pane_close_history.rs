@@ -48,6 +48,19 @@ pub struct PaneCloseRecord {
     pub session_value: Option<String>,
     pub cwd: String,
     pub workspace_id: String,
+    /// Workspace display name at close time (staged with the record so the
+    /// historial hover tooltip can name where the pane last lived without a
+    /// later workspace lookup). Absent on records written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    /// First user prompt from the agent transcript (claude/cx sessions), cut
+    /// char-safe host-side. Extracted once when the record is flushed; absent
+    /// for shells/codex/pi and on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
+    /// Last user prompt from the agent transcript, same rules as `first_prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
 }
 
 impl PaneCloseRecord {
@@ -270,6 +283,157 @@ fn delete_record_from(path: &std::path::Path, ts_unix_ms: u64, pane_id: &str) ->
     true
 }
 
+/// Max chars kept for each extracted prompt (char-safe cut). The historial
+/// hover tooltip renders these, so a very long first/last prompt is clipped
+/// here once rather than bloating the durable log or the render model.
+const PROMPT_MAX_CHARS: usize = 240;
+
+/// Char-safe truncate to at most `max` chars (never splits a multibyte char).
+fn truncate_chars(s: &str, max: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(max).collect()
+}
+
+/// Base dirs that may hold a claude/cx session transcript, newest-preferred at
+/// call sites. `~/.claude` plus every `~/.claude-code-router/profiles/*/claude`
+/// (the cx router writes per-profile claude homes). Best-effort: unreadable dirs
+/// are skipped.
+fn claude_transcript_bases() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(home) = dirs_home() {
+        bases.push(home.join(".claude"));
+        let profiles = home.join(".claude-code-router").join("profiles");
+        if let Ok(entries) = std::fs::read_dir(&profiles) {
+            for entry in entries.flatten() {
+                let claude = entry.path().join("claude");
+                if claude.is_dir() {
+                    bases.push(claude);
+                }
+            }
+        }
+    }
+    bases
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Encode a cwd into the transcript project-dir name: every non-alphanumeric
+/// byte becomes `-` (mirrors the claude-code / archive-pane.sh encoding).
+fn encode_cwd(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Extract the first and last user prompt (char-safe, capped at
+/// [`PROMPT_MAX_CHARS`]) from a claude/cx session transcript for `record`, if it
+/// names an `id`-kind session whose jsonl can be located. Returns
+/// `(first, last)`; either/both `None` when unavailable. Best-effort and
+/// filesystem-only — never panics. Codex/pi/terminal records return `(None,
+/// None)` (no claude transcript to read).
+pub fn extract_prompts(record: &PaneCloseRecord) -> (Option<String>, Option<String>) {
+    if record.session_kind.as_deref() != Some("id") {
+        return (None, None);
+    }
+    if record.agent.as_deref() != Some("claude") {
+        return (None, None);
+    }
+    let Some(value) = record.session_value.as_deref() else {
+        return (None, None);
+    };
+    let enc = encode_cwd(&record.cwd);
+    for base in claude_transcript_bases() {
+        let path = base
+            .join("projects")
+            .join(&enc)
+            .join(format!("{value}.jsonl"));
+        if let Some(prompts) = read_user_prompts(&path) {
+            return prompts;
+        }
+    }
+    (None, None)
+}
+
+/// Read the user prompts out of a session jsonl. Returns `None` when the file is
+/// missing/unreadable or has no user messages; otherwise `Some((first, last))`
+/// with `last == first` collapsed to `None` when there is a single message.
+fn read_user_prompts(path: &std::path::Path) -> Option<(Option<String>, Option<String>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut prompts: Vec<String> = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if !is_user_message(&value) {
+            continue;
+        }
+        if let Some(text) = message_text(&value) {
+            let text = text.trim();
+            if !text.is_empty() {
+                prompts.push(text.to_string());
+            }
+        }
+    }
+    if prompts.is_empty() {
+        return None;
+    }
+    let first = truncate_chars(&prompts[0], PROMPT_MAX_CHARS);
+    let last = if prompts.len() == 1 {
+        None
+    } else {
+        Some(truncate_chars(&prompts[prompts.len() - 1], PROMPT_MAX_CHARS))
+    };
+    Some((Some(first), last))
+}
+
+/// Whether a transcript entry is a user message (either the flat `type: "user"`
+/// shape or the nested `message.role: "user"` shape).
+fn is_user_message(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(|t| t.as_str()) == Some("user")
+        || value
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            == Some("user")
+}
+
+/// Pull the display text out of a message entry: `message.content`/`content` may
+/// be a plain string or an array of content blocks (join every `type: "text"`
+/// block's `text`). Mirrors the archive-pane.sh jq extraction.
+fn message_text(value: &serde_json::Value) -> Option<String> {
+    let content = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .or_else(|| value.get("content"))?;
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Current wall-clock time in unix milliseconds (saturating; 0 on a clock
 /// before the epoch, which is never expected).
 pub fn now_unix_ms() -> u64 {
@@ -311,6 +475,9 @@ mod tests {
             session_value: Some("abc-123".to_string()),
             cwd: "/home/dev/herdr".to_string(),
             workspace_id: "ws-1".to_string(),
+            workspace_name: Some("herdr".to_string()),
+            first_prompt: None,
+            last_prompt: None,
         }
     }
 
@@ -449,6 +616,64 @@ mod tests {
         let path = std::env::temp_dir().join("herdr-pane-hist-does-not-exist.jsonl");
         let _ = std::fs::remove_file(&path);
         assert!(read_recent_from(&path, 5).is_empty());
+    }
+
+    #[test]
+    fn read_user_prompts_extracts_first_and_last_across_shapes() {
+        let dir = std::env::temp_dir().join(format!("herdr-hist-prompts-{}", now_unix_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        // Mix flat `type:user` (string content) and nested `message.role:user`
+        // (array-of-blocks content); an assistant line must be ignored.
+        let body = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"first hello"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":"ignored"}}"#,
+            "\n",
+            r#"{"message":{"role":"user","content":[{"type":"text","text":"middle"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"last bye"}]}}"#,
+            "\n",
+        );
+        std::fs::write(&path, body).unwrap();
+
+        let (first, last) = read_user_prompts(&path).expect("prompts present");
+        assert_eq!(first.as_deref(), Some("first hello"));
+        assert_eq!(last.as_deref(), Some("last bye"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_user_prompts_single_message_has_no_last() {
+        let dir = std::env::temp_dir().join(format!("herdr-hist-prompts-one-{}", now_unix_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"only\"}}\n",
+        )
+        .unwrap();
+        let (first, last) = read_user_prompts(&path).expect("one prompt");
+        assert_eq!(first.as_deref(), Some("only"));
+        assert!(last.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_prompts_skips_non_id_and_non_claude() {
+        let mut rec = sample(1, "p");
+        rec.session_kind = Some("path".to_string());
+        assert_eq!(extract_prompts(&rec), (None, None));
+        let mut rec = sample(1, "p");
+        rec.agent = Some("codex".to_string());
+        assert_eq!(extract_prompts(&rec), (None, None));
+    }
+
+    #[test]
+    fn encode_cwd_maps_non_alnum_to_dashes() {
+        assert_eq!(encode_cwd("/home/dev/herdr"), "-home-dev-herdr");
+        assert_eq!(encode_cwd("/a_b.c"), "-a-b-c");
     }
 
     #[test]

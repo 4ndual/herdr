@@ -19,7 +19,9 @@ api_version = 3
 module = "target/wasm32-unknown-unknown/release/historial_dash_ui.wasm"
 hot_reload = "on"
 surfaces = ["right_panel"]
-capabilities = ["layout_read"]
+# mouse_all: the guest resolves row HOVER from the raw Move stream (its own
+# restore hit-rects would otherwise suppress Move over the row label region).
+capabilities = ["layout_read", "mouse_all"]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON.
 ui_input_file = "historial_input.json"

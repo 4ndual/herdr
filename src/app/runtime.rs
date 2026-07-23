@@ -55,7 +55,15 @@ impl App {
         if self.state.pane_close_log_pending.is_empty() {
             return;
         }
-        let records = std::mem::take(&mut self.state.pane_close_log_pending);
+        let mut records = std::mem::take(&mut self.state.pane_close_log_pending);
+        // Enrich each record with the first/last user prompt from its agent
+        // transcript once, here in the runtime layer (filesystem I/O stays out
+        // of pure `AppState`), before the record is persisted.
+        for record in &mut records {
+            let (first, last) = crate::pane_close_history::extract_prompts(record);
+            record.first_prompt = first;
+            record.last_prompt = last;
+        }
         crate::pane_close_history::append_records(&records);
     }
 

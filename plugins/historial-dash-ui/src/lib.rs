@@ -14,8 +14,8 @@
 mod render;
 
 use herdr_ui_plugin_api::{
-    HostEffect, UiActionKind, UiEvent, UiFrameContext, UiLayer, UiNode, UiSurface, UiUpdate,
-    UiUpdateScope,
+    HostEffect, MouseEvent, MouseEventKind, UiActionKind, UiEvent, UiFrameContext, UiLayer, UiNode,
+    UiSurface, UiUpdate, UiUpdateScope,
 };
 use historial_dash_model::HistorialRenderModel;
 use ratatui::buffer::Buffer;
@@ -29,6 +29,20 @@ static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Re-synced from the host's carved rect width in `handle_frame` so host state
 /// (a restart, or a rail collapse) always wins.
 static COLLAPSED: AtomicBool = AtomicBool::new(false);
+
+/// Most recent render model, cached so a raw mouse `Move` (which carries no
+/// input) can re-render the hover tooltip against the same rows the last frame
+/// drew.
+static MODEL: Mutex<Option<HistorialRenderModel>> = Mutex::new(None);
+/// Absolute carved panel rect (x, y, width, height) from the last frame — the
+/// anchor for resolving which row an absolute mouse coordinate is over.
+static AREA: Mutex<Option<(u16, u16, u16, u16)>> = Mutex::new(None);
+/// Index of the row whose tooltip is currently shown, or `None`.
+static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
+/// Whether plain terminal/shell rows are listed. Default off (agent rows only);
+/// toggled by clicks on `render::ACTION_TOGGLE_TERMINALS`. Guest-persistent in
+/// memory (resets to the default on reload, which is acceptable).
+static SHOW_TERMINALS: AtomicBool = AtomicBool::new(false);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -89,11 +103,85 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &UiEvent) -> UiUpdate {
     match event {
         UiEvent::Frame(ctx) => handle_frame(ctx),
+        UiEvent::Mouse(mouse) => handle_mouse(mouse),
         UiEvent::Action {
             action_id, kind, ..
         } => handle_action(action_id, *kind),
         _ => UiUpdate::default(),
     }
+}
+
+/// Resolve the row index an absolute `(col, row)` is over, given the cached panel
+/// rect and the visible row count, or `None` when off the list.
+fn hovered_row_at(area: (u16, u16, u16, u16), rows: usize, col: u16, row: u16) -> Option<usize> {
+    let (x, y, width, height) = area;
+    if width <= 3 || height <= 1 {
+        return None;
+    }
+    if col < x || col >= x.saturating_add(width) {
+        return None;
+    }
+    let first_row_y = y + 1;
+    if row < first_row_y {
+        return None;
+    }
+    let idx = (row - first_row_y) as usize;
+    let max_rows = (height - 1) as usize;
+    let visible = rows.min(max_rows);
+    (idx < visible).then_some(idx)
+}
+
+/// Re-render the right-panel layer from the cached model/area/hover. Used by the
+/// raw mouse path, which has no frame rect of its own. Returns `None` when there
+/// is nothing carved to draw into (so the caller falls back to an empty update).
+fn render_from_cache() -> Option<UiUpdate> {
+    let model_guard = MODEL.lock().expect("model mutex poisoned");
+    let model = model_guard.as_ref()?;
+    let (x, y, width, height) = (*AREA.lock().expect("area mutex poisoned"))?;
+    if width <= 3 || height == 0 {
+        return None;
+    }
+    let area = Rect::new(x, y, width, height);
+    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+    let mut buf = Buffer::empty(area);
+    let hits = render::render(model, area, &mut buf, hovered, show_terminals);
+    let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
+    Some(UiUpdate {
+        layers: vec![right_panel_layer(nodes, hits)],
+        effects: Vec::new(),
+        scope: UiUpdateScope::Partial,
+        consumed_action_ids: Vec::new(),
+    })
+}
+
+/// Raw mouse handling (requires the `mouse_all` capability, which delivers every
+/// mouse event outside this module's own hit-rects, plus `Move` over them). Only
+/// `Move` matters: it updates the hovered row so the tooltip follows the cursor.
+/// Clicks are owned by the host-resolved hit-rects (restore/fork/delete) and are
+/// ignored here. Every branch re-renders the current layer from cache — returning
+/// an empty update would blank the panel (and, in the click case, replace its
+/// declared restore/fork/delete hit-rects), so we never do that.
+fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
+    if mouse.kind == MouseEventKind::Move {
+        let area = *AREA.lock().expect("area mutex poisoned");
+        // Hover maps against the VISIBLE (filtered) rows, matching what the
+        // renderer draws under the show-terminals toggle.
+        let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+        let rows = MODEL
+            .lock()
+            .expect("model mutex poisoned")
+            .as_ref()
+            .map(|m| render::visible_rows(m, show_terminals).len())
+            .unwrap_or(0);
+        let next = area.and_then(|a| hovered_row_at(a, rows, mouse.column, mouse.row));
+        let mut guard = HOVERED.lock().expect("hover mutex poisoned");
+        *guard = next;
+    }
+    // Re-render the current panel (same content when hover is unchanged, so the
+    // host sees no diff and nothing is clobbered). Falls back to an empty update
+    // only when there is no carved panel to draw (nothing to blank).
+    render_from_cache().unwrap_or_default()
 }
 
 fn parse_model(ctx: &UiFrameContext) -> Option<HistorialRenderModel> {
@@ -122,6 +210,23 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
 
     let area = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
 
+    // Cache the model + carved rect so a later raw `Move` (no input, no rect) can
+    // re-render the tooltip. Clamp any stale hover against the new row count.
+    *MODEL.lock().expect("model mutex poisoned") = Some(model.clone());
+    *AREA.lock().expect("area mutex poisoned") =
+        Some((area.x, area.y, area.width, area.height));
+    {
+        let mut hov = HOVERED.lock().expect("hover mutex poisoned");
+        if let Some(i) = *hov {
+            let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+            let max_rows = area.height.saturating_sub(1) as usize;
+            let visible = render::visible_rows(&model, show_terminals).len().min(max_rows);
+            if i >= visible {
+                *hov = None;
+            }
+        }
+    }
+
     // Zero rect: the host only carves the right panel when a right_panel layer
     // already has content, and collapses the content column to nothing when the
     // rail is collapsed. Emit an invisible placeholder line (so the rail keeps
@@ -149,8 +254,10 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
         COLLAPSED.store(false, Ordering::SeqCst);
     }
 
+    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
     let mut buf = Buffer::empty(area);
-    let hits = render::render(&model, area, &mut buf);
+    let hits = render::render(&model, area, &mut buf, hovered, show_terminals);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     UiUpdate {
@@ -167,8 +274,18 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     if kind != UiActionKind::LeftDown {
         return UiUpdate::default();
     }
-    // Only the collapse toggle is guest-owned; restore/fork/delete are resolved
-    // host-side and never reach the guest.
+    // The collapse toggle and the terminals toggle are guest-owned;
+    // restore/fork/delete are resolved host-side and never reach the guest.
+    if action_id == render::ACTION_TOGGLE_TERMINALS {
+        let show = !SHOW_TERMINALS.load(Ordering::SeqCst);
+        SHOW_TERMINALS.store(show, Ordering::SeqCst);
+        // A stale hover index may now point past the newly filtered list; drop it
+        // and let the next frame/move re-resolve it.
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        // Re-render immediately with the new filter (falls back to empty only when
+        // there is no carved panel, which never happens on a header click).
+        return render_from_cache().unwrap_or_default();
+    }
     if action_id != render::ACTION_TOGGLE_PANEL {
         return UiUpdate::default();
     }
@@ -214,9 +331,13 @@ mod tests {
                 key: format!("{i}:w_1_p_{i}"),
                 agent: "claude".to_string(),
                 label: "herdr".to_string(),
+                sid4: "c123".to_string(),
                 reltime: "5m".to_string(),
                 cwd: "/tmp".to_string(),
                 restorable: true,
+                workspace_name: "myws".to_string(),
+                first_prompt: "first".to_string(),
+                last_prompt: "last".to_string(),
             });
         }
         let model_json = serde_json::to_string(&model).expect("model serializes");
@@ -277,6 +398,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn toggle_terminals_action_flips_state() {
+        let before = SHOW_TERMINALS.load(Ordering::SeqCst);
+        let event: UiEvent =
+            serde_json::from_str(&action_json(render::ACTION_TOGGLE_TERMINALS, "left_down"))
+                .expect("action parses");
+        let _ = handle_event(&event);
+        assert_ne!(SHOW_TERMINALS.load(Ordering::SeqCst), before);
+        // Flip back so the process-global default is left as found.
+        let _ = handle_event(&event);
+        assert_eq!(SHOW_TERMINALS.load(Ordering::SeqCst), before);
     }
 
     #[test]

@@ -803,6 +803,12 @@ impl UiPluginManager {
             .iter()
             .map(|module| (module.plugin_id.clone(), module.module_id.clone()))
             .collect::<Vec<_>>();
+        // Move events have no declarative counterpart (only clicks route through
+        // the hit-rect Action path), so the dedupe below is scoped to button
+        // events. A MouseAll module therefore still receives hover `Move` over
+        // its own hit-rects — required for row hover tooltips on a surface whose
+        // clicks are otherwise owned by declared hit-rects (e.g. historial-dash).
+        let is_move = matches!(kind, MouseEventKind::Move);
         let mut changed = false;
         for (plugin_id, module_id) in keys {
             // fork(f5-mouse-dedupe): a module whose current layers declare an
@@ -812,7 +818,9 @@ impl UiPluginManager {
             // MouseAll broadcast for cells inside its own hit-rects. The raw
             // stream continues for every other cell. Kept general so v3 Action
             // routing can reuse `should_deliver_raw_mouse`.
-            if !self.should_deliver_raw_mouse(&plugin_id, &module_id, mouse.column, mouse.row) {
+            if !is_move
+                && !self.should_deliver_raw_mouse(&plugin_id, &module_id, mouse.column, mouse.row)
+            {
                 continue;
             }
             changed |= self.dispatch_event_for_module(&plugin_id, &module_id, &event);
@@ -1074,6 +1082,7 @@ impl UiPluginManager {
             ));
         }
         let negotiated_version = module.negotiated_version;
+        let had_effects = !update.effects.is_empty();
         let (api_effects, other_effects): (Vec<HostEffect>, Vec<HostEffect>) = update
             .effects
             .iter()
@@ -1102,6 +1111,17 @@ impl UiPluginManager {
             negotiated_version,
             update.scope,
         );
+        // Signal a change only when the module's layers actually differ from
+        // what is already loaded (or it emitted effects). Returning `true`
+        // unconditionally would force a full state refresh on every event a
+        // module accepts — including raw mouse `Move`/click broadcasts to a
+        // `mouse_all` module that re-rendered identical content — needlessly
+        // reprojecting `ui_surface_layers` each time.
+        let layers_changed = self
+            .loaded_updates
+            .get(&key)
+            .map(|old| old.layers != merged_layers)
+            .unwrap_or(true);
         self.loaded_updates.insert(
             key,
             UiUpdate {
@@ -1111,7 +1131,7 @@ impl UiPluginManager {
                 consumed_action_ids: Vec::new(),
             },
         );
-        true
+        layers_changed || had_effects
     }
 
     #[cfg(test)]
@@ -2258,13 +2278,14 @@ mod tests {
         };
 
         assert_eq!(header_text(&manager), "0");
-        // Inside the module's declared hit-rect: raw broadcast suppressed, the
-        // guest's on_event is never invoked, so the counter does not advance.
-        assert!(!manager.dispatch_crossterm_mouse_event(moved(12, 0)));
-        assert_eq!(header_text(&manager), "0");
-        // Outside the hit-rect: delivered, counter advances.
-        assert!(manager.dispatch_crossterm_mouse_event(moved(0, 0)));
+        // Move events are always delivered (they have no hit-rect Action
+        // counterpart to dedupe against), including over the module's own
+        // declared hit-rect — hover tooltips depend on this.
+        assert!(manager.dispatch_crossterm_mouse_event(moved(12, 0)));
         assert_eq!(header_text(&manager), "1");
+        // Outside the hit-rect: also delivered, counter advances again.
+        assert!(manager.dispatch_crossterm_mouse_event(moved(0, 0)));
+        assert_eq!(header_text(&manager), "2");
 
         let _ = std::fs::remove_dir_all(root);
     }

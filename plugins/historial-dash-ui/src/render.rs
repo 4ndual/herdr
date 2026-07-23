@@ -23,6 +23,10 @@ use unicode_width::UnicodeWidthStr;
 /// `left_down` of this id. NOT host-intercepted (unlike the row actions).
 pub const ACTION_TOGGLE_PANEL: &str = "historial:toggle_panel";
 
+/// Show/hide-terminals toggle in the header. Guest-owned: `lib.rs` flips a
+/// static flag and re-renders on a `left_down` of this id. Not host-intercepted.
+pub const ACTION_TOGGLE_TERMINALS: &str = "historial:toggle_terminals";
+
 /// Prefixes for host-resolved row actions. The suffix after the final `:` in the
 /// restore/fork/delete ids is the row's stable key (`"<ts>:<pane_id>"`), so the
 /// host parses it back to the source record. These are declared here but handled
@@ -35,19 +39,47 @@ const PANEL_TITLE: &str = "HISTORIAL";
 const COLLAPSE_BTN: &str = "[<]";
 const EXPAND_HANDLE: &str = ">";
 const EMPTY_HINT: &str = "no closed panes yet";
+const EMPTY_AGENTS_HINT: &str = "no agent panes (t: show terminals)";
 const FORK_BTN: &str = "[f]";
 const DEL_BTN: &str = "[x]";
+/// Terminals-shown / terminals-hidden toggle glyphs (fixed width so the header
+/// layout doesn't shift when the state flips).
+const TERM_TOGGLE_ON: &str = "[T]";
+const TERM_TOGGLE_OFF: &str = "[t]";
+
+/// The rows to actually render, honoring the show-terminals toggle: when off
+/// (default), plain terminal/shell rows are filtered out. Shared by the renderer
+/// and the guest's hover hit-testing so both agree on row indices.
+pub fn visible_rows(
+    model: &HistorialRenderModel,
+    show_terminals: bool,
+) -> Vec<&historial_dash_model::HistorialRow> {
+    model
+        .rows
+        .iter()
+        .filter(|row| show_terminals || !row.is_terminal())
+        .collect()
+}
 
 /// Render the historial list into `buf`. Returns the frame's clickable hit
-/// rects (collapse button, and per restorable row: restore / fork / delete).
-pub fn render(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer) -> Vec<UiHitRect> {
+/// rects (collapse button, terminals toggle, and per restorable row: restore /
+/// fork / delete). `hovered` is the index (into the *visible* rows) of the row
+/// whose tooltip should be drawn beneath it. `show_terminals` gates whether
+/// plain terminal rows are listed.
+pub fn render(
+    model: &HistorialRenderModel,
+    area: Rect,
+    buf: &mut Buffer,
+    hovered: Option<usize>,
+    show_terminals: bool,
+) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
     if area.width <= 3 {
         return render_handle(area, buf);
     }
-    render_full(model, area, buf)
+    render_full(model, area, buf, hovered, show_terminals)
 }
 
 /// Slim collapsed handle: a single ">" glyph near the top, clickable to expand.
@@ -72,12 +104,26 @@ fn render_handle(area: Rect, buf: &mut Buffer) -> Vec<UiHitRect> {
     }]
 }
 
-fn render_full(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer) -> Vec<UiHitRect> {
+fn render_full(
+    model: &HistorialRenderModel,
+    area: Rect,
+    buf: &mut Buffer,
+    hovered: Option<usize>,
+    show_terminals: bool,
+) -> Vec<UiHitRect> {
     let width = area.width as usize;
     let mut hits = Vec::new();
 
-    // Row 0: title left, "[<]" collapse button far right.
+    // Row 0: title left; "<toggle> [<]" affordances far right. The terminals
+    // toggle glyph reflects state ([T] shown / [t] hidden) but keeps a fixed
+    // width so the layout is stable.
     let btn_w = COLLAPSE_BTN.width() as u16;
+    let toggle_label = if show_terminals {
+        TERM_TOGGLE_ON
+    } else {
+        TERM_TOGGLE_OFF
+    };
+    let toggle_w = toggle_label.width() as u16;
     let mut header = vec![Span::styled(
         PANEL_TITLE,
         Style::default()
@@ -85,12 +131,22 @@ fn render_full(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer) -> Ve
             .add_modifier(Modifier::BOLD),
     )];
     let title_w = PANEL_TITLE.width() as u16;
-    if area.width > title_w + btn_w + 1 {
-        let pad = area.width - title_w - btn_w;
+    let right_w = toggle_w + 1 + btn_w; // toggle + space + collapse
+    if area.width > title_w + right_w + 1 {
+        let pad = area.width - title_w - right_w;
         header.push(Span::raw(" ".repeat(pad as usize)));
     } else {
         header.push(Span::raw(" "));
     }
+    header.push(Span::styled(
+        toggle_label,
+        Style::default().fg(if show_terminals {
+            Color::Green
+        } else {
+            Color::DarkGray
+        }),
+    ));
+    header.push(Span::raw(" "));
     header.push(Span::styled(COLLAPSE_BTN, Style::default().fg(Color::DarkGray)));
     Paragraph::new(Line::from(header)).render(
         Rect {
@@ -101,21 +157,37 @@ fn render_full(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer) -> Ve
         },
         buf,
     );
+    let collapse_x = area.x + area.width.saturating_sub(btn_w);
     hits.push(UiHitRect {
-        x: area.x + area.width.saturating_sub(btn_w),
+        x: collapse_x,
         y: area.y,
         width: btn_w,
         height: 1,
         action_id: ACTION_TOGGLE_PANEL.to_string(),
+    });
+    let toggle_x = collapse_x.saturating_sub(1 + toggle_w);
+    hits.push(UiHitRect {
+        x: toggle_x,
+        y: area.y,
+        width: toggle_w,
+        height: 1,
+        action_id: ACTION_TOGGLE_TERMINALS.to_string(),
     });
 
     if area.height <= 1 {
         return hits;
     }
 
-    if model.rows.is_empty() {
+    let rows = visible_rows(model, show_terminals);
+    if rows.is_empty() {
+        // Distinguish "log is empty" from "all rows are terminals but hidden".
+        let hint = if model.rows.is_empty() {
+            EMPTY_HINT
+        } else {
+            EMPTY_AGENTS_HINT
+        };
         Paragraph::new(Line::from(Span::styled(
-            EMPTY_HINT,
+            hint,
             Style::default().fg(Color::DarkGray),
         )))
         .render(
@@ -130,14 +202,89 @@ fn render_full(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer) -> Ve
         return hits;
     }
 
-    // One line per closed pane, newest first, within the available rows.
+    // One line per visible closed pane, newest first, within the available rows.
     let max_rows = (area.height - 1) as usize;
-    for (i, row) in model.rows.iter().take(max_rows).enumerate() {
+    let visible = rows.len().min(max_rows);
+    for (i, row) in rows.iter().take(max_rows).enumerate() {
         let y = area.y + 1 + i as u16;
         render_row(row, area.x, y, width, buf, &mut hits);
     }
 
+    // Hover tooltip: draw workspace name + first/last prompt directly beneath the
+    // hovered row, clipped to the panel and overwriting the rows below it.
+    if let Some(idx) = hovered {
+        if idx < visible {
+            let start_y = area.y + 2 + idx as u16;
+            render_tooltip(rows[idx], area, start_y, buf);
+        }
+    }
+
     hits
+}
+
+/// Basename of a cwd path (final non-empty segment), or the whole string when it
+/// has no separators. Empty cwd yields "~".
+fn folder_basename(cwd: &str) -> &str {
+    let trimmed = cwd.trim_end_matches('/');
+    match trimmed.rsplit('/').next() {
+        Some(name) if !name.is_empty() => name,
+        _ => "~",
+    }
+}
+
+/// Draw the hover tooltip (workspace name, first prompt, last prompt) starting at
+/// `start_y`, wrapping each field to the panel width and stopping at the panel
+/// bottom.
+fn render_tooltip(row: &historial_dash_model::HistorialRow, area: Rect, start_y: u16, buf: &mut Buffer) {
+    let bottom = area.y + area.height; // exclusive
+    let width = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if !row.workspace_name.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("@ {}", row.workspace_name),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    push_wrapped(&mut lines, "1st: ", &row.first_prompt, width);
+    push_wrapped(&mut lines, "last: ", &row.last_prompt, width);
+    if lines.is_empty() {
+        return;
+    }
+
+    for (i, line) in lines.into_iter().enumerate() {
+        let y = start_y + i as u16;
+        if y >= bottom {
+            break;
+        }
+        Paragraph::new(line).render(
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+            buf,
+        );
+    }
+}
+
+/// Push `prefix + text` wrapped to `width` columns as muted tooltip lines.
+/// No-op when `text` is empty.
+fn push_wrapped(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, width: usize) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let full = format!("{prefix}{text}");
+    let cols = width.max(4);
+    let chars: Vec<char> = full.chars().collect();
+    for chunk in chars.chunks(cols) {
+        let s: String = chunk.iter().collect();
+        lines.push(Line::from(Span::styled(
+            s,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 }
 
 fn render_row(
@@ -159,7 +306,18 @@ fn render_row(
     let reserved = reltime_w + actions_w + 2;
     let text_budget = (width as u16).saturating_sub(reserved).max(4) as usize;
 
-    let label = truncate_to(&format!("{} {}", row.agent, row.label), text_budget);
+    // Row text: "<agent> <pane-label?> <sid4?> <folder>". Missing pieces are
+    // skipped so a shell/terminal row reads "terminal <folder>".
+    let mut parts: Vec<&str> = vec![row.agent.as_str()];
+    if !row.label.trim().is_empty() {
+        parts.push(row.label.trim());
+    }
+    if !row.sid4.is_empty() {
+        parts.push(row.sid4.as_str());
+    }
+    let folder = folder_basename(&row.cwd);
+    parts.push(folder);
+    let label = truncate_to(&parts.join(" "), text_budget);
     let mut spans: Vec<Span> = Vec::new();
     let restore_w = label.width() as u16;
     spans.push(Span::styled(
@@ -255,10 +413,26 @@ mod tests {
             key: key.to_string(),
             agent: "claude".to_string(),
             label: "herdr".to_string(),
+            sid4: "c123".to_string(),
             reltime: "5m".to_string(),
             cwd: "/home/dev/herdr".to_string(),
             restorable,
+            workspace_name: "myws".to_string(),
+            first_prompt: "first prompt text".to_string(),
+            last_prompt: "last prompt text".to_string(),
         }
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        let area = *buf.area();
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
     }
 
     #[test]
@@ -268,7 +442,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf);
+        let hits = render(&model, area, &mut buf, None, true);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.iter().any(|id| *id == "historial:restore:100:w_1_p_1"));
@@ -283,27 +457,90 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf);
+        let hits = render(&model, area, &mut buf, None, true);
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:restore:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:fork:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:del:")));
     }
 
     #[test]
-    fn empty_model_renders_header_only() {
+    fn empty_model_renders_header_toggles_only() {
         let model = HistorialRenderModel::default();
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].action_id, "historial:toggle_panel");
+        let hits = render(&model, area, &mut buf, None, true);
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"historial:toggle_panel"));
+        assert!(ids.contains(&"historial:toggle_terminals"));
+    }
+
+    fn terminal_row(key: &str) -> HistorialRow {
+        HistorialRow {
+            key: key.to_string(),
+            agent: "terminal".to_string(),
+            label: String::new(),
+            sid4: String::new(),
+            reltime: "1h".to_string(),
+            cwd: "/home/dev/scratch".to_string(),
+            restorable: false,
+            workspace_name: String::new(),
+            first_prompt: String::new(),
+            last_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn terminals_hidden_by_default_and_revealed_by_toggle() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true), terminal_row("2:w_1_p_2")],
+        };
+        let area = Rect::new(0, 0, 44, 12);
+
+        // Hidden: the terminal folder ("scratch") is not drawn; the claude row is.
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, false);
+        let hidden = buffer_text(&buf);
+        assert!(hidden.contains("claude"));
+        assert!(!hidden.contains("scratch"));
+
+        // Shown: the terminal row appears.
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, true);
+        let shown = buffer_text(&buf);
+        assert!(shown.contains("scratch"));
+        assert!(shown.contains("terminal"));
+    }
+
+    #[test]
+    fn header_declares_terminals_toggle_hit() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let area = Rect::new(0, 0, 44, 12);
+        let mut buf = Buffer::empty(area);
+        let hits = render(&model, area, &mut buf, None, false);
+        assert!(hits
+            .iter()
+            .any(|h| h.action_id == "historial:toggle_terminals"));
+    }
+
+    #[test]
+    fn all_terminal_rows_hidden_shows_agents_hint() {
+        let model = HistorialRenderModel {
+            rows: vec![terminal_row("1:w_1_p_1"), terminal_row("2:w_1_p_2")],
+        };
+        let area = Rect::new(0, 0, 44, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, false);
+        assert!(buffer_text(&buf).contains("no agent panes"));
     }
 
     #[test]
     fn collapsed_handle_declares_toggle() {
         let area = Rect::new(0, 0, 3, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&HistorialRenderModel::default(), area, &mut buf);
+        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, true);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
     }
