@@ -65,6 +65,17 @@ title = "Resume in cx"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/resume-in-cx.sh\" >/dev/null 2>&1 &"]
 
+# resume-search: open the resume-search picker (searches ALL claude-family
+# transcripts) in a NEW TAB whose root pane runs the picker; on Enter/click it
+# execs the resumed session into that same pane (see
+# ../resume-picker/bin/resume-picker.sh). A plain terminal pane runs it in place.
+# Detached so it outlives the action runner (socket work only; nothing is killed).
+[[actions]]
+id = "resume-search"
+title = "Resume search"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-resume-picker.sh\" >/dev/null 2>&1 &"]
+
 # remote: enable Claude Code Remote Control on the CURRENT pane's LIVE conversation
 # so it can be continued from the phone / claude.ai. For a claude orchestrator it
 # types the `/remote-control` slash command into the running agent; codex/cx/pi

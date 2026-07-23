@@ -114,6 +114,16 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "resume-search",
+        label: "Resume search",
+        emoji: "\u{1F50E}", // 🔎
+        shortcut: "\u{2303}\u{2325}S", // ⌃⌥S (display only; spec proposed ⌃⌥R but that already binds Remote)
+        color: "muted",
+        description: "Search ALL claude-family transcripts and resume the picked session in the same pane",
+        action_id: "resume-search",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "remote",
         label: "Remote",
         emoji: "\u{1F4F1}",            // 📱
