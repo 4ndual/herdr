@@ -945,6 +945,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-manager-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -984,6 +992,7 @@ dependencies = [
  "ctrlc",
  "goal-dash-core",
  "goal-dash-model",
+ "harness-manager-model",
  "herdr-ui-plugin-api",
  "historial-dash-model",
  "interprocess",
