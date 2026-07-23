@@ -758,6 +758,26 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+            // Archive this tab's focused pane via the archive-dash plugin
+            // action; the outer App/event loop dispatches the request.
+            if let Some(pane_id) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(tab_idx))
+                .map(|tab| tab.layout.focused())
+            {
+                state.request_plugin_action = Some(crate::app::state::PluginActionRequest {
+                    plugin_id: "builtin.archive-dash".to_string(),
+                    action_id: "archive".to_string(),
+                    ws_idx,
+                    pane_id,
+                });
+            } else {
+                tracing::warn!(ws_idx, tab_idx, "archive context menu: no pane to archive");
+            }
+            leave_modal(state);
+        }
         (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
             state.selected = ws_idx;
             state.active = Some(ws_idx);
@@ -1213,6 +1233,27 @@ impl App {
                         });
                 } else {
                     tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+                // Same archive-the-focused-pane request as the TUI apply path.
+                if let Some(pane_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tabs.get(tab_idx))
+                    .map(|tab| tab.layout.focused())
+                {
+                    self.state.request_plugin_action =
+                        Some(crate::app::state::PluginActionRequest {
+                            plugin_id: "builtin.archive-dash".to_string(),
+                            action_id: "archive".to_string(),
+                            ws_idx,
+                            pane_id,
+                        });
+                } else {
+                    tracing::warn!(ws_idx, tab_idx, "archive context menu: no pane to archive");
                 }
                 leave_modal(&mut self.state);
             }
@@ -2007,7 +2048,10 @@ mod tests {
             list: MenuListState::new(0),
             plugin_items: Vec::new(),
         };
-        assert_eq!(menu.items(), &["New tab", "Rename", "Fork", "Close"]);
+        assert_eq!(
+            menu.items(),
+            &["New tab", "Rename", "Fork", "Archive", "Close"]
+        );
         let rename = menu.items().iter().position(|item| *item == "Rename");
         let fork = menu.items().iter().position(|item| *item == "Fork");
         let close = menu.items().iter().position(|item| *item == "Close");
@@ -2031,7 +2075,7 @@ mod tests {
             list: MenuListState::new(0),
             plugin_items: Vec::new(),
         };
-        // "Fork" is index 2 in ["New tab", "Rename", "Fork", "Close"].
+        // "Fork" is index 2 in ["New tab", "Rename", "Fork", "Archive", "Close"].
         let fork_idx = menu
             .items()
             .iter()
