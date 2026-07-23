@@ -90,7 +90,39 @@ struct HarnessCache {
     plugins: Vec<String>,
     skills: Vec<(String, PathBuf)>,
     profile: Option<String>,
+    /// Which agent CLI drives the focused session: "claude", "cx" (Claude Code
+    /// routed through the CCR gateway), "codex", "pi", or "terminal". Derived on
+    /// the full rescan (cx vs claude comes from which projects root the resolved
+    /// transcript lives under). Empty until first resolved; callers fall back to
+    /// "claude".
+    agent_kind: String,
     session_lines: Vec<(String, String, String, u8)>, // (label, meta, tooltip, indent)
+}
+
+/// App-derived, per-tick facts the pure `refresh`/`full_rescan` path cannot get
+/// from disk alone: the focused pane's live agent pid, the herdr pane id and
+/// session attach command, and — when the user launched a tmux *inside* the
+/// pane — that inner tmux's attach info. Resolved in [`tick`] where `App` is in
+/// hand, then threaded down.
+#[derive(Default)]
+struct SessionEnv {
+    agent_pid: Option<u32>,
+    pane_id: Option<u32>,
+    /// `herdr session attach <name>` (or bare `herdr` for the default session).
+    herdr_attach_cmd: String,
+    /// The herdr session name, `None` for the default session.
+    herdr_session: Option<String>,
+    /// Set only when a tmux client/server runs within the focused pane's own
+    /// foreground job (i.e. the user ran `tmux` inside the herdr pane). The
+    /// herdr app's own outer tmux, if any, is an ancestor of the server and
+    /// never appears here.
+    inner_tmux: Option<TmuxAttach>,
+}
+
+struct TmuxAttach {
+    session: String,
+    attach_cmd: String,
+    clients: usize,
 }
 
 static CACHE: Mutex<Option<HarnessCache>> = Mutex::new(None);
@@ -99,11 +131,12 @@ static CACHE: Mutex<Option<HarnessCache>> = Mutex::new(None);
 /// the dash tick (~1 Hz) next to [`crate::historial_host::tick`].
 pub fn tick(app: &mut App) {
     let focus = crate::plugin_focus::focus_input(&app.state);
-    // Resolve the focused pane's live claude process pid the same way
-    // `handle_pane_process_info` does (from the terminal runtime's foreground
-    // job), before locking the cache. This works in the headless server tick
-    // path too, since that is where this tick runs for client/server mode.
-    let claude_pid = focused_claude_pid(app);
+    // Resolve the app-derived session facts (live agent pid, herdr pane id and
+    // attach command, any inner tmux) the same way `handle_pane_process_info`
+    // reaches the pane's foreground job, before locking the cache. This works in
+    // the headless server tick path too, since that is where this tick runs for
+    // client/server mode.
+    let env = resolve_session_env(app);
     let json = {
         let mut guard = match CACHE.lock() {
             Ok(g) => g,
@@ -113,7 +146,7 @@ pub fn tick(app: &mut App) {
             }
         };
         let cache = guard.get_or_insert_with(HarnessCache::default);
-        refresh(cache, &focus, claude_pid);
+        refresh(cache, &focus, &env);
         render_json(cache)
     };
     if let Some(json) = json {
@@ -121,22 +154,44 @@ pub fn tick(app: &mut App) {
     }
 }
 
-/// Resolve the focused pane's live claude-ish process pid from its terminal
-/// runtime's foreground job (the same source `App::handle_pane_process_info`
-/// uses), so a fresh `claude` session that does not carry `--resume <sid>` in
-/// its command line still resolves its process. Returns the newest (highest
-/// pid = deepest/most-recent) foreground process whose base name is
-/// `claude` / `claude-*` / `node`.
-fn focused_claude_pid(app: &App) -> Option<u32> {
-    let ws_idx = app.state.active?;
-    let ws = app.state.workspaces.get(ws_idx)?;
-    let pane_id = ws.focused_pane_id()?;
-    let runtime =
+/// Resolve the focused pane's session facts from its terminal runtime's
+/// foreground job (the same source `App::handle_pane_process_info` uses): the
+/// live agent pid (newest `claude` / `claude-*` / `node`, so a fresh session
+/// with no `--resume <sid>` in argv still resolves), the herdr pane id and
+/// session attach command, and any tmux the user launched *inside* the pane.
+/// Only the pane's own foreground job is scanned, so herdr's own outer tmux (an
+/// ancestor of the server, e.g. under the E2E `test-host`) is never mistaken for
+/// an inner one.
+fn resolve_session_env(app: &App) -> SessionEnv {
+    let mut env = SessionEnv {
+        herdr_attach_cmd: crate::session::local_attach_command(),
+        herdr_session: crate::session::active_name(),
+        ..SessionEnv::default()
+    };
+    let Some(ws_idx) = app.state.active else {
+        return env;
+    };
+    let Some(ws) = app.state.workspaces.get(ws_idx) else {
+        return env;
+    };
+    let Some(pane_id) = ws.focused_pane_id() else {
+        return env;
+    };
+    env.pane_id = Some(pane_id.raw());
+    let Some(runtime) =
         app.state
-            .runtime_for_pane_in_workspace(&app.terminal_runtimes, ws_idx, pane_id)?;
-    let shell_pid = runtime.child_pid()?;
-    let job = crate::detect::foreground_job(shell_pid)?;
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, ws_idx, pane_id)
+    else {
+        return env;
+    };
+    let Some(shell_pid) = runtime.child_pid() else {
+        return env;
+    };
+    let Some(job) = crate::detect::foreground_job(shell_pid) else {
+        return env;
+    };
     let mut best: Option<u32> = None;
+    let mut tmux_pid: Option<u32> = None;
     for p in &job.processes {
         let name = p.argv0.as_deref().unwrap_or(&p.name);
         let base = Path::new(name)
@@ -145,15 +200,57 @@ fn focused_claude_pid(app: &App) -> Option<u32> {
             .unwrap_or(name);
         if base == "node" || base == "claude" || base.starts_with("claude-") {
             best = Some(best.map_or(p.pid, |b| b.max(p.pid)));
+        } else if base == "tmux" || base.starts_with("tmux:") {
+            tmux_pid = Some(tmux_pid.map_or(p.pid, |b| b.max(p.pid)));
         }
     }
-    best
+    env.agent_pid = best;
+    if let Some(pid) = tmux_pid {
+        env.inner_tmux = resolve_tmux_attach(pid);
+    }
+    env
+}
+
+/// Resolve the tmux session a process runs inside from its `TMUX` env var
+/// (`<socket>,<server_pid>,<session_id>`), mapping the numeric session id to a
+/// name on that server's socket. Best-effort; `None` if the env or lookup fails.
+fn resolve_tmux_attach(pid: u32) -> Option<TmuxAttach> {
+    let procenv = run_capture("ps", &["eww", "-p", &pid.to_string(), "-o", "command="])?;
+    let tmux_var = procenv
+        .split_whitespace()
+        .find_map(|t| t.strip_prefix("TMUX="))?;
+    let mut parts = tmux_var.split(',');
+    let socket = parts.next()?;
+    let _server_pid = parts.next();
+    let want = format!("${}", parts.next().unwrap_or(""));
+    let list = run_capture(
+        "tmux",
+        &[
+            "-S",
+            socket,
+            "list-sessions",
+            "-F",
+            "#{session_id} #{session_name}",
+        ],
+    )?;
+    let session = list.lines().find_map(|l| {
+        let (id, name) = l.split_once(' ')?;
+        (id == want).then(|| name.to_string())
+    })?;
+    let clients = run_capture("tmux", &["-S", socket, "list-clients", "-t", &session, "-F", "x"])
+        .map(|c| c.lines().count())
+        .unwrap_or(0);
+    Some(TmuxAttach {
+        attach_cmd: format!("tmux -S {socket} attach -t {session}"),
+        session,
+        clients,
+    })
 }
 
 fn refresh(
     cache: &mut HarnessCache,
     focus: &herdr_ui_plugin_api::FocusInput,
-    claude_pid: Option<u32>,
+    env: &SessionEnv,
 ) {
     // Latest-focused Claude pane wins; other focuses keep the last target.
     if focus.agent == herdr_ui_plugin_api::AgentKind::Claude {
@@ -180,7 +277,7 @@ fn refresh(
         scan_jsonl(cache, &path);
     }
     if cache.tick % FULL_RESCAN_TICKS == 0 {
-        full_rescan(cache, &sid, &cwd, claude_pid);
+        full_rescan(cache, &sid, &cwd, env);
     }
     cache.tick = cache.tick.wrapping_add(1);
 }
@@ -440,8 +537,20 @@ fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, claude_pid: Option<u32>) {
+fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, env: &SessionEnv) {
     let home = home_dir();
+
+    // Which agent drives this session. The target is only ever set for a Claude
+    // pane (see `refresh`), so the split is claude vs cx: a cx session (Claude
+    // Code routed through the CCR gateway) writes its transcript under
+    // `~/.claude-code-router/profiles/<p>/claude/projects/…` rather than
+    // `~/.claude/projects/…`, so the resolved transcript path tells them apart.
+    cache.agent_kind = match &cache.transcript {
+        Some(p) if p.to_string_lossy().contains(".claude-code-router/profiles/") => "cx",
+        _ => "claude",
+    }
+    .to_string();
+    let agent_kind = cache.agent_kind.clone();
 
     // Context file candidates: static harness inputs that exist on disk.
     cache.ctx_paths.clear();
@@ -535,7 +644,16 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, claude_pid: Optio
     cache.session_lines.push((
         format!("session {sid8}"),
         String::new(),
-        format!("session id: {sid}\nresume: claude --resume {sid}"),
+        format!("session id: {sid}\nresume: {agent_kind} --resume {sid}"),
+        0,
+    ));
+    cache.session_lines.push((
+        format!("agent {agent_kind}"),
+        String::new(),
+        match agent_kind.as_str() {
+            "cx" => "cx: Claude Code driving GPT models through the CCR gateway (transcript under ~/.claude-code-router/profiles)".to_string(),
+            _ => "plain Claude Code (transcript under ~/.claude/projects)".to_string(),
+        },
         0,
     ));
     if let Some(profile) = &cache.profile {
@@ -557,14 +675,14 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, claude_pid: Optio
     // emit one indented row per child process (up to 5), mirroring the parent's
     // pid/cpu/rss and carrying the full command line in the tooltip.
     let mut proc_line = ("process: n/det".to_string(), String::new(),
-        "no claude process with this session id in its command line (fresh sessions may not carry --resume)".to_string(), 0u8);
+        format!("no {agent_kind} process with this session id in its command line (fresh sessions may not carry --resume)"), 0u8);
     let mut child_lines: Vec<(String, String, String, u8)> = Vec::new();
     if let Some(ps) = run_capture("ps", &["-axo", "pid=,ppid=,%cpu=,rss=,command="]) {
         let rows: Vec<&str> = ps.lines().collect();
         // Prefer the pid herdr resolved from the pane's foreground job (works
         // for fresh sessions with no --resume in argv); fall back to the sid
         // grep for older/resumed sessions that carry it.
-        let by_pid = claude_pid.and_then(|pid| {
+        let by_pid = env.agent_pid.and_then(|pid| {
             let pidstr = pid.to_string();
             rows.iter()
                 .find(|l| l.split_whitespace().next() == Some(pidstr.as_str()))
@@ -580,7 +698,7 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, claude_pid: Optio
                 .filter(|l| l.split_whitespace().nth(1) == Some(pid.as_str()))
                 .collect();
             proc_line = (
-                format!("claude pid {pid}"),
+                format!("{agent_kind} pid {pid}"),
                 format!("{cpu}% {}MB +{}", rss_kb / 1024, children.len()),
                 format!("cpu {cpu}% · rss {}MB · {} child procs", rss_kb / 1024, children.len()),
                 0,
@@ -610,40 +728,38 @@ fn full_rescan(cache: &mut HarnessCache, sid: &str, cwd: &str, claude_pid: Optio
     }
     cache.session_lines.push(proc_line);
     cache.session_lines.extend(child_lines);
-    // tmux pane whose current path matches the target cwd (best effort).
-    let mut tmux_line = (
-        "tmux: none detected".to_string(),
-        String::new(),
-        "no tmux pane with this cwd".to_string(),
-        0u8,
-    );
-    if let Some(panes) = run_capture(
-        "tmux",
-        &[
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}:#{window_index}.#{pane_index} #{pane_current_path}",
-        ],
-    ) {
-        if let Some(line) = panes
-            .lines()
-            .find(|l| l.split_whitespace().nth(1) == Some(cwd))
-        {
-            let target = line.split_whitespace().next().unwrap_or("?");
-            let session = target.split(':').next().unwrap_or(target);
-            let clients = run_capture("tmux", &["list-clients", "-F", "#{client_session}"])
-                .map(|c| c.lines().filter(|l| *l == session).count())
-                .unwrap_or(0);
-            tmux_line = (
-                format!("tmux {target}"),
-                format!("{clients} client(s)"),
-                format!("attach: tmux attach -t {session}"),
-                0,
-            );
-        }
-    }
-    cache.session_lines.push(tmux_line);
+    // Attach row. A herdr pane is a herdr-native PTY, not a tmux pane, so the
+    // old "tmux by matching cwd" probe always said "none detected". Instead: if
+    // the user launched a tmux *inside* the pane, surface that inner tmux;
+    // otherwise surface how to reattach the herdr pane itself. "none detected"
+    // stays only when neither is known.
+    let attach_line = if let Some(t) = &env.inner_tmux {
+        (
+            format!("tmux {}", t.session),
+            format!("{} client(s)", t.clients),
+            format!("attach: {}", t.attach_cmd),
+            0u8,
+        )
+    } else if let Some(pane_id) = env.pane_id {
+        let session = env.herdr_session.as_deref().unwrap_or("default");
+        (
+            format!("herdr pane {pane_id}"),
+            format!("session {session}"),
+            format!(
+                "herdr pane {pane_id} · session {session}\nattach: {}",
+                env.herdr_attach_cmd
+            ),
+            0u8,
+        )
+    } else {
+        (
+            "attach: none detected".to_string(),
+            String::new(),
+            "no herdr pane or inner tmux resolved for this session".to_string(),
+            0u8,
+        )
+    };
+    cache.session_lines.push(attach_line);
 }
 
 // ── Model projection ───────────────────────────────────────────────────────
@@ -688,7 +804,12 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
         Some((sid, cwd)) => {
             let sid8: String = sid.chars().take(8).collect();
             let folder = basename(Path::new(cwd));
-            format!("claude · {sid8} · {folder}")
+            let kind = if cache.agent_kind.is_empty() {
+                "claude"
+            } else {
+                cache.agent_kind.as_str()
+            };
+            format!("{kind} · {sid8} · {folder}")
         }
         None => String::new(),
     };
@@ -1100,7 +1221,7 @@ impl App {
         if acted {
             // Force a full rescan + immediate republish so the panel (and the
             // guest's open menu, keyed off a model change) updates this frame.
-            let claude_pid = focused_claude_pid(self);
+            let env = resolve_session_env(self);
             let json = {
                 let mut guard = match CACHE.lock() {
                     Ok(g) => g,
@@ -1108,7 +1229,7 @@ impl App {
                 };
                 if let Some(cache) = guard.as_mut() {
                     if let Some((sid, cwd)) = cache.target.clone() {
-                        full_rescan(cache, &sid, &cwd, claude_pid);
+                        full_rescan(cache, &sid, &cwd, &env);
                     }
                     render_json(cache)
                 } else {
