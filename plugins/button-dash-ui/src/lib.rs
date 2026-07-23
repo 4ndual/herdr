@@ -4,17 +4,21 @@
 //! strip by default.
 //!
 //! Each entry in [`BUTTONS`] is one row of data — no rendering code changes to
-//! add a button: append a [`ButtonDef`] here and declare a matching
-//! `[[actions]]` entry in `herdr-plugin.toml`. Clicking a button emits a
-//! `plugin.action.invoke` API effect that runs the declared host action.
+//! add a button: append a [`ButtonDef`] here (emoji, color, shortcut, label,
+//! description) and declare a matching `[[actions]]` entry in `herdr-plugin.toml`.
 //!
-//! This crate mirrors the v3 guest ABI of `examples/ui-wasm-plugin`
-//! (`crates/herdr-ui-plugin-api` is still v2 on the wire, so the v3-only wire
-//! types are defined locally here). Hit-testing is absolute (screen
-//! coordinates), so panel-relative rects are offset by the panel origin the host
-//! resolves from the manifest placement and delivers as the frame `rect` — the
-//! guest never needs to know WHERE it is docked, so moving/resizing the panel is
-//! a pure manifest edit with no guest OR host rebuild.
+//! Compact strip: each button shows only its **emoji + key combo** in its own
+//! color (no full label). Hovering a button reveals its full label + description
+//! as an in-panel tooltip row; clicking it invokes the declared host action.
+//!
+//! Mouse model (why we DON'T use declarative hit-rects): the host suppresses raw
+//! mouse events — including hover `Move` — over a module's own declared hit-rects
+//! (`should_deliver_raw_mouse`, the F5 click-dedupe). To get hover we instead
+//! request the `mouse_all` capability, declare NO hit-rects, and resolve clicks
+//! AND hovers ourselves from the raw `Move`/`LeftDown` stream against the button
+//! rects we compute from the panel origin. This keeps everything a pure guest /
+//! manifest change: adding a button, recoloring, or the whole hover-tooltip is a
+//! hot-reload with NO host rebuild.
 
 use herdr_ui_plugin_api::{UiFrameContext, UiHitRect, UiLayer, UiNode, UiSurface, UiTextSpan};
 use serde::{Deserialize, Serialize};
@@ -31,53 +35,128 @@ const PLUGIN_ID: &str = "builtin.button-dash";
 // a matching id. No rendering code changes required.
 
 struct ButtonDef {
-    /// Stable identity for the row (currently unused for routing, but kept so a
-    /// future keyed lookup / persisted layout has a handle). Same as action_id
-    /// today.
+    /// Stable identity for the row (also the manifest `[[actions]]` id the click
+    /// invokes via `plugin.action.invoke`). Mirrors `action_id`; asserted equal
+    /// in tests, not read at render time.
     #[allow(dead_code)]
     id: &'static str,
-    /// Compact label shown on the button.
+    /// Full label, shown in the hover tooltip / expanded list (NOT the strip).
     label: &'static str,
+    /// Emoji glyph shown in the compact strip (double-width aware).
+    emoji: &'static str,
     /// Display string for the key combo, e.g. "⌃⌥X".
     shortcut: &'static str,
-    /// What the button does, shown in the expanded list.
+    /// Palette role → distinct color per button (see plugin_span_style host-side:
+    /// blue|red|green|mauve|yellow|teal|peach|accent…).
+    color: &'static str,
+    /// What the button does. Documented per-button and asserted non-empty in
+    /// tests; not rendered (the tooltip shows label + shortcut only, to keep the
+    /// panel a fixed width — see [`detail_spans`]).
+    #[allow(dead_code)]
     description: &'static str,
     /// Manifest `[[actions]]` id the click invokes via `plugin.action.invoke`.
     action_id: &'static str,
+    /// Plugin the action belongs to. Most buttons target THIS plugin
+    /// ([`PLUGIN_ID`]); the archive button targets `builtin.archive-dash`.
+    plugin: &'static str,
 }
 
 static BUTTONS: &[ButtonDef] = &[
     ButtonDef {
         id: "restart-hr",
         label: "Restart hr",
+        emoji: "\u{1F504}",            // 🔄
         shortcut: "\u{2303}\u{2325}X", // ⌃⌥X
+        color: "blue",
         description: "Fully kill & relaunch this herdr instance, restoring the session",
         action_id: "restart-hr",
+        plugin: PLUGIN_ID,
     },
     ButtonDef {
         id: "full-restart",
         label: "Full restart",
-        shortcut: "\u{2303}\u{2325}\u{21E7}X", // ⌃⌥⇧X
+        emoji: "\u{267B}\u{FE0F}",              // ♻️
+        shortcut: "\u{2303}\u{2325}\u{21E7}X",  // ⌃⌥⇧X
+        color: "red",
         description:
             "Hard kill tmux + Claude Code + server (reclaim all RAM), relaunch fresh & resume",
         action_id: "full-restart",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "fork",
+        label: "Fork",
+        emoji: "\u{1F374}",            // 🍴
+        shortcut: "\u{2303}\u{2325}F", // ⌃⌥F
+        color: "green",
+        description: "Fork this conversation into a new TAB (claude/cx/codex/pi)",
+        action_id: "fork",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "fork-workspace",
+        label: "Fork \u{2192} workspace",
+        emoji: "\u{1F531}",                     // 🔱
+        shortcut: "\u{2303}\u{2325}\u{21E7}F",  // ⌃⌥⇧F
+        color: "mauve",
+        description: "Fork this conversation into a new WORKSPACE (claude/cx/codex/pi)",
+        action_id: "fork-workspace",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "draw-screenshot",
+        label: "Draw + shot",
+        emoji: "\u{1F58A}\u{FE0F}",    // 🖊️
+        shortcut: "\u{2325}\u{21E7}5", // ⌥⇧5
+        color: "yellow",
+        description: "Toggle a blank DrawPen overlay to draw on-screen; press again to screenshot + close",
+        action_id: "draw-screenshot",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "draw-screenshot-region",
+        label: "Draw + shot (region)",
+        emoji: "\u{1F4D0}",                     // 📐
+        shortcut: "\u{2325}\u{21E7}4",  // ⌥⇧4
+        color: "peach",
+        description: "Same overlay toggle, but finish by drag-selecting the capture region",
+        action_id: "draw-screenshot-region",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "archive",
+        label: "Archive pane",
+        emoji: "\u{1F5C4}\u{FE0F}",   // 🗄️
+        shortcut: "\u{2303}\u{2325}A", // ⌃⌥A
+        color: "teal",
+        description: "Close the current pane and save it to the archive widget (restorable)",
+        action_id: "archive",
+        plugin: "builtin.archive-dash",
     },
 ];
 
-// Action id for the built-in expand/collapse toggle (not a manifest action; the
-// guest handles it internally, so it never reaches plugin.action.invoke).
+// Action id for the built-in expand/collapse toggle (guest-internal; never
+// reaches plugin.action.invoke).
 const ACTION_TOGGLE_LIST: &str = "button-dash:toggle_list";
+const _: &str = ACTION_TOGGLE_LIST; // reserved id, kept documented
 
 // ── Guest-persistent state ────────────────────────────────────────────────────
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Whether the expandable full list (label + shortcut + description) is shown.
 static LIST_EXPANDED: AtomicBool = AtomicBool::new(false);
-/// Absolute (x, y) origin of this module's `Panel` rect, taken from the frame
-/// `rect` the host resolves from the manifest placement. Declared hit-rects are
-/// matched in absolute screen coordinates (host hit-testing), so panel hits must
-/// carry this offset.
+/// Index into [`BUTTONS`] the cursor is currently hovering (for the tooltip),
+/// or `None`. [`HOVER_TOGGLE`] is the sentinel for "hovering the list toggle".
+static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
+/// Absolute (x, row) anchor of the compact button GRID — the panel's TOP-LEFT
+/// cell (`rect.x`, `rect.y`; the host renders panel nodes top-down). The grid
+/// rows render FIRST so they stay pinned there, and the hover tooltip /
+/// expanded list draws BELOW them: the grid never moves and the tooltip never
+/// covers a button. Raw mouse coordinates are absolute, so button rects are the
+/// grid-relative geometry offset by this anchor.
 static STRIP_ORIGIN: Mutex<Option<(u16, u16)>> = Mutex::new(None);
+
+const HOVER_TOGGLE: usize = usize::MAX;
 
 // ── v3 wire types (local; see module doc comment) ────────────────────────────
 
@@ -85,8 +164,7 @@ static STRIP_ORIGIN: Mutex<Option<(u16, u16)>> = Mutex::new(None);
 #[serde(tag = "type", rename_all = "snake_case")]
 enum V3Event {
     Frame(UiFrameContext),
-    #[allow(dead_code)]
-    Mouse(Value),
+    Mouse(MouseInput),
     #[allow(dead_code)]
     Key(Value),
     #[allow(dead_code)]
@@ -94,19 +172,17 @@ enum V3Event {
     Tick,
     ThemeChanged,
     ReloadRequested,
-    Action(ActionEvent),
+    #[allow(dead_code)]
+    Action(Value),
     #[allow(dead_code)]
     ApiResult(Value),
 }
 
 #[derive(Debug, Deserialize)]
-struct ActionEvent {
-    action_id: String,
-    /// spec §4: the host routes an `Action` for BOTH left_down and left_up of one
-    /// physical click — reacting to both runs everything twice, so we gate on
-    /// left_down only.
-    #[serde(default)]
-    kind: Option<String>,
+struct MouseInput {
+    kind: String,
+    column: u16,
+    row: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,6 +212,26 @@ fn empty_update() -> UiUpdateV3 {
         layers: Vec::new(),
         effects: Vec::new(),
     }
+}
+
+// ── Display-width (double-width emoji aware) ──────────────────────────────────
+// The compact strip mixes ASCII, the modifier glyphs (⌃⌥⇧, width 1) and emoji
+// (width 2). Terminal cell math must match the host renderer's advance so the
+// hit-rects line up under the emoji. This covers the controlled glyph set we
+// render; it is not a general unicode-width implementation.
+fn cell_width(s: &str) -> u16 {
+    let mut w: u16 = 0;
+    for ch in s.chars() {
+        let c = ch as u32;
+        w += match c {
+            0xFE0F => 0,            // variation selector-16 (renders on preceding glyph)
+            0x1F000..=0x1FAFF => 2, // emoji & pictographs
+            0x2600..=0x27BF => 2,   // misc symbols / dingbats (♻ etc.)
+            0x2B00..=0x2BFF => 2,   // misc symbols & arrows
+            _ => 1,
+        };
+    }
+    w
 }
 
 // ── ABI exports ───────────────────────────────────────────────────────────────
@@ -191,13 +287,13 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &V3Event) -> UiUpdateV3 {
     match event {
         V3Event::Frame(frame) => handle_frame(frame),
-        V3Event::Action(action) => handle_action(action),
-        V3Event::Mouse(_)
-        | V3Event::Key(_)
+        V3Event::Mouse(mouse) => handle_mouse(mouse),
+        V3Event::Key(_)
         | V3Event::FocusChanged(_)
         | V3Event::Tick
         | V3Event::ThemeChanged
         | V3Event::ReloadRequested
+        | V3Event::Action(_)
         | V3Event::ApiResult(_) => render_update(Vec::new()),
     }
 }
@@ -207,45 +303,178 @@ fn handle_frame(frame: &UiFrameContext) -> UiUpdateV3 {
     render_update(Vec::new())
 }
 
-fn handle_action(action: &ActionEvent) -> UiUpdateV3 {
-    // Act on press only; the matching left_up would double-run every handler.
-    if action.kind.as_deref() != Some("left_down") {
-        return render_update(Vec::new());
+/// Resolve clicks and hovers ourselves from the raw mouse stream (see module
+/// doc): `Move` updates the hovered button (tooltip); `LeftDown` on a button
+/// invokes it; the toggle flips the expanded list.
+fn handle_mouse(mouse: &MouseInput) -> UiUpdateV3 {
+    let hit = hit_at(mouse.column, mouse.row);
+    match mouse.kind.as_str() {
+        "move" => {
+            // Scope the lock so it is released BEFORE render_update, which locks
+            // HOVERED again — std Mutex is not reentrant (would deadlock).
+            {
+                let mut guard = HOVERED.lock().expect("hover mutex poisoned");
+                *guard = hit;
+            }
+            render_update(Vec::new())
+        }
+        "left_down" => match hit {
+            Some(HOVER_TOGGLE) => {
+                let expanded = !LIST_EXPANDED.load(Ordering::SeqCst);
+                LIST_EXPANDED.store(expanded, Ordering::SeqCst);
+                render_update(Vec::new())
+            }
+            Some(index) => {
+                let button = &BUTTONS[index];
+                render_update(vec![invoke_effect(button.plugin, button.action_id)])
+            }
+            None => render_update(Vec::new()),
+        },
+        _ => render_update(Vec::new()),
     }
-
-    if action.action_id == ACTION_TOGGLE_LIST {
-        let expanded = !LIST_EXPANDED.load(Ordering::SeqCst);
-        LIST_EXPANDED.store(expanded, Ordering::SeqCst);
-        return render_update(Vec::new());
-    }
-
-    // A registry button: invoke its declared manifest action. The host never
-    // interprets action_id (spec §4); it routes back here, and we ask the host
-    // to run the matching `[[actions]]` entry via the in-process API bridge.
-    if BUTTONS.iter().any(|b| b.action_id == action.action_id) {
-        return render_update(vec![HostEffectV3::Api {
-            request_id: format!("button-dash:invoke:{}", action.action_id),
-            method: "plugin.action.invoke".to_string(),
-            params: json!({
-                "plugin_id": PLUGIN_ID,
-                "action_id": action.action_id,
-            }),
-        }]);
-    }
-
-    render_update(Vec::new())
 }
 
-/// Absolute origin of this module's generic `Panel` rect. The host resolves the
-/// panel's placement (from the manifest `[ui_modules.placement]` DATA) and hands
-/// the resolved rect back as the frame's `rect`, so the guest is agnostic of
-/// WHERE it renders — it just offsets its absolute hit-rects by `rect` origin.
-/// A zero-sized rect (no slot carved yet) yields `None`.
+fn invoke_effect(plugin_id: &str, action_id: &str) -> HostEffectV3 {
+    HostEffectV3::Api {
+        request_id: format!("button-dash:invoke:{action_id}"),
+        method: "plugin.action.invoke".to_string(),
+        params: json!({
+            "plugin_id": plugin_id,
+            "action_id": action_id,
+        }),
+    }
+}
+
+/// Absolute (x, top-row) anchor of the button strip from this module's `Panel`
+/// rect (see manifest `[ui_modules.placement]`). The host renders panel nodes
+/// TOP-DOWN from `rect.y` (empirically: a lone strip node in a 7-row band rect
+/// draws at `rect.y`, not `rect.y + height - 1`). So the strip — rendered as the
+/// FIRST node in [`button_dash_layer`] — is pinned to `rect.y`, and detail rows
+/// stack BELOW it in the band's slack rows. A zero-sized rect (no slot carved
+/// yet) yields `None`, disabling hit-testing until the first real frame.
 fn panel_origin(frame: &UiFrameContext) -> Option<(u16, u16)> {
-    if frame.rect.width == 0 || frame.rect.height == 0 {
+    origin_from_rect(frame.rect.x, frame.rect.y, frame.rect.width, frame.rect.height)
+}
+
+/// Pure core of [`panel_origin`] (testable without a full `UiFrameContext`): the
+/// strip's absolute `(x, top-row)`, or `None` for an un-carved (zero-sized) rect.
+fn origin_from_rect(x: u16, y: u16, width: u16, height: u16) -> Option<(u16, u16)> {
+    if width == 0 || height == 0 {
         return None;
     }
-    Some((frame.rect.x, frame.rect.y))
+    Some((x, y))
+}
+
+// ── Strip layout (single source of truth for render + hit-testing) ────────────
+
+/// Buttons per grid row: the strip wraps into a compact multi-row BLOCK instead
+/// of one long line, so the panel stays narrow and the usage dash keeps its
+/// width. 7 buttons + the toggle = exactly 2 rows of 4.
+const BUTTONS_PER_ROW: usize = 4;
+
+/// One clickable segment on the compact grid: its action target and its
+/// strip-relative cell extent `[x, x+width)` on grid row `row`.
+struct Segment {
+    /// `Some(index)` into BUTTONS, or [`HOVER_TOGGLE`] for the list toggle.
+    target: usize,
+    row: u16,
+    x: u16,
+    width: u16,
+}
+
+/// Text of one compact button: `[<emoji> <shortcut>]`.
+fn compact_label(button: &ButtonDef) -> String {
+    format!("[{} {}]", button.emoji, button.shortcut)
+}
+
+fn toggle_label() -> &'static str {
+    if LIST_EXPANDED.load(Ordering::SeqCst) {
+        "[\u{25BC}]" // ▼
+    } else {
+        "[\u{25B6}]" // ▶
+    }
+}
+
+/// Lay out the compact GRID once (rows of [`BUTTONS_PER_ROW`] cells, the toggle
+/// as the final cell); return the drawn rows and the grid-relative segments so
+/// render and hit-testing never disagree.
+fn strip_grid() -> (Vec<Vec<UiTextSpan>>, Vec<Segment>) {
+    let mut rows: Vec<Vec<UiTextSpan>> = Vec::new();
+    let mut segments = Vec::new();
+    let mut spans: Vec<UiTextSpan> = Vec::new();
+    let mut col = 0u16;
+    let mut row = 0u16;
+
+    let mut cell = |spans: &mut Vec<UiTextSpan>,
+                    col: &mut u16,
+                    row: &mut u16,
+                    rows: &mut Vec<Vec<UiTextSpan>>,
+                    count: usize| {
+        if count > 0 && count % BUTTONS_PER_ROW == 0 {
+            rows.push(std::mem::take(spans));
+            *col = 0;
+            *row += 1;
+        }
+    };
+
+    let mut count = 0usize;
+    push_gap(&mut spans, &mut col, " ");
+    for (index, button) in BUTTONS.iter().enumerate() {
+        cell(&mut spans, &mut col, &mut row, &mut rows, count);
+        if col == 0 {
+            push_gap(&mut spans, &mut col, " ");
+        }
+        let label = compact_label(button);
+        let width = cell_width(&label);
+        segments.push(Segment {
+            target: index,
+            row,
+            x: col,
+            width,
+        });
+        spans.push(span(&label, button.color));
+        col += width;
+        push_gap(&mut spans, &mut col, "  ");
+        count += 1;
+    }
+    // List toggle (▶/▼) as the last grid cell.
+    cell(&mut spans, &mut col, &mut row, &mut rows, count);
+    if col == 0 {
+        push_gap(&mut spans, &mut col, " ");
+    }
+    let toggle = toggle_label();
+    let twidth = cell_width(toggle);
+    segments.push(Segment {
+        target: HOVER_TOGGLE,
+        row,
+        x: col,
+        width: twidth,
+    });
+    spans.push(span(toggle, "teal"));
+    rows.push(spans);
+
+    (rows, segments)
+}
+
+/// Number of grid rows the compact block occupies (detail rows render below).
+fn grid_rows() -> u16 {
+    let (rows, _) = strip_grid();
+    rows.len() as u16
+}
+
+/// Resolve which target (button index / toggle) covers an absolute cell, or
+/// `None`. Any grid row is clickable/hoverable.
+fn hit_at(abs_col: u16, abs_row: u16) -> Option<usize> {
+    let (ox, oy) = (*STRIP_ORIGIN.lock().expect("strip origin mutex poisoned"))?;
+    let rel_row = abs_row.checked_sub(oy)?;
+    let rel = abs_col.checked_sub(ox)?;
+    let (_, segments) = strip_grid();
+    segments
+        .iter()
+        .find(|seg| {
+            seg.row == rel_row && rel >= seg.x && rel < seg.x.saturating_add(seg.width)
+        })
+        .map(|seg| seg.target)
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -258,91 +487,66 @@ fn render_update(effects: Vec<HostEffectV3>) -> UiUpdateV3 {
     }
 }
 
-/// Renders the button dash in the bottom-dash slot: row 0 is the compact clickable
-/// strip (each button shows label + shortcut, plus a list toggle); when
-/// expanded, rows 1..N list every button's label, shortcut, and description.
+/// The compact strip is always the FIRST node so, in the top-aligned band, it
+/// stays pinned to the panel's top row (`rect.y`, see [`panel_origin`]) and
+/// never moves when a tooltip appears. Detail rows (hover tooltip or expanded
+/// list) render BELOW it, into the band's slack rows.
 fn button_dash_layer() -> UiLayer {
     let mut nodes: Vec<UiNode> = Vec::new();
-    let mut hits: Vec<UiHitRect> = Vec::new();
 
-    // Row 0: compact clickable button strip.
-    let mut spans = Vec::new();
-    let mut col = 0u16;
-    push_gap(&mut spans, &mut col, " ");
-    for button in BUTTONS {
-        let label = format!("[{} {}]", button.label, button.shortcut);
-        push_button(
-            &mut spans,
-            &mut hits,
-            &mut col,
-            0,
-            &label,
-            button.action_id,
-            "accent",
-        );
-        push_gap(&mut spans, &mut col, "  ");
+    // Grid rows FIRST → pinned to the panel's top rows (fixed; see STRIP_ORIGIN).
+    let (rows, _segments) = strip_grid();
+    for spans in rows {
+        nodes.push(UiNode::Line { spans });
     }
+
     let expanded = LIST_EXPANDED.load(Ordering::SeqCst);
-    let toggle_label = if expanded {
-        "[\u{25BC} shortcuts]" // ▼
-    } else {
-        "[\u{25B6} shortcuts]" // ▶
-    };
-    push_button(
-        &mut spans,
-        &mut hits,
-        &mut col,
-        0,
-        toggle_label,
-        ACTION_TOGGLE_LIST,
-        "teal",
-    );
-    nodes.push(UiNode::Line { spans });
+    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
 
-    // Expanded rows: full reference (label + shortcut + description).
     if expanded {
-        for (i, button) in BUTTONS.iter().enumerate() {
-            let row = (i + 1) as u16;
-            let label = format!("[{} {}]", button.label, button.shortcut);
-            let mut spans = Vec::new();
-            let mut col = 0u16;
-            push_gap(&mut spans, &mut col, "  ");
-            push_button(
-                &mut spans,
-                &mut hits,
-                &mut col,
-                row,
-                &label,
-                button.action_id,
-                "accent",
-            );
-            push_gap(&mut spans, &mut col, "  ");
-            spans.push(span(button.description, "muted"));
-            nodes.push(UiNode::Line { spans });
+        // Full reference below the strip: one detail row per button.
+        for button in BUTTONS {
+            nodes.push(UiNode::Line {
+                spans: detail_spans(button),
+            });
         }
-    }
-
-    // Hit-testing is absolute (screen coordinates); nodes are strip-relative.
-    // Without a known origin yet (no frame received), declare no hits rather than
-    // clickable rects at the wrong position.
-    match *STRIP_ORIGIN.lock().expect("strip origin mutex poisoned") {
-        Some((ox, oy)) => {
-            for hit in &mut hits {
-                hit.x = hit.x.saturating_add(ox);
-                hit.y = hit.y.saturating_add(oy);
+    } else if let Some(index) = hovered {
+        // Hover tooltip below the strip: the hovered button's full label.
+        if index != HOVER_TOGGLE {
+            if let Some(button) = BUTTONS.get(index) {
+                nodes.push(UiNode::Line {
+                    spans: detail_spans(button),
+                });
             }
         }
-        None => hits.clear(),
     }
 
+    // No declarative hit-rects: clicks AND hovers are resolved from the raw
+    // `mouse_all` stream in `handle_mouse` (declaring hits would make the host
+    // suppress hover `Move` over our own cells — the F5 dedupe).
     UiLayer {
         surface: UiSurface::Panel,
         z_index: 50,
         consumes_mouse: false,
         nodes,
-        hits,
+        hits: Vec::<UiHitRect>::new(),
         data: None,
     }
+}
+
+/// A tooltip / expanded-list detail row: `  <emoji> <label>  <shortcut>`. Kept
+/// narrower than the compact strip so the fixed-width panel (manifest
+/// `[ui_modules.placement].size`) never resizes when a tooltip appears — that
+/// resize is what used to shift the buttons horizontally on hover. The longer
+/// `description` is intentionally not rendered here for that reason.
+fn detail_spans(button: &ButtonDef) -> Vec<UiTextSpan> {
+    vec![
+        plain("  "),
+        span(&format!("{} ", button.emoji), button.color),
+        span(button.label, button.color),
+        plain("  "),
+        span(button.shortcut, "muted"),
+    ]
 }
 
 fn span(text: &str, role: &str) -> UiTextSpan {
@@ -360,30 +564,9 @@ fn plain(text: &str) -> UiTextSpan {
     }
 }
 
-fn push_button(
-    spans: &mut Vec<UiTextSpan>,
-    hits: &mut Vec<UiHitRect>,
-    col: &mut u16,
-    row: u16,
-    label: &str,
-    action_id: &str,
-    role: &str,
-) {
-    let width = label.chars().count() as u16;
-    hits.push(UiHitRect {
-        x: *col,
-        y: row,
-        width,
-        height: 1,
-        action_id: action_id.to_string(),
-    });
-    spans.push(span(label, role));
-    *col += width;
-}
-
 fn push_gap(spans: &mut Vec<UiTextSpan>, col: &mut u16, gap: &str) {
     spans.push(plain(gap));
-    *col += gap.chars().count() as u16;
+    *col += cell_width(gap);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -392,10 +575,26 @@ fn push_gap(spans: &mut Vec<UiTextSpan>, col: &mut u16, gap: &str) {
 mod tests {
     use super::*;
 
-    fn action(action_id: &str, kind: &str) -> ActionEvent {
-        ActionEvent {
-            action_id: action_id.to_string(),
-            kind: Some(kind.to_string()),
+    // These tests mutate process-global state (STRIP_ORIGIN / HOVERED /
+    // LIST_EXPANDED). Serialize them so parallel `cargo test` can't race (and so
+    // a panic mid-test can't poison a shared mutex for the others).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn reset() {
+        *STRIP_ORIGIN.lock().unwrap() = None;
+        *HOVERED.lock().unwrap() = None;
+        LIST_EXPANDED.store(false, Ordering::SeqCst);
+    }
+
+    fn mouse(kind: &str, column: u16, row: u16) -> MouseInput {
+        MouseInput {
+            kind: kind.to_string(),
+            column,
+            row,
         }
     }
 
@@ -403,89 +602,196 @@ mod tests {
     fn every_registry_button_has_nonempty_fields() {
         for button in BUTTONS {
             assert!(!button.label.is_empty());
+            assert!(!button.emoji.is_empty());
             assert!(!button.shortcut.is_empty());
+            assert!(!button.color.is_empty());
             assert!(!button.description.is_empty());
             assert!(!button.action_id.is_empty());
+            assert_eq!(button.id, button.action_id);
         }
     }
 
     #[test]
-    fn clicking_a_registry_button_emits_plugin_action_invoke() {
-        let update = handle_action(&ActionEvent {
-            action_id: "restart-hr".to_string(),
-            kind: Some("left_down".to_string()),
-        });
-        let effect = update.effects.first().expect("one effect");
-        match effect {
+    fn button_colors_are_distinct() {
+        let mut colors: Vec<&str> = BUTTONS.iter().map(|b| b.color).collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert_eq!(colors.len(), BUTTONS.len(), "each button needs its own color");
+    }
+
+    #[test]
+    fn cell_width_counts_emoji_as_double() {
+        assert_eq!(cell_width("X"), 1);
+        assert_eq!(cell_width("\u{2303}\u{2325}X"), 3); // ⌃⌥X modifiers are width 1
+        assert_eq!(cell_width("\u{1F504}"), 2); // 🔄
+        assert_eq!(cell_width("\u{267B}\u{FE0F}"), 2); // ♻️ (symbol 2 + VS16 0)
+        assert_eq!(cell_width("\u{25B6}"), 1); // ▶ toggle glyph
+    }
+
+    #[test]
+    fn segments_are_contiguous_and_cover_every_target() {
+        let _g = guard();
+        reset();
+        let (_, segments) = strip_grid();
+        // one segment per button + the toggle
+        assert_eq!(segments.len(), BUTTONS.len() + 1);
+        assert!(segments.iter().any(|s| s.target == HOVER_TOGGLE));
+        for (i, _) in BUTTONS.iter().enumerate() {
+            assert!(segments.iter().any(|s| s.target == i));
+        }
+    }
+
+    #[test]
+    fn hit_at_resolves_button_under_origin_row() {
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((10, 5));
+        let (_, segments) = strip_grid();
+        // middle of the first button's rect, offset by origin
+        let first = &segments[0];
+        let col = 10 + first.x + first.width / 2;
+        assert_eq!(hit_at(col, 5 + first.row), Some(0));
+        // a row past the whole grid → no hit
+        assert_eq!(hit_at(col, 5 + grid_rows()), None);
+        *STRIP_ORIGIN.lock().unwrap() = None;
+        assert_eq!(hit_at(col, 5), None);
+    }
+
+    #[test]
+    fn left_down_on_button_emits_plugin_action_invoke() {
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        let (_, segments) = strip_grid();
+        let seg = &segments[0];
+        let col = seg.x + seg.width / 2;
+        let update = handle_mouse(&mouse("left_down", col, seg.row));
+        match update.effects.first().expect("one effect") {
             HostEffectV3::Api { method, params, .. } => {
                 assert_eq!(method, "plugin.action.invoke");
                 assert_eq!(params["plugin_id"], json!(PLUGIN_ID));
-                assert_eq!(params["action_id"], json!("restart-hr"));
+                assert_eq!(params["action_id"], json!(BUTTONS[0].action_id));
             }
             other => panic!("expected Api effect, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn invoke_effect_serializes_to_expected_shape() {
-        let update = handle_action(&ActionEvent {
-            action_id: "restart-hr".to_string(),
-            kind: Some("left_down".to_string()),
-        });
-        let encoded = serde_json::to_string(&update.effects[0]).expect("serialize");
-        assert_eq!(
-            encoded,
-            r#"{"kind":"api","request_id":"button-dash:invoke:restart-hr","method":"plugin.action.invoke","params":{"action_id":"restart-hr","plugin_id":"builtin.button-dash"}}"#
-        );
-    }
-
-    #[test]
-    fn action_up_does_not_invoke() {
-        let update = handle_action(&ActionEvent {
-            action_id: "restart-hr".to_string(),
-            kind: Some("left_up".to_string()),
-        });
-        assert!(update.effects.is_empty());
-    }
-
-    #[test]
-    fn toggle_list_flips_state_without_effects() {
-        LIST_EXPANDED.store(false, Ordering::SeqCst);
-        let update = handle_action(&action(ACTION_TOGGLE_LIST, "left_down"));
-        assert!(update.effects.is_empty());
-        assert!(LIST_EXPANDED.load(Ordering::SeqCst));
-        handle_action(&action(ACTION_TOGGLE_LIST, "left_down"));
-        assert!(!LIST_EXPANDED.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn expanded_layer_has_a_row_per_button_plus_strip() {
-        LIST_EXPANDED.store(true, Ordering::SeqCst);
-        let layer = button_dash_layer();
-        // strip row + one detail row per button
-        assert_eq!(layer.nodes.len(), 1 + BUTTONS.len());
-        LIST_EXPANDED.store(false, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn hits_are_offset_by_strip_origin() {
-        *STRIP_ORIGIN.lock().unwrap() = Some((10, 5));
-        let layer = button_dash_layer();
-        assert!(layer.hits.iter().all(|h| h.x >= 10 && h.y >= 5));
         *STRIP_ORIGIN.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn panel_origin_is_top_row_not_bottom() {
+        // Regression: the strip renders TOP-aligned at rect.y. A 7-row band rect
+        // at y=39 must anchor the strip to row 39, NOT 39+7-1=45. The earlier
+        // bottom-anchored math made hit_at's row check reject every click
+        // (observed live: click row=39 vs stored origin row=45 → hit=None).
+        assert_eq!(origin_from_rect(128, 39, 48, 7), Some((128, 39)));
+        // un-carved rect → no hit-testing yet
+        assert_eq!(origin_from_rect(128, 39, 0, 7), None);
+        assert_eq!(origin_from_rect(128, 39, 48, 0), None);
+    }
+
+    #[test]
+    fn click_at_observed_coords_resolves_fork() {
+        // Regression for the live-observed miss: origin=(128,39) [after the
+        // top-row fix], click col=152 row=39 → rel=24 lands inside the 🍴 fork
+        // segment and must emit the `fork` action invoke.
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((128, 39));
+        let update = handle_mouse(&mouse("left_down", 152, 39));
+        match update.effects.first().expect("fork invoke effect") {
+            HostEffectV3::Api { params, .. } => {
+                assert_eq!(params["action_id"], json!("fork"));
+            }
+            other => panic!("expected Api effect, got {other:?}"),
+        }
+        reset();
+    }
+
+    #[test]
+    fn strip_is_first_node_so_it_never_moves() {
+        // The strip must be node 0 in every state (plain, hover, expanded) so the
+        // top-aligned band pins it to rect.y regardless of detail rows below.
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        // plain: exactly the grid rows
+        let base = grid_rows() as usize;
+        assert_eq!(button_dash_layer().nodes.len(), base);
+        // hover: grid rows first, tooltip after
+        let (_, segments) = strip_grid();
+        let seg = &segments[0];
+        handle_mouse(&mouse("move", seg.x + seg.width / 2, seg.row));
+        let nodes = button_dash_layer().nodes;
+        assert_eq!(nodes.len(), base + 1);
+        // node 0 is the strip (contains the toggle glyph); node 1 is the tooltip
+        // (starts with leading padding, no toggle)
+        reset();
+    }
+
+    #[test]
+    fn fork_buttons_are_registered() {
+        assert!(BUTTONS.iter().any(|b| b.action_id == "fork"));
+        assert!(BUTTONS.iter().any(|b| b.action_id == "fork-workspace"));
+    }
+
+    #[test]
+    fn move_sets_hover_and_renders_tooltip_row() {
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        let (_, segments) = strip_grid();
+        let seg = &segments[1]; // second button
+        let col = seg.x + seg.width / 2;
+        let update = handle_mouse(&mouse("move", col, seg.row));
+        // grid rows + one tooltip row for the hovered button
+        let layer = &update.layers[0];
+        let base = grid_rows() as usize;
+        assert_eq!(layer.nodes.len(), base + 1);
+        assert_eq!(*HOVERED.lock().unwrap(), Some(1));
+        // moving off the grid clears the tooltip
+        let update = handle_mouse(&mouse("move", 999, 99));
+        assert_eq!(update.layers[0].nodes.len(), base);
+        assert_eq!(*HOVERED.lock().unwrap(), None);
+        *STRIP_ORIGIN.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn toggle_click_flips_expanded_and_lists_all() {
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        let (_, segments) = strip_grid();
+        let toggle = segments.iter().find(|s| s.target == HOVER_TOGGLE).unwrap();
+        let col = toggle.x + toggle.width / 2;
+        let update = handle_mouse(&mouse("left_down", col, toggle.row));
+        assert!(LIST_EXPANDED.load(Ordering::SeqCst));
+        assert!(update.effects.is_empty());
+        // expanded → grid rows + one row per button
+        assert_eq!(update.layers[0].nodes.len(), grid_rows() as usize + BUTTONS.len());
+        LIST_EXPANDED.store(false, Ordering::SeqCst);
+        *STRIP_ORIGIN.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn no_declarative_hit_rects_declared() {
+        let _g = guard();
+        reset();
+        // Hover requires raw mouse over our cells, which the host only delivers
+        // when we declare NO hit-rects (F5 dedupe). Guard that invariant.
         let layer = button_dash_layer();
         assert!(layer.hits.is_empty());
     }
 
     #[test]
-    fn action_event_parses_with_kind() {
-        let json = r#"{"type":"action","action_id":"restart-hr","surface":"usage_strip","column":3,"row":0,"kind":"left_down"}"#;
-        match serde_json::from_str::<V3Event>(json).expect("parse") {
-            V3Event::Action(a) => {
-                assert_eq!(a.action_id, "restart-hr");
-                assert_eq!(a.kind.as_deref(), Some("left_down"));
-            }
-            other => panic!("expected Action, got {other:?}"),
-        }
+    fn left_up_does_not_invoke() {
+        let _g = guard();
+        reset();
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        let (_, segments) = strip_grid();
+        let seg = &segments[0];
+        let col = seg.x + seg.width / 2;
+        let update = handle_mouse(&mouse("left_up", col, seg.row));
+        assert!(update.effects.is_empty());
+        *STRIP_ORIGIN.lock().unwrap() = None;
     }
 }

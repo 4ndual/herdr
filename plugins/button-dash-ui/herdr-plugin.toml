@@ -36,6 +36,44 @@ title = "Full restart"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/full-restart-herdr.sh\" >/dev/null 2>&1 &"]
 
+# fork: fork the CURRENT pane's agent conversation into a NEW TAB (current
+# workspace). Works for claude/cx/codex/pi by reusing herdr's own resume
+# convention + each agent's fork flag (see scripts/fork-conversation.sh). The
+# script reads the source pane from the inherited HERDR_PANE_ID and resolves the
+# agent/session/cwd live via `herdr pane get`. Detached so it outlives the action
+# runner (it does socket work only; nothing is killed, unlike the restart buttons).
+[[actions]]
+id = "fork"
+title = "Fork → tab"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" tab >/dev/null 2>&1 &"]
+
+# fork-workspace: same fork, but into a NEW WORKSPACE instead of a new tab.
+[[actions]]
+id = "fork-workspace"
+title = "Fork → workspace"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" workspace >/dev/null 2>&1 &"]
+
+# draw-screenshot: toggle a BLANK DrawPen live-annotation overlay, then capture
+# the annotated screen and fully close it (see scripts/draw-screenshot.sh). Press
+# once to start drawing on-screen; press again to screenshot + close. Detached so
+# it outlives the action runner. Needs Screen Recording (screencapture) +
+# Accessibility (cliclick ⌘⇧A) permission for the herdr process.
+[[actions]]
+id = "draw-screenshot"
+title = "Draw + screenshot"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" >/dev/null 2>&1 &"]
+
+# draw-screenshot-region: same toggle, but the finishing capture is an
+# interactive drag-selection (screencapture -i) instead of instant fullscreen.
+[[actions]]
+id = "draw-screenshot-region"
+title = "Draw + screenshot (region)"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" region >/dev/null 2>&1 &"]
+
 [[ui_modules]]
 id = "button-ui"
 title = "Button Dash"
@@ -49,7 +87,11 @@ hot_reload = "on"
 # renders is pure manifest DATA now — edit the `[ui_modules.placement]` table
 # below and the panel moves/resizes on the next tick with NO host rebuild.
 surfaces = ["panel"]
-capabilities = ["layout_read", "toasts", "api_read", "api_write"]
+# mouse_all: the buttons resolve clicks AND hover (for the emoji tooltip) from
+# the raw mouse stream instead of declarative hit-rects — the host suppresses raw
+# mouse (incl. hover Move) over a module's own hit-rects (F5 dedupe), so hover
+# tooltips REQUIRE the raw path. This keeps the whole feature a guest hot-reload.
+capabilities = ["layout_read", "toasts", "api_read", "api_write", "mouse_all"]
 
 # Placement spec (see .local/prd/generic-plugin-panel-placement.md):
 #   region   = bottom_band | left | right | top | bottom | free
@@ -59,8 +101,14 @@ capabilities = ["layout_read", "toasts", "api_read", "api_write"]
 # This reproduces the old BottomDash result exactly: a snug slot on the RIGHT of
 # the usage band, leaving the usage dash at least 24 columns.
 [ui_modules.placement]
+# Fixed width (not "auto"): the compact GRID wraps 4 buttons per row (~43
+# cells wide); a fixed 45-cell slot means the panel NEVER resizes when a hover tooltip /
+# expanded list appears, so the buttons can't shift horizontally on hover (the
+# tooltip rows are kept narrower than the strip — see detail_spans). "auto"
+# regrew the panel to the widest row each frame, which moved the buttons under
+# the cursor. Bump this if you add buttons.
 region = "bottom_band"
 align = "end"
-size = "auto"
+size = "45"
 min_peer = 24
-z = 50
+z = 60
