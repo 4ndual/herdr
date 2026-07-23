@@ -55,6 +55,16 @@ title = "Fork → workspace"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" workspace >/dev/null 2>&1 &"]
 
+# resume-in-cx: fork the CURRENT claude pane's conversation into a NEW TAB running
+# UNDER cx (GPT-via-CCR gateway), leaving the original conversation untouched (see
+# scripts/resume-in-cx.sh). Claude-family panes only; codex/pi/terminal get a toast.
+# Detached so it outlives the action runner (socket work only; nothing is killed).
+[[actions]]
+id = "resume-in-cx"
+title = "Resume in cx"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/resume-in-cx.sh\" >/dev/null 2>&1 &"]
+
 # remote: enable Claude Code Remote Control on the CURRENT pane's LIVE conversation
 # so it can be continued from the phone / claude.ai. For a claude orchestrator it
 # types the `/remote-control` slash command into the running agent; codex/cx/pi

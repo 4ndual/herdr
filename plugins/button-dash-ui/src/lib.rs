@@ -104,6 +104,16 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "resume-in-cx",
+        label: "Resume in cx",
+        emoji: "\u{1F916}",            // 🤖
+        shortcut: "\u{2303}\u{2325}C", // ⌃⌥C
+        color: "accent",
+        description: "Fork this claude conversation into a new TAB running under cx (GPT-via-CCR)",
+        action_id: "resume-in-cx",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "remote",
         label: "Remote",
         emoji: "\u{1F4F1}",            // 📱
@@ -745,7 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_button_is_registered() {
+    fn resume_cx_and_remote_buttons_are_registered() {
+        assert!(BUTTONS.iter().any(|b| b.action_id == "resume-in-cx"));
         assert!(BUTTONS.iter().any(|b| b.action_id == "remote"));
     }
 
