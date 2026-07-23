@@ -3572,10 +3572,11 @@ mod tests {
             .state
             .context_menu_rect()
             .expect("tab context menu rect");
+        // items are [New tab, Rename, Fork, Close] — Close is the 4th row
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 3,
+            menu.y + 4,
         ));
 
         assert_eq!(app.state.workspaces[0].tabs.len(), 1);
