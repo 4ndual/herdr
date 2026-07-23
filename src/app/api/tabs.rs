@@ -231,16 +231,25 @@ impl App {
             .and_then(|ws| ws.tabs.get(tab_idx))
             .map(|tab| tab.layout.pane_ids())
             .unwrap_or_default();
-        let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
-            return tab_not_found(id, &target.tab_id);
-        };
-        if ws.tabs.len() <= 1 {
+        let tab_count = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .map(|ws| ws.tabs.len())
+            .unwrap_or(0);
+        if tab_count <= 1 {
             return encode_error(
                 id,
                 "tab_close_failed",
                 "cannot close the last tab in a workspace",
             );
         }
+        // Record each pane in the tab before it is torn down. Guarded above so
+        // this never runs for the last tab (that routes through workspace close).
+        self.state.stage_pane_close_history(ws_idx, pane_ids.iter().copied());
+        let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
+            return tab_not_found(id, &target.tab_id);
+        };
         if !ws.close_tab(tab_idx) {
             return encode_error(
                 id,

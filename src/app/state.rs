@@ -1549,11 +1549,69 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// Pane-close history records staged by close paths (pure), drained and
+    /// appended to the durable log by the runtime layer. Never persisted in the
+    /// session snapshot.
+    pub(crate) pane_close_log_pending: Vec<crate::pane_close_history::PaneCloseRecord>,
 }
 
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Build a pane-close history record for a pane that is about to be torn
+    /// down. Must be called *before* the pane/terminal is removed, while the
+    /// pane still resolves to its `TerminalState`. Returns `None` when the pane
+    /// or its terminal metadata cannot be resolved.
+    pub(crate) fn build_pane_close_record(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::pane_close_history::PaneCloseRecord> {
+        let ws = self.workspaces.get(ws_idx)?;
+        let workspace_id = ws.id.clone();
+        let pane_number = ws.public_pane_number(pane_id)?;
+        let public_pane_id = crate::workspace::public_pane_id_for_number(&ws.id, pane_number);
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id)?;
+        let terminal = self.terminals.get(&terminal_id)?;
+
+        let session = crate::app::creation::terminal_agent_session_info(terminal);
+        let agent = session
+            .as_ref()
+            .map(|info| info.agent.clone())
+            .or_else(|| terminal.effective_display_agent())
+            .or_else(|| terminal.effective_agent_label().map(str::to_string));
+
+        Some(crate::pane_close_history::PaneCloseRecord {
+            ts_unix_ms: crate::pane_close_history::now_unix_ms(),
+            pane_id: public_pane_id,
+            label: terminal.effective_title(),
+            agent,
+            session_source: session.as_ref().map(|info| info.source.clone()),
+            session_kind: session.as_ref().map(|info| match info.kind {
+                crate::agent_resume::AgentSessionRefKind::Id => "id".to_string(),
+                crate::agent_resume::AgentSessionRefKind::Path => "path".to_string(),
+            }),
+            session_value: session.as_ref().map(|info| info.value.clone()),
+            cwd: terminal.cwd.display().to_string(),
+            workspace_id,
+        })
+    }
+
+    /// Stage pane-close history records for `pane_ids` in workspace `ws_idx`,
+    /// before those panes are removed. Records are drained and written to the
+    /// durable log by the runtime layer (see `App::flush_pane_close_history`).
+    pub(crate) fn stage_pane_close_history(
+        &mut self,
+        ws_idx: usize,
+        pane_ids: impl IntoIterator<Item = crate::layout::PaneId>,
+    ) {
+        for pane_id in pane_ids {
+            if let Some(record) = self.build_pane_close_record(ws_idx, pane_id) {
+                self.pane_close_log_pending.push(record);
+            }
+        }
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1903,6 +1961,7 @@ impl AppState {
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            pane_close_log_pending: Vec::new(),
         }
     }
 

@@ -46,6 +46,17 @@ impl App {
                 runtime.shutdown();
             }
         }
+        self.flush_pane_close_history();
+    }
+
+    /// Drain any pane-close history records staged by the close paths and append
+    /// them to the durable log. Best-effort; never blocks the close path.
+    pub(crate) fn flush_pane_close_history(&mut self) {
+        if self.state.pane_close_log_pending.is_empty() {
+            return;
+        }
+        let records = std::mem::take(&mut self.state.pane_close_log_pending);
+        crate::pane_close_history::append_records(&records);
     }
 
     pub(crate) fn drain_api_requests(&mut self) -> bool {

@@ -1482,7 +1482,10 @@ impl AppState {
         let mut pane_ids = Vec::new();
         for idx in &close_indices {
             terminal_ids.extend(self.terminal_ids_for_workspace(*idx));
-            pane_ids.extend(self.pane_ids_for_workspace(*idx));
+            let ws_pane_ids = self.pane_ids_for_workspace(*idx);
+            // Record each still-attached pane before the workspace is dropped.
+            self.stage_pane_close_history(*idx, ws_pane_ids.iter().copied());
+            pane_ids.extend(ws_pane_ids);
             if let Some(workspace_id) = self.workspaces.get(*idx).map(|ws| ws.id.clone()) {
                 crate::logging::workspace_closed(&workspace_id);
             }
@@ -5261,6 +5264,40 @@ mod tests {
 
         assert!(!state.terminals.contains_key(&terminal_id));
         assert!(!state.plugin_panes.contains_key(&pane_id));
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn close_workspace_stages_pane_close_record() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        let workspace_id = state.workspaces[0].id.clone();
+        let pane_number = state.workspaces[0].public_pane_number(pane_id).unwrap();
+        let public_pane_id =
+            crate::workspace::public_pane_id_for_number(&state.workspaces[0].id, pane_number);
+        {
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.cwd = std::path::PathBuf::from("/tmp/work");
+            terminal.persisted_agent_session =
+                Some(crate::agent_resume::PersistedAgentSession {
+                    source: "herdr:claude".into(),
+                    agent: "claude".into(),
+                    session_ref: crate::agent_resume::AgentSessionRef::id("sess-9").unwrap(),
+                });
+        }
+
+        state.close_selected_workspace();
+
+        assert_eq!(state.pane_close_log_pending.len(), 1);
+        let record = &state.pane_close_log_pending[0];
+        assert_eq!(record.pane_id, public_pane_id);
+        assert_eq!(record.workspace_id, workspace_id);
+        assert_eq!(record.cwd, "/tmp/work");
+        assert_eq!(record.agent.as_deref(), Some("claude"));
+        assert_eq!(record.session_source.as_deref(), Some("herdr:claude"));
+        assert_eq!(record.session_kind.as_deref(), Some("id"));
+        assert_eq!(record.session_value.as_deref(), Some("sess-9"));
         state.assert_invariants_for_test();
     }
 

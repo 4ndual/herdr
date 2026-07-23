@@ -76,6 +76,7 @@ mod kitty_graphics;
 mod layout;
 mod logging;
 mod pane;
+mod pane_close_history;
 mod persist;
 mod platform;
 mod plugin_collector;
