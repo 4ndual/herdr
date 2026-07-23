@@ -116,6 +116,9 @@ const GOAL_PANEL_MAX_WIDTH: u16 = 56;
 // panel: one clickable icon per right-panel plugin, so the user can switch which
 // plugin's panel is expanded (or collapse the active one).
 const RIGHT_PANEL_RAIL_WIDTH: u16 = 3;
+/// Extra rows kept below a content-sized right panel so a row hover-tooltip has
+/// space to render without the panel reserving the whole column height.
+const RIGHT_PANEL_CONTENT_PAD: u16 = 4;
 
 // Absolute floor a panel's peer region always keeps along the carve axis, even
 // if a manifest declares a smaller `min_peer` — one column/row is reserved so a
@@ -351,6 +354,25 @@ fn compute_view_internal(
             Constraint::Length(rail_w),
         ])
         .areas(terminal_area);
+        // Content-size the panel height: a short panel (e.g. a 7-row historial)
+        // carves a box only as tall as its current content instead of the whole
+        // column, so it no longer visually dominates. Derived from the active
+        // plugin's most-recent layer (previous frame), converging in one tick;
+        // clamped to the full column height as the sane max, so a long list still
+        // gets the whole column.
+        let content = match active_right_panel
+            .as_deref()
+            .and_then(|plugin_id| right_panel_content_height(app, plugin_id))
+        {
+            // Small padding below the content so a row hover-tooltip (drawn
+            // beneath the hovered row) has a few lines to render into without the
+            // panel having to reserve the whole column.
+            Some(h) if content_w > 0 => Rect {
+                height: h.saturating_add(RIGHT_PANEL_CONTENT_PAD).clamp(1, content.height),
+                ..content
+            },
+            _ => content,
+        };
         let icons =
             build_right_panel_rail(&right_panel_plugins, active_right_panel.as_deref(), rail);
         (panes, content, icons)
@@ -459,6 +481,35 @@ fn compute_view_internal(
         panel_rects,
         right_panel_rail_icons,
     };
+}
+
+/// Content height (rows) of the active right-panel plugin's most-recent layer:
+/// `1 + index of the last node carrying any visible text`. Lets the layout carve
+/// a content-sized panel box (a short historial no longer reserves the whole
+/// column). `None` when the plugin has not rendered a non-empty layer yet, so the
+/// caller keeps the full column height until content is known. Pure over the
+/// loaded layers.
+fn right_panel_content_height(app: &AppState, plugin_id: &str) -> Option<u16> {
+    let mut last_content: Option<usize> = None;
+    for entry in app.ui_surface_layers.iter() {
+        if entry.layer.surface != herdr_ui_plugin_api::UiSurface::RightPanel
+            || entry.plugin_id != plugin_id
+        {
+            continue;
+        }
+        for (i, node) in entry.layer.nodes.iter().enumerate() {
+            let has_text = match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => {
+                    spans.iter().any(|s| !s.text.trim().is_empty())
+                }
+                _ => true,
+            };
+            if has_text {
+                last_content = Some(i);
+            }
+        }
+    }
+    last_content.map(|i| (i as u16).saturating_add(1))
 }
 
 /// Build the right-panel rail icons: one clickable 1-row rect per plugin, stacked

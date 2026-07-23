@@ -2413,10 +2413,23 @@ impl App {
     /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
     fn historial_render_input_json(&self) -> Option<String> {
         let now = crate::pane_close_history::now_unix_ms();
+        // `read_recent` yields newest-first; deduplicate so the same session (or,
+        // for sessionless terminals, the same pane) appears once — keeping the
+        // most-recent record (the first seen). Dedup key is the session value
+        // when present, else the pane id.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let rows = crate::pane_close_history::read_recent(HISTORIAL_ROW_LIMIT)
             .into_iter()
+            .filter(|record| {
+                let dedup_key = record
+                    .session_value
+                    .clone()
+                    .unwrap_or_else(|| format!("pane:{}", record.pane_id));
+                seen.insert(dedup_key)
+            })
             .map(|record| {
                 let restorable = record.restorable();
+                let is_subagent = crate::pane_close_history::is_subagent_record(&record);
                 // No detected agent -> "terminal" (replaces the old "shell").
                 let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
                 // Pane label only; empty when absent so the row omits it (the
@@ -2447,6 +2460,7 @@ impl App {
                     workspace_name: record.workspace_name.unwrap_or_default(),
                     first_prompt: record.first_prompt.unwrap_or_default(),
                     last_prompt: record.last_prompt.unwrap_or_default(),
+                    is_subagent,
                 }
             })
             .collect();

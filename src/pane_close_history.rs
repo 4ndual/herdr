@@ -337,26 +337,60 @@ fn encode_cwd(cwd: &str) -> String {
 /// filesystem-only — never panics. Codex/pi/terminal records return `(None,
 /// None)` (no claude transcript to read).
 pub fn extract_prompts(record: &PaneCloseRecord) -> (Option<String>, Option<String>) {
-    if record.session_kind.as_deref() != Some("id") {
-        return (None, None);
-    }
-    if record.agent.as_deref() != Some("claude") {
-        return (None, None);
-    }
-    let Some(value) = record.session_value.as_deref() else {
+    let Some((path, _is_cx)) = find_transcript(record) else {
         return (None, None);
     };
+    read_user_prompts(&path).unwrap_or((None, None))
+}
+
+/// Locate the claude/cx session transcript jsonl for `record`, returning its
+/// path and whether it is a cx (CCR router) transcript (found under
+/// `~/.claude-code-router/profiles/*`). `None` for non-`id`/non-claude sessions
+/// or when no file exists. A cx session is still reported by the runtime as
+/// `agent = "claude"` (cx *is* Claude Code), so both agent labels are accepted.
+fn find_transcript(record: &PaneCloseRecord) -> Option<(PathBuf, bool)> {
+    if record.session_kind.as_deref() != Some("id") {
+        return None;
+    }
+    if !matches!(record.agent.as_deref(), Some("claude") | Some("cx")) {
+        return None;
+    }
+    let value = record.session_value.as_deref()?;
     let enc = encode_cwd(&record.cwd);
     for base in claude_transcript_bases() {
         let path = base
             .join("projects")
             .join(&enc)
             .join(format!("{value}.jsonl"));
-        if let Some(prompts) = read_user_prompts(&path) {
-            return prompts;
+        if path.is_file() {
+            let is_cx = base
+                .to_string_lossy()
+                .contains(".claude-code-router/profiles/");
+            return Some((path, is_cx));
         }
     }
-    (None, None)
+    None
+}
+
+/// Resolve the display agent kind for a claude/cx `record` from its transcript
+/// location: `"cx"` when the transcript lives under the CCR router profiles,
+/// `"claude"` when under `~/.claude`, `None` when neither applies (leave the
+/// record's existing agent untouched — codex/pi/terminal). Filesystem-only,
+/// best-effort; called once at flush time.
+pub fn resolve_display_agent(record: &PaneCloseRecord) -> Option<String> {
+    let (_, is_cx) = find_transcript(record)?;
+    Some(if is_cx { "cx" } else { "claude" }.to_string())
+}
+
+/// Whether `record`'s session is a subagent run: its transcript jsonl is an
+/// `agent-*` file (Claude Code stores subagent transcripts as `agent-<id>.jsonl`).
+/// Derived purely from the session value, so it needs no filesystem access.
+pub fn is_subagent_record(record: &PaneCloseRecord) -> bool {
+    record
+        .session_value
+        .as_deref()
+        .map(|v| v.starts_with("agent-"))
+        .unwrap_or(false)
 }
 
 /// Read the user prompts out of a session jsonl. Returns `None` when the file is
@@ -668,6 +702,17 @@ mod tests {
         let mut rec = sample(1, "p");
         rec.agent = Some("codex".to_string());
         assert_eq!(extract_prompts(&rec), (None, None));
+    }
+
+    #[test]
+    fn is_subagent_record_detects_agent_prefixed_session() {
+        let mut rec = sample(1, "p");
+        rec.session_value = Some("agent-deadbeef-1234".to_string());
+        assert!(is_subagent_record(&rec));
+        rec.session_value = Some("11112222-3333".to_string());
+        assert!(!is_subagent_record(&rec));
+        rec.session_value = None;
+        assert!(!is_subagent_record(&rec));
     }
 
     #[test]

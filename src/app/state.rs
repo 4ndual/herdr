@@ -1733,7 +1733,10 @@ impl AppState {
         Some(crate::pane_close_history::PaneCloseRecord {
             ts_unix_ms: crate::pane_close_history::now_unix_ms(),
             pane_id: public_pane_id,
-            label: terminal.effective_title(),
+            // Human pane name: the OSC/agent title if any, else the manual label
+            // (e.g. "codeword"). `show_agent_labels=false` so the agent name is
+            // not folded in here — the historial row renders the agent separately.
+            label: terminal.border_label(false),
             agent,
             session_source: session.as_ref().map(|info| info.source.clone()),
             session_kind: session.as_ref().map(|info| match info.kind {

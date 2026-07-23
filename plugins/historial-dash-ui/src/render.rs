@@ -27,6 +27,84 @@ pub const ACTION_TOGGLE_PANEL: &str = "historial:toggle_panel";
 /// static flag and re-renders on a `left_down` of this id. Not host-intercepted.
 pub const ACTION_TOGGLE_TERMINALS: &str = "historial:toggle_terminals";
 
+/// Hide/show-subagents toggle in the header. Guest-owned like the terminals
+/// toggle: filters out rows whose session is a subagent run.
+pub const ACTION_TOGGLE_SUBAGENTS: &str = "historial:toggle_subagents";
+
+/// Per-agent filter cycle button in the header. Guest-owned: each `left_down`
+/// advances the filter all -> claude -> cx -> codex -> pi -> all.
+pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
+
+/// Per-agent-kind filter selected in the header (item: per-agent filter).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum AgentFilter {
+    #[default]
+    All,
+    Claude,
+    Cx,
+    Codex,
+    Pi,
+}
+
+impl AgentFilter {
+    /// Map a monotonically-incremented click counter to a filter, so `lib.rs` can
+    /// persist the selection as a single atomic usize.
+    pub fn from_index(i: usize) -> Self {
+        match i % 5 {
+            0 => AgentFilter::All,
+            1 => AgentFilter::Claude,
+            2 => AgentFilter::Cx,
+            3 => AgentFilter::Codex,
+            _ => AgentFilter::Pi,
+        }
+    }
+
+    /// Fixed-width (3-col) header glyph for this filter so the layout is stable.
+    fn glyph(self) -> &'static str {
+        match self {
+            AgentFilter::All => "[*]",
+            AgentFilter::Claude => "[c]",
+            AgentFilter::Cx => "[x]",
+            AgentFilter::Codex => "[o]",
+            AgentFilter::Pi => "[p]",
+        }
+    }
+
+    /// Whether a row with display agent `agent` passes this filter. `All` passes
+    /// everything (including terminals); a specific kind matches only that agent.
+    fn matches(self, agent: &str) -> bool {
+        match self {
+            AgentFilter::All => true,
+            AgentFilter::Claude => agent == "claude",
+            AgentFilter::Cx => agent == "cx",
+            AgentFilter::Codex => agent == "codex",
+            AgentFilter::Pi => agent == "pi",
+        }
+    }
+}
+
+/// The composed header filter state: terminals toggle, subagents toggle, and the
+/// per-agent filter. Shared by the renderer and the guest's hover hit-testing so
+/// both agree on which rows are visible.
+#[derive(Clone, Copy, Default)]
+pub struct RowFilters {
+    pub show_terminals: bool,
+    pub hide_subagents: bool,
+    pub agent: AgentFilter,
+}
+
+impl RowFilters {
+    fn keep(&self, row: &historial_dash_model::HistorialRow) -> bool {
+        if !self.show_terminals && row.is_terminal() {
+            return false;
+        }
+        if self.hide_subagents && row.is_subagent {
+            return false;
+        }
+        self.agent.matches(&row.agent)
+    }
+}
+
 /// Prefixes for host-resolved row actions. The suffix after the final `:` in the
 /// restore/fork/delete ids is the row's stable key (`"<ts>:<pane_id>"`), so the
 /// host parses it back to the source record. These are declared here but handled
@@ -46,19 +124,18 @@ const DEL_BTN: &str = "[x]";
 /// layout doesn't shift when the state flips).
 const TERM_TOGGLE_ON: &str = "[T]";
 const TERM_TOGGLE_OFF: &str = "[t]";
+/// Subagents-hidden ([S]) / subagents-shown ([s]) toggle glyphs (fixed width).
+const SUBAGENT_TOGGLE_ON: &str = "[S]";
+const SUBAGENT_TOGGLE_OFF: &str = "[s]";
 
 /// The rows to actually render, honoring the show-terminals toggle: when off
 /// (default), plain terminal/shell rows are filtered out. Shared by the renderer
 /// and the guest's hover hit-testing so both agree on row indices.
 pub fn visible_rows(
     model: &HistorialRenderModel,
-    show_terminals: bool,
+    filters: RowFilters,
 ) -> Vec<&historial_dash_model::HistorialRow> {
-    model
-        .rows
-        .iter()
-        .filter(|row| show_terminals || !row.is_terminal())
-        .collect()
+    model.rows.iter().filter(|row| filters.keep(row)).collect()
 }
 
 /// Render the historial list into `buf`. Returns the frame's clickable hit
@@ -71,7 +148,7 @@ pub fn render(
     area: Rect,
     buf: &mut Buffer,
     hovered: Option<usize>,
-    show_terminals: bool,
+    filters: RowFilters,
 ) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -79,7 +156,7 @@ pub fn render(
     if area.width <= 3 {
         return render_handle(area, buf);
     }
-    render_full(model, area, buf, hovered, show_terminals)
+    render_full(model, area, buf, hovered, filters)
 }
 
 /// Slim collapsed handle: a single ">" glyph near the top, clickable to expand.
@@ -109,21 +186,29 @@ fn render_full(
     area: Rect,
     buf: &mut Buffer,
     hovered: Option<usize>,
-    show_terminals: bool,
+    filters: RowFilters,
 ) -> Vec<UiHitRect> {
     let width = area.width as usize;
     let mut hits = Vec::new();
 
-    // Row 0: title left; "<toggle> [<]" affordances far right. The terminals
-    // toggle glyph reflects state ([T] shown / [t] hidden) but keeps a fixed
-    // width so the layout is stable.
-    let btn_w = COLLAPSE_BTN.width() as u16;
-    let toggle_label = if show_terminals {
+    // Row 0: title left; the filter cluster "[agent][s][t] [<]" pinned far right.
+    // Every glyph is fixed 3 cols so the header never shifts as state flips.
+    let btn_w = COLLAPSE_BTN.width() as u16; // [<]
+    let agent_glyph = filters.agent.glyph();
+    let agent_w = agent_glyph.width() as u16;
+    let sub_w = SUBAGENT_TOGGLE_ON.width() as u16; // fixed 3
+    let term_label = if filters.show_terminals {
         TERM_TOGGLE_ON
     } else {
         TERM_TOGGLE_OFF
     };
-    let toggle_w = toggle_label.width() as u16;
+    let term_w = term_label.width() as u16;
+    let sub_label = if filters.hide_subagents {
+        SUBAGENT_TOGGLE_ON
+    } else {
+        SUBAGENT_TOGGLE_OFF
+    };
+
     let mut header = vec![Span::styled(
         PANEL_TITLE,
         Style::default()
@@ -131,7 +216,8 @@ fn render_full(
             .add_modifier(Modifier::BOLD),
     )];
     let title_w = PANEL_TITLE.width() as u16;
-    let right_w = toggle_w + 1 + btn_w; // toggle + space + collapse
+    // agent + subagent + terminals + space + collapse.
+    let right_w = agent_w + sub_w + term_w + 1 + btn_w;
     if area.width > title_w + right_w + 1 {
         let pad = area.width - title_w - right_w;
         header.push(Span::raw(" ".repeat(pad as usize)));
@@ -139,8 +225,24 @@ fn render_full(
         header.push(Span::raw(" "));
     }
     header.push(Span::styled(
-        toggle_label,
-        Style::default().fg(if show_terminals {
+        agent_glyph,
+        Style::default().fg(if filters.agent == AgentFilter::All {
+            Color::DarkGray
+        } else {
+            Color::Magenta
+        }),
+    ));
+    header.push(Span::styled(
+        sub_label,
+        Style::default().fg(if filters.hide_subagents {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        }),
+    ));
+    header.push(Span::styled(
+        term_label,
+        Style::default().fg(if filters.show_terminals {
             Color::Green
         } else {
             Color::DarkGray
@@ -157,6 +259,7 @@ fn render_full(
         },
         buf,
     );
+    // Hit-rects, laid out right-to-left to match the rendered cluster.
     let collapse_x = area.x + area.width.saturating_sub(btn_w);
     hits.push(UiHitRect {
         x: collapse_x,
@@ -165,20 +268,36 @@ fn render_full(
         height: 1,
         action_id: ACTION_TOGGLE_PANEL.to_string(),
     });
-    let toggle_x = collapse_x.saturating_sub(1 + toggle_w);
+    let term_x = collapse_x.saturating_sub(1 + term_w);
     hits.push(UiHitRect {
-        x: toggle_x,
+        x: term_x,
         y: area.y,
-        width: toggle_w,
+        width: term_w,
         height: 1,
         action_id: ACTION_TOGGLE_TERMINALS.to_string(),
+    });
+    let sub_x = term_x.saturating_sub(sub_w);
+    hits.push(UiHitRect {
+        x: sub_x,
+        y: area.y,
+        width: sub_w,
+        height: 1,
+        action_id: ACTION_TOGGLE_SUBAGENTS.to_string(),
+    });
+    let agent_x = sub_x.saturating_sub(agent_w);
+    hits.push(UiHitRect {
+        x: agent_x,
+        y: area.y,
+        width: agent_w,
+        height: 1,
+        action_id: ACTION_CYCLE_AGENT.to_string(),
     });
 
     if area.height <= 1 {
         return hits;
     }
 
-    let rows = visible_rows(model, show_terminals);
+    let rows = visible_rows(model, filters);
     if rows.is_empty() {
         // Distinguish "log is empty" from "all rows are terminals but hidden".
         let hint = if model.rows.is_empty() {
@@ -420,6 +539,7 @@ mod tests {
             workspace_name: "myws".to_string(),
             first_prompt: "first prompt text".to_string(),
             last_prompt: "last prompt text".to_string(),
+            is_subagent: false,
         }
     }
 
@@ -442,7 +562,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, true);
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.iter().any(|id| *id == "historial:restore:100:w_1_p_1"));
@@ -457,7 +577,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, true);
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:restore:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:fork:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:del:")));
@@ -468,11 +588,52 @@ mod tests {
         let model = HistorialRenderModel::default();
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, true);
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
-        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.contains(&"historial:toggle_terminals"));
+        assert!(ids.contains(&"historial:toggle_subagents"));
+        assert!(ids.contains(&"historial:cycle_agent"));
+    }
+
+    #[test]
+    fn subagent_and_agent_filters_compose() {
+        let mut sub = row("1:w_1_p_1", true);
+        sub.is_subagent = true;
+        sub.agent = "claude".to_string();
+        let cx = {
+            let mut r = row("2:w_1_p_2", true);
+            r.agent = "cx".to_string();
+            r
+        };
+        let model = HistorialRenderModel {
+            rows: vec![sub, cx],
+        };
+        // Hide subagents: only the cx row remains.
+        let f = RowFilters {
+            hide_subagents: true,
+            ..RowFilters::default()
+        };
+        let visible = visible_rows(&model, f);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].agent, "cx");
+        // Per-agent filter = claude: only the (subagent) claude row remains.
+        let f = RowFilters {
+            agent: AgentFilter::Claude,
+            ..RowFilters::default()
+        };
+        let visible = visible_rows(&model, f);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].agent, "claude");
+        // Compose both: claude filter + hide subagents -> nothing (the only claude
+        // row is a subagent).
+        let f = RowFilters {
+            agent: AgentFilter::Claude,
+            hide_subagents: true,
+            ..RowFilters::default()
+        };
+        assert!(visible_rows(&model, f).is_empty());
     }
 
     fn terminal_row(key: &str) -> HistorialRow {
@@ -487,6 +648,7 @@ mod tests {
             workspace_name: String::new(),
             first_prompt: String::new(),
             last_prompt: String::new(),
+            is_subagent: false,
         }
     }
 
@@ -499,14 +661,14 @@ mod tests {
 
         // Hidden: the terminal folder ("scratch") is not drawn; the claude row is.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, false);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default());
         let hidden = buffer_text(&buf);
         assert!(hidden.contains("claude"));
         assert!(!hidden.contains("scratch"));
 
         // Shown: the terminal row appears.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, true);
+        let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         let shown = buffer_text(&buf);
         assert!(shown.contains("scratch"));
         assert!(shown.contains("terminal"));
@@ -519,7 +681,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, false);
+        let hits = render(&model, area, &mut buf, None, RowFilters::default());
         assert!(hits
             .iter()
             .any(|h| h.action_id == "historial:toggle_terminals"));
@@ -532,7 +694,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, false);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default());
         assert!(buffer_text(&buf).contains("no agent panes"));
     }
 
@@ -540,7 +702,7 @@ mod tests {
     fn collapsed_handle_declares_toggle() {
         let area = Rect::new(0, 0, 3, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, true);
+        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
     }

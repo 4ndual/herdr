@@ -20,8 +20,10 @@ use herdr_ui_plugin_api::{
 use historial_dash_model::HistorialRenderModel;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+use render::{AgentFilter, RowFilters};
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
@@ -43,6 +45,22 @@ static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
 /// toggled by clicks on `render::ACTION_TOGGLE_TERMINALS`. Guest-persistent in
 /// memory (resets to the default on reload, which is acceptable).
 static SHOW_TERMINALS: AtomicBool = AtomicBool::new(false);
+/// Whether subagent rows are hidden. Default off (show subagents); toggled by
+/// clicks on `render::ACTION_TOGGLE_SUBAGENTS`. Guest-persistent in memory.
+static HIDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
+/// Monotonic per-agent filter click counter; `AgentFilter::from_index` maps it to
+/// the current selection (all/claude/cx/codex/pi). Advanced by clicks on
+/// `render::ACTION_CYCLE_AGENT`.
+static AGENT_FILTER_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+/// The composed header filter state read from the guest's static flags.
+fn current_filters() -> RowFilters {
+    RowFilters {
+        show_terminals: SHOW_TERMINALS.load(Ordering::SeqCst),
+        hide_subagents: HIDE_SUBAGENTS.load(Ordering::SeqCst),
+        agent: AgentFilter::from_index(AGENT_FILTER_INDEX.load(Ordering::SeqCst)),
+    }
+}
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -143,9 +161,9 @@ fn render_from_cache() -> Option<UiUpdate> {
     }
     let area = Rect::new(x, y, width, height);
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
-    let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+    let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, show_terminals);
+    let hits = render::render(model, area, &mut buf, hovered, filters);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -167,12 +185,12 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
         let area = *AREA.lock().expect("area mutex poisoned");
         // Hover maps against the VISIBLE (filtered) rows, matching what the
         // renderer draws under the show-terminals toggle.
-        let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+        let filters = current_filters();
         let rows = MODEL
             .lock()
             .expect("model mutex poisoned")
             .as_ref()
-            .map(|m| render::visible_rows(m, show_terminals).len())
+            .map(|m| render::visible_rows(m, filters).len())
             .unwrap_or(0);
         let next = area.and_then(|a| hovered_row_at(a, rows, mouse.column, mouse.row));
         let mut guard = HOVERED.lock().expect("hover mutex poisoned");
@@ -218,9 +236,9 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     {
         let mut hov = HOVERED.lock().expect("hover mutex poisoned");
         if let Some(i) = *hov {
-            let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+            let filters = current_filters();
             let max_rows = area.height.saturating_sub(1) as usize;
-            let visible = render::visible_rows(&model, show_terminals).len().min(max_rows);
+            let visible = render::visible_rows(&model, filters).len().min(max_rows);
             if i >= visible {
                 *hov = None;
             }
@@ -255,9 +273,9 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     }
 
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
-    let show_terminals = SHOW_TERMINALS.load(Ordering::SeqCst);
+    let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(&model, area, &mut buf, hovered, show_terminals);
+    let hits = render::render(&model, area, &mut buf, hovered, filters);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     UiUpdate {
@@ -284,6 +302,18 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         *HOVERED.lock().expect("hover mutex poisoned") = None;
         // Re-render immediately with the new filter (falls back to empty only when
         // there is no carved panel, which never happens on a header click).
+        return render_from_cache().unwrap_or_default();
+    }
+    if action_id == render::ACTION_TOGGLE_SUBAGENTS {
+        let hide = !HIDE_SUBAGENTS.load(Ordering::SeqCst);
+        HIDE_SUBAGENTS.store(hide, Ordering::SeqCst);
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        return render_from_cache().unwrap_or_default();
+    }
+    if action_id == render::ACTION_CYCLE_AGENT {
+        // Advance the per-agent filter one step (all -> claude -> cx -> ... -> all).
+        AGENT_FILTER_INDEX.fetch_add(1, Ordering::SeqCst);
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
         return render_from_cache().unwrap_or_default();
     }
     if action_id != render::ACTION_TOGGLE_PANEL {
@@ -338,6 +368,7 @@ mod tests {
                 workspace_name: "myws".to_string(),
                 first_prompt: "first".to_string(),
                 last_prompt: "last".to_string(),
+            is_subagent: false,
             });
         }
         let model_json = serde_json::to_string(&model).expect("model serializes");
@@ -411,6 +442,28 @@ mod tests {
         // Flip back so the process-global default is left as found.
         let _ = handle_event(&event);
         assert_eq!(SHOW_TERMINALS.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn toggle_subagents_action_flips_state() {
+        let before = HIDE_SUBAGENTS.load(Ordering::SeqCst);
+        let event: UiEvent =
+            serde_json::from_str(&action_json(render::ACTION_TOGGLE_SUBAGENTS, "left_down"))
+                .expect("action parses");
+        let _ = handle_event(&event);
+        assert_ne!(HIDE_SUBAGENTS.load(Ordering::SeqCst), before);
+        let _ = handle_event(&event);
+        assert_eq!(HIDE_SUBAGENTS.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn cycle_agent_action_advances_index() {
+        let before = AGENT_FILTER_INDEX.load(Ordering::SeqCst);
+        let event: UiEvent =
+            serde_json::from_str(&action_json(render::ACTION_CYCLE_AGENT, "left_down"))
+                .expect("action parses");
+        let _ = handle_event(&event);
+        assert_eq!(AGENT_FILTER_INDEX.load(Ordering::SeqCst), before + 1);
     }
 
     #[test]

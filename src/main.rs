@@ -755,6 +755,17 @@ fn main() -> io::Result<()> {
         crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
         if config.ui.mouse_capture {
             execute!(io::stdout(), EnableMouseCapture)?;
+            // crossterm's EnableMouseCapture enables button + drag reporting
+            // (?1002) but not any-motion (?1003), so bare hover moves are never
+            // delivered. Enable any-motion tracking too, so UI-plugin surfaces
+            // that resolve hover from the raw Move stream (e.g. the historial
+            // panel's row tooltips) actually receive `Move` events. Teardown's
+            // `clear_host_mouse_reporting` already emits `?1003l`.
+            {
+                use std::io::Write;
+                std::io::stdout().write_all(b"\x1b[?1003h")?;
+                std::io::stdout().flush()?;
+            }
         } else {
             execute!(io::stdout(), DisableMouseCapture)?;
         }

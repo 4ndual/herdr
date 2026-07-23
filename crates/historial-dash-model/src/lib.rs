@@ -41,6 +41,11 @@ pub struct HistorialRow {
     /// Empty when unavailable.
     #[serde(default)]
     pub last_prompt: String,
+    /// Whether this row is a subagent run (its transcript is an `agent-*` jsonl).
+    /// Drives the "hide subagents" header filter. Defaults false for older
+    /// records / non-agent rows.
+    #[serde(default)]
+    pub is_subagent: bool,
 }
 
 /// Full render model the host publishes each tick to `historial_input.json`.
@@ -83,6 +88,7 @@ mod tests {
                 workspace_name: "herdr".to_string(),
                 first_prompt: "hi".to_string(),
                 last_prompt: "bye".to_string(),
+                is_subagent: false,
             }],
         };
         let json = serde_json::to_string(&model).expect("serialize");
