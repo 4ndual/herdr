@@ -491,10 +491,10 @@ fn build_right_panel_rail(
 /// generic marker for unknown plugins.
 fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
     match plugin_id {
-        "builtin.historial-dash" => "H",
-        "builtin.goal-dash" => "G",
-        "builtin.usage-dash" => "U",
-        _ => "*",
+        "builtin.historial-dash" => "\u{1F553}", // 🕓
+        "builtin.goal-dash" => "\u{1F3AF}",      // 🎯
+        "builtin.usage-dash" => "\u{1F4CA}",     // 📊
+        _ => "\u{25A6}",                         // ▦
     }
 }
 
