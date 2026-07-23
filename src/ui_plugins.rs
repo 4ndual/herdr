@@ -803,12 +803,17 @@ impl UiPluginManager {
             .iter()
             .map(|module| (module.plugin_id.clone(), module.module_id.clone()))
             .collect::<Vec<_>>();
-        // Move events have no declarative counterpart (only clicks route through
-        // the hit-rect Action path), so the dedupe below is scoped to button
-        // events. A MouseAll module therefore still receives hover `Move` over
-        // its own hit-rects — required for row hover tooltips on a surface whose
-        // clicks are otherwise owned by declared hit-rects (e.g. historial-dash).
-        let is_move = matches!(kind, MouseEventKind::Move);
+        // Move and scroll events have no declarative counterpart (only clicks
+        // route through the hit-rect Action path), so the dedupe below is scoped
+        // to button events. A MouseAll module therefore still receives hover
+        // `Move` AND wheel scroll over its own hit-rects — hover is required for
+        // row tooltips, and scroll must reach the guest even when the cursor sits
+        // over a full-width row hit-rect (otherwise scrolling stalls the moment
+        // the pointer is over a row, e.g. historial-dash / harness-manager).
+        let is_move_or_scroll = matches!(
+            kind,
+            MouseEventKind::Move | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        );
         let mut changed = false;
         for (plugin_id, module_id) in keys {
             // fork(f5-mouse-dedupe): a module whose current layers declare an
@@ -818,7 +823,7 @@ impl UiPluginManager {
             // MouseAll broadcast for cells inside its own hit-rects. The raw
             // stream continues for every other cell. Kept general so v3 Action
             // routing can reuse `should_deliver_raw_mouse`.
-            if !is_move
+            if !is_move_or_scroll
                 && !self.should_deliver_raw_mouse(&plugin_id, &module_id, mouse.column, mouse.row)
             {
                 continue;
@@ -2286,6 +2291,44 @@ mod tests {
         // Outside the hit-rect: also delivered, counter advances again.
         assert!(manager.dispatch_crossterm_mouse_event(moved(0, 0)));
         assert_eq!(header_text(&manager), "2");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_mouse_broadcast_delivers_scroll_over_declared_hit_rects() {
+        // fork(f5-mouse-dedupe) R5: wheel scroll must reach a MouseAll module even
+        // when the cursor sits over one of the module's own full-width row
+        // hit-rects. Only button clicks are deduped against the Action path;
+        // scroll (like Move) has no Action counterpart, so suppressing it stalled
+        // scrolling the instant the pointer was over a row (historial-dash /
+        // harness-manager). This locks in that scroll is always delivered.
+        let root = unique_root("f5-scroll-over-hit");
+        write_counter_wasm(
+            &root.join("dist/goal-ui.wasm"),
+            r#"{"layers":[{"surface":"header","hits":[{"x":10,"y":0,"width":5,"height":1,"action_id":"a"}],"nodes":[{"kind":"line","spans":[{"text":"@"}]}]}]}"#,
+        );
+        let mut manager = installed(plugin_at(&root));
+
+        let scroll = |kind: crossterm::event::MouseEventKind, col: u16, row: u16| {
+            crossterm::event::MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            }
+        };
+        use crossterm::event::MouseEventKind::{ScrollDown, ScrollUp};
+
+        assert_eq!(header_text(&manager), "0");
+        // Scroll INSIDE the declared hit-rect (the bug case): still delivered.
+        assert!(manager.dispatch_crossterm_mouse_event(scroll(ScrollDown, 12, 0)));
+        assert_eq!(header_text(&manager), "1");
+        assert!(manager.dispatch_crossterm_mouse_event(scroll(ScrollUp, 12, 0)));
+        assert_eq!(header_text(&manager), "2");
+        // Scroll outside the hit-rect: delivered too.
+        assert!(manager.dispatch_crossterm_mouse_event(scroll(ScrollDown, 0, 0)));
+        assert_eq!(header_text(&manager), "3");
 
         let _ = std::fs::remove_dir_all(root);
     }
