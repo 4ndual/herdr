@@ -710,6 +710,12 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.config_reload");
         }
 
+        if let Some(request) = self.app.state.request_plugin_action.take() {
+            self.app.dispatch_requested_plugin_action(request);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_plugin_action");
+        }
+
         needs_render
     }
 

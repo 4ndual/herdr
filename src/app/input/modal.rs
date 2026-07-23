@@ -736,6 +736,28 @@ pub(super) fn apply_context_menu_action(
             state.switch_tab(tab_idx);
             open_rename_active_tab(state, false);
         }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+            // Fork the conversation of this tab's focused pane into a new tab
+            // via the existing button-dash "fork" plugin action. AppState cannot
+            // reach the plugin runtime directly, so record a request the outer
+            // App/event loop dispatches.
+            if let Some(pane_id) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(tab_idx))
+                .map(|tab| tab.layout.focused())
+            {
+                state.request_plugin_action = Some(crate::app::state::PluginActionRequest {
+                    plugin_id: "builtin.button-dash".to_string(),
+                    action_id: "fork".to_string(),
+                    ws_idx,
+                    pane_id,
+                });
+            } else {
+                tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+            }
+            leave_modal(state);
+        }
         (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
             state.selected = ws_idx;
             state.active = Some(ws_idx);
@@ -1952,6 +1974,63 @@ mod tests {
     }
 
     #[test]
+    fn tab_context_menu_lists_fork_between_rename_and_close() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        };
+        assert_eq!(menu.items(), &["New tab", "Rename", "Fork", "Close"]);
+        let rename = menu.items().iter().position(|item| *item == "Rename");
+        let fork = menu.items().iter().position(|item| *item == "Fork");
+        let close = menu.items().iter().position(|item| *item == "Close");
+        assert!(rename < fork, "Fork must come after Rename");
+        assert!(fork < close, "Fork must come before Close");
+    }
+
+    #[test]
+    fn tab_context_menu_fork_requests_button_dash_plugin_action_for_focused_pane() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.active = Some(0);
+        state.selected = 0;
+        let expected_pane = state.workspaces[0].tabs[0].layout.focused();
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        };
+        // "Fork" is index 2 in ["New tab", "Rename", "Fork", "Close"].
+        let fork_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Fork")
+            .expect("fork item present");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, fork_idx);
+
+        assert_eq!(
+            state.request_plugin_action,
+            Some(crate::app::state::PluginActionRequest {
+                plugin_id: "builtin.button-dash".to_string(),
+                action_id: "fork".to_string(),
+                ws_idx: 0,
+                pane_id: expected_pane,
+            })
+        );
+    }
+
+    #[test]
     fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
         let mut state = state_with_workspaces(&["main", "issue"]);
         state.active = Some(0);
@@ -2007,7 +2086,6 @@ mod tests {
         app.state.selected = 1;
         app.state.mode = Mode::ContextMenu;
         let menu = ContextMenuState {
-            plugin_items: Vec::new(),
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
@@ -2015,6 +2093,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let idx = menu
             .items()

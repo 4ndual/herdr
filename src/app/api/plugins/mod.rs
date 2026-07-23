@@ -286,6 +286,77 @@ impl App {
         .map_err(|(_, message)| message)
     }
 
+    /// Dispatch a UI-requested plugin action, surfacing failures as a toast.
+    ///
+    /// This is the outer-loop consumer of `AppState::request_plugin_action`. On
+    /// error (plugin/action missing, disabled, unsupported platform) it shows
+    /// the standard needs-attention toast rather than crashing.
+    pub(crate) fn dispatch_requested_plugin_action(
+        &mut self,
+        request: crate::app::state::PluginActionRequest,
+    ) {
+        if let Err(err) = self.invoke_plugin_action_for_pane(
+            &request.plugin_id,
+            &request.action_id,
+            request.ws_idx,
+            request.pane_id,
+        ) {
+            tracing::warn!(
+                plugin_id = %request.plugin_id,
+                action_id = %request.action_id,
+                error = %err,
+                "requested plugin action failed",
+            );
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: "plugin action failed".to_string(),
+                context: err,
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
+        }
+    }
+
+    /// Invoke a plugin action against a specific pane's context.
+    ///
+    /// Used by UI flows (such as the tab context menu "Fork" item) that already
+    /// know which pane the action should target. Builds the invocation context
+    /// from that pane so the plugin command sees the right
+    /// `HERDR_PANE_ID`/`HERDR_TAB_ID`/`HERDR_WORKSPACE_ID`.
+    pub(crate) fn invoke_plugin_action_for_pane(
+        &mut self,
+        plugin_id: &str,
+        action_id: &str,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Result<(), String> {
+        let (plugin, action) = self
+            .find_plugin_action(Some(plugin_id), action_id)
+            .map_err(|(_, message)| message)?;
+        if !plugin.enabled {
+            return Err(format!("plugin {} is disabled", plugin.plugin_id));
+        }
+        ensure_platform_supported(
+            effective_platforms(&action.platforms, &plugin.platforms),
+            &action.qualified_id(),
+        )
+        .map_err(|(_, message)| message)?;
+        let mut context = self.plugin_context_for_pane(ws_idx, pane_id, "context-menu");
+        context.invocation_source = Some("context-menu".to_string());
+        self.start_plugin_command(
+            &plugin,
+            Some(action.action_id),
+            None,
+            action.command,
+            &context,
+            None,
+        )
+        .map(|_| ())
+        .map_err(|(_, message)| message)
+    }
+
     pub(crate) fn invoke_plugin_link_handler_for_url(
         &mut self,
         url: &str,
