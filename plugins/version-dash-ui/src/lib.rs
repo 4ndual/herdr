@@ -1,27 +1,50 @@
 //! Version-dash guest: a compact "running herdr version vs latest stable"
-//! indicator rendered in a generic plugin `Panel` docked on the LEFT of the
-//! bottom dash band (position is pure manifest DATA — see `[ui_modules.placement]`).
+//! indicator rendered in a generic plugin `Panel` docked as a single full-width
+//! line on the bottom row (position is pure manifest DATA — see
+//! `[ui_modules.placement]`). It tracks two instances: `hr` (the daily driver)
+//! and `test` (herdrtest).
 //!
 //! Data path (spec §7.1, the generic `ui_input_file` transport — NO host code):
-//! the out-of-process `version-dash-collector` fetches the release channel
-//! manifest + the running fork's version on a 10-minute cadence and writes
-//! `version_input.json` into this module's state dir. The host reads that file
-//! each frame and injects it as `HERDR_PLUGIN_UI_INPUT_JSON`, which the guest
-//! deserializes and renders. Clicking the strip toasts the latest release date
-//! and notes URL.
+//! the out-of-process `version-dash-collector` resolves each instance's version,
+//! the latest stable release, and per-instance health on a 10-minute cadence,
+//! then writes `version_input.json` into this module's state dir. The host reads
+//! that file each frame and injects it as `HERDR_PLUGIN_UI_INPUT_JSON`, which the
+//! guest deserializes and renders.
+//!
+//! Interaction:
+//!   - LEFT-click an instance → toast its versions + latest release date/notes.
+//!   - RIGHT-click an instance → invoke its staged-update plugin action
+//!     (`test` pulls the fork integration-tip build; `hr` pulls the exact build
+//!     currently running in `test`). The actual update work runs in the plugin's
+//!     declared action scripts; the guest only fires the intent.
 
 mod render;
 
 use herdr_ui_plugin_api::{
-    HostEffect, UiActionKind, UiEvent, UiLayer, UiSurface, UiUpdate, UiUpdateScope,
+    HostEffect, UiActionKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate, UiUpdateScope,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::sync::Mutex;
 use version_dash_model::VersionRenderInput;
 
-/// Cache of the last input we rendered, so an `Action` click can build its toast
-/// from the same data the strip is showing without re-reading any file.
+/// This plugin's manifest id, used to route right-click update intents back to
+/// our own declared action scripts via `InvokePluginAction`.
+const PLUGIN_ID: &str = "builtin.version-dash";
+
+/// Action id prefix for a per-instance hit rect: `version:instance:<label>`.
+/// The `kind` (LeftDown/RightDown) on the resulting `UiEvent::Action` decides
+/// toast vs update.
+const INSTANCE_ACTION_PREFIX: &str = "version:instance:";
+
+/// Declared plugin actions (see herdr-plugin.toml `[[actions]]`). `test` pulls
+/// the fork integration-tip build; `hr` may ONLY pull the exact build running in
+/// `test` (staged promotion — enforced in the action script, not just hidden).
+const ACTION_UPDATE_TEST: &str = "update-herdrtest-from-latest";
+const ACTION_UPDATE_HR: &str = "update-hr-from-herdrtest";
+
+/// Cache of the last input we rendered, so a click can build its toast from the
+/// same data the strip is showing without re-reading any file.
 static LAST_INPUT: Mutex<Option<VersionRenderInput>> = Mutex::new(None);
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -108,14 +131,14 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
 
     // Render into a CONTENT-sized buffer, independent of the incoming panel rect,
     // so the host can measure the natural width and carve the slot even on the
-    // first content frame (before which `ctx.rect` is still zero). The hit rect
-    // comes from the real (carved) panel rect so clicks map to screen cells.
+    // first content frame (before which `ctx.rect` is still zero). The per-instance
+    // hit rects come from the real (carved) panel rect so clicks map to cells.
     let content = Rect::new(0, 0, render::content_width(&input).max(1), 1);
     let mut buf = Buffer::empty(content);
-    render::render(&input, content, &mut buf);
+    let ranges = render::render(&input, content, &mut buf);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     let panel = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
-    let hits = render::hit_rect(panel);
+    let hits = instance_hits(panel, &ranges);
 
     UiUpdate {
         layers: vec![UiLayer {
@@ -130,16 +153,52 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     }
 }
 
-fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
-    // Fire once per physical click (press only), and only for our own action.
-    if kind != UiActionKind::LeftDown || action_id != render::ACTION_OPEN {
-        return UiUpdate::default();
+/// Map each instance's line-relative column range to an absolute hit rect on the
+/// carved panel row. Clamped to the panel width so a rect never spills past the
+/// slot. Empty until the panel has been carved (rect still zero at bootstrap).
+fn instance_hits(panel: Rect, ranges: &[render::InstanceSpan]) -> Vec<UiHitRect> {
+    if panel.width == 0 || panel.height == 0 {
+        return Vec::new();
     }
+    let mut hits = Vec::new();
+    for span in ranges {
+        if span.start >= panel.width {
+            break;
+        }
+        let width = span.width.min(panel.width - span.start);
+        if width == 0 {
+            continue;
+        }
+        hits.push(UiHitRect {
+            x: panel.x + span.start,
+            y: panel.y,
+            width,
+            height: 1,
+            action_id: format!("{INSTANCE_ACTION_PREFIX}{}", span.label),
+        });
+    }
+    hits
+}
+
+fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
+    let Some(label) = action_id.strip_prefix(INSTANCE_ACTION_PREFIX) else {
+        return UiUpdate::default();
+    };
+    match kind {
+        // Fire once per physical click (press only).
+        UiActionKind::LeftDown => toast_effect(label),
+        UiActionKind::RightDown => update_effect(label),
+        _ => UiUpdate::default(),
+    }
+}
+
+/// Left-click: toast the clicked instance's version detail (or latest info).
+fn toast_effect(label: &str) -> UiUpdate {
     let message = LAST_INPUT
         .lock()
         .expect("input mutex poisoned")
         .as_ref()
-        .map(toast_message)
+        .map(|input| toast_message(input, label))
         .unwrap_or_else(|| "version: no data yet".to_string());
 
     UiUpdate {
@@ -150,18 +209,63 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     }
 }
 
-/// Build the click toast from the last rendered input: state line + latest
-/// release date + notes URL, plus any collector error for offline visibility.
-fn toast_message(input: &VersionRenderInput) -> String {
-    let current = input.current.as_deref().unwrap_or("unknown");
+/// Right-click: invoke the staged-update action for the clicked instance. The
+/// enforcement (hr may only take the exact test build) lives in the action
+/// script; the guest just fires the intent for the matching instance.
+fn update_effect(label: &str) -> UiUpdate {
+    let action_id = match label {
+        "hr" => ACTION_UPDATE_HR,
+        "test" => ACTION_UPDATE_TEST,
+        _ => return UiUpdate::default(),
+    };
+    UiUpdate {
+        layers: Vec::new(),
+        effects: vec![HostEffect::InvokePluginAction {
+            plugin_id: PLUGIN_ID.to_string(),
+            action_id: action_id.to_string(),
+            payload_json: None,
+        }],
+        scope: UiUpdateScope::Partial,
+        consumed_action_ids: Vec::new(),
+    }
+}
+
+/// Find an instance by label in the last input.
+fn find_instance<'a>(
+    input: &'a VersionRenderInput,
+    label: &str,
+) -> Option<&'a version_dash_model::InstanceStatus> {
+    input.instances.iter().find(|i| i.label == label)
+}
+
+/// Build the click toast for `label`: its version + change count, plus the shared
+/// latest release date / notes URL, plus any collector error for offline
+/// visibility. The host renders toasts on a single line, so parts join with
+/// " · " rather than newlines (which collapse into a run-on string).
+fn toast_message(input: &VersionRenderInput, label: &str) -> String {
     let latest = input.latest.as_deref().unwrap_or("unknown");
-    // The host renders toasts on a single line, so join parts with " · "
-    // separators rather than newlines (which collapse into a run-on string).
-    let mut parts = vec![if input.update_available() {
-        format!("herdr {current} — update {latest} available")
-    } else {
-        format!("herdr {current} — up to date (latest {latest})")
-    }];
+    let mut parts = Vec::new();
+
+    match find_instance(input, label) {
+        Some(inst) => {
+            let version = inst.version.as_deref().unwrap_or("unknown");
+            let changes = match inst.local_changes {
+                Some(n) if n > 0 => format!(" (+{n} local)"),
+                _ => String::new(),
+            };
+            let state = match inst.state {
+                version_dash_model::InstanceState::UpToDate => "up to date",
+                version_dash_model::InstanceState::Behind => "update available",
+                version_dash_model::InstanceState::Broken => "BROKEN",
+                version_dash_model::InstanceState::Unknown => "unknown",
+            };
+            parts.push(format!(
+                "{label} {version}{changes} — {state} (latest {latest})"
+            ));
+        }
+        None => parts.push(format!("{label}: no data")),
+    }
+
     if let Some(date) = input.latest_date.as_deref() {
         parts.push(format!("released {date}"));
     }
@@ -169,7 +273,6 @@ fn toast_message(input: &VersionRenderInput) -> String {
         parts.push(url.to_string());
     }
     if !input.age_label.is_empty() {
-        // "just now" already reads as a time, so don't append "ago".
         if input.age_label == "just now" {
             parts.push("checked just now".to_string());
         } else {
@@ -185,11 +288,32 @@ fn toast_message(input: &VersionRenderInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use version_dash_model::{InstanceState, InstanceStatus};
+
+    fn inst(label: &str, ver: &str, changes: Option<u32>, state: InstanceState) -> InstanceStatus {
+        InstanceStatus {
+            label: label.into(),
+            version: Some(ver.into()),
+            local_changes: changes,
+            state,
+        }
+    }
+
+    fn sample_input() -> VersionRenderInput {
+        VersionRenderInput {
+            instances: vec![
+                inst("hr", "0.7.3", Some(107), InstanceState::Behind),
+                inst("test", "0.7.5", Some(0), InstanceState::UpToDate),
+            ],
+            latest: Some("0.7.5".into()),
+            ..Default::default()
+        }
+    }
 
     fn frame_json(env: &str) -> String {
         format!(
             "{{\"type\":\"frame\",\"surface\":\"panel\",\
-             \"rect\":{{\"x\":0,\"y\":0,\"width\":28,\"height\":3}},\
+             \"rect\":{{\"x\":0,\"y\":0,\"width\":60,\"height\":1}},\
              \"focused\":false,\
              \"host\":{{\"focus\":{{\"session_id\":null,\"session_ref\":null,\
              \"cwd\":null,\"agent\":\"None\",\"is_self_focus\":false}},\
@@ -213,76 +337,101 @@ mod tests {
     }
 
     #[test]
-    fn renders_panel_layer_from_injected_input() {
-        let input = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: Some("0.7.5".into()),
-            ..Default::default()
-        };
-        let event: UiEvent =
-            serde_json::from_str(&frame_json(&env_with_input(&input))).expect("frame parses");
+    fn renders_panel_layer_with_per_instance_hits() {
+        let event: UiEvent = serde_json::from_str(&frame_json(&env_with_input(&sample_input())))
+            .expect("frame parses");
         let update = handle_event(&event);
         assert_eq!(update.layers.len(), 1);
         assert!(matches!(update.layers[0].surface, UiSurface::Panel));
         assert!(!update.layers[0].nodes.is_empty());
-        assert!(update.layers[0]
-            .hits
-            .iter()
-            .any(|h| h.action_id == render::ACTION_OPEN));
+        let hits = &update.layers[0].hits;
+        assert!(hits.iter().any(|h| h.action_id == "version:instance:hr"));
+        assert!(hits.iter().any(|h| h.action_id == "version:instance:test"));
     }
 
     #[test]
     fn missing_input_env_renders_nothing() {
         let event: UiEvent = serde_json::from_str(&frame_json("{}")).expect("frame parses");
-        let update = handle_event(&event);
-        assert!(update.layers.is_empty());
+        assert!(handle_event(&event).layers.is_empty());
     }
 
     #[test]
-    fn toast_message_names_update_date_and_url() {
-        // Pure builder — no shared static, so it's isolation-safe under the
-        // parallel test runner (LAST_INPUT is exercised via the action path below).
-        let input = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: Some("0.7.5".into()),
-            notes_url: Some("https://github.com/ogulcancelik/herdr/releases/tag/v0.7.5".into()),
-            latest_date: Some("2026-07-20".into()),
-            age_label: "3h".into(),
-            ..Default::default()
-        };
-        let msg = toast_message(&input);
-        assert!(msg.contains("update 0.7.5 available"), "{msg}");
-        assert!(msg.contains("releases/tag/v0.7.5"), "{msg}");
-        assert!(msg.contains("released 2026-07-20"), "{msg}");
-        assert!(msg.contains("checked 3h ago"), "{msg}");
+    fn instance_hits_are_disjoint_and_clamped() {
+        let (_, ranges) = render::build(&sample_input());
+        let panel = Rect::new(3, 9, 40, 1);
+        let hits = instance_hits(panel, &ranges);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].x, 3); // first token at panel.x
+        assert!(hits[0].x + hits[0].width <= hits[1].x); // disjoint, in order
+        for h in &hits {
+            assert!(h.x + h.width <= panel.x + panel.width, "clamped to panel");
+            assert_eq!(h.y, 9);
+            assert_eq!(h.height, 1);
+        }
     }
 
     #[test]
-    fn toast_message_up_to_date_variant() {
-        let input = VersionRenderInput {
-            current: Some("0.7.5".into()),
-            latest: Some("0.7.5".into()),
-            ..Default::default()
-        };
-        assert!(toast_message(&input).contains("up to date"));
-    }
-
-    #[test]
-    fn click_left_down_emits_exactly_one_toast() {
-        // Content-agnostic (LAST_INPUT is a shared static across parallel tests):
-        // assert only that a left_down on our action yields one ShowToast effect.
+    fn left_click_hr_toasts_hr_detail() {
+        *LAST_INPUT.lock().unwrap() = Some(sample_input());
         let action: UiEvent =
-            serde_json::from_str(&action_json(render::ACTION_OPEN, "left_down")).expect("action");
+            serde_json::from_str(&action_json("version:instance:hr", "left_down")).expect("action");
         let update = handle_event(&action);
         assert_eq!(update.effects.len(), 1);
-        assert!(matches!(update.effects[0], HostEffect::ShowToast { .. }));
+        match &update.effects[0] {
+            HostEffect::ShowToast { message } => {
+                assert!(message.contains("hr 0.7.3"), "{message}");
+                assert!(message.contains("+107 local"), "{message}");
+                assert!(message.contains("update available"), "{message}");
+            }
+            other => panic!("expected toast, got {other:?}"),
+        }
     }
 
     #[test]
-    fn click_left_up_is_ignored() {
+    fn right_click_test_invokes_update_from_latest() {
         let action: UiEvent =
-            serde_json::from_str(&action_json(render::ACTION_OPEN, "left_up")).expect("action");
+            serde_json::from_str(&action_json("version:instance:test", "right_down"))
+                .expect("action");
         let update = handle_event(&action);
-        assert!(update.effects.is_empty(), "left_up must not toast");
+        assert_eq!(update.effects.len(), 1);
+        match &update.effects[0] {
+            HostEffect::InvokePluginAction {
+                plugin_id,
+                action_id,
+                ..
+            } => {
+                assert_eq!(plugin_id, PLUGIN_ID);
+                assert_eq!(action_id, ACTION_UPDATE_TEST);
+            }
+            other => panic!("expected invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_hr_invokes_update_from_herdrtest() {
+        let action: UiEvent =
+            serde_json::from_str(&action_json("version:instance:hr", "right_down"))
+                .expect("action");
+        let update = handle_event(&action);
+        match &update.effects[0] {
+            HostEffect::InvokePluginAction { action_id, .. } => {
+                assert_eq!(action_id, ACTION_UPDATE_HR);
+            }
+            other => panic!("expected invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_up_is_ignored() {
+        let action: UiEvent =
+            serde_json::from_str(&action_json("version:instance:hr", "left_up")).expect("action");
+        assert!(handle_event(&action).effects.is_empty());
+    }
+
+    #[test]
+    fn unknown_action_id_ignored() {
+        let action: UiEvent =
+            serde_json::from_str(&action_json("something:else", "left_down")).expect("action");
+        assert!(handle_event(&action).effects.is_empty());
     }
 }

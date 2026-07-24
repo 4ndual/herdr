@@ -6,16 +6,22 @@
 #
 # Idempotent: re-run after rebuilding the collector to refresh the binary + agent.
 #
+# The collector now tracks TWO instances (hr + herdrtest) and reads their
+# versions directly from each instance's own binary, plus a git local-changes
+# count from the fork checkout. Those paths are resolved from HOME-relative
+# defaults inside the collector (~/.herdr-hr/bin/herdr, ~/.local/bin/herdrtest,
+# ~/.herdr-test/.../herdr.sock, ~/Projects/herdr), so the agent no longer needs a
+# HERDR_VERSION_BIN. Override the collector's HERDR_VERSION_* vars only for a
+# sandbox run.
+#
 # Env overrides (all optional):
-#   HR_ROOT            hr XDG root (default ~/.herdr-hr)
-#   HERDR_VERSION_BIN  herdr binary whose --version is the "current" (default the fork release binary)
+#   HR_ROOT            hr XDG root (default ~/.herdr-hr) — where version_input.json lands
 #   VD_CHANNEL         stable|preview (default stable)
 #   VD_INTERVAL_SECS   cadence (default 600)
 set -euo pipefail
 
 REPO="$HOME/Projects/herdr"
 HR_ROOT="${HR_ROOT:-$HOME/.herdr-hr}"
-HERDR_VERSION_BIN="${HERDR_VERSION_BIN:-$REPO/target/release/herdr}"
 VD_CHANNEL="${VD_CHANNEL:-stable}"
 VD_INTERVAL_SECS="${VD_INTERVAL_SECS:-600}"
 
@@ -46,7 +52,6 @@ cat > "$PLIST" <<PLISTEOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>XDG_STATE_HOME</key><string>$HR_ROOT/state</string>
-    <key>HERDR_VERSION_BIN</key><string>$HERDR_VERSION_BIN</string>
     <key>HERDR_VERSION_CHANNEL</key><string>$VD_CHANNEL</string>
     <key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:$HOME/.local/bin</string>
   </dict>
