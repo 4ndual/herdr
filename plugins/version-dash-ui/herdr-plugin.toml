@@ -1,0 +1,46 @@
+id = "builtin.version-dash"
+name = "Version Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "At-a-glance running herdr version vs latest stable release (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "version"
+title = "Version Dash"
+description = "Compact running-vs-latest herdr version indicator in the bottom dash band"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/version_dash_ui.wasm"
+hot_reload = "on"
+# Generic data-driven placement: a snug slot on the LEFT of the bottom dash
+# band, beside the usage strip (which stays center/right). WHERE it renders is
+# pure manifest DATA — edit the placement table and it moves with no host
+# rebuild. Mirrors the button-dash `panel`/`bottom_band` idiom.
+surfaces = ["panel"]
+# layout_read + focused_session: needed to receive per-frame `frame` events
+# (which carry the injected HERDR_PLUGIN_UI_INPUT_JSON). toasts: the click shows
+# the latest release date + notes URL as a toast.
+capabilities = ["layout_read", "focused_session", "toasts"]
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
+# (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
+# out-of-process `version-dash-collector` writes it on a 10-minute cadence (via a
+# LaunchAgent — see scripts/), so there is NO in-host writer and NO `collector`
+# manifest field (that field routes exclusively through the usage-dash tick).
+ui_input_file = "version_input.json"
+
+[ui_modules.placement]
+# region/align/size/min_peer/z, same spec as button-dash. A fixed slot on the
+# LEFT of the bottom band; the usage dash keeps at least 24 columns. 36 cells
+# fits the widest state — `herdr 0.7.10 · latest 0.7.10 (12m)` — without
+# clipping the stale-age suffix.
+region = "bottom_band"
+align = "start"
+size = "36"
+min_peer = 24
+z = 55

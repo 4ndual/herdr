@@ -1,0 +1,24 @@
+# Out-of-process version-dash collector. A member of the ROOT herdr workspace
+# (not the sibling wasm `version-dash-ui` nested workspace) so it builds into
+# `<workspace>/target/release/version-dash-collector`. It is NOT referenced by a
+# `collector` manifest field (that routes only through the usage-dash tick);
+# instead a LaunchAgent runs it on a 10-minute cadence — see ../scripts/.
+[package]
+name = "version-dash-collector"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "hot-reloadable out-of-process collector that produces the version-dash snapshot"
+publish = false
+# Override directory-based workspace discovery: the parent `version-dash-ui` dir
+# is itself a (wasm) workspace root, so pin membership to the repo-root workspace.
+workspace = "../../.."
+
+[[bin]]
+name = "version-dash-collector"
+path = "src/main.rs"
+
+[dependencies]
+version-dash-model = { path = "../../../crates/version-dash-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
