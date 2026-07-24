@@ -1222,6 +1222,9 @@ impl App {
         frame_area: ratatui::layout::Rect,
         buf: &mut ratatui::buffer::Buffer,
     ) {
+        if self.state.overlay_suppresses_host_images() {
+            return;
+        }
         for (rect, path) in self.resolve_plugin_surface_images(frame_area) {
             crate::host_image::paint_halfblock_image(&path, rect, buf);
         }
