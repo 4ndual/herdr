@@ -71,7 +71,18 @@ impl PaneCloseRecord {
     pub fn resume_plan(&self) -> Option<crate::agent_resume::AgentResumePlan> {
         use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind};
         let source = self.session_source.as_deref()?;
-        let agent = self.agent.as_deref()?;
+        // A cx session is Claude Code launched through the gateway: it is
+        // *persisted* with the display agent "cx" (so the row and the [x] filter
+        // read cx), but it resumes through the same `herdr:claude` source —
+        // cx-resume re-dispatches it back up as cx. Normalize cx -> claude here so
+        // the plan lookup (and therefore `restorable()`, which gates whether the
+        // row survives projection at all) treats it as the claude session it is.
+        // Without this, every cx row is judged non-restorable and dropped from the
+        // historial entirely.
+        let agent = match self.agent.as_deref()? {
+            "cx" => "claude",
+            other => other,
+        };
         let kind = match self.session_kind.as_deref()? {
             "id" => AgentSessionRefKind::Id,
             "path" => AgentSessionRefKind::Path,
@@ -602,6 +613,23 @@ mod tests {
         let plan = record.resume_plan().expect("claude session is restorable");
         assert_eq!(plan.argv, vec!["cx-resume", "abc-123"]);
         assert!(record.restorable());
+    }
+
+    #[test]
+    fn resume_plan_treats_cx_display_agent_as_restorable_claude() {
+        // Regression: a cx session persists with display agent "cx" but source
+        // "herdr:claude". It must stay restorable (else it is dropped from the
+        // historial) and resume through cx-resume, exactly like a claude row.
+        let mut record = sample(1, "p");
+        record.agent = Some("cx".to_string());
+        record.session_source = Some("herdr:claude".to_string());
+        assert!(record.restorable(), "cx rows must be restorable");
+        let plan = record.resume_plan().expect("cx session resolves a plan");
+        assert_eq!(plan.argv, vec!["cx-resume", "abc-123"]);
+        assert_eq!(
+            record.fork_argv().expect("cx forkable"),
+            vec!["cx-resume", "abc-123", "--fork-session"]
+        );
     }
 
     #[test]
