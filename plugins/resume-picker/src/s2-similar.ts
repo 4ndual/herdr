@@ -10,7 +10,7 @@
 
 import { MetaCache, loadConfig, metaToResultLine } from "./sessions.ts";
 import type { CorpusConfig, ResultLine, SectionSearcher } from "./types.ts";
-import { sentinelLine } from "./types.ts";
+import { sentinelLine, recencyFactor } from "./types.ts";
 import { Embedder, loadIndex, NoModelError, type IndexRecord } from "./s2-indexer.ts";
 
 /** How many top hits to surface. */
@@ -66,15 +66,17 @@ export function makeSimilarSearcher(config: CorpusConfig = loadConfig()): Sectio
     if (signal.aborted) return;
 
     // Cosine top-k over the in-memory records (13k * 384 dot products ~ a few ms).
+    // The threshold gates on raw semantic similarity; the sort then blends in
+    // recency (via the record's mtime — no transcript re-parse) so a recent,
+    // actively-growing session outranks an equally-similar stale one.
+    const now = Date.now();
     const scored: { rec: IndexRecord; score: number }[] = [];
     for (const rec of index.values()) {
-      const score = cosine(qVec, rec.vec);
-      if (score >= SIM_THRESHOLD) scored.push({ rec, score });
+      const sim = cosine(qVec, rec.vec);
+      if (sim >= SIM_THRESHOLD) scored.push({ rec, score: sim * recencyFactor(rec.mtimeMs, now) });
     }
     scored.sort((a, b) => b.score - a.score);
     if (signal.aborted) return;
-
-    const now = Date.now();
     let emitted = 0;
     const seen = new Set<string>(); // dedupe a session that indexed under >1 path
     for (const { rec, score } of scored) {

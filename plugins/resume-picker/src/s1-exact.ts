@@ -9,7 +9,7 @@
 // the 1.8G corpus); metadata comes from the mtime-keyed meta cache.
 
 import type { SectionSearcher, ResultLine, SessionMeta } from "./types.ts";
-import { sentinelLine, tokenizeQuery, isExcludedTranscript } from "./types.ts";
+import { sentinelLine, tokenizeQuery, isExcludedTranscript, recencyFactor } from "./types.ts";
 import { loadConfig, MetaCache, metaToResultLine } from "./sessions.ts";
 
 // Per-file match cap. Must be high enough that a file dense in common terms
@@ -38,6 +38,32 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
   return async function* exact(query: string, signal: AbortSignal): AsyncIterable<ResultLine> {
     const q = query.trim();
     if (!q || rootPaths.length === 0) return;
+
+    // Session-id short-circuit: if the query contains a full UUID or a standalone
+    // 8+ hex prefix, the user is naming a specific session ("find this session
+    // 0ccc55a3… in what folder"). Its own id rarely appears in its transcript
+    // CONTENT, so content search misses it — resolve it directly by transcript
+    // filename and surface it first. Emitted ids are skipped by content ranking.
+    const shownIds = new Set<string>();
+    const idMatch = q.match(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f-]{4,})?\b/i);
+    if (idMatch) {
+      const prefix = idMatch[0].toLowerCase();
+      for (const root of rootPaths) {
+        if (signal.aborted) return;
+        const glob = new Bun.Glob(`**/${prefix}*.jsonl`);
+        for (const rel of glob.scanSync({ cwd: root, onlyFiles: true })) {
+          const full = `${root}/${rel}`;
+          if (isExcludedTranscript(full)) continue;
+          const meta = metaCache.getMeta(full);
+          if (!meta || shownIds.has(meta.sessionId)) continue;
+          shownIds.add(meta.sessionId);
+          yield metaToResultLine(meta, meta.summary || meta.lastPrompt || "(matched by session id)");
+        }
+      }
+      metaCache.flush();
+      // A bare id query has no other useful terms to content-search.
+      if (/^[0-9a-f-]{8,}$/i.test(q)) return;
+    }
 
     // Tokenize; if the query is all-stopwords, fall back to the raw phrase so a
     // single meaningful token or an exotic string still searches.
@@ -76,11 +102,12 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
     signal.addEventListener("abort", onAbort, { once: true });
 
     const needleSet = new Set(needles);
-    // Distinct terms matched per RAW path. We deliberately do NOT resolve
+    // Per-term MATCH COUNTS per RAW path. We deliberately do NOT resolve
     // metadata here — that reads the whole transcript, and a common term matches
     // thousands of files. Counting is metadata-free; parsing waits for the
-    // shortlist below.
-    const termsByPath = new Map<string, Set<string>>();
+    // shortlist below. Counts (not just presence) let a session that is densely
+    // about a rare term outrank one that merely name-drops several common ones.
+    const termsByPath = new Map<string, Map<string, number>>();
     let carry = "";
 
     try {
@@ -107,12 +134,12 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
           if (!needleSet.has(term)) continue;
           if (isExcludedTranscript(path)) continue;
 
-          let set = termsByPath.get(path);
-          if (!set) {
-            set = new Set();
-            termsByPath.set(path, set);
+          let counts = termsByPath.get(path);
+          if (!counts) {
+            counts = new Map();
+            termsByPath.set(path, counts);
           }
-          set.add(term);
+          counts.set(term, (counts.get(term) ?? 0) + 1);
         }
       }
     } finally {
@@ -121,25 +148,41 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
     }
     if (signal.aborted) return;
 
-    // Rank candidate PATHS by distinct-term count (AND-preferred) — no metadata
-    // needed — then parse metadata only for the shortlist. Dedupe by session
-    // realpath (symlink bridges) keeping the highest term count.
-    const byCount = [...termsByPath.entries()].sort((a, b) => b[1].size - a[1].size);
+    // Document frequency per term across all matched paths: how many distinct
+    // transcripts contain each term. A term matching few files is distinctive
+    // ("bitwarden", "cmix"); one matching most is generic ("fixing", "plugin").
+    const df = new Map<string, number>();
+    for (const counts of termsByPath.values())
+      for (const t of counts.keys()) df.set(t, (df.get(t) ?? 0) + 1);
+    const N = Math.max(1, termsByPath.size);
+    // Smoothed IDF: rare term → large weight, near-universal term → ~log(2).
+    const idf = (t: string): number => Math.log(1 + N / (df.get(t) ?? 1));
+
+    // Shortlist paths by a metadata-free proxy of relevance (sum of idf over the
+    // distinct terms present) so the parse budget goes to the strongest
+    // candidates — a path dense in a rare term must not be dropped before we can
+    // score it. Then parse metadata only for the shortlist.
+    const pathScore = (counts: Map<string, number>): number => {
+      let s = 0;
+      for (const t of counts.keys()) s += idf(t);
+      return s;
+    };
+    const byRelevance = [...termsByPath.entries()].sort((a, b) => pathScore(b[1]) - pathScore(a[1]));
 
     const recency = (m: SessionMeta) => Math.max(m.lastUserMs, m.lastAgentMs, m.createdMs);
-    const bySession = new Map<string, { meta: SessionMeta; terms: Set<string> }>();
-    for (const [path, terms] of byCount) {
+    // Aggregate matched paths into sessions, summing per-term counts (a
+    // conversation can live under several paths — cx bridges, copies).
+    const bySession = new Map<string, { meta: SessionMeta; counts: Map<string, number> }>();
+    for (const [path, counts] of byRelevance) {
       if (bySession.size >= SHORTLIST) break;
       if (signal.aborted) return;
       const meta = metaCache.getMeta(path);
       if (!meta) continue;
-      // Dedupe by session id (a transcript can exist under several paths — cx
-      // bridges, copies — all the same conversation).
       const existing = bySession.get(meta.sessionId);
       if (existing) {
-        for (const t of terms) existing.terms.add(t);
+        for (const [t, c] of counts) existing.counts.set(t, (existing.counts.get(t) ?? 0) + c);
       } else {
-        bySession.set(meta.sessionId, { meta, terms: new Set(terms) });
+        bySession.set(meta.sessionId, { meta, counts: new Map(counts) });
       }
     }
     metaCache.flush();
@@ -151,29 +194,34 @@ export function makeExactSearcher(cache?: MetaCache): SectionSearcher {
     // session whose own user prompts use the query words is what the user is
     // describing. We can't cheaply see every user turn, but the first and last
     // prompts (cached in meta) are a strong, instant proxy for the topic.
-    const promptHits = (m: SessionMeta, terms: Set<string>): number => {
+    const promptHits = (m: SessionMeta, terms: Iterable<string>): number => {
       const hay = `${m.summary} ${m.lastPrompt}`.toLowerCase();
       let n = 0;
       for (const t of terms) if (hay.includes(t)) n++;
       return n;
     };
-    const ranked = [...bySession.values()].sort((a, b) => {
-      // AND-preferred: most distinct query terms first. This is the recall gate
-      // and, for a specific query, is already near-unique to the right session.
-      if (b.terms.size !== a.terms.size) return b.terms.size - a.terms.size;
-      // Within a tier (e.g. an ambiguous query many sessions match in full),
-      // prefer the session whose own user prompts use the query words — that's
-      // the one the query is describing — then the more recent.
-      const pa = promptHits(a.meta, a.terms);
-      const pb = promptHits(b.meta, b.terms);
-      if (pb !== pa) return pb - pa;
-      return recency(b.meta) - recency(a.meta);
-    });
+    // Relevance = Σ over matched terms of idf(term)·(1+ln(count)). This is the
+    // core discriminator: a session densely about a rare term (bitwarden ×98,
+    // cmix ×2267) beats one that name-drops several common terms once each,
+    // while matching more DISTINCT terms still adds up — AND-preference falls out
+    // naturally instead of being a hard ×100 tier that saturates. Recency folds
+    // in multiplicatively (relevance × decay, per the ranking spec) and a mild
+    // prompt-topic boost rewards sessions whose own first/last prompt uses the
+    // query words (a strong proxy for "this conversation is ABOUT the query").
+    const now = Date.now();
+    const relevance = (counts: Map<string, number>): number => {
+      let s = 0;
+      for (const [t, c] of counts) s += idf(t) * (1 + Math.log(c));
+      return s;
+    };
+    const score = (h: { meta: SessionMeta; counts: Map<string, number> }): number =>
+      relevance(h.counts) * (1 + 0.15 * promptHits(h.meta, h.counts.keys())) * recencyFactor(recency(h.meta), now);
+    const ranked = [...bySession.values()].sort((a, b) => score(b) - score(a));
 
-    const shown = ranked.slice(0, TOP_N);
+    const shown = ranked.filter((h) => !shownIds.has(h.meta.sessionId)).slice(0, TOP_N);
     for (const h of shown) {
       if (signal.aborted) return;
-      const snippet = extractSnippet(h.meta, [...h.terms]) || h.meta.summary || "(no preview)";
+      const snippet = extractSnippet(h.meta, [...h.counts.keys()]) || h.meta.summary || "(no preview)";
       yield metaToResultLine(h.meta, snippet);
     }
     const more = ranked.length - shown.length;

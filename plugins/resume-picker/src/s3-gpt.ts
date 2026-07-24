@@ -18,16 +18,27 @@
 
 import { readFileSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { spawn } from "node:child_process";
 import type { CorpusConfig, ResultLine, ResumeRef, SectionSearcher, SessionMeta } from "./types.ts";
 import { isExcludedTranscript } from "./types.ts";
 import { loadConfig, MetaCache, buildChain } from "./sessions.ts";
+import { loadIndex } from "./s2-indexer.ts";
 
-/** Wall-clock budget for the single cx call before we give up. */
+/** Per-luna-call wall-clock cap (also bounded by the remaining budget). */
 export const GPT_TIMEOUT_MS = 30_000;
-/** Cap on transcripts handed to the model — keeps the prompt small and the call cheap. */
+/**
+ * Total S3 budget measured from when the searcher starts (the debounce settle).
+ * S3 is the deliberately-slow "thinking" section: it keeps re-querying luna for
+ * MORE, different results until this elapses. A new keystroke aborts and the
+ * budget restarts on the next settle.
+ */
+export const S3_BUDGET_MS = 30_000;
+/** Cap on transcripts handed to the model per round — keeps each prompt cheap. */
 export const MAX_CANDIDATES = 30;
+/** Extra recent sessions mixed into later rounds so S3 can surface a fresh
+ * conversation by TOPIC even when it shares few literal words with the query. */
+const RECENT_ANGLE = 20;
 /** A degradation line carries an empty sessionId so the TUI renders it non-selectable. */
 const DEGRADED_ID = "";
 
@@ -250,25 +261,80 @@ function windowAround(text: string, query: string): string {
   return (start > 0 ? "…" : "") + clean.slice(start, end) + (end < clean.length ? "…" : "");
 }
 
-/** Build the strict-format prompt handed to the model. */
-export function buildPrompt(query: string, candidates: Candidate[]): string {
+/**
+ * Load a condensed version of the search-session skill's methodology to prime
+ * luna on HOW to investigate the corpus (topic = first+last user message; reason
+ * about concept, not keywords; corpus layout). Reads the real skill file so the
+ * model gets the actual instructions; falls back to an embedded summary.
+ */
+function methodology(): string {
+  const path = join(process.env.HOME ?? homedir(), ".claude", "skills", "search-session", "SKILL.md");
+  try {
+    const raw = readFileSync(path, "utf8");
+    // Keep it bounded — the Storage Layout + strategy sections are what matter.
+    return raw.slice(0, 2500);
+  } catch {
+    return [
+      "Claude/Codex sessions are JSONL transcripts. A session's TOPIC is captured",
+      "by its first user message (what it started as) and last user message (where",
+      "it ended up). To find a conversation, reason about what the user MEANS and",
+      "match it to a session's topic even when the wording differs — do not rely on",
+      "literal keyword overlap.",
+    ].join("\n");
+  }
+}
+
+/**
+ * Build the reasoning prompt handed to luna. It is a CONCEPTUAL task, not a
+ * keyword match: luna is told to reason about what the user is describing and
+ * pick candidates whose topic matches that concept. `round`/`excludeIds` drive
+ * the continuous find-more loop — later rounds push for DIFFERENT sessions from
+ * another angle and forbid the ids already surfaced.
+ */
+export function buildPrompt(
+  query: string,
+  candidates: Candidate[],
+  opts: { excludeIds?: string[]; round?: number } = {},
+): string {
+  const { excludeIds = [], round = 0 } = opts;
   const lines = candidates.map((c, i) => {
-    const summary = c.meta.summary.replace(/\s+/g, " ").slice(0, 140);
-    const snip = c.snippet.replace(/\s+/g, " ").slice(0, 160);
-    return `[${i + 1}] id=${c.meta.sessionId}\n    summary: ${summary}\n    match: ${snip}`;
+    const first = (c.meta.summary || "").replace(/\s+/g, " ").slice(0, 160);
+    const last = (c.meta.lastPrompt || "").replace(/\s+/g, " ").slice(0, 160);
+    const snip = c.snippet.replace(/\s+/g, " ").slice(0, 140);
+    return `[${i + 1}] id=${c.meta.sessionId}\n    started: ${first}\n    ended: ${last}\n    match: ${snip}`;
   });
+  const header =
+    round === 0
+      ? [
+          `You are the deep "search harder" brain of a resume-search picker. Literal`,
+          `keyword search and embedding search already ran; you are the fallback that`,
+          `THINKS. Reason about what the user is actually describing and find the`,
+          `session(s) whose TOPIC matches that concept — not mere word overlap.`,
+        ]
+      : [
+          `Keep searching HARDER, from a DIFFERENT angle. You already surfaced some`,
+          `sessions; now find OTHER, genuinely-relevant ones the user might mean.`,
+          `Do NOT repeat any of these already-found ids: ${excludeIds.join(", ") || "(none)"}.`,
+        ];
   return [
-    `You are ranking Claude/Codex chat sessions for a resume-search picker.`,
-    `The user is looking for the session about: "${query}".`,
+    `# How Claude/Codex session search works`,
+    methodology(),
     ``,
-    `Candidates (already text-matched the query — judge TRUE topical relevance):`,
+    `# Task`,
+    ...header,
+    ``,
+    `The user is trying to recall the conversation about: "${query}".`,
+    `Think about the MEANING/intent, then judge each candidate by its started/ended`,
+    `topic. A candidate matched some text but may be irrelevant — use judgement.`,
+    ``,
+    `Candidates:`,
     ...lines,
     ``,
-    `Return ONLY lines in this exact format, one per genuinely relevant session,`,
-    `most relevant first:`,
-    `HIT|<full-session-id>|<a short quote (<=100 chars) showing why it matches>`,
-    `Use only ids from the candidate list. If none are genuinely relevant, output`,
-    `the single line: NONE`,
+    `Return ONLY lines in this exact format, most relevant first, one per session`,
+    `you genuinely believe matches the user's concept:`,
+    `HIT|<full-session-id>|<short reason (<=100 chars) tying it to the concept>`,
+    `Use only ids from the candidate list above. If none genuinely fit, output the`,
+    `single line: NONE`,
     `Output nothing else — no preamble, no markdown, no numbering.`,
   ].join("\n");
 }
@@ -365,50 +431,129 @@ export function runCodex(prompt: string, signal: AbortSignal, timeoutMs = GPT_TI
 }
 
 /**
- * The S3 SectionSearcher. Fired on demand by the picker (empty/weak local
- * results or explicit "search deeper"). Yields real ResultLines mapped from the
- * model's picks, or exactly one degradation line, or nothing if aborted.
+ * The RECENCY angle: the most-recently-active sessions from the S2 index (mtime
+ * order — no FS walk). Mixed into later loop rounds so S3 can surface a fresh
+ * conversation the user means even when it shares little literal text with the
+ * query. Empty when the index isn't built yet.
+ */
+function recentCandidates(config: CorpusConfig, cache: MetaCache, limit: number): Candidate[] {
+  let records: { path: string; mtimeMs: number }[] = [];
+  try {
+    records = [...loadIndex(config).values()].map((r) => ({ path: r.path, mtimeMs: r.mtimeMs }));
+  } catch {
+    return [];
+  }
+  records.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const out: Candidate[] = [];
+  for (const r of records) {
+    if (out.length >= limit) break;
+    if (isExcludedTranscript(r.path)) continue;
+    const meta = cache.getMeta(r.path);
+    if (!meta) continue;
+    out.push({ path: meta.jsonlPath, meta, snippet: meta.summary.slice(0, 140) });
+  }
+  return out;
+}
+
+/** Merge candidate lists, deduped by session id, preserving order. */
+function mergeCandidates(...lists: Candidate[][]): Candidate[] {
+  const seen = new Set<string>();
+  const out: Candidate[] = [];
+  for (const list of lists)
+    for (const c of list) {
+      if (seen.has(c.meta.sessionId)) continue;
+      seen.add(c.meta.sessionId);
+      out.push(c);
+    }
+  return out;
+}
+
+/**
+ * The S3 SectionSearcher — a CONTINUOUS conceptual finder. Fired on demand
+ * (Tab "search deeper", or auto when S1+S2 came back empty). It repeatedly asks
+ * luna to reason over candidate topics and surface relevant sessions, each round
+ * pushing for MORE/different ones, until the S3_BUDGET_MS window (from start =
+ * the debounce settle) closes or the query changes (abort). NEW results (deduped
+ * by session id within S3) are yielded in arrival order so they append at the
+ * bottom of the section without reshuffling. Yields exactly one degradation line
+ * only if the whole run surfaced nothing; never fabricates a session.
  */
 export const searchGpt: SectionSearcher = async function* (query: string, signal: AbortSignal) {
   const q = query.trim();
   if (!q) return;
+  const deadline = Date.now() + S3_BUDGET_MS;
 
   const config = loadConfig();
   const cache = new MetaCache(config);
 
-  const candidates = await gatherCandidates(q, config, cache, signal);
-  cache.flush();
-  if (signal.aborted) return;
-  if (candidates.length === 0) {
+  const termCandidates = await gatherCandidates(q, config, cache, signal);
+  if (signal.aborted) {
+    cache.flush();
+    return;
+  }
+  // No literal foothold at all: fast, honest degradation (don't burn the budget
+  // asking luna about unrelated recent sessions).
+  if (termCandidates.length === 0) {
+    cache.flush();
     yield degraded("gpt: no matching transcripts");
     return;
   }
 
-  const prompt = buildPrompt(q, candidates);
-  const out = await runCodex(prompt, signal);
-  if (signal.aborted) return; // query changed mid-flight — discard silently
-  if (out === null) {
-    yield degraded("gpt: timed out");
-    return;
-  }
-
-  const hits = parseHits(out);
-  if (hits.length === 0) {
-    yield degraded("gpt: no relevant sessions");
-    return;
-  }
-
-  const byId = new Map(candidates.map((c) => [c.meta.sessionId, c]));
+  const shown = new Set<string>(); // session ids already surfaced in S3 (no dupes)
   const now = Date.now();
-  let yielded = 0;
-  for (const hit of hits) {
-    if (signal.aborted) return;
-    const cand = byId.get(hit.sessionId) ?? findByPrefix(byId, hit.sessionId);
-    if (!cand) continue; // model returned an id not in the candidate set — never fabricate
-    yield metaToResultLine(cand.meta, hit.snippet || cand.snippet, now);
-    yielded++;
+  let round = 0;
+  let emptyRounds = 0;
+  let anyTimeout = false;
+
+  while (Date.now() < deadline && !signal.aborted && emptyRounds < 2) {
+    // Round 0: the literal-recall pool. Later rounds add the recency angle and
+    // exclude everything already shown, so luna hunts genuinely-new sessions.
+    const pool =
+      round === 0
+        ? termCandidates
+        : mergeCandidates(termCandidates, recentCandidates(config, cache, RECENT_ANGLE)).filter(
+            (c) => !shown.has(c.meta.sessionId),
+          );
+    if (pool.length === 0) break;
+
+    const prompt = buildPrompt(q, pool.slice(0, MAX_CANDIDATES + RECENT_ANGLE), {
+      excludeIds: [...shown],
+      round,
+    });
+    const remaining = deadline - Date.now();
+    if (remaining < 2_000) break; // not enough time for a useful call
+    const out = await runCodex(prompt, signal, Math.min(GPT_TIMEOUT_MS, remaining));
+    if (signal.aborted) {
+      cache.flush();
+      return;
+    }
+    if (out === null) {
+      anyTimeout = true;
+      emptyRounds++;
+      round++;
+      continue;
+    }
+
+    const byId = new Map(pool.map((c) => [c.meta.sessionId, c]));
+    let newThisRound = 0;
+    for (const hit of parseHits(out)) {
+      if (signal.aborted) {
+        cache.flush();
+        return;
+      }
+      const cand = byId.get(hit.sessionId) ?? findByPrefix(byId, hit.sessionId);
+      if (!cand) continue; // id not in the pool — never fabricate
+      if (shown.has(cand.meta.sessionId)) continue; // no dupes within S3
+      shown.add(cand.meta.sessionId);
+      yield metaToResultLine(cand.meta, hit.snippet || cand.snippet, now);
+      newThisRound++;
+    }
+    emptyRounds = newThisRound === 0 ? emptyRounds + 1 : 0;
+    round++;
   }
-  if (yielded === 0) yield degraded("gpt: no relevant sessions");
+
+  cache.flush();
+  if (shown.size === 0) yield degraded(anyTimeout ? "gpt: timed out" : "gpt: no relevant sessions");
 };
 
 /** Canonical searcher export the picker's plugin loader binds to (`mod.search`). */

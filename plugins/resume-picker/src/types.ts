@@ -129,6 +129,26 @@ export function tokenizeQuery(query: string, cap = 8): string[] {
 }
 
 /**
+ * Recency multiplier for ranking: the session's last-activity time decays a
+ * relevance score so that, among comparably-relevant results, the most recent
+ * (and actively-growing) conversation wins — that's almost always what the user
+ * is reaching for. Bounded in [floor, 1] with a gentle half-life so a strong
+ * older match is nudged, never buried. `lastMs` is epoch ms of last activity;
+ * 0/unknown yields the floor.
+ */
+export function recencyFactor(
+  lastMs: number,
+  now = Date.now(),
+  halfLifeDays = 21,
+  floor = 0.6,
+): number {
+  if (!lastMs) return floor;
+  const ageDays = Math.max(0, (now - lastMs) / 86_400_000);
+  const decay = Math.pow(0.5, ageDays / halfLifeDays);
+  return floor + (1 - floor) * decay;
+}
+
+/**
  * A transcript we never want to rank as a resumable session: subagent /
  * headless sidechain files (`agent-*.jsonl`, or anything under a `subagents/`
  * dir). They carry no user-driven conversation to resume, so S1/S2/S3 all skip
