@@ -296,6 +296,54 @@ pub(crate) fn halfblock_cells(img: &RgbaImage, cols: u16, rows: u16) -> Vec<Half
     out
 }
 
+/// Fit an image of `img_width` x `img_height` pixels into at most
+/// `max_cols` x `max_rows` half-block cells, preserving aspect ratio.
+///
+/// A half-block cell is one character wide and stacks two vertical pixels, so a
+/// `cols` x `rows` grid samples the image at `cols` x `rows*2` pixels. Assuming
+/// the two stacked sub-pixels are roughly square on screen (the usual ~1:2
+/// character cell), an undistorted image needs `cols : rows*2 == width : height`,
+/// i.e. `rows = cols * height / (2 * width)`. We first fit to the full width
+/// budget, then fall back to the height budget when that would overflow.
+/// Returns `(0, 0)` when any input is zero.
+pub(crate) fn fit_halfblock_box(
+    img_width: u32,
+    img_height: u32,
+    max_cols: u16,
+    max_rows: u16,
+) -> (u16, u16) {
+    if img_width == 0 || img_height == 0 || max_cols == 0 || max_rows == 0 {
+        return (0, 0);
+    }
+    let w = img_width as u64;
+    let h = img_height as u64;
+
+    // Width-constrained: use the whole width budget, derive rows from aspect.
+    let cols = max_cols as u64;
+    let rows = ((cols * h + w) / (2 * w)).max(1); // round-ish, never below 1
+    if rows <= max_rows as u64 {
+        return (cols as u16, rows as u16);
+    }
+
+    // Height-constrained: use the whole height budget, derive cols from aspect.
+    let rows = max_rows as u64;
+    let cols = ((rows * 2 * w + h / 2) / h).clamp(1, max_cols as u64);
+    (cols as u16, rows as u16)
+}
+
+/// The half-block cell box (`cols`, `rows`) for the image at `path`, fitted to
+/// at most `max_cols` x `max_rows` while preserving aspect ratio. `None` when
+/// the image can't be loaded. Reuses the mtime-keyed decode cache, so repeated
+/// calls across frames don't re-decode.
+pub(crate) fn halfblock_image_box(
+    path: &Path,
+    max_cols: u16,
+    max_rows: u16,
+) -> Option<(u16, u16)> {
+    let img = cached_rgba_image(path)?;
+    Some(fit_halfblock_box(img.width, img.height, max_cols, max_rows))
+}
+
 /// Paint a half-block mosaic of `path` into `area` of the ratatui buffer. Used
 /// as the host image fallback when kitty graphics are unavailable. Silently
 /// does nothing if the file is missing/undecodable so the surface just shows
@@ -390,6 +438,60 @@ pub(crate) fn cached_rgba_image(path: &Path) -> Option<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_halfblock_box_zero_inputs_yield_zero() {
+        assert_eq!(fit_halfblock_box(0, 10, 40, 12), (0, 0));
+        assert_eq!(fit_halfblock_box(10, 0, 40, 12), (0, 0));
+        assert_eq!(fit_halfblock_box(10, 10, 0, 12), (0, 0));
+        assert_eq!(fit_halfblock_box(10, 10, 40, 0), (0, 0));
+    }
+
+    #[test]
+    fn fit_halfblock_box_width_constrained_uses_full_width() {
+        // A wide 200x50 image against a generous budget: width wins. rows =
+        // cols * h / (2w) = 100 * 50 / 400 = 12.5 -> ~13, which fits in 40.
+        let (cols, rows) = fit_halfblock_box(200, 50, 100, 40);
+        assert_eq!(cols, 100, "uses the full width budget");
+        assert!((12..=13).contains(&rows), "rows tracks aspect, got {rows}");
+        assert!(rows <= 40);
+    }
+
+    #[test]
+    fn fit_halfblock_box_height_constrained_when_tall() {
+        // A tall 50x200 image: fitting to full width (80) would need
+        // rows = 80 * 200 / 100 = 160 > 12, so it clamps to the height budget
+        // and derives a narrower width instead.
+        let (cols, rows) = fit_halfblock_box(50, 200, 80, 12);
+        assert_eq!(rows, 12, "uses the full height budget");
+        // cols = rows*2*w/h = 24*50/200 = 6.
+        assert!((5..=7).contains(&cols), "cols tracks aspect, got {cols}");
+        assert!(cols <= 80);
+    }
+
+    #[test]
+    fn fit_halfblock_box_scales_beyond_the_old_40x12_cap() {
+        // The prior hard cap was 40x12; a large pane budget must now produce a
+        // much bigger box for a landscape image.
+        let (cols, rows) = fit_halfblock_box(1600, 900, 120, 40);
+        assert!(cols > 40, "width scales past the old cap, got {cols}");
+        assert!(rows > 12, "height scales past the old cap, got {rows}");
+        assert!(cols <= 120 && rows <= 40, "stays within budget");
+    }
+
+    #[test]
+    fn fit_halfblock_box_preserves_aspect_ratio() {
+        // On-screen the box is cols wide by rows*2 pixel-rows tall; that ratio
+        // should track the source aspect within one cell of rounding.
+        let (img_w, img_h) = (300u32, 100u32);
+        let (cols, rows) = fit_halfblock_box(img_w, img_h, 90, 60);
+        let target = img_w as f64 / img_h as f64;
+        let actual = cols as f64 / (rows as f64 * 2.0);
+        assert!(
+            (actual - target).abs() < 0.25,
+            "aspect {actual:.3} vs target {target:.3} (cols={cols}, rows={rows})"
+        );
+    }
 
     #[test]
     fn parses_single_placeholder_with_coordinates() {
