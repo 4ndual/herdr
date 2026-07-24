@@ -2,19 +2,80 @@
 //!
 //! Two consumers share this crate:
 //!   - the out-of-process `version-dash-collector` binary FILLS a
-//!     [`VersionRenderInput`], serializes it, and writes it to the plugin's
-//!     state dir (`version_input.json`);
+//!     [`VersionRenderInput`] (one [`InstanceStatus`] per herdr instance it
+//!     tracks), serializes it, and writes it to the plugin's state dir
+//!     (`version_input.json`);
 //!   - the `version-dash-ui` guest wasm module READS the same struct back from
 //!     the host-injected `HERDR_PLUGIN_UI_INPUT_JSON` and renders it.
 //!
 //! It contains NO I/O and NO rendering so it compiles cleanly to
 //! `wasm32-unknown-unknown` for the guest and to a native binary for the
-//! collector. The only logic here is version parsing / comparison, which both
-//! sides need and which is unit-tested below.
+//! collector. The only logic here is version parsing / comparison / state
+//! classification, which both sides need and which is unit-tested below.
 
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
+
+/// Per-instance freshness/health, deciding the strip color.
+///
+/// v1 caveat: `UpToDate`/`Behind` are decided by comparing the instance's
+/// VERSION STRING against the latest stable release. They do NOT distinguish
+/// which fork BUILD an instance runs (both instances share a version string
+/// until a bump), because the `+N` change count is git-source-derived, not
+/// baked per-binary. Per-build freshness coloring is a later host-code follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceState {
+    /// At or ahead of the latest stable release (green).
+    UpToDate,
+    /// Behind the latest stable release — an update exists (yellow).
+    Behind,
+    /// Instance is broken: server socket dead or binary won't report a version
+    /// (red). Only ever set for herdrtest — see the collector's criterion.
+    Broken,
+    /// Version could not be resolved and the instance is not known-broken (dim).
+    #[default]
+    Unknown,
+}
+
+/// One tracked herdr instance (hr or herdrtest).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct InstanceStatus {
+    /// Short display label, e.g. `"hr"` / `"test"`.
+    pub label: String,
+    /// The instance's running version (from its binary `--version`), e.g.
+    /// `"0.7.3"`. `None` when unresolved (unknown/broken).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Count of own-fork commits ahead of the latest upstream stable tag
+    /// (git-source-derived; reflects source HEAD, not the exact per-binary
+    /// build — see [`InstanceState`]). Rendered as `+N`. `None` when unknown.
+    #[serde(default)]
+    pub local_changes: Option<u32>,
+    /// Freshness/health color state.
+    #[serde(default)]
+    pub state: InstanceState,
+}
+
+impl InstanceStatus {
+    /// Classify state from the instance's version vs the latest stable release.
+    /// `broken` (herdrtest liveness failure) always wins. A missing/unparseable
+    /// version with no broken signal is `Unknown`.
+    pub fn classify(version: Option<&str>, latest: Option<&str>, broken: bool) -> InstanceState {
+        if broken {
+            return InstanceState::Broken;
+        }
+        match (version, latest) {
+            (Some(v), Some(l)) => match compare_versions(v, l) {
+                // v >= latest ⇒ up to date; v < latest ⇒ behind.
+                Ordering::Less => InstanceState::Behind,
+                _ => InstanceState::UpToDate,
+            },
+            _ => InstanceState::Unknown,
+        }
+    }
+}
 
 /// Everything the strip needs to render, produced by the collector each run.
 ///
@@ -24,13 +85,12 @@ use serde::{Deserialize, Serialize};
 /// (wasm has no wall clock), so all time formatting happens collector-side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct VersionRenderInput {
-    /// The running fork's version (from `herdr --version`), e.g. `"0.7.3"`.
-    /// `None` when the collector could not resolve it.
+    /// Tracked instances, in display order (hr first, then herdrtest).
     #[serde(default)]
-    pub current: Option<String>,
+    pub instances: Vec<InstanceStatus>,
     /// The latest STABLE version from the release channel manifest
-    /// (`herdr.dev/latest.json`), e.g. `"0.7.5"`. `None` when the last fetch
-    /// failed and there is no cached value.
+    /// (`herdr.dev/latest.json`), e.g. `"0.7.5"`. `None` on a failed fetch with
+    /// no cached value.
     #[serde(default)]
     pub latest: Option<String>,
     /// URL to the latest release's notes / changelog (for the click toast).
@@ -43,56 +103,28 @@ pub struct VersionRenderInput {
     /// e.g. `"just now"`, `"12m"`, `"3h"`. Empty when never fetched.
     #[serde(default)]
     pub age_label: String,
-    /// True when the last successful fetch is older than the freshness budget
-    /// (the collector's cadence times a slack factor): the strip dims + shows
-    /// the age so a dead collector / offline host is visible, never a crash.
+    /// True when the last successful fetch is older than the freshness budget:
+    /// the strip dims + shows the age so a dead collector / offline host is
+    /// visible, never a crash.
     #[serde(default)]
     pub stale: bool,
-    /// Last error string when the most recent run failed (offline, bad JSON,
-    /// …). The previous good `latest`/`notes_url` are still carried so the
-    /// strip shows last-known + age instead of going blank.
+    /// Last error string when the most recent run failed (offline, bad JSON, …).
+    /// The previous good values are still carried so the strip shows last-known.
     #[serde(default)]
     pub error: Option<String>,
-}
-
-impl VersionRenderInput {
-    /// True when a strictly newer stable release than the running fork exists.
-    /// Missing/unparseable versions are never treated as an update (fail quiet).
-    pub fn update_available(&self) -> bool {
-        match (self.current.as_deref(), self.latest.as_deref()) {
-            (Some(current), Some(latest)) => compare_versions(latest, current) == Ordering::Greater,
-            _ => false,
-        }
-    }
-
-    /// True when the running fork is at or ahead of the latest stable release
-    /// (the fork can lead upstream). Only meaningful when both versions parse.
-    pub fn up_to_date(&self) -> bool {
-        match (self.current.as_deref(), self.latest.as_deref()) {
-            (Some(current), Some(latest)) => compare_versions(latest, current) != Ordering::Greater,
-            _ => false,
-        }
-    }
 }
 
 /// Parse a dotted version like `"0.7.3"` or `"0.7.3-preview.4"` into its numeric
 /// release components (`[0, 7, 3]`), ignoring any `-suffix`/`+build` metadata.
 /// Returns `None` when there is no leading numeric component to compare.
 pub fn parse_version(raw: &str) -> Option<Vec<u64>> {
-    // Drop a leading `v`, then everything from the first `-` (pre-release) or
-    // `+` (build metadata): we only order the numeric release train.
     let core = raw.trim().trim_start_matches('v');
-    let core = core
-        .split(['-', '+'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let core = core.split(['-', '+']).next().unwrap_or("").trim();
     if core.is_empty() {
         return None;
     }
     let mut parts = Vec::new();
     for segment in core.split('.') {
-        // A non-numeric segment (e.g. a git hash) ends the comparable prefix.
         match segment.parse::<u64>() {
             Ok(n) => parts.push(n),
             Err(_) => break,
@@ -106,8 +138,8 @@ pub fn parse_version(raw: &str) -> Option<Vec<u64>> {
 }
 
 /// Compare two version strings by their numeric release components, treating a
-/// shorter version as zero-padded (`0.7` == `0.7.0`). Unparseable inputs sort
-/// as "not greater" so they never masquerade as an available update.
+/// shorter version as zero-padded (`0.7` == `0.7.0`). Unparseable inputs sort as
+/// `Equal` so they never masquerade as an available update.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     match (parse_version(a), parse_version(b)) {
         (Some(a), Some(b)) => {
@@ -122,7 +154,6 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
             }
             Ordering::Equal
         }
-        // If either side is unparseable we cannot claim one is newer.
         _ => Ordering::Equal,
     }
 }
@@ -150,7 +181,6 @@ mod tests {
 
     #[test]
     fn numeric_ordering_not_lexicographic() {
-        // The bug a naive string compare would hit: "0.7.10" < "0.7.9" lexically.
         assert_eq!(compare_versions("0.7.10", "0.7.9"), Ordering::Greater);
         assert_eq!(compare_versions("0.7.2", "0.7.10"), Ordering::Less);
         assert_eq!(compare_versions("0.8.0", "0.7.99"), Ordering::Greater);
@@ -169,49 +199,61 @@ mod tests {
     }
 
     #[test]
-    fn update_available_only_when_latest_is_strictly_newer() {
-        let update = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: Some("0.7.5".into()),
-            ..Default::default()
-        };
-        assert!(update.update_available());
-        assert!(!update.up_to_date());
-
-        // Fork ahead of upstream stable (real case: fork 0.7.3 vs stable 0.7.2).
-        let ahead = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: Some("0.7.2".into()),
-            ..Default::default()
-        };
-        assert!(!ahead.update_available());
-        assert!(ahead.up_to_date());
-
-        // Equal.
-        let equal = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: Some("0.7.3".into()),
-            ..Default::default()
-        };
-        assert!(!equal.update_available());
-        assert!(equal.up_to_date());
+    fn classify_broken_wins_over_version() {
+        assert_eq!(
+            InstanceStatus::classify(Some("0.7.5"), Some("0.7.5"), true),
+            InstanceState::Broken
+        );
     }
 
     #[test]
-    fn missing_versions_are_not_an_update() {
-        let no_latest = VersionRenderInput {
-            current: Some("0.7.3".into()),
-            latest: None,
-            ..Default::default()
-        };
-        assert!(!no_latest.update_available());
-        assert!(!no_latest.up_to_date());
+    fn classify_behind_and_uptodate() {
+        // Fork 0.7.3 vs stable 0.7.5 ⇒ behind (yellow).
+        assert_eq!(
+            InstanceStatus::classify(Some("0.7.3"), Some("0.7.5"), false),
+            InstanceState::Behind
+        );
+        // At latest ⇒ up to date (green).
+        assert_eq!(
+            InstanceStatus::classify(Some("0.7.5"), Some("0.7.5"), false),
+            InstanceState::UpToDate
+        );
+        // Ahead of latest (fork can lead) ⇒ up to date (green).
+        assert_eq!(
+            InstanceStatus::classify(Some("0.8.0"), Some("0.7.5"), false),
+            InstanceState::UpToDate
+        );
+    }
+
+    #[test]
+    fn classify_unknown_without_version() {
+        assert_eq!(
+            InstanceStatus::classify(None, Some("0.7.5"), false),
+            InstanceState::Unknown
+        );
+        assert_eq!(
+            InstanceStatus::classify(Some("0.7.5"), None, false),
+            InstanceState::Unknown
+        );
     }
 
     #[test]
     fn round_trips_through_json() {
         let input = VersionRenderInput {
-            current: Some("0.7.3".into()),
+            instances: vec![
+                InstanceStatus {
+                    label: "hr".into(),
+                    version: Some("0.7.3".into()),
+                    local_changes: Some(107),
+                    state: InstanceState::Behind,
+                },
+                InstanceStatus {
+                    label: "test".into(),
+                    version: Some("0.7.5".into()),
+                    local_changes: Some(0),
+                    state: InstanceState::UpToDate,
+                },
+            ],
             latest: Some("0.7.5".into()),
             notes_url: Some("https://herdr.dev/changelog".into()),
             latest_date: Some("2026-07-20".into()),

@@ -1,0 +1,86 @@
+#!/bin/bash
+# update-herdrtest.sh — stage the CURRENT fork integration-tip build into the
+# herdrtest instance (right-click "test" in the version-dash strip).
+#
+# "latest" for herdrtest = the fork integration-tip RELEASE build (a
+# `cargo build --release` of the current branch). Upstream merges stay manual git
+# ops; this only promotes what is already on the branch.
+#
+# Pipeline (staged promotion):
+#   1. build the fork release binary in an ISOLATED CARGO_TARGET_DIR (never the
+#      live target/ that hr snapshots from, never a running binary);
+#   2. sanity-check the fresh binary answers `--version`;
+#   3. stage it NEXT TO the destination (SAME volume — a cross-volume mv would
+#      overwrite the running inode and SIGKILL the live process) then atomic-mv
+#      over ~/.local/bin/herdrtest;
+#   4. restart herdrtest (only when VD_DO_RESTART=1 — see the safety note).
+#
+# SAFETY: the binary swap is always safe (atomic mv keeps the old inode alive for
+# the still-running process). The RESTART step is gated behind VD_DO_RESTART=1
+# because herdrtest has no self-heal client loop; without it we swap the binary
+# and leave the restart to the human. Live wiring of the restart is gated on
+# team-lead ack after sandbox E2E.
+#
+# Env overrides (all optional — sandbox E2E points these at throwaway clones):
+#   HERDR_REPO        fork checkout                (default ~/Projects/herdr)
+#   VD_TEST_BIN       destination binary            (default ~/.local/bin/herdrtest)
+#   VD_TARGET_DIR     isolated cargo target dir     (default ~/Projects/herdr/target-versiondash-build)
+#   VD_TEST_TMUX      herdrtest tmux host session   (default test-host)
+#   VD_TEST_GEOM      tmux geometry WxH             (default 220x55)
+#   VD_DO_RESTART     "1" to actually restart       (default off: swap only)
+#   ZIG / DEVELOPER_DIR   toolchain (default the herdr build toolchain)
+set -euo pipefail
+
+HERDR_REPO="${HERDR_REPO:-$HOME/Projects/herdr}"
+VD_TEST_BIN="${VD_TEST_BIN:-$HOME/.local/bin/herdrtest}"
+VD_TARGET_DIR="${VD_TARGET_DIR:-$HERDR_REPO/target-versiondash-build}"
+VD_TEST_TMUX="${VD_TEST_TMUX:-test-host}"
+VD_TEST_GEOM="${VD_TEST_GEOM:-220x55}"
+VD_DO_RESTART="${VD_DO_RESTART:-0}"
+export ZIG="${ZIG:-$HOME/.local/zig/0.15.2/zig}"
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
+
+log() { printf '» %s\n' "$*"; }
+die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+[[ -d "$HERDR_REPO" ]] || die "fork checkout not found: $HERDR_REPO"
+
+log "building fork integration-tip release (isolated target: $VD_TARGET_DIR)"
+CARGO_TARGET_DIR="$VD_TARGET_DIR" \
+  cargo build --manifest-path "$HERDR_REPO/Cargo.toml" --release --bin herdr
+
+FRESH="$VD_TARGET_DIR/release/herdr"
+[[ -x "$FRESH" ]] || die "build did not produce $FRESH"
+
+log "sanity-checking fresh binary --version"
+FRESH_VER="$("$FRESH" --version 2>/dev/null)" || die "fresh binary won't report --version"
+log "fresh build: $FRESH_VER"
+
+DEST_DIR="$(dirname "$VD_TEST_BIN")"
+mkdir -p "$DEST_DIR"
+# Stage on the SAME volume as the destination, then atomic mv. A cp/mv from a
+# different volume onto the live path would rewrite the running inode → SIGKILL.
+STAGE="$DEST_DIR/.herdrtest.new.$$"
+cp "$FRESH" "$STAGE"
+chmod +x "$STAGE"
+mv -f "$STAGE" "$VD_TEST_BIN"
+log "promoted → $VD_TEST_BIN ($("$VD_TEST_BIN" --version 2>/dev/null))"
+
+if [[ "$VD_DO_RESTART" == "1" ]]; then
+  log "restarting herdrtest into a fresh detached tmux ($VD_TEST_TMUX)"
+  # herdrtest has no self-heal client loop, so the action must relaunch it
+  # explicitly (methodology §5) — kill the host session and start a fresh
+  # detached one on the new binary. herdr restores the persisted session
+  # (panes/tabs) on boot, so attached work reappears.
+  GEOM_X="${VD_TEST_GEOM%x*}"
+  GEOM_Y="${VD_TEST_GEOM#*x}"
+  tmux kill-session -t "$VD_TEST_TMUX" 2>/dev/null || true
+  # Sweep any straggler still bound to the old server before relaunch.
+  pkill -f "$VD_TEST_BIN server" 2>/dev/null || true
+  sleep 0.5
+  tmux new-session -d -s "$VD_TEST_TMUX" -x "$GEOM_X" -y "$GEOM_Y" "$VD_TEST_BIN"
+  log "herdrtest relaunched in tmux $VD_TEST_TMUX (${GEOM_X}x${GEOM_Y})"
+else
+  log "binary swapped; restart skipped (set VD_DO_RESTART=1 to restart herdrtest)"
+fi
+log "done"
