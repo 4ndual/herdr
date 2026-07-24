@@ -7549,6 +7549,13 @@
             "id": {
               "type": "string"
             },
+            "image_file": {
+              "description": "fork: optional single path segment naming an image file under this\nmodule's plugin directory. When declared, the HOST loads it and paints\nit over the module's surface `Rect` (kitty transmit path, or half-block\nfallback). Purely host-consumed — it never crosses the wasm guest ABI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "$ref": "#/schemas/success_response/$defs/PluginUiModuleKind",
               "default": "wasm"

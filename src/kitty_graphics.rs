@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -11,7 +12,9 @@ use ratatui::layout::Rect;
 
 use crate::app::state::AppState;
 use crate::app::Mode;
-use crate::ghostty::{KittyImageDescriptor, KittyImageFormat, KittyImagePlacement};
+use crate::ghostty::{
+    KittyImageDescriptor, KittyImageFormat, KittyImagePlacement, KittyPlacementRenderInfo,
+};
 use crate::layout::PaneId;
 use crate::terminal::TerminalRuntimeRegistry;
 
@@ -140,11 +143,12 @@ pub(crate) fn paint_local_pane_graphics(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
+    plugin_images: &[(Rect, PathBuf)],
 ) -> io::Result<()> {
     let cache = LOCAL_HOST_GRAPHICS.get_or_init(|| Mutex::new(HostGraphicsCache::default()));
     let mut bytes = Vec::new();
     if let Ok(mut cache) = cache.lock() {
-        bytes = encode_local_pane_graphics(app, terminal_runtimes, cell_size, &mut cache);
+        bytes = encode_local_pane_graphics(app, terminal_runtimes, cell_size, plugin_images, &mut cache);
     }
     if bytes.is_empty() {
         return Ok(());
@@ -164,6 +168,7 @@ pub(crate) fn encode_local_pane_graphics(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     cell_size: HostCellSize,
+    plugin_images: &[(Rect, PathBuf)],
     cache: &mut HostGraphicsCache,
 ) -> Vec<u8> {
     let mode_ok = app.mode == Mode::Terminal;
@@ -191,12 +196,18 @@ pub(crate) fn encode_local_pane_graphics(
 
     let view_key = active_view_key(app);
     let uploaded_images = cache.images.clone();
-    let placements =
+    let mut placements =
         collect_visible_placements(app, terminal_runtimes, cell_size, &uploaded_images);
     tracing::debug!(
         placements_collected = placements.len(),
         "collect_visible_placements result"
     );
+    let synthetic = collect_synthetic_placements(app, terminal_runtimes, cell_size, plugin_images);
+    tracing::debug!(
+        synthetic_collected = synthetic.len(),
+        "collect_synthetic_placements result"
+    );
+    placements.extend(synthetic);
 
     let mut bytes = Vec::new();
     let view_changed = cache.update_view(view_key);
@@ -536,6 +547,194 @@ fn collect_visible_placements(
         "collect_visible_placements: done"
     );
     placements
+}
+
+/// Upper bound on the on-screen size of a synthesized image so a Claude
+/// `[Image #N]` preview does not overdraw the whole pane. Aspect ratio is
+/// preserved within this box.
+const MAX_SYNTHETIC_IMAGE_COLS: u32 = 40;
+const MAX_SYNTHETIC_IMAGE_ROWS: u32 = 12;
+
+/// Synthetic pane-id namespace for images that are not owned by a real pane
+/// (plugin-panel surfaces). Kept far above real pane ids so the `(PaneId, ..)`
+/// dedup keys never collide with terminal panes.
+const SYNTHETIC_PANE_ID_BASE: u32 = 0xF000_0000;
+
+/// Build host placements that herdr synthesizes itself (rather than reading
+/// them from a pane's ghostty kitty store): Claude `[Image #N]` previews and
+/// plugin-panel images. These flow through the same encode/dedup pipeline as
+/// real pane graphics.
+fn collect_synthetic_placements(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    cell_size: HostCellSize,
+    plugin_images: &[(Rect, PathBuf)],
+) -> Vec<HostPlacement> {
+    let mut out = Vec::new();
+    collect_plugin_panel_images(plugin_images, cell_size, &mut out);
+    collect_claude_pane_images(app, terminal_runtimes, cell_size, &mut out);
+    out
+}
+
+/// A plugin surface that declared a host-consumed `image_file` gets that image
+/// painted to fill its resolved screen `Rect`. The `(Rect, path)` pairs are
+/// resolved by the caller (which owns the plugin manager) from each module's
+/// manifest `image_file` and its surface layout.
+fn collect_plugin_panel_images(
+    plugin_images: &[(Rect, PathBuf)],
+    cell_size: HostCellSize,
+    out: &mut Vec<HostPlacement>,
+) {
+    for (index, (rect, path)) in plugin_images.iter().enumerate() {
+        let rect = *rect;
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        let Some(img) = crate::host_image::cached_kitty_image(path) else {
+            continue;
+        };
+        let (cols, rows) = fit_image_cells(
+            img.width_px,
+            img.height_px,
+            cell_size,
+            rect.width as u32,
+            rect.height as u32,
+        );
+        let pane_id = PaneId::from_raw(SYNTHETIC_PANE_ID_BASE + index as u32);
+        out.push(synthetic_placement(
+            pane_id, rect, cell_size, 0, 0, cols, rows, &img, 1,
+        ));
+    }
+}
+
+/// Claude Code emits `[Image #N]` as literal text. For each visible Claude
+/// pane, resolve the placeholder to its on-disk cache file and paint it at the
+/// placeholder's cell position. Re-resolved every render so resume/compaction
+/// renumbering and cache GC are tolerated (a missing file simply leaves the
+/// text).
+fn collect_claude_pane_images(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    cell_size: HostCellSize,
+    out: &mut Vec<HostPlacement>,
+) {
+    let Some(ws_idx) = app.active else {
+        return;
+    };
+    let Some(cache_root) = crate::host_image::default_image_cache_root() else {
+        return;
+    };
+    for info in &app.view.pane_infos {
+        let Some(session) = app.claude_session_value_for_pane(ws_idx, info.id) else {
+            continue;
+        };
+        let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        else {
+            continue;
+        };
+        let rows: Vec<String> = runtime.visible_text().lines().map(str::to_string).collect();
+        for (placeholder, file) in
+            crate::host_image::resolve_pane_placeholders(&cache_root, &session, &rows)
+        {
+            if placeholder.col as u32 >= info.inner_rect.width as u32
+                || placeholder.row as u32 >= info.inner_rect.height as u32
+            {
+                continue;
+            }
+            let Some(img) = crate::host_image::cached_kitty_image(&file) else {
+                continue;
+            };
+            let (cols, rows_cells) = fit_image_cells(
+                img.width_px,
+                img.height_px,
+                cell_size,
+                MAX_SYNTHETIC_IMAGE_COLS,
+                MAX_SYNTHETIC_IMAGE_ROWS,
+            );
+            out.push(synthetic_placement(
+                info.id,
+                info.inner_rect,
+                cell_size,
+                placeholder.col as i32,
+                placeholder.row as i32,
+                cols,
+                rows_cells,
+                &img,
+                placeholder.number,
+            ));
+        }
+    }
+}
+
+/// Fit an image (pixel dims) into a cell box, preserving aspect ratio and
+/// never exceeding `max_cols`/`max_rows`.
+fn fit_image_cells(
+    width_px: u32,
+    height_px: u32,
+    cell_size: HostCellSize,
+    max_cols: u32,
+    max_rows: u32,
+) -> (u32, u32) {
+    let cell_w = cell_size.width_px.max(1);
+    let cell_h = cell_size.height_px.max(1);
+    let natural_cols = width_px.div_ceil(cell_w).max(1);
+    let natural_rows = height_px.div_ceil(cell_h).max(1);
+
+    let mut cols = natural_cols.min(max_cols.max(1));
+    let mut rows = ((natural_rows as u64 * cols as u64) / natural_cols as u64).max(1) as u32;
+    if rows > max_rows.max(1) {
+        rows = max_rows.max(1);
+        cols = ((natural_cols as u64 * rows as u64) / natural_rows as u64).max(1) as u32;
+    }
+    (cols.max(1), rows.max(1))
+}
+
+/// Construct a `HostPlacement` for a host-synthesized image. `seed` uniquely
+/// identifies the image within its pane (the `N` of `[Image #N]`, or a panel
+/// index) so multiple images per pane get distinct dedup/placement keys.
+#[allow(clippy::too_many_arguments)]
+fn synthetic_placement(
+    pane_id: PaneId,
+    area: Rect,
+    cell_size: HostCellSize,
+    viewport_col: i32,
+    viewport_row: i32,
+    grid_cols: u32,
+    grid_rows: u32,
+    img: &crate::host_image::KittyImageBytes,
+    seed: u32,
+) -> HostPlacement {
+    HostPlacement {
+        pane_id,
+        area,
+        cell_size,
+        scrollback_offset: 0,
+        placement: KittyImagePlacement {
+            image_id: seed,
+            placement_id: seed,
+            z: 0,
+            x_offset: 0,
+            y_offset: 0,
+            image_width: img.width_px,
+            image_height: img.height_px,
+            format: img.format,
+            data_len: img.data.len(),
+            data_fingerprint: img.fingerprint,
+            data: img.data.clone(),
+            render: KittyPlacementRenderInfo {
+                pixel_width: 0,
+                pixel_height: 0,
+                grid_cols,
+                grid_rows,
+                viewport_col,
+                viewport_row,
+                source_x: 0,
+                source_y: 0,
+                source_width: 0,
+                source_height: 0,
+            },
+        },
+    }
 }
 
 fn host_image_id(pane_id: PaneId, placement: &KittyImagePlacement) -> u32 {
@@ -1309,6 +1508,102 @@ mod tests {
         assert!(!delete.contains("d=I"));
         assert!(placements.is_empty());
         assert_eq!(images.len(), 1);
+    }
+
+    fn write_temp_png(name: &str, width: u32, height: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kitty_synth_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels = vec![128u8; (width * height * 4) as usize];
+            writer.write_image_data(&pixels).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn fit_image_cells_preserves_aspect_and_caps() {
+        let cell = HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        // 200x400 px with 10x20 cells => 20x20 natural cells; cap cols at 8.
+        let (cols, rows) = fit_image_cells(200, 400, cell, 8, 100);
+        assert_eq!(cols, 8);
+        assert_eq!(rows, 8);
+        // Row cap dominates: cap rows at 4 => cols scale down to 4.
+        let (cols, rows) = fit_image_cells(200, 400, cell, 100, 4);
+        assert_eq!(rows, 4);
+        assert_eq!(cols, 4);
+    }
+
+    #[test]
+    fn plugin_panel_image_builds_placement_and_encodes_upload_and_display() {
+        let path = write_temp_png("panel.png", 40, 40);
+        let cell = HostCellSize {
+            width_px: 10,
+            height_px: 10,
+        };
+        let rect = Rect::new(3, 4, 6, 6);
+
+        let mut placements = Vec::new();
+        collect_plugin_panel_images(&[(rect, path.clone())], cell, &mut placements);
+        assert_eq!(placements.len(), 1, "one synthetic placement built");
+        let placement = &placements[0];
+        assert_eq!(placement.area, rect);
+        assert_eq!(placement.placement.format, KittyImageFormat::Png);
+        assert!(placement.placement.data_len > 0);
+        // 40x40 px at 10x10 cells => 4x4 natural cells, fits the 6x6 rect.
+        assert_eq!(placement.placement.render.grid_cols, 4);
+        assert_eq!(placement.placement.render.grid_rows, 4);
+
+        let mut images = HashMap::new();
+        let mut host_placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+        encode_graphics_update(
+            &mut bytes,
+            &placements,
+            false,
+            &mut images,
+            &mut host_placements,
+            &mut sources,
+        );
+        let emitted = String::from_utf8_lossy(&bytes);
+        assert!(emitted.contains("a=t"), "uploads the image");
+        assert!(emitted.contains("f=100"), "PNG transmit format");
+        assert!(emitted.contains("a=p"), "displays the placement");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn plugin_panel_image_skips_zero_area_and_missing_file() {
+        let cell = HostCellSize {
+            width_px: 10,
+            height_px: 10,
+        };
+        let mut out = Vec::new();
+        // Zero-area rect is skipped.
+        collect_plugin_panel_images(
+            &[(Rect::new(0, 0, 0, 5), PathBuf::from("/nonexistent.png"))],
+            cell,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        // Missing file is skipped (no panic).
+        collect_plugin_panel_images(
+            &[(Rect::new(0, 0, 5, 5), PathBuf::from("/nonexistent.png"))],
+            cell,
+            &mut out,
+        );
+        assert!(out.is_empty());
     }
 
     #[test]

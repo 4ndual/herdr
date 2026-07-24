@@ -306,6 +306,12 @@ pub struct PluginManifestUiModule {
     /// plugin's own process side writes the file; the host never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_input_file: Option<String>,
+    /// fork: optional single path segment naming an image file under this
+    /// module's plugin directory. When declared, the HOST loads it and paints
+    /// it over the module's surface `Rect` (kitty transmit path, or half-block
+    /// fallback). Purely host-consumed — it never crosses the wasm guest ABI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file: Option<String>,
     /// fork(wave-2): optional argv naming a command the host executes on each
     /// dashboard tick to PRODUCE this module's snapshot out-of-process, so
     /// collection logic hot-reloads (rebuild the bin) without a host rebuild.

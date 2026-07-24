@@ -41,6 +41,11 @@ pub(crate) struct RegisteredUiModule {
     /// the host surfaces as `HERDR_PLUGIN_UI_INPUT_JSON` each frame. `None` when
     /// the module declares no input file.
     pub ui_input_file: Option<String>,
+    /// Manifest `image_file` (fork): a plugin-directory-relative image filename
+    /// the HOST loads and paints over this module's surface `Rect` (kitty path,
+    /// half-block fallback). Purely host-consumed — never crosses the wasm ABI.
+    /// `None` when the module declares no image.
+    pub image_file: Option<String>,
 }
 
 /// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
@@ -496,6 +501,7 @@ impl UiPluginManager {
                     placement: module.placement.clone(),
                     requested_capabilities: module.capabilities.clone(),
                     ui_input_file: module.ui_input_file.clone(),
+                    image_file: module.image_file.clone(),
                 };
                 let key = module_key(&registered);
                 if let Some(mtime) = old_mtimes.get(&registered.module_path).copied() {
@@ -784,6 +790,37 @@ impl UiPluginManager {
                 .then_with(|| a.module_id.cmp(&b.module_id))
         });
         layers
+    }
+
+    /// Modules that declare a host-consumed `image_file`, resolved to
+    /// `(plugin_id, module_id, surface, absolute_path)`. The surface is the
+    /// module's first declared surface; the host paints the image over that
+    /// surface's screen `Rect`. Only modules with a currently loaded update are
+    /// returned, so a disabled/unloaded plugin paints nothing.
+    pub(crate) fn surface_images(&self) -> Vec<(String, String, UiSurface, PathBuf)> {
+        let mut out = Vec::new();
+        for module in &self.modules {
+            let Some(image_file) = module.image_file.as_ref() else {
+                continue;
+            };
+            if !self.loaded_updates.contains_key(&module_key(module)) {
+                continue;
+            }
+            let Some(surface) = module.surfaces.first().map(|declared| map_surface(*declared))
+            else {
+                continue;
+            };
+            let Some(path) = module.manifest_path.parent().map(|dir| dir.join(image_file)) else {
+                continue;
+            };
+            out.push((
+                module.plugin_id.clone(),
+                module.module_id.clone(),
+                surface,
+                path,
+            ));
+        }
+        out
     }
 
     pub(crate) fn dispatch_crossterm_mouse_event(
@@ -1419,6 +1456,7 @@ mod tests {
             placement: None,
             requested_capabilities: Vec::new(),
             ui_input_file: None,
+            image_file: None,
         };
         let effect = HostEffect::SetSurfaceCollapsed {
             surface: UiSurface::UsageStrip,
@@ -1486,6 +1524,7 @@ mod tests {
                     PluginUiCapability::MouseAll,
                 ],
                 ui_input_file: None,
+                image_file: None,
                 collector: None,
             }],
             link_handlers: vec![],

@@ -284,6 +284,7 @@ mod tests {
                 PluginUiCapability::FocusedSession,
             ],
             ui_input_file: Some("input.json".to_string()),
+            image_file: None,
             collector: None,
         }];
         plugin

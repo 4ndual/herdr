@@ -1143,6 +1143,78 @@ impl App {
         self.render_notify.notify_one();
     }
 
+    /// Resolve each plugin module that declared a manifest `image_file` to the
+    /// absolute screen `Rect` of its surface plus the image path, for the host
+    /// image layer. Empty when no module declares an image.
+    pub(crate) fn resolve_plugin_surface_images(
+        &self,
+        frame_area: ratatui::layout::Rect,
+    ) -> Vec<(ratatui::layout::Rect, std::path::PathBuf)> {
+        self.ui_plugins
+            .surface_images()
+            .into_iter()
+            .map(|(plugin_id, module_id, surface, path)| {
+                let rect = crate::ui::ui_plugin_owner_surface_rect(
+                    &self.state,
+                    frame_area,
+                    surface,
+                    &plugin_id,
+                    &module_id,
+                );
+                (rect, path)
+            })
+            .collect()
+    }
+
+    /// Paint host images as a half-block mosaic directly into the frame buffer.
+    /// This is the fallback used when kitty graphics are unavailable (kitty
+    /// disabled, non-Ghostty terminal, or tmux); it works on any terminal since
+    /// it emits only colored `▀` cells. Covers both plugin-panel images and
+    /// Claude `[Image #N]` previews.
+    pub(crate) fn paint_halfblock_images(
+        &self,
+        frame_area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+    ) {
+        for (rect, path) in self.resolve_plugin_surface_images(frame_area) {
+            crate::host_image::paint_halfblock_image(&path, rect, buf);
+        }
+
+        let Some(ws_idx) = self.state.active else {
+            return;
+        };
+        let Some(cache_root) = crate::host_image::default_image_cache_root() else {
+            return;
+        };
+        for info in &self.state.view.pane_infos {
+            let Some(session) = self.state.claude_session_value_for_pane(ws_idx, info.id) else {
+                continue;
+            };
+            let Some(runtime) =
+                self.state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, info.id)
+            else {
+                continue;
+            };
+            let rows: Vec<String> = runtime.visible_text().lines().map(str::to_string).collect();
+            for (placeholder, path) in
+                crate::host_image::resolve_pane_placeholders(&cache_root, &session, &rows)
+            {
+                if placeholder.col as u32 >= info.inner_rect.width as u32
+                    || placeholder.row as u32 >= info.inner_rect.height as u32
+                {
+                    continue;
+                }
+                let x = info.inner_rect.x + placeholder.col;
+                let y = info.inner_rect.y + placeholder.row;
+                let width = info.inner_rect.right().saturating_sub(x).min(40);
+                let height = info.inner_rect.bottom().saturating_sub(y).min(12);
+                let box_rect = ratatui::layout::Rect::new(x, y, width, height);
+                crate::host_image::paint_halfblock_image(&path, box_rect, buf);
+            }
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
@@ -1291,8 +1363,11 @@ impl App {
                     self.full_redraw_pending = false;
                 }
                 let mut cell_size = crate::kitty_graphics::HostCellSize::default();
+                #[allow(unused_assignments)]
+                let mut frame_area = ratatui::layout::Rect::default();
                 terminal.draw(|frame| {
                     let area = frame.area();
+                    frame_area = area;
                     if kitty_graphics_enabled {
                         cell_size = crate::kitty_graphics::HostCellSize::from_terminal(area);
                         crate::ui::compute_view_with_cell_size(
@@ -1315,12 +1390,17 @@ impl App {
                         &self.terminal_runtimes,
                         frame,
                     );
+                    if !kitty_graphics_enabled {
+                        self.paint_halfblock_images(area, frame.buffer_mut());
+                    }
                 })?;
                 if kitty_graphics_enabled {
+                    let plugin_images = self.resolve_plugin_surface_images(frame_area);
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
                         &self.terminal_runtimes,
                         cell_size,
+                        &plugin_images,
                     )?;
                 }
                 self.sync_pending_agent_resume_deadline(now);
