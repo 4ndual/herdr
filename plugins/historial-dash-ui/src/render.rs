@@ -115,6 +115,96 @@ impl RowFilters {
     }
 }
 
+/// A clickable header button, used both to describe it on hover and to resolve
+/// which button an absolute mouse coordinate landed on (shared geometry with the
+/// rendered hit-rects so hover and click always agree).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderButton {
+    Agent,
+    Terminals,
+    Legend,
+    Collapse,
+}
+
+impl HeaderButton {
+    /// One-line human description shown as a hover hint at the panel bottom, so
+    /// the otherwise-cryptic `[*][t][?][<]` glyphs are self-explanatory.
+    pub fn describe(self, filters: RowFilters) -> String {
+        match self {
+            HeaderButton::Agent => {
+                format!("[*] filter: {}  (all>claude>cx>codex>pi)", filters.agent.label())
+            }
+            HeaderButton::Terminals => {
+                if filters.show_terminals {
+                    "[t] terminals shown  (click to hide)".to_string()
+                } else {
+                    "[t] terminals hidden  (click to show)".to_string()
+                }
+            }
+            HeaderButton::Legend => "[?] toggle the help legend".to_string(),
+            HeaderButton::Collapse => "[<] collapse this panel".to_string(),
+        }
+    }
+
+    /// Accent color for this button, applied even when inactive so each glyph
+    /// reads as a distinct control rather than gray text.
+    fn color(self, filters: RowFilters) -> Color {
+        match self {
+            HeaderButton::Agent => {
+                if filters.agent == AgentFilter::All { Color::Magenta } else { Color::LightMagenta }
+            }
+            HeaderButton::Terminals => {
+                if filters.show_terminals { Color::Green } else { Color::LightGreen }
+            }
+            HeaderButton::Legend => Color::Yellow,
+            HeaderButton::Collapse => Color::Cyan,
+        }
+    }
+}
+
+/// Fixed glyph width shared by every header button (all glyphs are 3 cols).
+const HEADER_BTN_W: u16 = 3;
+
+/// Resolve which header button (if any) the absolute coordinate `(col, row)` is
+/// over. Mirrors the right-to-left hit-rect layout in [`render_full`] exactly so
+/// hover and click agree. Returns `None` off the header row or between buttons.
+pub fn header_button_at(area: Rect, col: u16, row: u16) -> Option<HeaderButton> {
+    if area.width <= 3 || area.height == 0 || row != area.y {
+        return None;
+    }
+    let collapse_x = area.x + area.width.saturating_sub(HEADER_BTN_W);
+    let legend_x = collapse_x.saturating_sub(1 + HEADER_BTN_W);
+    let term_x = legend_x.saturating_sub(HEADER_BTN_W);
+    let agent_x = term_x.saturating_sub(HEADER_BTN_W);
+    let hit = |x: u16| col >= x && col < x + HEADER_BTN_W;
+    if hit(collapse_x) {
+        Some(HeaderButton::Collapse)
+    } else if hit(legend_x) {
+        Some(HeaderButton::Legend)
+    } else if hit(term_x) {
+        Some(HeaderButton::Terminals)
+    } else if hit(agent_x) {
+        Some(HeaderButton::Agent)
+    } else {
+        None
+    }
+}
+
+/// Draw the header hover hint at row `y` (full width), in the hovered button's
+/// accent color. Callers place it near the header/content so it stays close to
+/// the button being hovered (the right panel can be full-height, so a bottom-line
+/// hint would be far away). No-op if `y` is outside the panel.
+fn draw_header_hint(area: Rect, buf: &mut Buffer, y: u16, text: &str, color: Color) {
+    if area.height < 2 || y < area.y || y >= area.y + area.height {
+        return;
+    }
+    Paragraph::new(Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )))
+    .render(Rect { x: area.x, y, width: area.width, height: 1 }, buf);
+}
+
 /// Prefixes for host-resolved row actions. The suffix after the final `:` in the
 /// restore/fork/delete ids is the row's stable key (`"<ts>:<pane_id>"`), so the
 /// host parses it back to the source record. These are declared here but handled
@@ -158,6 +248,7 @@ pub fn render(
     buf: &mut Buffer,
     hovered: Option<usize>,
     filters: RowFilters,
+    header_hover: Option<HeaderButton>,
 ) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -165,7 +256,7 @@ pub fn render(
     if area.width <= 3 {
         return render_handle(area, buf);
     }
-    render_full(model, area, buf, hovered, filters)
+    render_full(model, area, buf, hovered, filters, header_hover)
 }
 
 /// Slim collapsed handle: a single ">" glyph near the top, clickable to expand.
@@ -196,6 +287,7 @@ fn render_full(
     buf: &mut Buffer,
     hovered: Option<usize>,
     filters: RowFilters,
+    header_hover: Option<HeaderButton>,
 ) -> Vec<UiHitRect> {
     let width = area.width as usize;
     let mut hits = Vec::new();
@@ -228,32 +320,29 @@ fn render_full(
     } else {
         header.push(Span::raw(" "));
     }
+    // Each button keeps its accent color even when inactive so the glyphs read
+    // as distinct controls; the active state adds BOLD.
+    let btn_style = |btn: HeaderButton, active: bool| {
+        let s = Style::default().fg(btn.color(filters));
+        if active { s.add_modifier(Modifier::BOLD) } else { s }
+    };
     header.push(Span::styled(
         agent_glyph,
-        Style::default().fg(if filters.agent == AgentFilter::All {
-            Color::DarkGray
-        } else {
-            Color::Magenta
-        }),
+        btn_style(HeaderButton::Agent, filters.agent != AgentFilter::All),
     ));
     header.push(Span::styled(
         term_label,
-        Style::default().fg(if filters.show_terminals {
-            Color::Green
-        } else {
-            Color::DarkGray
-        }),
+        btn_style(HeaderButton::Terminals, filters.show_terminals),
     ));
     header.push(Span::styled(
         LEGEND_BTN,
-        Style::default().fg(if filters.show_legend {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        }),
+        btn_style(HeaderButton::Legend, filters.show_legend),
     ));
     header.push(Span::raw(" "));
-    header.push(Span::styled(COLLAPSE_BTN, Style::default().fg(Color::DarkGray)));
+    header.push(Span::styled(
+        COLLAPSE_BTN,
+        btn_style(HeaderButton::Collapse, false),
+    ));
     Paragraph::new(Line::from(header)).render(
         Rect {
             x: area.x,
@@ -301,9 +390,16 @@ fn render_full(
         return hits;
     }
 
+    // Hover hint for a header button, drawn on the bottom line. Reserve that line
+    // (below) so it never collides with a row.
+    let header_hint = header_hover.map(|b| (b.describe(filters), b.color(filters)));
+
     // Legend overlay: replace the list with a dense, dim help panel while open.
     if filters.show_legend {
         render_legend(model, area, buf, filters.agent);
+        if let Some((text, color)) = &header_hint {
+            draw_header_hint(area, buf, area.y + area.height - 1, text, *color);
+        }
         return hits;
     }
 
@@ -328,11 +424,19 @@ fn render_full(
             },
             buf,
         );
+        if let Some((text, color)) = &header_hint {
+            draw_header_hint(area, buf, area.y + 2, text, *color);
+        }
         return hits;
     }
 
     // One line per visible closed pane, newest first, within the available rows.
-    let max_rows = (area.height - 1) as usize;
+    // Reserve one line for the header hover hint (drawn just under the list) so it
+    // never collides with a row.
+    let mut max_rows = (area.height - 1) as usize;
+    if header_hint.is_some() && max_rows > 1 {
+        max_rows -= 1;
+    }
     let visible = rows.len().min(max_rows);
     for (i, row) in rows.iter().take(max_rows).enumerate() {
         let y = area.y + 1 + i as u16;
@@ -348,33 +452,30 @@ fn render_full(
         }
     }
 
+    // Place the hint on the line just under the row list, keeping it close to the
+    // header buttons rather than at a far-away panel bottom.
+    if let Some((text, color)) = &header_hint {
+        draw_header_hint(area, buf, area.y + 1 + visible as u16, text, *color);
+    }
+
     hits
 }
 
 /// The display label for a row and whether it is a *fallback* (rendered dim).
-/// Primary is the herdr pane name (`label`); when absent (a session that never
-/// ran in a named herdr pane) we fall back — dimmed — to the first few words of
-/// the first user prompt. We NEVER fall back to the cwd/folder name: the user
-/// explicitly does not want the project-folder encoding shown as a pane name, so
-/// a row with neither a pane name nor a prompt shows only its agent + sid.
+/// The label is the herdr pane name only (`label` = the pane's OSC/manual title
+/// as it shows on the live pane border) — this is how the user recognizes a
+/// conversation, so it is the sole source. We deliberately do NOT fall back to
+/// the first user prompt (noisy, not how panes are named) nor to the cwd/folder
+/// name (the project-folder encoding the user explicitly rejected). A row with
+/// no pane name shows only its agent + sid, which is honest rather than
+/// misleading. The bool is retained for the dim styling contract but is always
+/// `false` now that there is no fallback text.
 fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
     let label = row.label.trim();
     if !label.is_empty() {
         return (label.to_string(), false);
     }
-    let prompt = row.first_prompt.trim();
-    if !prompt.is_empty() {
-        return (first_words(prompt, 6), true);
-    }
-    (String::new(), true)
-}
-
-/// First `max` whitespace-separated words of `text`, joined by single spaces.
-fn first_words(text: &str, max: usize) -> String {
-    text.split_whitespace()
-        .take(max)
-        .collect::<Vec<_>>()
-        .join(" ")
+    (String::new(), false)
 }
 
 /// Render the legend overlay (shown while `[?]` is toggled on), describing the
@@ -629,7 +730,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.iter().any(|id| *id == "historial:restore:100:w_1_p_1"));
@@ -644,7 +745,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:restore:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:fork:")));
         assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:del:")));
@@ -655,7 +756,7 @@ mod tests {
         let model = HistorialRenderModel::default();
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
+        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"historial:toggle_panel"));
@@ -703,7 +804,7 @@ mod tests {
             show_legend: true,
             ..RowFilters::default()
         };
-        let _ = render(&model, area, &mut buf, None, f);
+        let _ = render(&model, area, &mut buf, None, f, None);
         let text = buffer_text(&buf);
         // Legend content is shown; the row's label ("herdr") is not.
         assert!(text.contains("agent filter"));
@@ -712,16 +813,59 @@ mod tests {
     }
 
     #[test]
-    fn unlabeled_row_falls_back_to_first_prompt_words() {
+    fn unlabeled_row_never_shows_first_prompt() {
+        // The pane name (label) is the only row title. A row with no pane name
+        // must NOT fall back to the first user prompt — it shows agent + sid only,
+        // matching how the user recognizes panes by their herdr name.
         let mut r = row("1:w_1_p_1", true);
         r.label = String::new();
         r.first_prompt = "fix the historial panel please now urgently".to_string();
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let text = buffer_text(&buf);
-        assert!(text.contains("fix the historial"));
+        assert!(!text.contains("fix the historial"));
+        assert!(text.contains("claude")); // agent still shown
+        assert!(text.contains("c123")); // sid still shown
+    }
+
+    #[test]
+    fn header_button_at_resolves_each_button_right_to_left() {
+        let area = Rect::new(0, 0, 44, 12);
+        // Layout (right-to-left): collapse at width-3, then a space, then legend,
+        // terminals, agent — each 3 cols.
+        let collapse_x = area.width - 3;
+        let legend_x = collapse_x - 1 - 3;
+        let term_x = legend_x - 3;
+        let agent_x = term_x - 3;
+        assert_eq!(header_button_at(area, collapse_x, 0), Some(HeaderButton::Collapse));
+        assert_eq!(header_button_at(area, legend_x, 0), Some(HeaderButton::Legend));
+        assert_eq!(header_button_at(area, term_x, 0), Some(HeaderButton::Terminals));
+        assert_eq!(header_button_at(area, agent_x, 0), Some(HeaderButton::Agent));
+        // Off the header row -> None.
+        assert_eq!(header_button_at(area, collapse_x, 1), None);
+        // Left of the button cluster -> None.
+        assert_eq!(header_button_at(area, 0, 0), None);
+    }
+
+    #[test]
+    fn header_hover_draws_description_hint_on_bottom_line() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let area = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            RowFilters::default(),
+            Some(HeaderButton::Agent),
+        );
+        // The hint text appears somewhere in the panel (bottom line).
+        assert!(buffer_text(&buf).contains("filter:"));
     }
 
     #[test]
@@ -735,7 +879,7 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let text = buffer_text(&buf);
         assert!(text.contains("claude"));
         assert!(text.contains("c123")); // sid still shown
@@ -768,7 +912,7 @@ mod tests {
         // Hidden: the terminal row is not drawn; the claude row is. The folder
         // name ("scratch") must never appear regardless of the toggle.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let hidden = buffer_text(&buf);
         assert!(hidden.contains("claude"));
         assert!(!hidden.contains("terminal"));
@@ -777,7 +921,7 @@ mod tests {
         // Shown: the terminal row appears (as its agent kind), still never the
         // folder name.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
+        let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         let shown = buffer_text(&buf);
         assert!(shown.contains("terminal"));
         assert!(!shown.contains("scratch"));
@@ -790,7 +934,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters::default());
+        let hits = render(&model, area, &mut buf, None, RowFilters::default(), None);
         assert!(hits
             .iter()
             .any(|h| h.action_id == "historial:toggle_terminals"));
@@ -803,7 +947,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         assert!(buffer_text(&buf).contains("no agent panes"));
     }
 
@@ -811,7 +955,7 @@ mod tests {
     fn collapsed_handle_declares_toggle() {
         let area = Rect::new(0, 0, 3, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
+        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
     }

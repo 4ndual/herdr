@@ -23,9 +23,14 @@ use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use render::{AgentFilter, RowFilters};
+use render::{AgentFilter, HeaderButton, RowFilters};
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// The header button the cursor is currently over (drives the hover-hint line),
+/// or `None`. Mutually exclusive with [`HOVERED`]: a move over a header button
+/// clears the row hover and vice-versa.
+static HEADER_HOVER: Mutex<Option<HeaderButton>> = Mutex::new(None);
 
 /// Guest-owned collapse state, toggled by clicks on `render::ACTION_TOGGLE_PANEL`.
 /// Re-synced from the host's carved rect width in `handle_frame` so host state
@@ -161,9 +166,10 @@ fn render_from_cache() -> Option<UiUpdate> {
     }
     let area = Rect::new(x, y, width, height);
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, filters);
+    let hits = render::render(model, area, &mut buf, hovered, filters, header_hover);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -183,18 +189,28 @@ fn render_from_cache() -> Option<UiUpdate> {
 fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     if mouse.kind == MouseEventKind::Move {
         let area = *AREA.lock().expect("area mutex poisoned");
-        // Hover maps against the VISIBLE (filtered) rows, matching what the
-        // renderer draws under the show-terminals toggle.
-        let filters = current_filters();
-        let rows = MODEL
-            .lock()
-            .expect("model mutex poisoned")
-            .as_ref()
-            .map(|m| render::visible_rows(m, filters).len())
-            .unwrap_or(0);
-        let next = area.and_then(|a| hovered_row_at(a, rows, mouse.column, mouse.row));
-        let mut guard = HOVERED.lock().expect("hover mutex poisoned");
-        *guard = next;
+        // A move over a header button shows that button's hint and suppresses any
+        // row tooltip; otherwise resolve the hovered row as before.
+        let header = area.and_then(|(x, y, w, h)| {
+            render::header_button_at(Rect::new(x, y, w, h), mouse.column, mouse.row)
+        });
+        if let Some(btn) = header {
+            *HEADER_HOVER.lock().expect("header hover mutex poisoned") = Some(btn);
+            *HOVERED.lock().expect("hover mutex poisoned") = None;
+        } else {
+            *HEADER_HOVER.lock().expect("header hover mutex poisoned") = None;
+            // Hover maps against the VISIBLE (filtered) rows, matching what the
+            // renderer draws under the show-terminals toggle.
+            let filters = current_filters();
+            let rows = MODEL
+                .lock()
+                .expect("model mutex poisoned")
+                .as_ref()
+                .map(|m| render::visible_rows(m, filters).len())
+                .unwrap_or(0);
+            let next = area.and_then(|a| hovered_row_at(a, rows, mouse.column, mouse.row));
+            *HOVERED.lock().expect("hover mutex poisoned") = next;
+        }
     }
     // Re-render the current panel (same content when hover is unchanged, so the
     // host sees no diff and nothing is clobbered). Falls back to an empty update
@@ -273,9 +289,10 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     }
 
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(&model, area, &mut buf, hovered, filters);
+    let hits = render::render(&model, area, &mut buf, hovered, filters, header_hover);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     UiUpdate {
