@@ -1256,9 +1256,26 @@ impl App {
                 }
                 let x = info.inner_rect.x + placeholder.col;
                 let y = info.inner_rect.y + placeholder.row;
-                let width = info.inner_rect.right().saturating_sub(x).min(40);
-                let height = info.inner_rect.bottom().saturating_sub(y).min(12);
-                let box_rect = ratatui::layout::Rect::new(x, y, width, height);
+                // Scale to the pane's budget instead of a fixed thumbnail so the
+                // image reads at chat scale. Width is whatever remains to the
+                // right edge; height is capped to ~80% of the pane so text above
+                // and below the image stays visible, and never past the bottom.
+                let max_cols = info.inner_rect.right().saturating_sub(x);
+                let height_budget = (info.inner_rect.height as u32 * 8 / 10) as u16;
+                let max_rows = info
+                    .inner_rect
+                    .bottom()
+                    .saturating_sub(y)
+                    .min(height_budget.max(1));
+                let Some((cols, rows)) =
+                    crate::host_image::halfblock_image_box(&path, max_cols, max_rows)
+                else {
+                    continue;
+                };
+                if cols == 0 || rows == 0 {
+                    continue;
+                }
+                let box_rect = ratatui::layout::Rect::new(x, y, cols, rows);
                 crate::host_image::paint_halfblock_image(&path, box_rect, buf);
             }
         }
