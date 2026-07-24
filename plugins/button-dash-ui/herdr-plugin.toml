@@ -87,11 +87,12 @@ title = "Remote"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
 
-# draw-screenshot: toggle a BLANK DrawPen live-annotation overlay, then capture
-# the annotated screen and fully close it (see scripts/draw-screenshot.sh). Press
-# once to start drawing on-screen; press again to screenshot + close. Detached so
-# it outlives the action runner. Needs Screen Recording (screencapture) +
-# Accessibility (cliclick ⌘⇧A) permission for the herdr process.
+# draw-screenshot: toggle a BLANK draw-on-screen overlay (our own scripts/
+# draw-overlay helper — floats over ANY Space incl. native fullscreen), then
+# capture the annotated screen and fully close it (see scripts/draw-screenshot.sh).
+# Press once to start drawing on-screen; press again (or RETURN) to screenshot +
+# close, ESC cancels. Detached so it outlives the action runner. Needs Screen
+# Recording (screencapture) permission for the herdr process.
 [[actions]]
 id = "draw-screenshot"
 title = "Draw + screenshot"
