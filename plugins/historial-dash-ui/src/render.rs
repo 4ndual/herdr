@@ -351,20 +351,12 @@ fn render_full(
     hits
 }
 
-/// Basename of a cwd path (final non-empty segment), or the whole string when it
-/// has no separators. Empty cwd yields "~".
-fn folder_basename(cwd: &str) -> &str {
-    let trimmed = cwd.trim_end_matches('/');
-    match trimmed.rsplit('/').next() {
-        Some(name) if !name.is_empty() => name,
-        _ => "~",
-    }
-}
-
 /// The display label for a row and whether it is a *fallback* (rendered dim).
-/// Primary is the pane label; when absent (unlabeled/older panes) we fall back to
-/// the first few words of the first prompt, and only as a last resort the cwd
-/// basename — both dimmed to signal they are inferred, not a real pane title.
+/// Primary is the herdr pane name (`label`); when absent (a session that never
+/// ran in a named herdr pane) we fall back — dimmed — to the first few words of
+/// the first user prompt. We NEVER fall back to the cwd/folder name: the user
+/// explicitly does not want the project-folder encoding shown as a pane name, so
+/// a row with neither a pane name nor a prompt shows only its agent + sid.
 fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
     let label = row.label.trim();
     if !label.is_empty() {
@@ -374,7 +366,7 @@ fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
     if !prompt.is_empty() {
         return (first_words(prompt, 6), true);
     }
-    (folder_basename(&row.cwd).to_string(), true)
+    (String::new(), true)
 }
 
 /// First `max` whitespace-separated words of `text`, joined by single spaces.
@@ -501,7 +493,8 @@ fn render_row(
 
     // Row text: "<agent> <pane-label> <sid4?>". The pane label is the primary
     // display; when the pane had no title/manual label we fall back (dimmed) to
-    // the first prompt words, or the folder as a last resort. No cwd column.
+    // the first prompt words. Never the folder/cwd — a nameless, promptless row
+    // shows just its agent + sid. No cwd column.
     let (label_text, is_fallback) = row_label(row);
     let mut parts: Vec<&str> = vec![row.agent.as_str()];
     if !label_text.is_empty() {
@@ -731,6 +724,24 @@ mod tests {
         assert!(text.contains("fix the historial"));
     }
 
+    #[test]
+    fn nameless_promptless_row_never_shows_folder() {
+        // A restorable agent row with no pane label and no first prompt must fall
+        // through to agent + sid only — never the cwd basename ("herdr").
+        let mut r = row("1:w_1_p_1", true);
+        r.label = String::new();
+        r.first_prompt = String::new();
+        r.cwd = "/home/dev/herdr".to_string();
+        let model = HistorialRenderModel { rows: vec![r] };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default());
+        let text = buffer_text(&buf);
+        assert!(text.contains("claude"));
+        assert!(text.contains("c123")); // sid still shown
+        assert!(!text.contains("herdr")); // folder never leaks in
+    }
+
     fn terminal_row(key: &str) -> HistorialRow {
         HistorialRow {
             key: key.to_string(),
@@ -754,19 +765,22 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
 
-        // Hidden: the terminal folder ("scratch") is not drawn; the claude row is.
+        // Hidden: the terminal row is not drawn; the claude row is. The folder
+        // name ("scratch") must never appear regardless of the toggle.
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters::default());
         let hidden = buffer_text(&buf);
         assert!(hidden.contains("claude"));
+        assert!(!hidden.contains("terminal"));
         assert!(!hidden.contains("scratch"));
 
-        // Shown: the terminal row appears.
+        // Shown: the terminal row appears (as its agent kind), still never the
+        // folder name.
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() });
         let shown = buffer_text(&buf);
-        assert!(shown.contains("scratch"));
         assert!(shown.contains("terminal"));
+        assert!(!shown.contains("scratch"));
     }
 
     #[test]
