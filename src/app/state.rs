@@ -1887,6 +1887,16 @@ impl AppState {
         }
     }
 
+    /// True when a modal/overlay mode is active, so the host image layer must
+    /// not paint pane or plugin images. Those images render after the frame
+    /// (kitty re-emit or half-block mosaic) and would bleed over any overlay
+    /// drawn on top of the panes — the resume-search popup, settings, global
+    /// menu, confirm dialogs, etc. Every mode except `Terminal` draws such an
+    /// overlay, so any non-`Terminal` mode suppresses host images.
+    pub(crate) fn overlay_suppresses_host_images(&self) -> bool {
+        !matches!(self.mode, Mode::Terminal)
+    }
+
     /// The Claude Code session UUID backing `pane_id`, or `None` when the pane
     /// is not a Claude agent (pi/omp and non-agent panes are excluded). Used by
     /// the host image layer to resolve `[Image #N]` cache files. Lives here
@@ -2510,6 +2520,39 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn overlay_suppresses_host_images_only_in_terminal_mode() {
+        let mut state = AppState::test_new();
+
+        // Terminal mode is the only mode with no overlay drawn on top of the
+        // panes, so host images are allowed to paint.
+        state.mode = Mode::Terminal;
+        assert!(
+            !state.overlay_suppresses_host_images(),
+            "terminal mode must allow host images"
+        );
+
+        // Every overlay/modal mode must suppress the host image layer so it
+        // cannot bleed over the overlay (the resume-search popup, settings,
+        // global menu, confirm dialogs, etc.).
+        for mode in [
+            Mode::ResumePicker,
+            Mode::Settings,
+            Mode::GlobalMenu,
+            Mode::ContextMenu,
+            Mode::ConfirmClose,
+            Mode::Navigator,
+            Mode::KeybindHelp,
+            Mode::Onboarding,
+        ] {
+            state.mode = mode;
+            assert!(
+                state.overlay_suppresses_host_images(),
+                "overlay mode {mode:?} must suppress host images"
+            );
+        }
+    }
 
     #[test]
     fn ensure_active_right_panel_only_clears_invalid_never_auto_expands() {
