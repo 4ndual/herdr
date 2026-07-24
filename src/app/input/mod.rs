@@ -109,6 +109,7 @@ impl App {
                 Mode::Navigator => {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
+                Mode::ResumePicker => self.handle_resume_picker_key(key),
                 Mode::Terminal => unreachable!(),
             },
         }

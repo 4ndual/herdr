@@ -15,6 +15,7 @@ mod navigator;
 mod onboarding;
 mod panes;
 mod release_notes;
+mod resume_picker;
 mod scrollbar;
 mod settings;
 mod sidebar;
@@ -913,6 +914,12 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::ResumePicker => resume_picker::render_resume_picker_overlay(
+            app,
+            terminal_runtimes,
+            frame,
+            terminal_area,
+        ),
         Mode::Terminal => {}
     }
 }

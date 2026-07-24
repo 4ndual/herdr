@@ -820,6 +820,10 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// The resume-search picker, hosted as a floating bordered overlay that
+    /// paints a hidden PTY (the resume-picker TUI) into a centered popup while
+    /// the rest of the UI stays visible around it. See [`ResumePickerOverlay`].
+    ResumePicker,
 }
 
 impl Mode {
@@ -1226,6 +1230,9 @@ pub enum HarnessActionKind {
     DisableSession,
     /// Disable the entry AND its ccp profile source (profile-wide).
     DisableProfile,
+    /// Select a profile for the tab-3 global view (host scans it and publishes
+    /// its [`harness_manager_model::ProfileView`] into the render model).
+    ViewProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1644,6 +1651,31 @@ pub struct AppState {
     /// appended to the durable log by the runtime layer. Never persisted in the
     /// session snapshot.
     pub(crate) pane_close_log_pending: Vec<crate::pane_close_history::PaneCloseRecord>,
+    /// Present while the resume-search picker overlay is open. Holds the pure
+    /// metadata for the hidden PTY runtime (the live runtime itself lives in the
+    /// `App`'s terminal registry, keyed by `terminal_id`). Drained by the runtime
+    /// layer on the picker's `PaneDied` to read the result file and resume.
+    pub(crate) resume_picker: Option<ResumePickerOverlay>,
+}
+
+/// Pure metadata for an open resume-search picker overlay.
+///
+/// The overlay hosts a hidden PTY that runs the existing resume-picker TUI
+/// (byte-for-byte). The picker renders to stderr (painted into the popup) and,
+/// on Enter/click, writes the resolved `exec cx …` command to `result_file`
+/// (its stdout, redirected by the overlay wrapper). On the picker's exit the
+/// runtime layer reads `result_file`; a non-empty command is opened in a new
+/// focused tab (`sh -lc <command>`), mirroring the picker's own
+/// `exec sh -c "$CMD"` — never clobbering the pane that was focused.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumePickerOverlay {
+    /// Registry key for the hidden PTY runtime.
+    pub terminal_id: crate::terminal::TerminalId,
+    /// Reserved pane id the PTY was spawned with, so `PaneDied { pane_id }`
+    /// routes back to this overlay. Never part of any tab layout.
+    pub pane_id: PaneId,
+    /// File the picker's stdout (the resolved command) is redirected to.
+    pub result_file: std::path::PathBuf,
 }
 
 impl AppState {
@@ -2122,6 +2154,7 @@ impl AppState {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
             pane_close_log_pending: Vec::new(),
+            resume_picker: None,
         }
     }
 

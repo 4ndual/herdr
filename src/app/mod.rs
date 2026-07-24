@@ -13,6 +13,7 @@ mod config_io;
 mod creation;
 mod ids;
 mod input;
+mod resume_picker;
 mod runtime;
 mod runtime_mutations;
 mod session;
@@ -904,6 +905,7 @@ impl App {
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
             pane_close_log_pending: Vec::new(),
+            resume_picker: None,
         };
 
         state.terminals = restored_terminals;
@@ -2898,6 +2900,9 @@ impl App {
             }
             Mode::Navigator => {
                 input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
+            }
+            Mode::ResumePicker => {
+                self.handle_resume_picker_key(key);
             }
             Mode::Terminal => {
                 // Should not be called in terminal mode.

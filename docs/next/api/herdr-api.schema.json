@@ -3074,6 +3074,18 @@
           ],
           "type": "string"
         },
+        "ResumePickerOpenParams": {
+          "description": "Open the resume-search picker as an in-app overlay. `wrapper` is the\nabsolute path to `resume-picker-overlay.sh` (the caller — the button script —\nresolves it from `$HERDR_PLUGIN_ROOT`, keeping plugin layout out of the host).",
+          "properties": {
+            "wrapper": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "wrapper"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -5040,6 +5052,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "resume_picker.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ResumePickerOpenParams"
             }
           },
           "required": [

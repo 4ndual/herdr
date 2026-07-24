@@ -187,6 +187,15 @@ impl App {
             return;
         }
 
+        // The resume-picker overlay hosts a hidden PTY that is not part of any
+        // workspace layout, so intercept its exit before the normal pane-death
+        // paths (which would fail to find it) run.
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.handle_resume_picker_pane_died(*pane_id) {
+                return;
+            }
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             let previous_toast = self.state.toast.clone();
             if let Some(update) = self.state.publish_pane_process_exit_if_agent(*pane_id) {
@@ -1068,6 +1077,9 @@ impl App {
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
             }
+            Method::ResumePickerOpen(params) => {
+                return self.handle_resume_picker_open(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,
@@ -1078,6 +1090,20 @@ impl App {
         };
 
         serde_json::to_string(&response).unwrap()
+    }
+
+    fn handle_resume_picker_open(
+        &mut self,
+        id: String,
+        params: crate::api::schema::ResumePickerOpenParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+        match self.open_resume_picker_overlay(std::path::PathBuf::from(params.wrapper)) {
+            Ok(()) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => {
+                responses::encode_error(id, "resume_picker_open_failed", err.to_string())
+            }
+        }
     }
 
     fn handle_notification_show(
