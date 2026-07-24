@@ -3,20 +3,27 @@ import { makeExactSearcher, extractSnippet } from "../src/s1-exact.ts";
 import { loadConfig, MetaCache } from "../src/sessions.ts";
 import { isSentinel } from "../src/types.ts";
 import { makeSandbox, withEnv, writeDaily } from "./helpers.ts";
+import type { SessionMeta } from "../src/types.ts";
 
-test("extractSnippet pulls human text centered on the query", () => {
-  const rec = JSON.stringify({ type: "user", message: { role: "user", content: "please find the ZEBRAFISH codeword now" } });
-  const s = extractSnippet(rec, "ZEBRAFISH");
-  expect(s).toContain("ZEBRAFISH");
-  expect(s).not.toContain("{"); // no raw json
+function fakeMeta(summary: string): SessionMeta {
+  return {
+    sessionId: "id", jsonlPath: "/p/id.jsonl", origin: "daily", cwd: "/p",
+    mtimeMs: 0, createdMs: 0, lastUserMs: 0, lastAgentMs: 0,
+    summary, lastPrompt: "", checkpoints: [], chainParentId: "",
+  };
+}
+
+test("extractSnippet centers the session summary on a matched term", () => {
+  const meta = fakeMeta("please find the zebrafish codeword now");
+  const s = extractSnippet(meta, ["zebrafish"]);
+  expect(s).toContain("zebrafish");
+  expect(s).not.toContain("{"); // human text only, never raw json
 });
 
-test("F1: a match with no extractable human text never returns raw JSON", () => {
-  // A record whose match is inside structured metadata (no message.content text)
-  // must NOT leak the raw JSON line; extractSnippet signals "no snippet" ("").
-  const rec = JSON.stringify({ type: "summary", leafUuid: "abc", meta: { KEYWORD42: true } });
-  const s = extractSnippet(rec, "KEYWORD42");
-  expect(s).toBe("");
+test("extractSnippet falls back to the summary head when no term is present", () => {
+  const meta = fakeMeta("a summary that does not contain the search token at all");
+  const s = extractSnippet(meta, ["missingterm"]);
+  expect(s).toContain("a summary");
 });
 
 test("F2: S1 caps at 10 rows by recency and appends a non-selectable '… N more' line", async () => {

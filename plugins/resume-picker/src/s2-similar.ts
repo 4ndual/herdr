@@ -10,6 +10,7 @@
 
 import { MetaCache, loadConfig, metaToResultLine } from "./sessions.ts";
 import type { CorpusConfig, ResultLine, SectionSearcher } from "./types.ts";
+import { sentinelLine } from "./types.ts";
 import { Embedder, loadIndex, NoModelError, type IndexRecord } from "./s2-indexer.ts";
 
 /** How many top hits to surface. */
@@ -30,17 +31,9 @@ function cosine(a: Float32Array, b: Float32Array): number {
   return s;
 }
 
-/** A degradation line the TUI can render verbatim (empty resumeRef, no-op). */
+/** A degradation line the TUI renders verbatim (canonical sentinel, non-selectable). */
 function degradationLine(text: string): ResultLine {
-  return {
-    snippet: text,
-    sessionId: "",
-    shortId: "",
-    lastUserAgo: "",
-    lastAgentAgo: "",
-    createdAgo: "",
-    resumeRef: { sessionId: "", jsonlPath: "", origin: "daily", cwd: "" },
-  };
+  return sentinelLine(text);
 }
 
 /** Build a SectionSearcher bound to a config (defaults to env-derived config). */
@@ -83,17 +76,16 @@ export function makeSimilarSearcher(config: CorpusConfig = loadConfig()): Sectio
 
     const now = Date.now();
     let emitted = 0;
+    const seen = new Set<string>(); // dedupe a session that indexed under >1 path
     for (const { rec, score } of scored) {
       if (signal.aborted) return;
       if (emitted >= TOP_K) break;
       // Prefer W1's rich meta (fresh timestamps); fall back to the stored snippet.
       const m = meta.getMeta(rec.path);
-      if (m) {
-        yield metaToResultLine(m, rec.snippet || m.summary, now);
-      } else {
-        // File vanished since indexing — skip rather than show a dead row.
-        continue;
-      }
+      if (!m) continue; // file vanished since indexing — skip rather than show a dead row
+      if (seen.has(m.sessionId)) continue;
+      seen.add(m.sessionId);
+      yield metaToResultLine(m, rec.snippet || m.summary, now);
       emitted++;
     }
     meta.flush();

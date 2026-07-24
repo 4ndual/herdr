@@ -21,6 +21,7 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import type { CorpusConfig, ResultLine, ResumeRef, SectionSearcher, SessionMeta } from "./types.ts";
+import { isExcludedTranscript } from "./types.ts";
 import { loadConfig, MetaCache, buildChain } from "./sessions.ts";
 
 /** Wall-clock budget for the single cx call before we give up. */
@@ -128,7 +129,7 @@ async function gatherCandidates(
 async function rgFiles(query: string, config: CorpusConfig, signal: AbortSignal): Promise<string[]> {
   const roots = config.roots.map((r) => r.path);
   if (roots.length === 0) return [];
-  const filtered = (list: string[]) => list.filter((p) => !p.includes("subagents"));
+  const filtered = (list: string[]) => list.filter((p) => !isExcludedTranscript(p));
 
   // Pass 1: the full phrase on a user-message line (search-session methodology).
   const phrase = escapeRe(query);

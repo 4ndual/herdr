@@ -27,6 +27,7 @@ import {
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig } from "./sessions.ts";
+import { isExcludedTranscript } from "./types.ts";
 import type { CorpusConfig, SessionOrigin } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -39,10 +40,6 @@ export const EMBED_DIM = 384;
 const MODEL_ID = "all-MiniLM-L6-v2";
 /** HF cache folder that ships the ONNX weights + tokenizer. */
 const MODEL_HF_DIR = "models--Qdrant--all-MiniLM-L6-v2-onnx";
-/** Total characters of session text retained for the doc (chunked before embed). */
-const DOC_CHAR_CAP = 6000;
-/** Max user messages concatenated into a doc (newest sessions have thousands). */
-const DOC_MAX_MESSAGES = 80;
 /** Per-message char cap — long pasted/injected prompts get their head only. */
 const MSG_CHAR_CAP = 500;
 /**
@@ -52,10 +49,19 @@ const MSG_CHAR_CAP = 500;
  */
 const CHUNK_CHARS = 900;
 const MAX_CHUNKS = 6;
+/**
+ * Total doc budget. embedDoc chunks the doc into at most MAX_CHUNKS windows and
+ * embeds ONLY those (chunkText reads from the front), so any text past
+ * CHUNK_CHARS*MAX_CHUNKS is never embedded. We therefore build the doc to fit
+ * exactly that budget and, for long sessions, fill it with a head sample AND a
+ * recent-tail sample — otherwise a huge multi-compaction session (whose recent
+ * work is at the END) would be embedded only from its stale opening messages.
+ */
+const DOC_CHAR_CAP = CHUNK_CHARS * MAX_CHUNKS;
 /** Snippet length stored per record for the result preview. */
 const SNIPPET_CHARS = 160;
 /** Index format version — bump to force a full rebuild on shape changes. */
-const INDEX_VERSION = 2;
+const INDEX_VERSION = 3;
 
 /**
  * Markers of agent-injected / boilerplate turns that carry no session topic
@@ -356,12 +362,14 @@ function walkJsonl(root: string, origin: SessionOrigin, seen: Set<string>, out: 
     if (st.isDirectory()) {
       walkJsonl(full, origin, seen, out);
     } else if (st.isFile() && name.endsWith(".jsonl")) {
+      if (isExcludedTranscript(full)) continue; // never index subagent/headless transcripts
       let real: string;
       try {
         real = realpathSync(full);
       } catch {
         continue;
       }
+      if (isExcludedTranscript(real)) continue;
       if (seen.has(real)) continue; // symlink dedupe
       seen.add(real);
       out.push({ path: real, origin, mtimeMs: st.mtimeMs });
@@ -385,11 +393,13 @@ export function buildDoc(real: string, origin: SessionOrigin): { doc: string; sn
   } catch {
     return { doc: "", snippet: "" };
   }
+  // Collect EVERY surviving human turn (not just the first N) so a long,
+  // multi-compaction session's recent work is available to the sampler below.
   const messages: string[] = [];
   let snippet = "";
 
   for (const line of content.split("\n")) {
-    if (!line || messages.length >= DOC_MAX_MESSAGES) continue;
+    if (!line) continue;
     let o: any;
     try {
       o = JSON.parse(line);
@@ -419,8 +429,45 @@ export function buildDoc(real: string, origin: SessionOrigin): { doc: string; sn
     messages.push(text.slice(0, MSG_CHAR_CAP));
   }
 
-  const doc = messages.join(" • ").slice(0, DOC_CHAR_CAP);
-  return { doc, snippet };
+  return { doc: sampleDoc(messages), snippet };
+}
+
+/**
+ * Compose the embedding doc from the collected turns within DOC_CHAR_CAP. Short
+ * sessions use everything; long ones get a HEAD sample (what the work started
+ * as) plus a recent-TAIL sample (what it became after compactions) so the
+ * embedding reflects the whole conversation, not just its stale opening. Without
+ * this, the char cap and downstream chunker both read from the front and the
+ * recent content is never embedded.
+ */
+export function sampleDoc(messages: string[]): string {
+  const SEP = " • ";
+  const full = messages.join(SEP);
+  if (full.length <= DOC_CHAR_CAP) return full;
+
+  const half = Math.floor(DOC_CHAR_CAP / 2);
+  // Head: take whole messages from the front until ~half the budget.
+  const head: string[] = [];
+  let hLen = 0;
+  let hi = 0;
+  for (; hi < messages.length; hi++) {
+    const add = messages[hi].length + SEP.length;
+    if (hLen + add > half && head.length > 0) break;
+    head.push(messages[hi]);
+    hLen += add;
+  }
+  // Tail: take whole messages from the back until ~half the budget, skipping any
+  // already consumed by the head.
+  const tail: string[] = [];
+  let tLen = 0;
+  for (let ti = messages.length - 1; ti >= hi; ti--) {
+    const add = messages[ti].length + SEP.length;
+    if (tLen + add > half && tail.length > 0) break;
+    tail.push(messages[ti]);
+    tLen += add;
+  }
+  tail.reverse();
+  return [...head, ...tail].join(SEP).slice(0, DOC_CHAR_CAP);
 }
 
 /** Heuristic: does this turn look like injected agent/system boilerplate? */

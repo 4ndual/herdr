@@ -435,8 +435,23 @@ function onData(chunk: Buffer): void {
   }
 }
 
+// Kick an incremental reindex in the background so the "similar" section sees
+// fresh content for actively-changing sessions. Detached + low priority (the
+// indexer drops its own niceness); never blocks the picker and its failure is
+// silent — S2 just queries whatever index exists.
+function kickBackgroundReindex(): void {
+  try {
+    const indexer = new URL("../src/s2-indexer.ts", import.meta.url).pathname;
+    const proc = Bun.spawn(["bun", indexer], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    proc.unref();
+  } catch {
+    // best-effort; the picker works against the existing index regardless
+  }
+}
+
 // --- main -------------------------------------------------------------------
 async function main(): Promise<void> {
+  kickBackgroundReindex();
   // Load optional plug-ins (non-blocking for S1). Both are relative to src/.
   await Promise.allSettled([
     loadPlugin("similar", new URL("../src/s2-similar.ts", import.meta.url).pathname),
