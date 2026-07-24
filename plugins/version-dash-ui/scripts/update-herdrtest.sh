@@ -27,6 +27,8 @@
 #   VD_TARGET_DIR     isolated cargo target dir     (default ~/Projects/herdr/target-versiondash-build)
 #   VD_TEST_TMUX      herdrtest tmux host session   (default test-host)
 #   VD_TEST_GEOM      tmux geometry WxH             (default 220x55)
+#   VD_TEST_ROOT      herdrtest XDG root            (default ~/.herdr-test)
+#   VD_TEST_SESSION   herdr session name            (default test)
 #   VD_DO_RESTART     "1" to actually restart       (default off: swap only)
 #   ZIG / DEVELOPER_DIR   toolchain (default the herdr build toolchain)
 set -euo pipefail
@@ -36,6 +38,8 @@ VD_TEST_BIN="${VD_TEST_BIN:-$HOME/.local/bin/herdrtest}"
 VD_TARGET_DIR="${VD_TARGET_DIR:-$HERDR_REPO/target-versiondash-build}"
 VD_TEST_TMUX="${VD_TEST_TMUX:-test-host}"
 VD_TEST_GEOM="${VD_TEST_GEOM:-220x55}"
+VD_TEST_ROOT="${VD_TEST_ROOT:-$HOME/.herdr-test}"
+VD_TEST_SESSION="${VD_TEST_SESSION:-test}"
 VD_DO_RESTART="${VD_DO_RESTART:-0}"
 export ZIG="${ZIG:-$HOME/.local/zig/0.15.2/zig}"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
@@ -78,8 +82,17 @@ if [[ "$VD_DO_RESTART" == "1" ]]; then
   # Sweep any straggler still bound to the old server before relaunch.
   pkill -f "$VD_TEST_BIN server" 2>/dev/null || true
   sleep 0.5
-  tmux new-session -d -s "$VD_TEST_TMUX" -x "$GEOM_X" -y "$GEOM_Y" "$VD_TEST_BIN"
-  log "herdrtest relaunched in tmux $VD_TEST_TMUX (${GEOM_X}x${GEOM_Y})"
+  # ~/.local/bin/herdrtest is a RAW herdr binary, not an env wrapper. Launching
+  # it bare inherits the caller's env (e.g. an hr shell) and it would start
+  # against the WRONG XDG root or fail to come up. Pin the herdrtest XDG root and
+  # session explicitly (same isolation pattern as hsand), scrubbing any inherited
+  # HERDR_* nesting vars first.
+  tmux new-session -d -s "$VD_TEST_TMUX" -x "$GEOM_X" -y "$GEOM_Y" \
+    "env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_SESSION \
+         -u HERDR_WORKSPACE_ID -u HERDR_TAB_ID -u HERDR_PANE_ID \
+     XDG_CONFIG_HOME=$VD_TEST_ROOT/config XDG_STATE_HOME=$VD_TEST_ROOT/state XDG_DATA_HOME=$VD_TEST_ROOT/data \
+     HERDR_SESSION=$VD_TEST_SESSION $VD_TEST_BIN --session $VD_TEST_SESSION"
+  log "herdrtest relaunched in tmux $VD_TEST_TMUX (${GEOM_X}x${GEOM_Y}, root=$VD_TEST_ROOT, session=$VD_TEST_SESSION)"
 else
   log "binary swapped; restart skipped (set VD_DO_RESTART=1 to restart herdrtest)"
 fi
