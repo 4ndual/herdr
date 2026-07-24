@@ -347,6 +347,13 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    /// Whether restart auto-continue is enabled (config `session.auto_continue_on_restore`).
+    pub(crate) auto_continue_on_restore: bool,
+    /// Whether this server boot was triggered by a restart (a fresh restart
+    /// sentinel was present at startup). Gates auto-continue to genuine restarts.
+    pub(crate) restart_restore_detected: bool,
+    /// Next time the auto-continue tick should run its readiness/stall sweep.
+    pub(crate) auto_continue_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
@@ -419,6 +426,40 @@ fn repeat_key_identity(
     key: &crate::input::TerminalKey,
 ) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
     (key.code, key.modifiers)
+}
+
+/// How recent a restart sentinel must be to count as "this boot came from a
+/// restart". The restart script drops the sentinel just before killing the old
+/// server and lets it age out via TTL, so a fresh boot sees a very recent file;
+/// a stale sentinel from an older restart is ignored.
+const RESTART_SENTINEL_MAX_AGE: Duration = Duration::from_secs(90);
+
+/// Whether a fresh restart sentinel (`.restart-request-<session>`, written by
+/// restart-herdr.sh into the state dir before the kill) is present. Read-only:
+/// the sentinel is left in place for the launcher's self-heal loop and ages out
+/// via TTL. Best-effort; any IO error means "not a restart".
+fn detect_fresh_restart_sentinel() -> bool {
+    let dir = crate::config::state_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(".restart-request-") {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age <= RESTART_SENTINEL_MAX_AGE);
+        if fresh {
+            return true;
+        }
+    }
+    false
 }
 
 fn auto_updates_enabled(no_session: bool) -> bool {
@@ -992,6 +1033,9 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            auto_continue_on_restore: config.session.auto_continue_on_restore,
+            restart_restore_detected: detect_fresh_restart_sentinel(),
+            auto_continue_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
             selection_autoscroll_deadline: None,
