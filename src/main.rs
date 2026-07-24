@@ -71,6 +71,7 @@ mod goal_host;
 mod handoff_runtime;
 mod harness_host;
 mod historial_host;
+mod host_image;
 mod input;
 mod integration;
 mod ipc;

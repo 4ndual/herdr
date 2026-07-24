@@ -837,6 +837,7 @@ fn plugin_link_list_unlink_round_trip() {
                 PluginUiCapability::ClipboardWrite,
             ],
             ui_input_file: None,
+            image_file: None,
             collector: None,
         }],
         link_handlers: vec![PluginManifestLinkHandler {

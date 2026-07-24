@@ -1887,6 +1887,22 @@ impl AppState {
         }
     }
 
+    /// The Claude Code session UUID backing `pane_id`, or `None` when the pane
+    /// is not a Claude agent (pi/omp and non-agent panes are excluded). Used by
+    /// the host image layer to resolve `[Image #N]` cache files. Lives here
+    /// because it reads `crate::app::creation`, which is private to the `app`
+    /// module.
+    pub(crate) fn claude_session_value_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<String> {
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id)?;
+        let terminal = self.terminals.get(&terminal_id)?;
+        let session = crate::app::creation::terminal_agent_session_info(terminal)?;
+        (session.agent == "claude").then_some(session.value)
+    }
+
     /// Returns true when the given (workspace, tab, pane) refers to the
     /// currently focused pane in the active workspace's active tab.
     pub(crate) fn runtime_for_pane_in_workspace<'a>(

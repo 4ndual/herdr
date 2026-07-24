@@ -109,6 +109,9 @@ struct RawPluginManifestUiModule {
     capabilities: Vec<PluginUiCapability>,
     #[serde(default)]
     ui_input_file: Option<String>,
+    // fork: optional host-consumed image filename (see PluginManifestUiModule::image_file).
+    #[serde(default)]
+    image_file: Option<String>,
     // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
     #[serde(default)]
     collector: Option<Vec<String>>,
@@ -529,6 +532,13 @@ fn normalize_manifest_ui_module(
         Some(name) => Some(normalize_ui_input_file(&name)?),
         None => None,
     };
+    // fork: image_file is a single path segment resolved against the plugin
+    // directory host-side; reuse the same single-segment guard as ui_input_file
+    // so a bad declaration can never escape the module's own directory.
+    let image_file = match module.image_file {
+        Some(name) => Some(normalize_image_file(&name)?),
+        None => None,
+    };
     // fork(wave-2): a declared collector is an argv the host will execute, so it
     // is normalized through the same non-empty-argv check as event/action/pane
     // commands (`normalize_command`), keeping the gate identical.
@@ -549,8 +559,28 @@ fn normalize_manifest_ui_module(
         placement: module.placement,
         capabilities: module.capabilities,
         ui_input_file,
+        image_file,
         collector,
     })
+}
+
+/// Validate a module's `image_file`: a single non-empty path segment, no
+/// separators, no parent refs. Rejecting a bad name at manifest load keeps the
+/// host-side loader confined to the module's own directory.
+fn normalize_image_file(name: &str) -> Result<String, (&'static str, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err((
+            "invalid_plugin_ui_image_file",
+            "ui module image_file must be a single path segment".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Validate a module's `ui_input_file` (spec §7.1): a single non-empty path
@@ -763,6 +793,7 @@ mod tests {
             placement: None,
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
+            image_file: None,
             collector: None,
         })
         .unwrap_err();
@@ -781,6 +812,7 @@ mod tests {
             placement: None,
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
+            image_file: None,
             collector: None,
         })
         .unwrap_err();
@@ -813,6 +845,7 @@ mod tests {
                 PluginUiCapability::ContextMenuAugment,
             ],
             ui_input_file: None,
+            image_file: None,
             collector: None,
         })
         .unwrap();
@@ -838,6 +871,7 @@ mod tests {
             placement: None,
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: Some(name.into()),
+            image_file: None,
             collector: None,
         }
     }
@@ -862,6 +896,23 @@ mod tests {
             let err = normalize_manifest_ui_module(ui_module_with_input_file(bad))
                 .expect_err("traversal/separator names must be rejected");
             assert_eq!(err.0, "invalid_plugin_ui_input_file");
+        }
+    }
+
+    // fork: image_file normalization mirrors ui_input_file's single-segment guard.
+    #[test]
+    fn image_file_accepts_single_segment_and_rejects_separators() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.image_file = Some(" demo-image.png ".to_string());
+        let module = normalize_manifest_ui_module(raw).expect("plain image filename is accepted");
+        assert_eq!(module.image_file.as_deref(), Some("demo-image.png"));
+
+        for bad in ["../escape.png", "sub/dir.png", "..", ".", "a\\b.png", "   "] {
+            let mut raw = ui_module_with_input_file("usage_input.json");
+            raw.image_file = Some(bad.to_string());
+            let err = normalize_manifest_ui_module(raw)
+                .expect_err("traversal/separator image names must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_image_file");
         }
     }
 

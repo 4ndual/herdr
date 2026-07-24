@@ -3474,7 +3474,7 @@ impl HeadlessServer {
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
+                    let (mut buffer, cursor) =
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
                             crate::server::render_stream::render_virtual_with_runtime_registry(
                                 &mut self.app.state,
@@ -3494,6 +3494,13 @@ impl HeadlessServer {
                                 pin_badge,
                             )
                         };
+                    // Half-block image fallback: when kitty graphics are off,
+                    // paint host images (plugin panels + Claude `[Image #N]`)
+                    // directly into the frame buffer so every client terminal
+                    // shows them, kitty-capable or not.
+                    if !self.app.state.kitty_graphics_enabled {
+                        self.app.paint_halfblock_images(area, &mut buffer);
+                    }
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -3554,6 +3561,17 @@ impl HeadlessServer {
                 }
             };
 
+            // Resolve plugin-panel image targets before borrowing `client`,
+            // since it needs the app plus the client's frame area.
+            let plugin_images = if is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known()
+            {
+                self.app.resolve_plugin_surface_images(area)
+            } else {
+                Vec::new()
+            };
+
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -3570,6 +3588,7 @@ impl HeadlessServer {
                         &self.app.state,
                         &self.app.terminal_runtimes,
                         cell_size,
+                        &plugin_images,
                         &mut next_graphics_cache,
                     ));
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);

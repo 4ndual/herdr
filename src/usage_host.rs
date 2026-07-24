@@ -198,6 +198,7 @@ mod tests {
             placement: None,
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: ui_input_file.map(str::to_string),
+            image_file: None,
             collector,
         }
     }
