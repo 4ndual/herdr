@@ -333,6 +333,8 @@ impl App {
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
 
+        changed |= self.tick_auto_continue_after_restart(now);
+
         // feat/native-dashes: refresh the dashboard cores from disk + run the
         // goal observer on a flat poll, then repaint so the strip/panel reflect
         // the focused pane. Skipped entirely when no dashboard is showing live
@@ -638,6 +640,7 @@ impl App {
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
+            self.auto_continue_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,

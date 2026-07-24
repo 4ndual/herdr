@@ -346,6 +346,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+# After a restart re-resumes an agent whose previous turn was interrupted by the
+# restart, nudge it to continue where it left off. Only fires for panes whose
+# transcript shows an in-flight turn (idle panes are left alone).
+# auto_continue_on_restore = true
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.

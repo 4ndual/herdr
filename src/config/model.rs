@@ -247,12 +247,18 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// After a Herdr server restart re-resumes an agent pane, if that pane's
+    /// previous turn was interrupted by the restart, nudge the resumed agent to
+    /// continue where it left off. Only fires on restart-triggered restores and
+    /// only for panes whose transcript shows an in-flight turn. Default: true.
+    pub auto_continue_on_restore: bool,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            auto_continue_on_restore: true,
         }
     }
 }
@@ -1177,6 +1183,19 @@ resume_agents_on_restore = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+    }
+
+    #[test]
+    fn auto_continue_on_restore_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.session.auto_continue_on_restore);
+
+        let toml = r#"
+[session]
+auto_continue_on_restore = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.session.auto_continue_on_restore);
     }
 
     #[test]

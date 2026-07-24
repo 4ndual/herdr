@@ -3871,6 +3871,14 @@ impl HeadlessServer {
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
 
+        // Drive restart auto-continue: once a resumed claude pane whose turn was
+        // interrupted by the restart becomes ready, nudge it to continue. This
+        // mirrors the hook in the direct-mode `App::handle_scheduled_tasks`; the
+        // headless server (client + server, what production always runs) needs it
+        // here or armed panes are never ticked. The 250ms client-accept poll wakes
+        // this loop, so the sweep runs at that cadence without an extra deadline.
+        changed |= self.app.tick_auto_continue_after_restart(now);
+
         // feat/native-dashes: the server renders (clients only blit), so the
         // dashboard cores must be refreshed here too — not just in the
         // non-headless `App::handle_scheduled_tasks` loop used by direct mode.
