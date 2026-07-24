@@ -97,6 +97,9 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
+    AgentPrompted {
+        agent: AgentInfo,
+    },
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,

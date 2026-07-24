@@ -274,6 +274,29 @@ fn agent_command() -> Command {
                 .arg(required("text", "TEXT")),
         )
         .subcommand(
+            Command::new("prompt")
+                .about("Submit a prompt to an agent (text plus Enter)")
+                .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
+                .arg(required("target", "TARGET"))
+                .arg(required("text", "TEXT"))
+                .arg(flag("wait").help("Wait for the first matching state after submission"))
+                .arg(
+                    option("until", "STATUS")
+                        .action(ArgAction::Append)
+                        .requires("wait")
+                        .value_parser(["idle", "working", "blocked", "unknown"])
+                        .help("State to match after --wait; repeat for more than one state"),
+                )
+                .arg(
+                    option("timeout", "MS")
+                        .requires("wait")
+                        .help("Fail after this many milliseconds"),
+                )
+                .after_help(
+                    "From a non-working state, --wait first requires an observed state change within 5000ms; otherwise it returns agent_prompt_stalled (a shorter --timeout returns timeout instead). It then settles on idle, done, or blocked by default, or any exact --until state.",
+                ),
+        )
+        .subcommand(
             Command::new("rename")
                 .about("Rename an agent")
                 .arg(required("target", "TARGET"))

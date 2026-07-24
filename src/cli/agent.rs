@@ -1,9 +1,16 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
+use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
-    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
+    AgentPromptParams, AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams,
+    AgentStatus, AgentTarget, EmptyParams, EventsSubscribeParams, Method, ReadFormat, ReadSource,
+    Request, Subscription, SubscriptionEventData, SubscriptionEventEnvelope,
 };
+
+/// Upstream `agent prompt --wait` requires an observed state change within this
+/// window after submitting from a non-working state; otherwise it stalls.
+const AGENT_PROMPT_EFFECT_TIMEOUT_MS: u64 = 5_000;
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
@@ -16,6 +23,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send" => agent_send(&args[1..]),
+        "prompt" => agent_prompt(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
@@ -577,6 +585,265 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
+    let Some(target) = args.first() else {
+        eprintln!(
+            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+        );
+        return Ok(2);
+    };
+    let Some(text) = args.get(1) else {
+        eprintln!("agent prompt requires text");
+        return Ok(2);
+    };
+    let mut wait = false;
+    let mut until = Vec::new();
+    let mut timeout_ms = None;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wait" => {
+                wait = true;
+                index += 1;
+            }
+            "--until" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("--until requires at least one status");
+                    return Ok(2);
+                };
+                until.push(parse_agent_wait_status(value)?);
+                index += 2;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --timeout");
+                    return Ok(2);
+                };
+                timeout_ms = Some(super::parse_u64_flag("--timeout", value)?);
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    if !until.is_empty() && !wait {
+        eprintln!("--until requires --wait");
+        return Ok(2);
+    }
+    if timeout_ms.is_some() && !wait {
+        eprintln!("--timeout requires --wait");
+        return Ok(2);
+    }
+
+    let prompt_request = Request {
+        id: "cli:agent:prompt".into(),
+        method: Method::AgentPrompt(AgentPromptParams {
+            target: target.clone(),
+            text: text.clone(),
+        }),
+    };
+
+    if !wait {
+        return super::print_response(&super::send_request(&prompt_request)?);
+    }
+
+    agent_prompt_wait(target, prompt_request, until, timeout_ms)
+}
+
+// Faithful adaptation of upstream's server-side `agent.prompt --wait`: the fork
+// resolves settled state client-side (like `agent wait`), so the CLI subscribes
+// to agent status changes, submits, then enforces the stall + settle semantics.
+fn agent_prompt_wait(
+    target: &str,
+    prompt_request: Request,
+    until: Vec<AgentStatus>,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<i32> {
+    // Baseline: whether the agent is already working decides if a stall gate applies.
+    let baseline = resolve_agent_target(target, "cli:agent:prompt:resolve")?;
+    if baseline.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&baseline).unwrap());
+        return Ok(1);
+    }
+    let Some(pane_id) = baseline["result"]["agent"]["pane_id"].as_str() else {
+        eprintln!("agent prompt failed: response did not include pane_id");
+        return Ok(1);
+    };
+    let pane_id = pane_id.to_owned();
+    let baseline_status = baseline["result"]["agent"]["agent_status"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+    let baseline_working = baseline_status == "working";
+
+    // Subscribe before submitting so a fast status change cannot slip through the
+    // gap between the prompt landing and the wait starting.
+    let effect_ms = timeout_ms.map_or(AGENT_PROMPT_EFFECT_TIMEOUT_MS, |timeout_ms| {
+        timeout_ms.min(AGENT_PROMPT_EFFECT_TIMEOUT_MS)
+    });
+    let recv_timeout = Duration::from_millis(effect_ms.max(1));
+    let subscribe = Request {
+        id: "cli:agent:prompt:wait".into(),
+        method: Method::EventsSubscribe(EventsSubscribeParams {
+            subscriptions: vec![Subscription::PaneAgentStatusChanged {
+                pane_id,
+                agent_status: None,
+            }],
+        }),
+    };
+    let (ack, mut stream) = ApiClient::local()
+        .subscribe_value(&subscribe, Some(recv_timeout))
+        .map_err(super::api_client_error_to_io)?;
+    if let Err(err) = crate::api::client::parse_response_value(ack) {
+        if let ApiClientError::ErrorResponse(response) = err {
+            eprintln!("{}", serde_json::to_string(&response).unwrap());
+            return Ok(1);
+        }
+        return Err(super::api_client_error_to_io(err));
+    }
+
+    // Submit the prompt. Surface any submission error (empty text, no agent, ...).
+    let prompt_response = super::send_request(&prompt_request)?;
+    if prompt_response.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&prompt_response).unwrap());
+        return Ok(1);
+    }
+
+    let wait_started = Instant::now();
+
+    // Phase 1 — effect gate: from a non-working baseline, require any observed
+    // state change within the effect window, else report stall (or timeout when
+    // the caller's --timeout is the shorter bound).
+    if !baseline_working {
+        match stream.next_event() {
+            Ok(Some(event)) => {
+                if let Some(status) = event_agent_status(&event) {
+                    if agent_prompt_status_settles(&until, status) {
+                        return print_agent_prompted(target);
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!("subscription closed before the agent responded");
+                return Ok(1);
+            }
+            Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
+                return agent_prompt_stalled(timeout_ms, effect_ms, &baseline_status);
+            }
+            Err(err) => return Err(super::api_client_error_to_io(err)),
+        }
+    }
+
+    // Phase 2 — settle: wait for a status that satisfies --until (default idle,
+    // done, or blocked). The socket read timeout is a poll granularity; the overall
+    // deadline is enforced against the caller's --timeout (indefinite when unset).
+    loop {
+        if let Some(total) = timeout_ms {
+            if wait_started.elapsed() >= Duration::from_millis(total) {
+                eprintln!(
+                    "{}",
+                    agent_prompt_error("timeout", "timed out waiting for agent status")
+                );
+                return Ok(1);
+            }
+        }
+        match stream.next_event() {
+            Ok(Some(event)) => {
+                if let Some(status) = event_agent_status(&event) {
+                    if agent_prompt_status_settles(&until, status) {
+                        return print_agent_prompted(target);
+                    }
+                }
+            }
+            Ok(None) => {
+                eprintln!("subscription closed before the agent settled");
+                return Ok(1);
+            }
+            Err(ApiClientError::Io(err)) if super::api_timeout_error(&err) => {
+                // Poll interval elapsed; loop re-checks the overall deadline.
+            }
+            Err(err) => return Err(super::api_client_error_to_io(err)),
+        }
+    }
+}
+
+fn event_agent_status(event: &SubscriptionEventEnvelope) -> Option<AgentStatus> {
+    match &event.data {
+        SubscriptionEventData::PaneAgentStatusChanged(changed) => Some(changed.agent_status),
+        _ => None,
+    }
+}
+
+fn agent_prompt_status_settles(until: &[AgentStatus], status: AgentStatus) -> bool {
+    let desired: &[AgentStatus] = if until.is_empty() {
+        &[AgentStatus::Idle, AgentStatus::Blocked]
+    } else {
+        until
+    };
+    desired.iter().any(|wanted| match wanted {
+        AgentStatus::Idle | AgentStatus::Done => {
+            matches!(status, AgentStatus::Idle | AgentStatus::Done)
+        }
+        AgentStatus::Working => status == AgentStatus::Working,
+        AgentStatus::Blocked => status == AgentStatus::Blocked,
+        AgentStatus::Unknown => status == AgentStatus::Unknown,
+    })
+}
+
+fn agent_prompt_stalled(
+    timeout_ms: Option<u64>,
+    effect_ms: u64,
+    baseline_status: &str,
+) -> std::io::Result<i32> {
+    let rendered = if agent_prompt_effect_code(timeout_ms) == "timeout" {
+        agent_prompt_error("timeout", "timed out waiting for agent status")
+    } else {
+        agent_prompt_error(
+            "agent_prompt_stalled",
+            &format!(
+                "agent prompt produced no observed state change within {effect_ms} ms; status is {baseline_status}"
+            ),
+        )
+    };
+    eprintln!("{rendered}");
+    Ok(1)
+}
+
+// When the effect window elapses with no state change, a caller-supplied
+// --timeout at or under the window reports `timeout`; otherwise it stalls.
+fn agent_prompt_effect_code(timeout_ms: Option<u64>) -> &'static str {
+    if timeout_ms.is_some_and(|timeout_ms| timeout_ms <= AGENT_PROMPT_EFFECT_TIMEOUT_MS) {
+        "timeout"
+    } else {
+        "agent_prompt_stalled"
+    }
+}
+
+fn agent_prompt_error(code: &str, message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "id": "cli:agent:prompt",
+        "error": { "code": code, "message": message },
+    }))
+    .unwrap_or_else(|_| format!("{{\"error\":{{\"code\":\"{code}\"}}}}"))
+}
+
+fn print_agent_prompted(target: &str) -> std::io::Result<i32> {
+    let resolved = resolve_agent_target(target, "cli:agent:prompt:result")?;
+    if resolved.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&resolved).unwrap());
+        return Ok(1);
+    }
+    let agent = resolved["result"]["agent"].clone();
+    let response = serde_json::json!({
+        "id": "cli:agent:prompt",
+        "result": { "type": "agent_prompted", "agent": agent },
+    });
+    println!("{}", serde_json::to_string(&response).unwrap());
+    Ok(0)
+}
+
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
@@ -671,6 +938,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send <target> <text>");
+    eprintln!(
+        "  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+    );
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
@@ -680,6 +950,52 @@ fn print_agent_help() {
     eprintln!("  herdr agent explain --file PATH --agent LABEL [--json]");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send writes literal text; use pane run when you want command text plus Enter"
+        "  agent send writes literal text; agent prompt submits text plus Enter atomically"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settle_matches_idle_done_and_blocked() {
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Idle));
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Done));
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Blocked));
+        assert!(!agent_prompt_status_settles(&[], AgentStatus::Working));
+        assert!(!agent_prompt_status_settles(&[], AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn explicit_until_matches_only_requested_states() {
+        let until = vec![AgentStatus::Working];
+        assert!(agent_prompt_status_settles(&until, AgentStatus::Working));
+        assert!(!agent_prompt_status_settles(&until, AgentStatus::Idle));
+    }
+
+    #[test]
+    fn until_idle_also_accepts_done() {
+        let until = vec![AgentStatus::Idle];
+        assert!(agent_prompt_status_settles(&until, AgentStatus::Done));
+    }
+
+    #[test]
+    fn effect_code_is_timeout_only_when_caller_timeout_is_shorter() {
+        assert_eq!(agent_prompt_effect_code(None), "agent_prompt_stalled");
+        assert_eq!(agent_prompt_effect_code(Some(10_000)), "agent_prompt_stalled");
+        assert_eq!(
+            agent_prompt_effect_code(Some(AGENT_PROMPT_EFFECT_TIMEOUT_MS)),
+            "timeout"
+        );
+        assert_eq!(agent_prompt_effect_code(Some(1_000)), "timeout");
+    }
+
+    #[test]
+    fn error_payload_carries_code_and_message() {
+        let rendered = agent_prompt_error("agent_prompt_stalled", "no change");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["error"]["code"], "agent_prompt_stalled");
+        assert_eq!(value["error"]["message"], "no change");
+    }
 }

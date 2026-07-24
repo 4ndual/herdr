@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 16,
+  "protocol": 17,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -1122,6 +1122,21 @@
     },
     "request": {
       "$defs": {
+        "AgentPromptParams": {
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
         "AgentReadParams": {
           "properties": {
             "format": {
@@ -4257,6 +4272,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentSendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.prompt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
             }
           },
           "required": [
@@ -7525,6 +7556,17 @@
             "module": {
               "type": "string"
             },
+            "placement": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PluginPanelPlacement"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Data-driven placement for this module's `Panel` surface. Only consulted\nwhen the module declares the `panel` surface; ignored otherwise. `None`\nfalls back to the `PluginPanelPlacement` default (free overlay)."
+            },
             "platforms": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/PluginPlatform"
@@ -7586,6 +7628,84 @@
             "zoomed"
           ],
           "type": "string"
+        },
+        "PluginPanelAlign": {
+          "enum": [
+            "start",
+            "center",
+            "end"
+          ],
+          "type": "string"
+        },
+        "PluginPanelPlacement": {
+          "description": "Data-driven placement for a `Panel` surface (schema mirror of the host's\ngeneric panel layout). Every field is manifest DATA, so a plugin controls\nwhere it renders with no host/enum change. Defaults reproduce a free overlay\nwith a snug (content-sized) box.",
+          "properties": {
+            "align": {
+              "$ref": "#/schemas/success_response/$defs/PluginPanelAlign",
+              "default": "start",
+              "description": "Where the panel sits along the carve axis of its region. Meaningful for\n`bottom_band` (which side of the usage band) and `free` (anchor within\nthe pane area); edge regions (`left`/`right`/`top`/`bottom`) already\nencode their edge."
+            },
+            "min_peer": {
+              "default": 24,
+              "description": "Cells (columns for vertical bands, rows for horizontal bands) the peer\nregion keeps: the panel is only carved when the peer keeps at least this\nmuch, so a secondary panel never squeezes the primary content unreadable.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "region": {
+              "$ref": "#/schemas/success_response/$defs/PluginPanelRegion",
+              "default": "free",
+              "description": "Which region the panel occupies / carves from."
+            },
+            "size": {
+              "description": "Extent along the carved dimension: `\"auto\"` (snug to content, default),\na cell count (`\"30\"`), or a percent of the available span (`\"30%\"`).\nParsed host-side; unparseable values fall back to `auto`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "z": {
+              "default": 0,
+              "description": "Draw/hit z-order among panels and other layers (higher is on top).",
+              "format": "int16",
+              "maximum": 32767,
+              "minimum": -32768,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "PluginPanelRegion": {
+          "oneOf": [
+            {
+              "enum": [
+                "right",
+                "bottom"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "bottom_band",
+              "description": "Share the usage-strip band: carve a slot beside the usage dash (its own\nrect + hit-rects). This is what button-dash uses.",
+              "type": "string"
+            },
+            {
+              "const": "left",
+              "description": "Carve a column band from the left/right of the pane area (panes shrink).",
+              "type": "string"
+            },
+            {
+              "const": "top",
+              "description": "Carve a row band from the top/bottom of the pane area (panes shrink).",
+              "type": "string"
+            },
+            {
+              "const": "free",
+              "description": "Overlay the pane area without carving; anchored by `align`.",
+              "type": "string"
+            }
+          ]
         },
         "PluginPlatform": {
           "enum": [
@@ -7713,6 +7833,11 @@
             {
               "const": "usage_strip",
               "description": "The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.",
+              "type": "string"
+            },
+            {
+              "const": "panel",
+              "description": "A generic, plugin-placed panel whose rect the host lays out from the\nmodule manifest `placement` spec (region/align/size/min_peer/z) rather\nthan a hardcoded per-variant match. Adding/moving/resizing a panel is a\npure manifest edit (hot-reload), no host rebuild.",
               "type": "string"
             }
           ]
@@ -8012,6 +8137,22 @@
                 },
                 "type": {
                   "const": "agent_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "type": {
+                  "const": "agent_prompted",
                   "type": "string"
                 }
               },

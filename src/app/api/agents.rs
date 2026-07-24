@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, PaneReadResult, ReadFormat,
-    ReadSource, ResponseResult,
+    AgentPromptParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget,
+    PaneReadResult, ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::App;
 
@@ -193,6 +193,41 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+
+    pub(super) fn handle_agent_prompt(&mut self, id: String, params: AgentPromptParams) -> String {
+        if params.text.is_empty() {
+            return encode_error(id, "empty_agent_prompt", "agent prompt must not be empty");
+        }
+        let resolved = match self.resolve_terminal_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let hosts_agent = self
+            .state
+            .workspaces
+            .get(resolved.ws_idx)
+            .and_then(|ws| ws.pane_state(resolved.pane_id))
+            .and_then(|pane_state| self.state.terminals.get(&pane_state.attached_terminal_id))
+            .is_some_and(|terminal| terminal.is_agent_terminal());
+        if !hosts_agent {
+            return encode_error(
+                id,
+                "agent_not_ready",
+                format!("no agent is ready in pane {}", params.target),
+            );
+        }
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        let bytes = crate::app::api_helpers::encode_api_submission(runtime, &params.text);
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            return encode_error(id, "agent_prompt_failed", err.to_string());
+        }
+        let Ok(agent) = self.agent_info_for_target(&params.target) else {
+            return agent_not_found(id, &params.target);
+        };
+        encode_success(id, ResponseResult::AgentPrompted { agent })
+    }
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -229,6 +264,84 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_rejects_empty_text() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_prompt(
+            "req-empty".into(),
+            AgentPromptParams {
+                target: "pi".into(),
+                text: String::new(),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "empty_agent_prompt");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_submits_text_with_enter_atomically() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Pi), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        let response = app.handle_agent_prompt(
+            "req".into(),
+            AgentPromptParams {
+                target: "pi".into(),
+                text: "A != B".into(),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentPrompted { agent } = success.result else {
+            panic!("expected prompted response");
+        };
+        assert_eq!(agent.agent_status, AgentStatus::Working);
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"A != B\r"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_rejects_pane_without_agent() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_agent_prompt(
+            "req-no-agent".into(),
+            AgentPromptParams {
+                target: public_pane_id,
+                text: "hello".into(),
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_not_ready");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
