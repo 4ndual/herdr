@@ -349,14 +349,34 @@ pub fn extract_prompts(record: &PaneCloseRecord) -> (Option<String>, Option<Stri
 /// or when no file exists. A cx session is still reported by the runtime as
 /// `agent = "claude"` (cx *is* Claude Code), so both agent labels are accepted.
 fn find_transcript(record: &PaneCloseRecord) -> Option<(PathBuf, bool)> {
-    if record.session_kind.as_deref() != Some("id") {
+    session_transcript_path(
+        record.agent.as_deref(),
+        record.session_kind.as_deref(),
+        record.session_value.as_deref(),
+        &record.cwd,
+    )
+}
+
+/// Locate the claude/cx session transcript jsonl for an `id`-kind claude/cx
+/// session identified by `session_value` running in `cwd`. Returns the jsonl
+/// path and whether it is a cx (CCR router) transcript. `None` for
+/// non-`id`/non-claude sessions or when no file exists. Shared by the historial
+/// close path and by restart auto-continue, which needs to inspect a live
+/// resumed pane's transcript by its session ref.
+pub fn session_transcript_path(
+    agent: Option<&str>,
+    session_kind: Option<&str>,
+    session_value: Option<&str>,
+    cwd: &str,
+) -> Option<(PathBuf, bool)> {
+    if session_kind != Some("id") {
         return None;
     }
-    if !matches!(record.agent.as_deref(), Some("claude") | Some("cx")) {
+    if !matches!(agent, Some("claude") | Some("cx")) {
         return None;
     }
-    let value = record.session_value.as_deref()?;
-    let enc = encode_cwd(&record.cwd);
+    let value = session_value?;
+    let enc = encode_cwd(cwd);
     for base in claude_transcript_bases() {
         let path = base
             .join("projects")
@@ -370,6 +390,72 @@ fn find_transcript(record: &PaneCloseRecord) -> Option<(PathBuf, bool)> {
         }
     }
     None
+}
+
+/// Whether a claude/cx transcript's last turn was left in flight (interrupted)
+/// rather than finished. Scans for the last user/assistant record and returns:
+/// a `user` record last (a prompt or tool result awaiting a response) → `true`;
+/// an `assistant` record whose `stop_reason` is not a clean turn end
+/// (`end_turn`/`stop_sequence`) — e.g. `tool_use`, `max_tokens`, or a partial
+/// record with no `stop_reason` — → `true`; a cleanly ended assistant turn or a
+/// transcript with no content records → `false`. Filesystem-only, best-effort,
+/// never panics.
+pub fn transcript_last_turn_interrupted(path: &std::path::Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut last_interrupted: Option<bool> = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if let Some(interrupted) = record_turn_interrupted(&value) {
+            last_interrupted = Some(interrupted);
+        }
+    }
+    last_interrupted.unwrap_or(false)
+}
+
+/// Classify a transcript entry as a content turn record and whether it leaves
+/// the turn in flight. `Some(true)` = interrupted content record, `Some(false)`
+/// = cleanly ended assistant turn, `None` = not a user/assistant content record
+/// (meta records like `system`, `summary`, `last-prompt`, `queue-operation`).
+fn record_turn_interrupted(value: &serde_json::Value) -> Option<bool> {
+    let role = record_role(value)?;
+    match role {
+        "user" => Some(true),
+        "assistant" => {
+            let stop = value
+                .get("message")
+                .and_then(|m| m.get("stop_reason"))
+                .and_then(|s| s.as_str());
+            Some(!matches!(stop, Some("end_turn") | Some("stop_sequence")))
+        }
+        _ => None,
+    }
+}
+
+/// The role of a content record: the flat `type: "user"|"assistant"` shape or
+/// the nested `message.role` shape. `None` for non-content records.
+fn record_role(value: &serde_json::Value) -> Option<&str> {
+    if let Some(role) = value
+        .get("message")
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+    {
+        if matches!(role, "user" | "assistant") {
+            return Some(role);
+        }
+    }
+    match value.get("type").and_then(|t| t.as_str()) {
+        Some(t @ ("user" | "assistant")) => Some(t),
+        _ => None,
+    }
 }
 
 /// Resolve the display agent kind for a claude/cx `record` from its transcript
@@ -731,5 +817,87 @@ mod tests {
         assert_eq!(relative_time(now - 2 * 86_400_000, now), "2d");
         // Future timestamp clamps.
         assert_eq!(relative_time(now + 10_000, now), "just now");
+    }
+
+    fn write_transcript(name: &str, lines: &[&str]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-transcript-test-{}-{}.jsonl",
+            name,
+            now_unix_ms()
+        ));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn interrupted_when_last_content_record_is_a_user_prompt() {
+        let path = write_transcript(
+            "user-last",
+            &[
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":"do the next thing"}}"#,
+                r#"{"type":"last-prompt"}"#,
+            ],
+        );
+        assert!(transcript_last_turn_interrupted(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn not_interrupted_when_last_assistant_turn_ended_cleanly() {
+        let path = write_transcript(
+            "assistant-end",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]}}"#,
+                r#"{"type":"last-prompt"}"#,
+                r#"{"type":"queue-operation"}"#,
+            ],
+        );
+        assert!(!transcript_last_turn_interrupted(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn interrupted_when_last_assistant_record_awaits_tool_use() {
+        let path = write_transcript(
+            "assistant-tooluse",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"run it"}}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#,
+            ],
+        );
+        assert!(transcript_last_turn_interrupted(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn interrupted_when_last_assistant_record_is_partial_without_stop_reason() {
+        let path = write_transcript(
+            "assistant-partial",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"go"}}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."}]}}"#,
+            ],
+        );
+        assert!(transcript_last_turn_interrupted(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn not_interrupted_when_no_content_records_or_file_missing() {
+        let path = write_transcript(
+            "meta-only",
+            &[
+                r#"{"type":"system"}"#,
+                r#"{"type":"summary"}"#,
+                r#"{"type":"last-prompt"}"#,
+            ],
+        );
+        assert!(!transcript_last_turn_interrupted(&path));
+        let _ = std::fs::remove_file(&path);
+
+        let missing = std::env::temp_dir().join("herdr-transcript-test-does-not-exist.jsonl");
+        assert!(!transcript_last_turn_interrupted(&missing));
     }
 }
