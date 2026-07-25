@@ -128,6 +128,83 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+/// Format a Unix-millisecond timestamp as a compact `"YYYY-MM-DD HH:MM"` label
+/// for display. This is an OS breakdown (timezone-dependent), so it lives behind
+/// the platform boundary: local wall-clock on Unix via the C library's
+/// thread-safe `localtime_r`; UTC on other targets, where we avoid a libc tz
+/// dependency and compute the civil date directly. Returns `None` only if the
+/// platform breakdown fails.
+#[cfg(unix)]
+pub fn format_local_datetime(ts_unix_ms: u64) -> Option<String> {
+    let secs = (ts_unix_ms / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` fills the caller-owned `tm` from `secs` using only
+    // thread-local scratch and the process timezone; both pointers are valid for
+    // the duration of the call and `tm` is read only after a non-null return.
+    let res = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if res.is_null() {
+        return None;
+    }
+    Some(format_ymd_hm(
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn format_local_datetime(ts_unix_ms: u64) -> Option<String> {
+    let (year, mon, day, hour, min) = utc_civil((ts_unix_ms / 1000) as i64);
+    Some(format_ymd_hm(year, mon, day, hour, min))
+}
+
+/// Render already-broken-down calendar fields as `"YYYY-MM-DD HH:MM"`. Pure.
+fn format_ymd_hm(year: i32, mon: i32, day: i32, hour: i32, min: i32) -> String {
+    format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}")
+}
+
+/// Break a Unix timestamp (seconds) into `(year, month, day, hour, min)` in UTC.
+/// Pure (Howard Hinnant's days<->civil algorithm); used on non-Unix targets that
+/// don't call into the C library for a local breakdown.
+#[cfg(not(unix))]
+fn utc_civil(secs: i64) -> (i32, i32, i32, i32, i32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let hour = (rem / 3600) as i32;
+    let min = ((rem % 3600) / 60) as i32;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let mon = (if mp < 10 { mp + 3 } else { mp - 9 }) as i32;
+    let year = (year + if mon <= 2 { 1 } else { 0 }) as i32;
+    (year, mon, day, hour, min)
+}
+
+#[cfg(test)]
+mod datetime_tests {
+    use super::format_ymd_hm;
+
+    #[test]
+    fn format_ymd_hm_is_zero_padded_fixed_width() {
+        assert_eq!(format_ymd_hm(2026, 7, 4, 9, 5), "2026-07-04 09:05");
+        assert_eq!(format_ymd_hm(2026, 12, 31, 23, 59), "2026-12-31 23:59");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn utc_civil_matches_known_epoch() {
+        // 2021-01-01T00:00:00Z
+        assert_eq!(super::utc_civil(1_609_459_200), (2021, 1, 1, 0, 0));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]

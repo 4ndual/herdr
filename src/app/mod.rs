@@ -105,7 +105,7 @@ fn build_historial_rows(
     now: u64,
 ) -> Vec<historial_dash_model::HistorialRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    records
+    let filtered: Vec<crate::pane_close_history::PaneCloseRecord> = records
         .into_iter()
         // Subagent runs (TaskCreate / Agent-tool workers, `agent-*.jsonl`) are
         // pure noise in the historial — excluded at the source, no toggle.
@@ -124,20 +124,43 @@ fn build_historial_rows(
                 .unwrap_or_else(|| format!("pane:{}", record.pane_id));
             seen.insert(dedup_key)
         })
-        .take(HISTORIAL_ROW_LIMIT)
+        .collect();
+
+    // Prioritize restorable agent sessions over plain terminals when applying the
+    // row cap. A burst of ephemeral closes (e.g. dozens of throwaway
+    // worktree-teardown terminal panes recorded in one WorktreeRemove sweep) must
+    // never evict the user's real claude/cx/codex/pi conversations from the
+    // panel — the whole point of the historial is resuming those sessions, and
+    // the guest hides terminals by default. Partition newest-first into sessions
+    // then terminals, fill the session quota first, and top up with terminals.
+    // Ordering is preserved within each group, so both stay newest-first.
+    let (mut sessions, terminals): (
+        Vec<crate::pane_close_history::PaneCloseRecord>,
+        Vec<crate::pane_close_history::PaneCloseRecord>,
+    ) = filtered
+        .into_iter()
+        .partition(|record| record.restorable());
+    let terminal_slots = HISTORIAL_ROW_LIMIT.saturating_sub(sessions.len());
+    sessions.truncate(HISTORIAL_ROW_LIMIT);
+    sessions.extend(terminals.into_iter().take(terminal_slots));
+
+    sessions
+        .into_iter()
         .map(|record| {
             let restorable = record.restorable();
             let is_subagent = crate::pane_close_history::is_subagent_record(&record);
             // No detected agent -> "terminal" (replaces the old "shell").
             let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
-            // Pane label only; empty when absent so the guest applies its
-            // first-prompt / folder fallback.
+            // The pane's herdr name (border_label at capture time). Empty only on
+            // older records or bare shells; the guest then falls the row identity
+            // back to the agent name (never the first prompt or folder).
             let label = record
                 .label
                 .clone()
                 .filter(|l| !l.trim().is_empty())
                 .unwrap_or_default();
-            // Last 4 chars of the session value (char-safe), empty when none.
+            // Full session value (tooltip) and its last-4 tail (dedup/debug).
+            let sid = record.session_value.clone().unwrap_or_default();
             let sid4 = record
                 .session_value
                 .as_deref()
@@ -152,10 +175,13 @@ fn build_historial_rows(
                 agent,
                 label,
                 sid4,
+                sid,
                 reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
+                abstime: crate::pane_close_history::absolute_time(record.ts_unix_ms),
                 cwd: record.cwd,
                 restorable,
                 workspace_name: record.workspace_name.unwrap_or_default(),
+                tab_name: record.tab_name.unwrap_or_default(),
                 first_prompt: record.first_prompt.unwrap_or_default(),
                 last_prompt: record.last_prompt.unwrap_or_default(),
                 is_subagent,
@@ -3015,6 +3041,7 @@ mod tests {
             cwd: "/home/dev/herdr".to_string(),
             workspace_id: "ws-1".to_string(),
             workspace_name: Some("herdr".to_string()),
+            tab_name: Some("main".to_string()),
             first_prompt: None,
             last_prompt: None,
         }
@@ -3060,6 +3087,48 @@ mod tests {
         // The deduped session appears exactly once.
         let dup_count = rows.iter().filter(|r| r.sid4 == "-sid").count();
         assert_eq!(dup_count, 1);
+    }
+
+    #[test]
+    fn build_historial_rows_terminal_burst_never_evicts_restorable_sessions() {
+        // Regression (historial persistence/"short" bug): a burst of ephemeral
+        // agentless terminal closes (e.g. a WorktreeRemove sweep recording dozens
+        // of throwaway worktree panes) must not push the user's real resumable
+        // sessions out of the capped panel. The newest records here are all
+        // terminals; the restorable sessions are older, yet must all survive.
+        let mut records = Vec::new();
+        // Newest: HISTORIAL_ROW_LIMIT + 20 agentless terminal closes.
+        for i in 0..(HISTORIAL_ROW_LIMIT + 20) {
+            records.push(historial_record(
+                10_000 - i as u64,
+                &format!("term-{i}"),
+                None,
+                None,
+                false,
+            ));
+        }
+        // Older: 5 real restorable claude sessions.
+        for i in 0..5 {
+            let sid = format!("real-sid-{i}");
+            records.push(historial_record(
+                100 - i as u64,
+                &format!("sess-{i}"),
+                Some("claude"),
+                Some(&sid),
+                true,
+            ));
+        }
+        let rows = build_historial_rows(records, 20_000);
+        // All 5 sessions survive despite being oldest and outnumbered.
+        let session_rows = rows.iter().filter(|r| r.restorable).count();
+        assert_eq!(session_rows, 5, "every restorable session must survive the cap");
+        // Cap is still respected overall.
+        assert_eq!(rows.len(), HISTORIAL_ROW_LIMIT);
+        // Sessions are listed first (newest-first within their group), terminals
+        // fill the remainder.
+        assert!(rows[0].restorable);
+        assert!(rows[4].restorable);
+        assert!(!rows[5].restorable);
     }
 
     fn release_notes_state() -> state::ReleaseNotesState {

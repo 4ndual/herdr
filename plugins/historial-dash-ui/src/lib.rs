@@ -379,13 +379,16 @@ mod tests {
                 agent: "claude".to_string(),
                 label: "herdr".to_string(),
                 sid4: "c123".to_string(),
+                sid: "sess-c123".to_string(),
                 reltime: "5m".to_string(),
+                abstime: "2026-07-24 15:57".to_string(),
                 cwd: "/tmp".to_string(),
                 restorable: true,
                 workspace_name: "myws".to_string(),
+                tab_name: "main".to_string(),
                 first_prompt: "first".to_string(),
                 last_prompt: "last".to_string(),
-            is_subagent: false,
+                is_subagent: false,
             });
         }
         let model_json = serde_json::to_string(&model).expect("model serializes");
