@@ -153,12 +153,37 @@ pub(crate) fn resolve_pane_placeholders(
         .collect()
 }
 
-/// The default Claude image-cache root, `~/.claude/image-cache`. cx / CCR
-/// sessions share the same directory (CCR routes the API, not the config dir),
-/// so no per-profile branching is needed.
+/// The default Claude image-cache root, `~/.claude/image-cache`. Used as the
+/// fallback when a pane's Claude session has not reported a transcript path
+/// (see [`image_cache_root_from_transcript_path`]) — e.g. before the first
+/// hook fires or for a Claude launched without the herdr hook.
 pub(crate) fn default_image_cache_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".claude").join("image-cache"))
+}
+
+/// Derive the image-cache root for a Claude session from its transcript path.
+///
+/// Claude Code writes pasted images to `<CLAUDE_CONFIG_DIR>/image-cache/` and
+/// the transcript to `<CLAUDE_CONFIG_DIR>/projects/<slug>/<session>.jsonl`. On
+/// this machine hr's panes run under a router profile whose config dir is *not*
+/// `~/.claude` (e.g. `~/.claude-code-router/profiles/default-claude-code/claude`),
+/// so the hardcoded default finds nothing. The claude herdr-hook already reports
+/// the transcript path, so we recover `CLAUDE_CONFIG_DIR` from it: walk up to the
+/// nearest ancestor directory named `projects` and take its parent, then join
+/// `image-cache`.
+///
+/// Returns `None` when the path has no `projects` ancestor (unexpected layout);
+/// the caller falls back to [`default_image_cache_root`].
+pub(crate) fn image_cache_root_from_transcript_path(transcript_path: &Path) -> Option<PathBuf> {
+    let projects = std::ffi::OsStr::new("projects");
+    // `ancestors()` yields deepest-first, so the first match is the nearest
+    // `projects` ancestor even if the config dir itself contains that segment.
+    transcript_path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(projects))
+        .and_then(Path::parent)
+        .map(|config_dir| config_dir.join("image-cache"))
 }
 
 /// Read PNG width/height from the IHDR chunk without decoding pixel data.
@@ -438,6 +463,42 @@ pub(crate) fn cached_rgba_image(path: &Path) -> Option<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_cache_root_derives_config_dir_from_transcript_path() {
+        // Router-profile layout: config dir is not ~/.claude.
+        let transcript = Path::new(
+            "/home/u/.claude-code-router/profiles/default-claude-code/claude/projects/-tmp-proj/abc.jsonl",
+        );
+        assert_eq!(
+            image_cache_root_from_transcript_path(transcript),
+            Some(PathBuf::from(
+                "/home/u/.claude-code-router/profiles/default-claude-code/claude/image-cache"
+            ))
+        );
+    }
+
+    #[test]
+    fn image_cache_root_uses_nearest_projects_ancestor() {
+        // A config dir path that itself contains a `projects` segment higher up
+        // must not fool the walk: the nearest (deepest) `projects` wins.
+        let transcript =
+            Path::new("/home/u/projects/work/claude/projects/-repo/session.jsonl");
+        assert_eq!(
+            image_cache_root_from_transcript_path(transcript),
+            Some(PathBuf::from("/home/u/projects/work/claude/image-cache"))
+        );
+    }
+
+    #[test]
+    fn image_cache_root_none_without_projects_ancestor() {
+        // Unexpected layout (no `projects` ancestor) -> None so the caller falls
+        // back to ~/.claude/image-cache.
+        assert_eq!(
+            image_cache_root_from_transcript_path(Path::new("/home/u/claude/session.jsonl")),
+            None
+        );
+    }
 
     #[test]
     fn fit_halfblock_box_zero_inputs_yield_zero() {

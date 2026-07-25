@@ -1219,12 +1219,18 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        self.note_claude_image_cache_root_for_pane(
+            ws_idx,
+            pane_id,
+            &agent_label,
+            params.agent_session_path.as_deref(),
+        );
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -1244,17 +1250,56 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Derive and record a Claude pane's image-cache root from its reported
+    /// transcript path (`<CLAUDE_CONFIG_DIR>/image-cache`) so inline `[Image #N]`
+    /// previews resolve against the profile Claude actually wrote them to, not
+    /// the hardcoded `~/.claude`. No-op for non-claude agents or absent paths.
+    fn note_claude_image_cache_root_for_pane(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        agent_label: &str,
+        agent_session_path: Option<&str>,
+    ) {
+        if agent_label != "claude" {
+            return;
+        }
+        let Some(path) = agent_session_path else {
+            return;
+        };
+        let root = crate::host_image::image_cache_root_from_transcript_path(
+            std::path::Path::new(path),
+        );
+        if root.is_none() {
+            tracing::debug!(
+                transcript = %path,
+                "claude transcript path has no `projects` ancestor; keeping default image-cache root"
+            );
+        }
+        if let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.note_claude_image_cache_root(root);
+            }
+        }
+    }
+
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,
         params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        self.note_claude_image_cache_root_for_pane(
+            ws_idx,
+            pane_id,
+            &agent_label,
+            params.agent_session_path.as_deref(),
+        );
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(

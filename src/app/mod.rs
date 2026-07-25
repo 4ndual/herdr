@@ -1232,11 +1232,19 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return;
         };
-        let Some(cache_root) = crate::host_image::default_image_cache_root() else {
-            return;
-        };
+        let default_cache_root = crate::host_image::default_image_cache_root();
         for info in &self.state.view.pane_infos {
             let Some(session) = self.state.claude_session_value_for_pane(ws_idx, info.id) else {
+                continue;
+            };
+            // Prefer the pane's own CLAUDE_CONFIG_DIR-derived cache root (from the
+            // reported transcript path); fall back to ~/.claude for panes whose
+            // agent hasn't reported a path yet.
+            let Some(cache_root) = self
+                .state
+                .claude_image_cache_root_for_pane(ws_idx, info.id)
+                .or_else(|| default_cache_root.clone())
+            else {
                 continue;
             };
             let Some(runtime) =
@@ -1262,11 +1270,14 @@ impl App {
                 // and below the image stays visible, and never past the bottom.
                 let max_cols = info.inner_rect.right().saturating_sub(x);
                 let height_budget = (info.inner_rect.height as u32 * 8 / 10) as u16;
-                let max_rows = info
+                // Keep a small reserve at the bottom so a low placeholder's image
+                // never paints over the composer/status chrome (wave-1 cheap
+                // mitigation; true row reservation is a wave-2 item).
+                let usable_bottom = info
                     .inner_rect
                     .bottom()
-                    .saturating_sub(y)
-                    .min(height_budget.max(1));
+                    .saturating_sub(crate::kitty_graphics::BOTTOM_CHROME_RESERVE_ROWS);
+                let max_rows = usable_bottom.saturating_sub(y).min(height_budget.max(1));
                 let Some((cols, rows)) =
                     crate::host_image::halfblock_image_box(&path, max_cols, max_rows)
                 else {

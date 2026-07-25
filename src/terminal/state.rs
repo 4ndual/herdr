@@ -125,6 +125,11 @@ pub struct TerminalState {
     recent_agent_process_exit_at: Option<Instant>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub auto_continue_after_restart: Option<AutoContinueAfterRestart>,
+    /// Image-cache root derived from the Claude session's reported transcript
+    /// path (`<CLAUDE_CONFIG_DIR>/image-cache`). `None` until a claude session
+    /// reports a path; render then falls back to `~/.claude/image-cache`. Keeps
+    /// the [`hook_authority`] session identity untouched.
+    pub claude_image_cache_root: Option<PathBuf>,
 }
 
 impl TerminalState {
@@ -153,6 +158,16 @@ impl TerminalState {
             recent_agent_process_exit_at: None,
             pending_agent_resume_plan: None,
             auto_continue_after_restart: None,
+            claude_image_cache_root: None,
+        }
+    }
+
+    /// Record the image-cache root derived from a Claude session transcript
+    /// path. Only overwrites when a new root is derived, so a later report that
+    /// omits the path (or a non-derivable layout) does not clear a good value.
+    pub fn note_claude_image_cache_root(&mut self, root: Option<PathBuf>) {
+        if root.is_some() {
+            self.claude_image_cache_root = root;
         }
     }
 

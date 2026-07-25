@@ -1913,6 +1913,21 @@ impl AppState {
         (session.agent == "claude").then_some(session.value)
     }
 
+    /// The image-cache root for a Claude pane, derived from its reported
+    /// transcript path (`<CLAUDE_CONFIG_DIR>/image-cache`). `None` when the pane
+    /// has not reported a path yet; callers fall back to `~/.claude/image-cache`.
+    pub(crate) fn claude_image_cache_root_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<std::path::PathBuf> {
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id)?;
+        self.terminals
+            .get(&terminal_id)?
+            .claude_image_cache_root
+            .clone()
+    }
+
     /// Returns true when the given (workspace, tab, pane) refers to the
     /// currently focused pane in the active workspace's active tab.
     pub(crate) fn runtime_for_pane_in_workspace<'a>(

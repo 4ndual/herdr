@@ -549,11 +549,30 @@ fn collect_visible_placements(
     placements
 }
 
-/// Upper bound on the on-screen size of a synthesized image so a Claude
-/// `[Image #N]` preview does not overdraw the whole pane. Aspect ratio is
-/// preserved within this box.
-const MAX_SYNTHETIC_IMAGE_COLS: u32 = 40;
-const MAX_SYNTHETIC_IMAGE_ROWS: u32 = 12;
+/// Rows reserved at the pane's bottom edge so an image whose placeholder sits
+/// low in the scrollback never paints over Claude's composer/status chrome
+/// (the multi-row bordered input box plus the status/hotkey line). Cheap
+/// mitigation only; true per-row reservation is a wave-2 item.
+pub(crate) const BOTTOM_CHROME_RESERVE_ROWS: u16 = 4;
+
+/// Cell budget for a Claude `[Image #N]` preview: full width remaining to the
+/// right of the placeholder, height capped to ~80% of the pane so surrounding
+/// text stays visible, and never past the bottom edge (minus a small reserve
+/// that keeps the composer/status chrome clear). Aspect ratio is preserved
+/// within this box by `fit_image_cells`. Mirrors the half-block fallback's
+/// `paint_halfblock_images` sizing so both paths render at the same pane scale.
+fn synthetic_pane_image_box(
+    inner_width: u16,
+    inner_height: u16,
+    col: u16,
+    row: u16,
+) -> (u32, u32) {
+    let max_cols = inner_width.saturating_sub(col) as u32;
+    let height_budget = (inner_height as u32 * 8 / 10).max(1);
+    let usable_bottom = inner_height.saturating_sub(BOTTOM_CHROME_RESERVE_ROWS);
+    let max_rows = (usable_bottom.saturating_sub(row) as u32).min(height_budget);
+    (max_cols, max_rows)
+}
 
 /// Synthetic pane-id namespace for images that are not owned by a real pane
 /// (plugin-panel surfaces). Kept far above real pane ids so the `(PaneId, ..)`
@@ -621,11 +640,17 @@ fn collect_claude_pane_images(
     let Some(ws_idx) = app.active else {
         return;
     };
-    let Some(cache_root) = crate::host_image::default_image_cache_root() else {
-        return;
-    };
+    let default_cache_root = crate::host_image::default_image_cache_root();
     for info in &app.view.pane_infos {
         let Some(session) = app.claude_session_value_for_pane(ws_idx, info.id) else {
+            continue;
+        };
+        // Prefer the pane's own CLAUDE_CONFIG_DIR-derived cache root; fall back to
+        // ~/.claude for panes that haven't reported a transcript path yet.
+        let Some(cache_root) = app
+            .claude_image_cache_root_for_pane(ws_idx, info.id)
+            .or_else(|| default_cache_root.clone())
+        else {
             continue;
         };
         let Some(runtime) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
@@ -644,13 +669,17 @@ fn collect_claude_pane_images(
             let Some(img) = crate::host_image::cached_kitty_image(&file) else {
                 continue;
             };
-            let (cols, rows_cells) = fit_image_cells(
-                img.width_px,
-                img.height_px,
-                cell_size,
-                MAX_SYNTHETIC_IMAGE_COLS,
-                MAX_SYNTHETIC_IMAGE_ROWS,
+            let (max_cols, max_rows) = synthetic_pane_image_box(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                placeholder.col,
+                placeholder.row,
             );
+            if max_cols == 0 || max_rows == 0 {
+                continue;
+            }
+            let (cols, rows_cells) =
+                fit_image_cells(img.width_px, img.height_px, cell_size, max_cols, max_rows);
             out.push(synthetic_placement(
                 info.id,
                 info.inner_rect,
@@ -1541,6 +1570,49 @@ mod tests {
         let (cols, rows) = fit_image_cells(200, 400, cell, 100, 4);
         assert_eq!(rows, 4);
         assert_eq!(cols, 4);
+    }
+
+    #[test]
+    fn synthetic_pane_image_box_uses_full_remaining_width() {
+        // 170-wide pane, placeholder at col 2 => 168 cols remain.
+        let (max_cols, _) = synthetic_pane_image_box(170, 64, 2, 10);
+        assert_eq!(max_cols, 168);
+    }
+
+    #[test]
+    fn synthetic_pane_image_box_caps_height_at_80_percent() {
+        // Placeholder high in the pane: 80% of 64 = 51 wins over the 55 usable
+        // rows below row 5 (60 usable bottom minus the placeholder row).
+        let (_, max_rows) = synthetic_pane_image_box(170, 64, 2, 5);
+        assert_eq!(max_rows, 51);
+    }
+
+    #[test]
+    fn synthetic_pane_image_box_never_exceeds_bottom() {
+        // Placeholder low in the pane: the usable-rows bound (pane bottom minus
+        // the chrome reserve minus the placeholder row) is below the 80% budget,
+        // so it wins.
+        let row = 55;
+        let (_, max_rows) = synthetic_pane_image_box(170, 64, 2, row);
+        assert_eq!(max_rows, (64 - BOTTOM_CHROME_RESERVE_ROWS - row) as u32);
+    }
+
+    #[test]
+    fn synthetic_pane_image_box_reserves_bottom_chrome_row() {
+        // Placeholder on the last usable row leaves no height, so a low image
+        // can never paint over the reserved composer/status chrome.
+        let last_usable = 64 - BOTTOM_CHROME_RESERVE_ROWS;
+        let (_, max_rows) = synthetic_pane_image_box(170, 64, 2, last_usable);
+        assert_eq!(max_rows, 0);
+    }
+
+    #[test]
+    fn synthetic_pane_image_box_scales_beyond_the_old_40x12_cap() {
+        // The whole point of the change: a large pane yields a box far bigger
+        // than the retired 40x12 constant.
+        let (max_cols, max_rows) = synthetic_pane_image_box(200, 80, 0, 4);
+        assert!(max_cols > 40, "max_cols {max_cols} should exceed old cap");
+        assert!(max_rows > 12, "max_rows {max_rows} should exceed old cap");
     }
 
     #[test]
