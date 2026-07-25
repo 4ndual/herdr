@@ -53,6 +53,12 @@ pub struct PaneCloseRecord {
     /// later workspace lookup). Absent on records written before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
+    /// Tab display name (custom name or 1-based number) at close time, staged
+    /// with the record so the historial hover tooltip can name which tab the
+    /// pane last lived in without a later workspace lookup. Absent on records
+    /// written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
     /// First user prompt from the agent transcript (claude/cx sessions), cut
     /// char-safe host-side. Extracted once when the record is flushed; absent
     /// for shells/codex/pi and on older records.
@@ -128,6 +134,36 @@ impl PaneCloseRecord {
 /// Absolute path of the history log.
 pub fn history_path() -> PathBuf {
     crate::config::state_dir().join(HISTORY_FILE)
+}
+
+/// Whether a pane close is an ephemeral throwaway not worth recording in the
+/// durable historial: a *bare terminal* (no detected agent, no resumable
+/// session) whose working directory sits inside the OS temp dir. This is the
+/// worktree-teardown / API-test churn (e.g. a `WorktreeRemove` sweep closing
+/// dozens of `/var/folders/.../herdr-api-worktree-*` panes) that otherwise
+/// floods the log with sessionless rows and, before the projection quota fix,
+/// evicted the user's real sessions from the panel.
+///
+/// Deliberately conservative: an *agent* session (claude/cx/codex/pi) that ran
+/// in a temp dir is still recorded — a scratch `/tmp` agent run is real,
+/// resumable history the user may want back. Only sessionless shells in temp are
+/// dropped. Pure over its inputs so it is unit-testable without env/fs access.
+pub fn is_ephemeral_terminal_close(
+    has_agent: bool,
+    has_session: bool,
+    cwd: &str,
+    temp_dir: &std::path::Path,
+) -> bool {
+    if has_agent || has_session {
+        return false;
+    }
+    // Normalize the macOS `/private` symlink prefix (`/var` -> `/private/var`)
+    // so a `/var/folders/...` cwd matches a `/private/var/folders/...` temp dir
+    // (or vice-versa).
+    let strip_private = |p: &str| p.strip_prefix("/private").unwrap_or(p).to_string();
+    let cwd_n = strip_private(cwd);
+    let temp_n = strip_private(&temp_dir.to_string_lossy());
+    !temp_n.is_empty() && cwd_n.starts_with(&temp_n)
 }
 
 /// Append `records` to the history log, one JSON line each. Best-effort: creates
@@ -591,6 +627,15 @@ pub fn relative_time(ts_unix_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Absolute wall-clock label ("YYYY-MM-DD HH:MM") for a millisecond timestamp,
+/// as a stable anchor alongside the compact [`relative_time`] in the historial
+/// hover tooltip. Local time on Unix; UTC on other targets (see
+/// [`crate::platform::format_local_datetime`]). Empty when the breakdown fails.
+#[allow(dead_code)] // historial tooltip rendering (host projection)
+pub fn absolute_time(ts_unix_ms: u64) -> String {
+    crate::platform::format_local_datetime(ts_unix_ms).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,9 +652,23 @@ mod tests {
             cwd: "/home/dev/herdr".to_string(),
             workspace_id: "ws-1".to_string(),
             workspace_name: Some("herdr".to_string()),
+            tab_name: Some("2".to_string()),
             first_prompt: None,
             last_prompt: None,
         }
+    }
+
+    #[test]
+    fn absolute_time_has_expected_shape() {
+        // 2021-01-01T00:00:00Z. We can't assert the exact local rendering (it
+        // depends on the host timezone), but the format is fixed-width
+        // "YYYY-MM-DD HH:MM" regardless of tz offset.
+        let s = absolute_time(1_609_459_200_000);
+        assert_eq!(s.len(), 16, "got {s:?}");
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b' ');
+        assert_eq!(s.as_bytes()[13], b':');
     }
 
     #[test]
@@ -827,6 +886,51 @@ mod tests {
         assert!(!is_subagent_record(&rec));
         rec.session_value = None;
         assert!(!is_subagent_record(&rec));
+    }
+
+    #[test]
+    fn ephemeral_close_skips_bare_terminal_in_temp_dir() {
+        let temp = std::path::Path::new("/var/folders/wp/abc/T");
+        // Bare terminal (no agent, no session) inside temp -> ephemeral.
+        assert!(is_ephemeral_terminal_close(
+            false,
+            false,
+            "/var/folders/wp/abc/T/herdr-api-worktree-remove-123",
+            temp,
+        ));
+        // Same, but cwd carries the macOS /private symlink prefix.
+        assert!(is_ephemeral_terminal_close(
+            false,
+            false,
+            "/private/var/folders/wp/abc/T/herdr-api-worktree-remove-123",
+            temp,
+        ));
+    }
+
+    #[test]
+    fn ephemeral_close_keeps_agent_sessions_and_non_temp_terminals() {
+        let temp = std::path::Path::new("/var/folders/wp/abc/T");
+        // An agent session in temp is real, resumable history -> keep.
+        assert!(!is_ephemeral_terminal_close(
+            true,
+            true,
+            "/var/folders/wp/abc/T/scratch",
+            temp,
+        ));
+        // A sessionless agent-labelled pane in temp -> keep (has_agent).
+        assert!(!is_ephemeral_terminal_close(
+            true,
+            false,
+            "/var/folders/wp/abc/T/scratch",
+            temp,
+        ));
+        // A bare terminal in a real project dir -> keep (not temp).
+        assert!(!is_ephemeral_terminal_close(
+            false,
+            false,
+            "/Users/dev/Projects/herdr",
+            temp,
+        ));
     }
 
     #[test]

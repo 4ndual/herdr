@@ -1762,13 +1762,37 @@ impl AppState {
             .or_else(|| terminal.effective_display_agent())
             .or_else(|| terminal.effective_agent_label().map(str::to_string));
 
+        let cwd = terminal.cwd.display().to_string();
+        // Skip recording ephemeral throwaway closes at the source: a bare
+        // terminal (no agent, no resumable session) inside the OS temp dir is
+        // worktree-teardown / api-test churn, not history worth keeping. Agent
+        // sessions in temp are still recorded (see `is_ephemeral_terminal_close`).
+        if crate::pane_close_history::is_ephemeral_terminal_close(
+            agent.is_some(),
+            session.is_some(),
+            &cwd,
+            &std::env::temp_dir(),
+        ) {
+            return None;
+        }
+
+        // Which tab the pane last lived in, by its display name (custom name or
+        // 1-based number) — staged so the historial hover tooltip can name it.
+        let tab_name = ws
+            .find_tab_index_for_pane(pane_id)
+            .and_then(|tab_idx| ws.tab_display_name(tab_idx));
+
         Some(crate::pane_close_history::PaneCloseRecord {
             ts_unix_ms: crate::pane_close_history::now_unix_ms(),
             pane_id: public_pane_id,
-            // Human pane name: the OSC/agent title if any, else the manual label
-            // (e.g. "codeword"). `show_agent_labels=false` so the agent name is
-            // not folded in here — the historial row renders the agent separately.
-            label: terminal.border_label(false),
+            // The manual pane label only (rare, most specific — e.g. "labs"),
+            // the same value the API exposes as the pane's name (creation.rs).
+            // NOT the agent-metadata title or agent name: the historial row's
+            // primary identifier is the pane's TAB display name (`tab_name`
+            // below), which herdr always assigns and the user scans by; this
+            // manual label, when present, takes precedence over the tab name in
+            // the guest. Usually `None`.
+            label: terminal.manual_label.clone(),
             agent,
             session_source: session.as_ref().map(|info| info.source.clone()),
             session_kind: session.as_ref().map(|info| match info.kind {
@@ -1776,9 +1800,10 @@ impl AppState {
                 crate::agent_resume::AgentSessionRefKind::Path => "path".to_string(),
             }),
             session_value: session.as_ref().map(|info| info.value.clone()),
-            cwd: terminal.cwd.display().to_string(),
+            cwd,
             workspace_id,
             workspace_name: Some(ws.display_name()),
+            tab_name,
             // Prompts are extracted from the (filesystem) transcript by the
             // runtime flush path, not here in pure `AppState`.
             first_prompt: None,
