@@ -100,9 +100,15 @@ const HISTORIAL_READ_LIMIT: usize = 400;
 /// the guest renders. Pure over `(records, now)` so it is unit-testable without a
 /// live log. Applies, in order: subagent exclusion, non-resumable-agent
 /// exclusion, session/pane dedup, and the [`HISTORIAL_ROW_LIMIT`] cap.
+///
+/// `resolve_tab_name` backfills a live tab display name for a record whose stored
+/// `tab_name` is empty (older records predate the field). It is called only when
+/// the stored name is blank and must return `None` (keep the fallback) when the
+/// pane/tab is gone — never a fabricated name.
 fn build_historial_rows(
     records: Vec<crate::pane_close_history::PaneCloseRecord>,
     now: u64,
+    resolve_tab_name: impl Fn(&crate::pane_close_history::PaneCloseRecord) -> Option<String>,
 ) -> Vec<historial_dash_model::HistorialRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let filtered: Vec<crate::pane_close_history::PaneCloseRecord> = records
@@ -170,6 +176,30 @@ fn build_historial_rows(
                     chars[start..].iter().collect::<String>()
                 })
                 .unwrap_or_default();
+            // Tab name: prefer the stored value; when older records left it empty,
+            // backfill a live tab name from the current workspace/tab state. A
+            // gone pane/tab yields None, falling back to the agent-kind default.
+            let tab_name = record
+                .tab_name
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| resolve_tab_name(&record))
+                .unwrap_or_default();
+            // Strip synthetic Claude Code command wrappers (caveat/`<command-*>`/
+            // `<bash-*>`) that older records persisted as the prompt, so a row
+            // never renders the injected caveat instead of a real typed prompt.
+            let first_prompt = record
+                .first_prompt
+                .as_deref()
+                .and_then(crate::pane_close_history::genuine_user_prompt)
+                .map(str::to_string)
+                .unwrap_or_default();
+            let last_prompt = record
+                .last_prompt
+                .as_deref()
+                .and_then(crate::pane_close_history::genuine_user_prompt)
+                .map(str::to_string)
+                .unwrap_or_default();
             historial_dash_model::HistorialRow {
                 key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
                 agent,
@@ -181,9 +211,9 @@ fn build_historial_rows(
                 cwd: record.cwd,
                 restorable,
                 workspace_name: record.workspace_name.unwrap_or_default(),
-                tab_name: record.tab_name.unwrap_or_default(),
-                first_prompt: record.first_prompt.unwrap_or_default(),
-                last_prompt: record.last_prompt.unwrap_or_default(),
+                tab_name,
+                first_prompt,
+                last_prompt,
                 is_subagent,
             }
         })
@@ -2555,15 +2585,39 @@ impl App {
         }
     }
 
+    /// Resolve a live tab display name for a historial `record` whose stored
+    /// `tab_name` is empty (older records predate the field). Maps the record's
+    /// public pane id back to a live pane in its recorded workspace and reports
+    /// that pane's current tab display name via the same `tab_display_name` path
+    /// used at capture time. `None` when the pane (and thus its tab) is gone — the
+    /// projection then keeps the agent-kind fallback. Never fabricates: only a
+    /// still-live pane in the recorded workspace yields a name.
+    fn historial_tab_name_backfill(
+        &self,
+        record: &crate::pane_close_history::PaneCloseRecord,
+    ) -> Option<String> {
+        let (ws_idx, pane_id) = self.parse_pane_id(&record.pane_id)?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        // Guard against public-pane-id reuse across restarts: only backfill when
+        // the live pane's workspace id matches the record's recorded workspace id.
+        if ws.id != record.workspace_id {
+            return None;
+        }
+        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        ws.tab_display_name(tab_idx)
+    }
+
     /// Project the recent pane-close log into the wasm-safe historial render
     /// model. Every display string (agent, label, compact relative time) and the
     /// per-row restorability is precomputed here host-side, since the historial
-    /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
+    /// guest can reach neither a clock nor the disk. Pure over the log + `now`,
+    /// with empty tab names backfilled live via [`Self::historial_tab_name_backfill`].
     fn historial_render_input_json(&self) -> Option<String> {
         let now = crate::pane_close_history::now_unix_ms();
         let rows = build_historial_rows(
             crate::pane_close_history::read_recent(HISTORIAL_READ_LIMIT),
             now,
+            |record| self.historial_tab_name_backfill(record),
         );
         let model = historial_dash_model::HistorialRenderModel { rows };
         match serde_json::to_string(&model) {
@@ -3059,7 +3113,7 @@ mod tests {
             // A plain terminal (no agent) — kept (guest `[t]` toggle governs it).
             historial_record(70, "p4", None, None, false),
         ];
-        let rows = build_historial_rows(records, 200);
+        let rows = build_historial_rows(records, 200, |_| None);
         let agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
         assert_eq!(agents, vec!["claude", "terminal"]);
         assert!(rows.iter().all(|r| !r.is_subagent));
@@ -3082,7 +3136,7 @@ mod tests {
                 true,
             ));
         }
-        let rows = build_historial_rows(records, 100_000);
+        let rows = build_historial_rows(records, 100_000, |_| None);
         assert_eq!(rows.len(), HISTORIAL_ROW_LIMIT);
         // The deduped session appears exactly once.
         let dup_count = rows.iter().filter(|r| r.sid4 == "-sid").count();
@@ -3118,7 +3172,7 @@ mod tests {
                 true,
             ));
         }
-        let rows = build_historial_rows(records, 20_000);
+        let rows = build_historial_rows(records, 20_000, |_| None);
         // All 5 sessions survive despite being oldest and outnumbered.
         let session_rows = rows.iter().filter(|r| r.restorable).count();
         assert_eq!(session_rows, 5, "every restorable session must survive the cap");
@@ -3129,6 +3183,45 @@ mod tests {
         assert!(rows[0].restorable);
         assert!(rows[4].restorable);
         assert!(!rows[5].restorable);
+    }
+
+    #[test]
+    fn build_historial_rows_strips_synthetic_command_wrappers_from_prompts() {
+        // An older record whose first_prompt was persisted as the injected
+        // local-command caveat, with a genuine last_prompt. The projection must
+        // blank the caveat and keep the real prompt (no resolver needed).
+        let mut rec = historial_record(100, "p1", Some("claude"), Some("sid-1"), true);
+        rec.first_prompt = Some(
+            "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond".to_string(),
+        );
+        rec.last_prompt = Some("hist other favorite flower are roses".to_string());
+        let rows = build_historial_rows(vec![rec], 200, |_| None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].first_prompt, "", "caveat must project to empty");
+        assert_eq!(rows[0].last_prompt, "hist other favorite flower are roses");
+    }
+
+    #[test]
+    fn build_historial_rows_backfills_empty_tab_name_from_resolver() {
+        // Old record with empty tab_name whose tab still exists live -> the
+        // resolver supplies the live name. A second old record whose tab is gone
+        // (resolver None) keeps the empty fallback. A record with a stored tab
+        // name never consults the resolver.
+        let mut live = historial_record(300, "w1:pY", Some("claude"), Some("sid-live"), true);
+        live.tab_name = None;
+        let mut gone = historial_record(200, "w1:pZ", Some("claude"), Some("sid-gone"), true);
+        gone.tab_name = None;
+        let mut named = historial_record(100, "w1:pQ", Some("claude"), Some("sid-named"), true);
+        named.tab_name = Some("keep-me".to_string());
+
+        let rows = build_historial_rows(vec![live, gone, named], 400, |record| {
+            // Live workspace/tab resolution stand-in: only "w1:pY"'s tab exists.
+            (record.pane_id == "w1:pY").then(|| "frozen-sick".to_string())
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].tab_name, "frozen-sick", "backfilled from live tab");
+        assert_eq!(rows[1].tab_name, "", "gone tab keeps empty fallback");
+        assert_eq!(rows[2].tab_name, "keep-me", "stored tab name is preserved");
     }
 
     fn release_notes_state() -> state::ReleaseNotesState {
