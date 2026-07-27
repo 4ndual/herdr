@@ -462,18 +462,26 @@ fn render_full(
 }
 
 /// The display label for a row and whether it is a *fallback* (rendered dim).
-/// The label is the herdr pane name only (`label` = the pane's OSC/manual title
-/// as it shows on the live pane border) — this is how the user recognizes a
-/// conversation, so it is the sole source. We deliberately do NOT fall back to
-/// the first user prompt (noisy, not how panes are named) nor to the cwd/folder
-/// name (the project-folder encoding the user explicitly rejected). A row with
-/// no pane name shows only its agent + sid, which is honest rather than
-/// misleading. The bool is retained for the dim styling contract but is always
-/// `false` now that there is no fallback text.
+/// Identity is taken in precedence order:
+///   1. the manual pane label (`label`) — rare, most specific (e.g. "labs");
+///   2. the pane's TAB display name (`tab_name`) — herdr always assigns one at
+///      tab creation (a user rename, "new"/"test", or a number), so this is the
+///      name the user scans by and is effectively never empty for a live pane.
+/// Both are real names, so neither reads as a fallback. When both are empty
+/// (legacy records written before `tab_name` was captured) the row shows only
+/// its agent + sid — the agent is already rendered as a separate leading part,
+/// so repeating it here would just print it twice. We deliberately do NOT fall
+/// back to the first user prompt (noisy, not how panes are named) nor to the
+/// cwd/folder name (the project-folder encoding the user explicitly rejected).
+/// The bool is retained for the dim styling contract.
 fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
     let label = row.label.trim();
     if !label.is_empty() {
         return (label.to_string(), false);
+    }
+    let tab = row.tab_name.trim();
+    if !tab.is_empty() {
+        return (tab.to_string(), false);
     }
     (String::new(), false)
 }
@@ -701,10 +709,13 @@ mod tests {
             agent: "claude".to_string(),
             label: "herdr".to_string(),
             sid4: "c123".to_string(),
+            sid: "sess-c123".to_string(),
             reltime: "5m".to_string(),
+            abstime: "2026-07-24 15:57".to_string(),
             cwd: "/home/dev/herdr".to_string(),
             restorable,
             workspace_name: "myws".to_string(),
+            tab_name: "tab-1".to_string(),
             first_prompt: "first prompt text".to_string(),
             last_prompt: "last prompt text".to_string(),
             is_subagent: false,
@@ -819,6 +830,7 @@ mod tests {
         // matching how the user recognizes panes by their herdr name.
         let mut r = row("1:w_1_p_1", true);
         r.label = String::new();
+        r.tab_name = String::new(); // no tab name either: the truly nameless case
         r.first_prompt = "fix the historial panel please now urgently".to_string();
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
@@ -828,6 +840,36 @@ mod tests {
         assert!(!text.contains("fix the historial"));
         assert!(text.contains("claude")); // agent still shown
         assert!(text.contains("c123")); // sid still shown
+    }
+
+    #[test]
+    fn unlabeled_row_falls_back_to_tab_name_not_the_bare_agent() {
+        // The common case: panes are almost never manually renamed, so the tab
+        // display name is what identifies the row. Without this fallback every
+        // unlabeled row collapses to its agent kind and the panel reads as a
+        // column of identical "cx" entries.
+        let mut r = row("1:w_1_p_1", true);
+        r.label = String::new();
+        r.tab_name = "overlay-compact-sol".to_string();
+        let model = HistorialRenderModel { rows: vec![r] };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        assert!(buffer_text(&buf).contains("overlay-compact-sol"));
+    }
+
+    #[test]
+    fn manual_pane_label_outranks_the_tab_name() {
+        let mut r = row("1:w_1_p_1", true);
+        r.label = "labs".to_string();
+        r.tab_name = "overlay-compact-sol".to_string();
+        let model = HistorialRenderModel { rows: vec![r] };
+        let area = Rect::new(0, 0, 60, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let text = buffer_text(&buf);
+        assert!(text.contains("labs"));
+        assert!(!text.contains("overlay-compact-sol"));
     }
 
     #[test]
@@ -874,6 +916,7 @@ mod tests {
         // through to agent + sid only — never the cwd basename ("herdr").
         let mut r = row("1:w_1_p_1", true);
         r.label = String::new();
+        r.tab_name = String::new();
         r.first_prompt = String::new();
         r.cwd = "/home/dev/herdr".to_string();
         let model = HistorialRenderModel { rows: vec![r] };
@@ -892,10 +935,13 @@ mod tests {
             agent: "terminal".to_string(),
             label: String::new(),
             sid4: String::new(),
+            sid: String::new(),
             reltime: "1h".to_string(),
+            abstime: String::new(),
             cwd: "/home/dev/scratch".to_string(),
             restorable: false,
             workspace_name: String::new(),
+            tab_name: String::new(),
             first_prompt: String::new(),
             last_prompt: String::new(),
             is_subagent: false,
