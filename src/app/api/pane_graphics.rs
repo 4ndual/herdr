@@ -52,7 +52,14 @@ impl App {
                 "pane already has an active graphics stream",
             );
         }
-        self.set_pane_graphics_layer(id, pane_id, params)
+        // fork: no owner-exclusivity check. Layers COEXIST, one per owner, so a
+        // `set` replaces the caller's own layer and leaves other owners' layers
+        // untouched. This supersedes the earlier `owner_conflict` refusal, which
+        // assumed one layer per pane; with a list per pane there is nothing to
+        // conflict over, and refusing would stop an image plugin and the user's
+        // CLI from painting the same pane for no benefit.
+        let owner = layer_owner(&params.owner);
+        self.set_pane_graphics_layer(id, pane_id, params, owner)
     }
 
     fn set_pane_graphics_layer(
@@ -60,6 +67,7 @@ impl App {
         id: String,
         pane_id: PaneId,
         params: PaneGraphicsSetParams,
+        owner: Option<String>,
     ) -> String {
         if params.image_width == 0 || params.image_height == 0 {
             return encode_error(
@@ -112,9 +120,9 @@ impl App {
             params.image_height,
             data,
             params.placement,
+            owner,
         );
-        self.state.pane_graphics_layers.insert(pane_id, layer);
-        self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
+        self.state.upsert_pane_graphics_layer(pane_id, layer);
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -137,9 +145,13 @@ impl App {
                 "pane already has an active graphics stream",
             );
         }
-        if self.state.pane_graphics_layers.remove(&pane_id).is_some() {
-            self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
-        }
+        // fork: a plugin clears only its own layer; the socket caller (`None`)
+        // clears the whole pane. That asymmetry is deliberate and matches the
+        // owner doc on `PaneGraphicsLayer`: the user at the CLI outranks any
+        // plugin and needs one call that reliably wipes a pane, while a plugin
+        // must never be able to erase another plugin's image.
+        self.state
+            .clear_pane_graphics_layers(pane_id, layer_owner(&params.owner).as_deref());
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -166,7 +178,12 @@ impl App {
             }
             None => return encode_error(id, "stream_closed", "pane graphics stream is not active"),
         }
-        self.set_pane_graphics_layer(id, pane_id, params)
+        // The stream's `owner` is a caller-chosen CLAIM TOKEN on the stream, not
+        // a layer owner: it is validated against `pane_graphics_streams` above
+        // and must not leak into the layer, whose owner means "which plugin may
+        // replace or clear this". A stream already has exclusive use of the pane
+        // (`stream_conflict` on every other path), so its layer needs no owner.
+        self.set_pane_graphics_layer(id, pane_id, params, None)
     }
 
     pub(super) fn handle_pane_graphics_stream_open(
@@ -197,6 +214,14 @@ impl App {
         self.state
             .pane_graphics_streams
             .insert(pane_id, params.owner);
+        // fork: a stream is an EXCLUSIVE claim on the pane, so opening one drops
+        // every owner's layer, not just the opener's — including layers plugins
+        // set earlier, which get no notification. That is deliberate and
+        // unchanged from upstream: `stream_conflict` already refuses every other
+        // `set`/`clear` while a stream is active, so co-existing layers cannot be
+        // kept coherent with a stream anyway. Nothing can be added back until the
+        // stream closes, which is why the close path can still remove the whole
+        // pane entry rather than a single owner's layer.
         self.state.pane_graphics_layers.remove(&pane_id);
         self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
 
@@ -255,6 +280,23 @@ fn pane_graphics_expected_data_len(
         .and_then(|bytes| usize::try_from(bytes).ok())
         .map(Some)
         .ok_or(())
+}
+
+/// The layer owner carried by a `set`/`clear` request, or `None` when the call
+/// came in over the socket API rather than the UI-plugin bridge.
+///
+/// `owner` is `#[serde(skip)]` on both params structs, so it can never be
+/// supplied by a caller — not by a CLI, not by a wasm guest's JSON. The only
+/// writer is `App::execute_ui_plugin_api_call`, which stamps the calling
+/// module's plugin id after deserialization. That is what makes the ownership
+/// check below a real boundary rather than an honour system.
+fn layer_owner(owner: &str) -> Option<String> {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner.to_string())
+    }
 }
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
@@ -343,26 +385,181 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
 
-        let layer = app
+        let layers = app
             .state
             .pane_graphics_layers
             .get(&pane_id)
             .expect("graphics layer stored");
-        assert_eq!(layer.image_width, 1);
-        assert_eq!(layer.image_height, 1);
-        assert_eq!(layer.render.grid_cols, 10);
-        assert_eq!(layer.render.grid_rows, 4);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].image_width, 1);
+        assert_eq!(layers[0].image_height, 1);
+        assert_eq!(layers[0].render.grid_cols, 10);
+        assert_eq!(layers[0].render.grid_rows, 4);
         assert!(!app.state.session_dirty);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id,
+                owner: String::new(),
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
+    }
+
+    fn set_request(id: &str, pane_id: &str, owner: &str) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                pane_id: pane_id.to_string(),
+                owner: owner.to_string(),
+                format: crate::api::schema::PaneGraphicsFormat::Rgba,
+                image_width: 1,
+                image_height: 1,
+                data: None,
+                data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3, 4]),
+                placement: Default::default(),
+            }),
+        }
+    }
+
+    /// fork: two plugins COEXIST on one pane, one layer each, in a deterministic
+    /// composite order. This replaces the earlier `owner_conflict` refusal — that
+    /// rule existed only because a pane held a single layer, and with a list per
+    /// pane it would block the ordinary case (an image plugin and something else
+    /// painting the same pane) to prevent a collision that can no longer happen.
+    #[test]
+    fn api_pane_graphics_layers_from_two_plugins_coexist_on_one_pane() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        let response = app.handle_api_request(set_request("first", &public_pane_id, "plugin:b"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let response = app.handle_api_request(set_request("second", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 2, "both plugins must hold a layer");
+        // Composite order is by owner, not by arrival, so the paint order is
+        // stable across frames instead of following insertion or hash order.
+        assert_eq!(
+            layers
+                .iter()
+                .map(|layer| layer.owner.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["plugin:a".to_string(), "plugin:b".to_string()]
+        );
+
+        // A second `set` from one plugin replaces ITS layer only.
+        let response = app.handle_api_request(set_request("again", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap().len(),
+            2
+        );
+    }
+
+    /// fork: a plugin's `clear` must not erase another plugin's image, while the
+    /// socket caller's `clear` wipes the pane. Same asymmetry as `owner`.
+    #[test]
+    fn api_pane_graphics_clear_is_scoped_to_the_calling_plugin() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        for owner in ["plugin:a", "plugin:b", ""] {
+            let response = app.handle_api_request(set_request("set", &public_pane_id, owner));
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        }
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap().len(),
+            3
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear-a".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id.clone(),
+                owner: "plugin:a".into(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 2, "only the calling plugin's layer goes away");
+        assert!(layers
+            .iter()
+            .all(|layer| layer.owner.as_deref() != Some("plugin:a")));
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear-cli".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id,
+                owner: String::new(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(
+            app.state.pane_graphics_layers.is_empty(),
+            "the socket caller clears the whole pane"
+        );
+    }
+
+    /// The socket API outranks any plugin: the user at the CLI must always be
+    /// able to take a pane back.
+    #[test]
+    fn api_pane_graphics_socket_caller_may_replace_and_clear_a_plugin_layer() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+
+        let response = app.handle_api_request(set_request("plugin", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let response = app.handle_api_request(set_request("cli", &public_pane_id, ""));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "cli-clear".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id,
+                owner: String::new(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.pane_graphics_layers.is_empty());
+    }
+
+    /// A plugin gets no unload event, so the host must drop its images when it
+    /// is disabled. Without this `plugin disable` succeeds while the plugin's
+    /// last image stays painted on the pane.
+    #[test]
+    fn disabling_a_plugin_clears_only_its_own_pane_graphics_layers() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        let response = app.handle_api_request(set_request("set", &public_pane_id, "plugin:images"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let revision_before = app.state.pane_graphics_revision;
+
+        assert_eq!(
+            app.state
+                .clear_pane_graphics_layers_for_owner("plugin:other"),
+            0,
+            "an unrelated plugin must not clear this layer"
+        );
+        assert_eq!(app.state.pane_graphics_revision, revision_before);
+        assert!(app.state.pane_graphics_layers.contains_key(&pane_id));
+
+        assert_eq!(
+            app.state
+                .clear_pane_graphics_layers_for_owner("plugin:images"),
+            1
+        );
+        assert!(app.state.pane_graphics_layers.is_empty());
+        assert_ne!(app.state.pane_graphics_revision, revision_before);
     }
 
     #[test]
@@ -392,6 +589,7 @@ mod tests {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id,
+                owner: String::new(),
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -541,7 +739,7 @@ mod tests {
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "stream_conflict");
         assert_eq!(
-            app.state.pane_graphics_layers.get(&pane_id).unwrap().data,
+            app.state.pane_graphics_layers.get(&pane_id).unwrap()[0].data,
             vec![1_u8, 2, 3, 4]
         );
 
@@ -549,6 +747,7 @@ mod tests {
             id: "graphics-clear-public".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id.clone(),
+                owner: String::new(),
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();

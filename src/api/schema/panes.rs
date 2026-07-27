@@ -302,6 +302,13 @@ pub struct PaneGraphicsPlacementParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsClearParams {
     pub pane_id: String,
+    /// Which plugin is asking, as `plugin:<plugin_id>`, or empty for a call that
+    /// came in over the socket API. `skip`ped like the stream `owner` above so
+    /// no caller can supply it: the UI-plugin bridge is the only writer, after
+    /// deserialization. See `layer_owner` in `src/app/api/pane_graphics.rs`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -138,7 +138,10 @@ fn build_historial_rows(
             let restorable = record.restorable();
             let is_subagent = crate::pane_close_history::is_subagent_record(&record);
             // No detected agent -> "terminal" (replaces the old "shell").
-            let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
+            let agent = record
+                .agent
+                .clone()
+                .unwrap_or_else(|| "terminal".to_string());
             // Pane label only; empty when absent so the guest applies its
             // first-prompt / folder fallback.
             let label = record
@@ -2905,7 +2908,7 @@ impl App {
             "method": method,
             "params": params,
         });
-        let request: crate::api::schema::Request = match serde_json::from_value(request_value) {
+        let mut request: crate::api::schema::Request = match serde_json::from_value(request_value) {
             Ok(request) => request,
             Err(err) => {
                 self.ui_plugins.dispatch_api_result(
@@ -2919,6 +2922,22 @@ impl App {
                 return;
             }
         };
+
+        // Stamp the calling plugin onto pane-graphics writes. This is the ONLY
+        // writer of `owner` on either params struct — both fields are
+        // `#[serde(skip)]`, so a guest cannot forge one through its JSON and a
+        // CLI cannot supply one at all. Done after deserialization for exactly
+        // that reason. The value matches the key the plugin disable/unlink
+        // cleanup uses, so a layer set here is findable when the plugin goes.
+        match &mut request.method {
+            crate::api::schema::Method::PaneGraphicsSet(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            crate::api::schema::Method::PaneGraphicsClear(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            _ => {}
+        }
 
         let started = std::time::Instant::now();
         let response_json = self.handle_api_request_after_internal_events_drained(request);

@@ -29,13 +29,14 @@ fn enable_graphics_and_render(
 fn set_graphics_layer(server: &mut HeadlessServer, pane_id: crate::layout::PaneId, data: Vec<u8>) {
     server.app.state.pane_graphics_layers.insert(
         pane_id,
-        crate::app::state::PaneGraphicsLayer::new(
+        vec![crate::app::state::PaneGraphicsLayer::new(
             api::schema::PaneGraphicsFormat::Png,
             1,
             1,
             data,
             api::schema::PaneGraphicsPlacementParams::default(),
-        ),
+            None,
+        )],
     );
 }
 

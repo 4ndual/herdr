@@ -3273,13 +3273,14 @@ mod tests {
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
         state.pane_graphics_layers.insert(
             pane_id,
-            crate::app::state::PaneGraphicsLayer::new(
+            vec![crate::app::state::PaneGraphicsLayer::new(
                 crate::api::schema::PaneGraphicsFormat::Rgba,
                 1,
                 1,
                 vec![1, 2, 3, 4],
                 crate::api::schema::PaneGraphicsPlacementParams::default(),
-            ),
+                None,
+            )],
         );
     }
 
