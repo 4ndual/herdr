@@ -217,6 +217,7 @@ mod tests {
                 enabled,
                 platforms: None,
                 build: vec![],
+                startup: Vec::new(),
                 actions: vec![],
                 events: vec![],
                 panes: vec![],

@@ -3426,6 +3426,7 @@ mod tests {
                 enabled: true,
                 platforms: None,
                 build: vec![],
+                startup: Vec::new(),
                 actions: vec![],
                 events: vec![],
                 panes: vec![],

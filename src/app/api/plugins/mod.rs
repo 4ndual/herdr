@@ -3549,6 +3549,8 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_PAYLOAD_JSON\" > {}"]
             method: Method::PluginPaneOpen(PluginPaneOpenParams {
                 plugin_id: "example.payload-pane".into(),
                 entrypoint: "board".into(),
+                width: None,
+                height: None,
                 placement: Some(PluginPanePlacement::Overlay),
                 workspace_id: None,
                 target_pane_id: None,
