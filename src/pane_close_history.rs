@@ -53,6 +53,12 @@ pub struct PaneCloseRecord {
     /// later workspace lookup). Absent on records written before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
+    /// Tab display name (custom name or 1-based number) at close time, staged
+    /// with the record so the historial row can identify the pane by the tab it
+    /// last lived in without a later workspace lookup (the tab is gone by the
+    /// time the panel renders). Absent on records written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_name: Option<String>,
     /// First user prompt from the agent transcript (claude/cx sessions), cut
     /// char-safe host-side. Extracted once when the record is flushed; absent
     /// for shells/codex/pi and on older records.
@@ -591,6 +597,14 @@ pub fn relative_time(ts_unix_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Absolute wall-clock label ("YYYY-MM-DD HH:MM") for a millisecond timestamp,
+/// as a stable anchor alongside the compact [`relative_time`] in the historial
+/// hover tooltip. Local time on Unix; UTC on other targets (see
+/// [`crate::platform::format_local_datetime`]). Empty when the breakdown fails.
+pub fn absolute_time(ts_unix_ms: u64) -> String {
+    crate::platform::format_local_datetime(ts_unix_ms).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,9 +621,23 @@ mod tests {
             cwd: "/home/dev/herdr".to_string(),
             workspace_id: "ws-1".to_string(),
             workspace_name: Some("herdr".to_string()),
+            tab_name: Some("2".to_string()),
             first_prompt: None,
             last_prompt: None,
         }
+    }
+
+    #[test]
+    fn absolute_time_has_expected_shape() {
+        // 2021-01-01T00:00:00Z. We can't assert the exact local rendering (it
+        // depends on the host timezone), but the format is fixed-width
+        // "YYYY-MM-DD HH:MM" regardless of tz offset.
+        let s = absolute_time(1_609_459_200_000);
+        assert_eq!(s.len(), 16, "got {s:?}");
+        assert_eq!(s.as_bytes()[4], b'-');
+        assert_eq!(s.as_bytes()[7], b'-');
+        assert_eq!(s.as_bytes()[10], b' ');
+        assert_eq!(s.as_bytes()[13], b':');
     }
 
     #[test]

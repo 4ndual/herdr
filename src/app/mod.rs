@@ -103,9 +103,15 @@ const HISTORIAL_READ_LIMIT: usize = 400;
 /// the guest renders. Pure over `(records, now)` so it is unit-testable without a
 /// live log. Applies, in order: subagent exclusion, non-resumable-agent
 /// exclusion, session/pane dedup, and the [`HISTORIAL_ROW_LIMIT`] cap.
+///
+/// `resolve_tab_name` backfills a live tab display name for a record whose
+/// stored `tab_name` is empty (records predating the field). It is called only
+/// when the stored name is blank and must return `None` (keep the fallback)
+/// when the pane/tab is gone — never a fabricated name.
 fn build_historial_rows(
     records: Vec<crate::pane_close_history::PaneCloseRecord>,
     now: u64,
+    resolve_tab_name: impl Fn(&crate::pane_close_history::PaneCloseRecord) -> Option<String>,
 ) -> Vec<historial_dash_model::HistorialRow> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     records
@@ -140,7 +146,8 @@ fn build_historial_rows(
                 .clone()
                 .filter(|l| !l.trim().is_empty())
                 .unwrap_or_default();
-            // Last 4 chars of the session value (char-safe), empty when none.
+            // Full session value (tooltip) and its last-4 tail (dedup/debug).
+            let sid = record.session_value.clone().unwrap_or_default();
             let sid4 = record
                 .session_value
                 .as_deref()
@@ -150,15 +157,28 @@ fn build_historial_rows(
                     chars[start..].iter().collect::<String>()
                 })
                 .unwrap_or_default();
+            // Tab name: prefer the value staged at close time; when an older
+            // record left it empty, backfill from live workspace/tab state. A
+            // gone pane/tab yields None, and the guest falls back to the agent
+            // kind rather than showing a fabricated name.
+            let tab_name = record
+                .tab_name
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| resolve_tab_name(&record))
+                .unwrap_or_default();
             historial_dash_model::HistorialRow {
                 key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
                 agent,
                 label,
                 sid4,
+                sid,
                 reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
+                abstime: crate::pane_close_history::absolute_time(record.ts_unix_ms),
                 cwd: record.cwd,
                 restorable,
                 workspace_name: record.workspace_name.unwrap_or_default(),
+                tab_name,
                 first_prompt: record.first_prompt.unwrap_or_default(),
                 last_prompt: record.last_prompt.unwrap_or_default(),
                 is_subagent,
@@ -2665,15 +2685,36 @@ impl App {
         }
     }
 
+    /// Live tab display name for a pane-close `record` whose staged `tab_name`
+    /// is empty (records written before that field existed). Returns `None` when
+    /// the pane is gone or its public id has been reused by another workspace,
+    /// so a stale row never borrows an unrelated tab's name.
+    fn historial_tab_name_backfill(
+        &self,
+        record: &crate::pane_close_history::PaneCloseRecord,
+    ) -> Option<String> {
+        let (ws_idx, pane_id) = self.parse_pane_id(&record.pane_id)?;
+        let ws = self.state.workspaces.get(ws_idx)?;
+        // Guard against public-pane-id reuse across restarts: only backfill when
+        // the live pane's workspace id matches the record's recorded workspace id.
+        if ws.id != record.workspace_id {
+            return None;
+        }
+        let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
+        ws.tab_display_name(tab_idx)
+    }
+
     /// Project the recent pane-close log into the wasm-safe historial render
     /// model. Every display string (agent, label, compact relative time) and the
     /// per-row restorability is precomputed here host-side, since the historial
-    /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
+    /// guest can reach neither a clock nor the disk. Pure over the log + `now`,
+    /// with empty tab names backfilled live via [`Self::historial_tab_name_backfill`].
     fn historial_render_input_json(&self) -> Option<String> {
         let now = crate::pane_close_history::now_unix_ms();
         let rows = build_historial_rows(
             crate::pane_close_history::read_recent(HISTORIAL_READ_LIMIT),
             now,
+            |record| self.historial_tab_name_backfill(record),
         );
         let model = historial_dash_model::HistorialRenderModel { rows };
         match serde_json::to_string(&model) {
@@ -3161,6 +3202,7 @@ mod tests {
             cwd: "/home/dev/herdr".to_string(),
             workspace_id: "ws-1".to_string(),
             workspace_name: Some("herdr".to_string()),
+            tab_name: Some("tab-1".to_string()),
             first_prompt: None,
             last_prompt: None,
         }
@@ -3178,7 +3220,7 @@ mod tests {
             // A plain terminal (no agent) — kept (guest `[t]` toggle governs it).
             historial_record(70, "p4", None, None, false),
         ];
-        let rows = build_historial_rows(records, 200);
+        let rows = build_historial_rows(records, 200, |_| None);
         let agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
         assert_eq!(agents, vec!["claude", "terminal"]);
         assert!(rows.iter().all(|r| !r.is_subagent));
@@ -3201,11 +3243,44 @@ mod tests {
                 true,
             ));
         }
-        let rows = build_historial_rows(records, 100_000);
+        let rows = build_historial_rows(records, 100_000, |_| None);
         assert_eq!(rows.len(), HISTORIAL_ROW_LIMIT);
         // The deduped session appears exactly once.
         let dup_count = rows.iter().filter(|r| r.sid4 == "-sid").count();
         assert_eq!(dup_count, 1);
+    }
+
+    #[test]
+    fn build_historial_rows_carries_tab_name_and_backfills_only_when_empty() {
+        // Stored tab name wins and is passed straight through: without it the
+        // guest has nothing but the agent kind to identify an unlabeled row.
+        let stored = historial_record(100, "p1", Some("claude"), Some("sid-1"), true);
+        let rows = build_historial_rows(vec![stored], 200, |_| Some("live".to_string()));
+        assert_eq!(rows[0].tab_name, "tab-1");
+
+        // A record predating the field (or one staged with a blank name) falls
+        // back to the live resolver.
+        let mut blank = historial_record(100, "p1", Some("claude"), Some("sid-1"), true);
+        blank.tab_name = Some("   ".to_string());
+        let rows = build_historial_rows(vec![blank], 200, |_| Some("live".to_string()));
+        assert_eq!(rows[0].tab_name, "live");
+
+        // A gone pane/tab resolves to nothing rather than a fabricated name.
+        let mut missing = historial_record(100, "p1", Some("claude"), Some("sid-1"), true);
+        missing.tab_name = None;
+        let rows = build_historial_rows(vec![missing], 200, |_| None);
+        assert_eq!(rows[0].tab_name, "");
+    }
+
+    #[test]
+    fn build_historial_rows_carries_full_sid_and_absolute_time() {
+        let record = historial_record(100, "p1", Some("claude"), Some("11112222-aaaa"), true);
+        let rows = build_historial_rows(vec![record], 200, |_| None);
+        // The tooltip needs the whole session id, not just the 4-char tail.
+        assert_eq!(rows[0].sid, "11112222-aaaa");
+        assert_eq!(rows[0].sid4, "aaaa");
+        // Absolute time is formatted host-side (the guest has no clock/tz).
+        assert_eq!(rows[0].abstime.len(), 16, "got {:?}", rows[0].abstime);
     }
 
     fn release_notes_state() -> state::ReleaseNotesState {

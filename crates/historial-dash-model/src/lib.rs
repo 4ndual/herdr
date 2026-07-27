@@ -19,10 +19,20 @@ pub struct HistorialRow {
     /// no label (the row then omits it).
     pub label: String,
     /// Last 4 chars of the session id/value, or empty when there is no session.
+    /// Kept for the dedup/debug view; the panel surfaces the full [`Self::sid`]
+    /// in the hover tooltip rather than a 4-char tail on the row.
     #[serde(default)]
     pub sid4: String,
+    /// Full session id/value (hover tooltip). Empty when there is no session.
+    #[serde(default)]
+    pub sid: String,
     /// Precomputed compact relative time ("just now", "5m", "3h", "2d").
     pub reltime: String,
+    /// Precomputed absolute local date-time ("YYYY-MM-DD HH:MM", hover tooltip).
+    /// Formatted host-side because the guest has no clock/timezone. Empty when
+    /// unavailable (records written before this field existed).
+    #[serde(default)]
+    pub abstime: String,
     /// Working directory of the closed pane; the row shows its basename.
     pub cwd: String,
     /// Whether a resume plan can be rebuilt for this row (has an official agent
@@ -33,6 +43,13 @@ pub struct HistorialRow {
     /// unknown (older records).
     #[serde(default)]
     pub workspace_name: String,
+    /// Tab display name (custom name or 1-based number) the pane last lived in.
+    /// The guest falls the row identity back to this when [`Self::label`] (the
+    /// rare manual pane rename) is empty, which is the common case — without it
+    /// every unlabeled row collapses to the bare agent name. Empty when unknown
+    /// (records written before this field existed).
+    #[serde(default)]
+    pub tab_name: String,
     /// First user prompt of the session, char-cut host-side (hover tooltip).
     /// Empty when unavailable.
     #[serde(default)]
@@ -82,10 +99,13 @@ mod tests {
                 agent: "claude".to_string(),
                 label: "herdr".to_string(),
                 sid4: "c123".to_string(),
+                sid: "sess-c123".to_string(),
                 reltime: "5m".to_string(),
+                abstime: "2026-07-24 15:57".to_string(),
                 cwd: "/home/dev/herdr".to_string(),
                 restorable: true,
                 workspace_name: "herdr".to_string(),
+                tab_name: "2".to_string(),
                 first_prompt: "hi".to_string(),
                 last_prompt: "bye".to_string(),
                 is_subagent: false,

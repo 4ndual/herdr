@@ -1889,6 +1889,13 @@ impl AppState {
             .or_else(|| terminal.effective_display_agent())
             .or_else(|| terminal.effective_agent_label().map(str::to_string));
 
+        // Which tab the pane last lived in, by its display name (custom name or
+        // 1-based number) — staged now because the tab is gone by the time the
+        // historial panel renders the row.
+        let tab_name = ws
+            .find_tab_index_for_pane(pane_id)
+            .and_then(|tab_idx| ws.tab_display_name(tab_idx));
+
         Some(crate::pane_close_history::PaneCloseRecord {
             ts_unix_ms: crate::pane_close_history::now_unix_ms(),
             pane_id: public_pane_id,
@@ -1906,6 +1913,7 @@ impl AppState {
             cwd: terminal.cwd.display().to_string(),
             workspace_id,
             workspace_name: Some(ws.display_name()),
+            tab_name,
             // Prompts are extracted from the (filesystem) transcript by the
             // runtime flush path, not here in pure `AppState`.
             first_prompt: None,
