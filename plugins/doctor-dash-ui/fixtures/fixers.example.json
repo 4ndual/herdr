@@ -1,0 +1,29 @@
+[
+  {
+    "id": "cx",
+    "label": "cx / CCR gateway",
+    "_why": "cx routes Claude Code through the CCR gateway on :3456. A zombie listener there answers the TCP connect but never replies, which is why the check makes a real request instead of just testing the port.",
+    "check": "command -v curl >/dev/null 2>&1 || exit 2; curl -s -m 3 -o /dev/null http://127.0.0.1:3456/ && exit 0 || exit 1",
+    "detail": "lsof -nP -iTCP:3456 -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print \"ccr listening, pid \" $2; found=1} END {if (!found) print \"nothing listening on :3456\"}'",
+    "fix": "launchctl kickstart -k gui/$(id -u)/com.andres.ccr && sleep 2",
+    "escalate": "\"$HERDR_PLUGIN_ROOT/scripts/escalate-to-cx.sh\" cx 'the CCR gateway on 127.0.0.1:3456 is not answering and restarting the com.andres.ccr LaunchAgent did not fix it. diagnose and repair it, then confirm curl to :3456 succeeds.'"
+  },
+  {
+    "id": "hr",
+    "label": "hr / herdr server",
+    "_why": "hr is the live daily driver. Its fix is DELIBERATELY not a restart: restarting hr kills the process tree of everything running inside it. The repair here only prunes stale client sockets, which is the failure this actually hits (a leftover client pins pane sizing and makes plugin surfaces clip). Anything heavier is escalated to an agent, on purpose.",
+    "check": "sock=\"$HOME/.herdr-hr/config/herdr/sessions/hr/herdr.sock\"; [ -S \"$sock\" ] || exit 1; command -v lsof >/dev/null 2>&1 || exit 2; lsof -nP -U 2>/dev/null | grep -q \"$sock\" && exit 0 || exit 1",
+    "detail": "sock=\"$HOME/.herdr-hr/config/herdr/sessions/hr/herdr.sock\"; pid=$(lsof -t \"$sock\" 2>/dev/null | head -n 1); if [ -n \"$pid\" ]; then clients=$(lsof -nP -U 2>/dev/null | grep -c herdr-client.sock); echo \"server pid $pid, $clients client socket(s)\"; else echo \"no process is holding $sock\"; fi",
+    "fix": "d=\"$HOME/.herdr-hr/config/herdr/sessions/hr\"; find \"$d\" -name 'herdr-client.sock*' -type s -mmin +60 -delete 2>/dev/null; exit 0",
+    "escalate": "\"$HERDR_PLUGIN_ROOT/scripts/escalate-to-cx.sh\" hr 'the hr herdr server socket at ~/.herdr-hr/config/herdr/sessions/hr/herdr.sock is not answering. diagnose it. DO NOT restart or kill hr without asking Andres first — it hosts every running session.'"
+  },
+  {
+    "id": "disk",
+    "label": "disk errors",
+    "_why": "The M4 runs close to full and cargo target dirs are the usual culprit. Broken is <8 GiB free on /, unknown when df cannot be read. The fix only removes provably regenerable build artefacts older than 14 days; anything else is an agent's judgement call, not a script's.",
+    "check": "free=$(df -g / 2>/dev/null | awk 'NR==2 {print $4}'); [ -n \"$free\" ] || exit 2; [ \"$free\" -ge 8 ] && exit 0 || exit 1",
+    "detail": "df -h / 2>/dev/null | awk 'NR==2 {print $4 \" free of \" $2 \" (\" $5 \" used)\"}'",
+    "fix": "find \"$HOME/Library/Caches\" -maxdepth 2 -type d -name 'incremental' -mtime +14 -exec rm -rf {} + 2>/dev/null; rm -rf \"$HOME/Library/Caches/com.apple.dt.Xcode/DerivedData\"/* 2>/dev/null; exit 0",
+    "escalate": "\"$HERDR_PLUGIN_ROOT/scripts/escalate-to-cx.sh\" disk 'the root volume is below 8 GiB free and the safe cache purge did not recover enough. follow the disk reclaim playbook in memory (reference_disk_space_recovery_m4), report what you would delete, and ask before deleting anything outside build artefacts.'"
+  }
+]

@@ -1,0 +1,79 @@
+id = "builtin.doctor-dash"
+name = "Doctor Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "One-click healers: a shortcut button that opens an overlay subpanel of health checks with deterministic fixes and agent escalation (wasm render)"
+platforms = ["linux", "macos"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "doctor"
+title = "Doctor Dash"
+description = "Shortcut button in the bottom dash + an overlay subpanel of one-click healers"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/doctor_dash_ui.wasm"
+hot_reload = "on"
+# TWO surfaces from ONE module (so open/close state is one guest instance, with
+# no cross-module round trip):
+#   panel   → the compact `[🩺 …]` button, placed by the DATA below.
+#   overlay → the modal subpanel, whose rect is the whole pane area; the guest
+#             draws a centred box into it and owns its own hit-rects.
+surfaces = ["panel", "overlay"]
+# layout_read : per-frame `frame` events (which carry HERDR_PLUGIN_UI_INPUT_JSON).
+# toasts      : surface a denied/failed invoke to the user.
+# api_write   : `plugin.action.invoke` lives in the WRITE allow-list
+#               (src/ui_plugin_api_bridge.rs) — this plugin needs NO `api_input`.
+# keyboard_input : ↑/↓ move the selection and esc closes. See the KEYBOARD note
+#               in src/lib.rs — keys are broadcast to plugins but NOT consumable,
+#               so no destructive key (⏎/fix) is bound.
+capabilities = ["layout_read", "toasts", "api_write", "keyboard_input"]
+# Generic §7.1 transport: `scripts/doctor.sh` writes this file into the module's
+# HERDR_PLUGIN_STATE_DIR and the host injects its bytes as
+# HERDR_PLUGIN_UI_INPUT_JSON on every frame. There is NO in-host writer and NO
+# `collector` manifest field (that routes exclusively through the usage-dash
+# tick). The runner is driven by the actions below, never by the render loop.
+ui_input_file = "doctor_input.json"
+
+[ui_modules.placement]
+# A snug fixed-width slot on the RIGHT of the usage band. The guest emits the
+# button layer at z_index 40, BELOW button-dash's 50, and `layout_plugin_panels`
+# carves in (z desc, plugin asc, module asc) order — so button-dash takes its 45
+# columns first and this button lands immediately to its LEFT, inside the same
+# shortcut-button area. Fixed (not "auto") so the button never reflows when the
+# rollup glyph changes width.
+region = "bottom_band"
+align = "end"
+size = "10"
+min_peer = 24
+z = 58
+
+# ── Actions (the ONLY things that execute commands) ──────────────────────────
+# Both run `scripts/doctor.sh`, which owns the fixers manifest path, runs the
+# per-fixer check/fix/escalate/detail commands, and writes the snapshot the guest
+# renders. The host runs plugin actions on a DETACHED std::thread
+# (src/app/api/plugins/runtime.rs) and reports completion as an AppEvent, so a
+# slow fix never blocks the render loop — see the ASYNC note in src/lib.rs.
+
+# check-all: run every fixer's `check` + `detail` and rewrite the snapshot. The
+# guest fires this when the overlay opens and when `⟲ recheck` is clicked.
+[[actions]]
+id = "check-all"
+title = "Doctor: run all checks"
+description = "Run every fixer's check + detail command and refresh the panel"
+command = ["bash", "scripts/doctor.sh", "check-all"]
+
+# run-fix: repair ONE fixer. Which one arrives as HERDR_PLUGIN_PAYLOAD_JSON
+# ({"id":"cx"}) via the invoke context's `plugin_payload_json`. The script marks
+# the row `working` before it starts, runs `fix`, and on a non-zero exit runs
+# `escalate` (handing off to an agent via cx) and keeps the row `working` with an
+# "escalated" note — a failed fix never drops the user into a terminal.
+[[actions]]
+id = "run-fix"
+title = "Doctor: fix one item"
+description = "Run one fixer's deterministic repair, escalating to an agent if it fails"
+command = ["bash", "scripts/doctor.sh", "fix"]

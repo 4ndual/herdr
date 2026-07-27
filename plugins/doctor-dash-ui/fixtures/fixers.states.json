@@ -1,0 +1,38 @@
+[
+  {
+    "id": "healthy-demo",
+    "label": "healthy demo",
+    "check": "exit 0",
+    "detail": "echo 'check exited 0 \u2014 nothing to do'",
+    "fix": "exit 0",
+    "escalate": "exit 0"
+  },
+  {
+    "id": "broken-demo",
+    "label": "broken demo (fix succeeds)",
+    "check": "test -f \"${HERDR_DOCTOR_FIXTURE_DIR:-/tmp}/doctor-demo-repaired\" && exit 0 || exit 1",
+    "detail": "test -f \"${HERDR_DOCTOR_FIXTURE_DIR:-/tmp}/doctor-demo-repaired\" && echo 'sentinel present' || echo 'sentinel missing \u2014 click to repair'",
+    "fix": "sleep 3; touch \"${HERDR_DOCTOR_FIXTURE_DIR:-/tmp}/doctor-demo-repaired\"",
+    "escalate": "exit 0"
+  },
+  {
+    "id": "unknown-demo",
+    "label": "unknown demo",
+    "check": "exit 2",
+    "detail": "echo 'check exited 2 \u2014 cannot determine'",
+    "fix": "exit 0",
+    "escalate": "exit 0"
+  },
+  {
+    "id": "escalating-demo",
+    "label": "partial fix demo (escalates)",
+    "check": "exit 1",
+    "detail": "echo 'needs work a button cannot safely finish'",
+    "fix": "sleep 2; echo 'cleared 2 of 6 items; the rest need judgement'; exit 1",
+    "escalate": "echo 'handing off'; exit 0",
+    "state": "echo 'raw facts for the escalation brief'",
+    "some_future_key": {
+      "nested": true
+    }
+  }
+]
