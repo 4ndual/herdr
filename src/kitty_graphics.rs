@@ -620,12 +620,15 @@ fn collect_visible_placements(
 /// Upper bound on the on-screen size of a synthesized image so a Claude
 /// `[Image #N]` preview does not overdraw the whole pane. Aspect ratio is
 /// preserved within this box.
+#[cfg(feature = "host-images")]
 const MAX_SYNTHETIC_IMAGE_COLS: u32 = 40;
+#[cfg(feature = "host-images")]
 const MAX_SYNTHETIC_IMAGE_ROWS: u32 = 12;
 
 /// Synthetic pane-id namespace for images that are not owned by a real pane
 /// (plugin-panel surfaces). Kept far above real pane ids so the `(PaneId, ..)`
 /// dedup keys never collide with terminal panes.
+#[cfg(feature = "host-images")]
 const SYNTHETIC_PANE_ID_BASE: u32 = 0xF000_0000;
 
 /// Build host placements that herdr synthesizes itself (rather than reading
@@ -639,9 +642,20 @@ fn collect_synthetic_placements(
     cell_size: HostCellSize,
     plugin_images: &[(Rect, PathBuf)],
 ) -> Vec<HostPlacement> {
+    #[allow(unused_mut)]
     let mut out = Vec::new();
-    collect_plugin_panel_images(plugin_images, cell_size, &mut out);
-    collect_claude_pane_images(app, terminal_runtimes, surface, cell_size, &mut out);
+    // fork: both sources read `crate::host_image`, so they vanish with the
+    // `host-images` feature. Real pane graphics (the ghostty kitty store and the
+    // 0.7.5 pane-graphics socket API) are unaffected — they never touch it.
+    #[cfg(feature = "host-images")]
+    {
+        collect_plugin_panel_images(plugin_images, cell_size, &mut out);
+        collect_claude_pane_images(app, terminal_runtimes, surface, cell_size, &mut out);
+    }
+    #[cfg(not(feature = "host-images"))]
+    {
+        let _ = (app, terminal_runtimes, surface, cell_size, plugin_images);
+    }
     out
 }
 
@@ -649,6 +663,7 @@ fn collect_synthetic_placements(
 /// painted to fill its resolved screen `Rect`. The `(Rect, path)` pairs are
 /// resolved by the caller (which owns the plugin manager) from each module's
 /// manifest `image_file` and its surface layout.
+#[cfg(feature = "host-images")]
 fn collect_plugin_panel_images(
     plugin_images: &[(Rect, PathBuf)],
     cell_size: HostCellSize,
@@ -681,6 +696,7 @@ fn collect_plugin_panel_images(
 /// placeholder's cell position. Re-resolved every render so resume/compaction
 /// renumbering and cache GC are tolerated (a missing file simply leaves the
 /// text).
+#[cfg(feature = "host-images")]
 fn collect_claude_pane_images(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -740,6 +756,7 @@ fn collect_claude_pane_images(
 
 /// Fit an image (pixel dims) into a cell box, preserving aspect ratio and
 /// never exceeding `max_cols`/`max_rows`.
+#[cfg_attr(not(feature = "host-images"), allow(dead_code))]
 fn fit_image_cells(
     width_px: u32,
     height_px: u32,
@@ -765,6 +782,7 @@ fn fit_image_cells(
 /// identifies the image within its pane (the `N` of `[Image #N]`, or a panel
 /// index) so multiple images per pane get distinct dedup/placement keys.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "host-images")]
 fn synthetic_placement(
     pane_id: PaneId,
     area: Rect,

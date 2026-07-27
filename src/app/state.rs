@@ -2030,6 +2030,10 @@ impl AppState {
     /// drawn on top of the panes — the resume-search popup, settings, global
     /// menu, confirm dialogs, etc. Every mode except `Terminal` draws such an
     /// overlay, so any non-`Terminal` mode suppresses host images.
+    // fork: only the host image renderer and its unit tests read this; it goes
+    // dead when the `host-images` feature is off. Kept (not gated) so an upstream
+    // merge that touches it has nothing to collide with.
+    #[cfg_attr(not(feature = "host-images"), allow(dead_code))]
     pub(crate) fn overlay_suppresses_host_images(&self) -> bool {
         !matches!(self.mode, Mode::Terminal)
     }
@@ -2039,6 +2043,10 @@ impl AppState {
     /// the host image layer to resolve `[Image #N]` cache files. Lives here
     /// because it reads `crate::app::creation`, which is private to the `app`
     /// module.
+    // fork: only the host image renderer and its unit tests read this; it goes
+    // dead when the `host-images` feature is off. Kept (not gated) so an upstream
+    // merge that touches it has nothing to collide with.
+    #[cfg_attr(not(feature = "host-images"), allow(dead_code))]
     pub(crate) fn claude_session_value_for_pane(
         &self,
         ws_idx: usize,
