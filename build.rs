@@ -66,6 +66,29 @@ fn emit_fork_provenance(manifest_dir: &std::path::Path) {
     );
 }
 
+/// Bake which fork VARIANT this binary is, alongside — never inside — the
+/// provenance string.
+///
+/// WHY separate: provenance answers "which commit", variant answers "which
+/// build of that commit". Two binaries can share a describe string and differ
+/// in what was compiled into them (a feature-stripped build, a bisect build),
+/// and appending the variant to the provenance value would corrupt it —
+/// `fork_commit_count` parses that string right-to-left and requires `g<sha>`
+/// to be the last field. So this gets its own `cargo:rustc-env` line, its own
+/// self-describing literal, and its own `#[used]` anchor, scrapeable the same
+/// way: `strings -a <bin> | grep '^HERDR_FORK_VARIANT='`.
+fn emit_fork_variant() {
+    println!("cargo:rerun-if-env-changed=HERDR_FORK_VARIANT");
+    // Always emit: `env!` in build_info.rs must resolve on every build. Empty is
+    // the honest value for a plain build — unlike provenance there is no
+    // fallback worth computing, and "unknown" would falsely imply a variant
+    // exists that we failed to name.
+    println!(
+        "cargo:rustc-env=HERDR_FORK_VARIANT={}",
+        env::var("HERDR_FORK_VARIANT").unwrap_or_default().trim()
+    );
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -86,6 +109,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     emit_fork_provenance(&manifest_dir);
+    emit_fork_variant();
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);

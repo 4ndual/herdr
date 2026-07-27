@@ -54,6 +54,34 @@ pub const FORK_PROVENANCE: &str =
 #[allow(dead_code)]
 static FORK_PROVENANCE_MARKER: &[u8] = FORK_PROVENANCE.as_bytes();
 
+/// The scrapeable, per-binary VARIANT marker, baked by `build.rs`.
+///
+/// Its own literal and its own `;` terminator, for the same reason
+/// [`FORK_PROVENANCE`] has them: Rust welds string literals together, so a
+/// marker without a terminator cannot be delimited by `strings`. It is a
+/// SEPARATE literal rather than an extra field on the provenance value because
+/// [`fork_commit_count`] parses that value right-to-left and requires `g<sha>`
+/// to be its last field — appending anything to it silently breaks the `+N`
+/// the version strip renders.
+pub const FORK_VARIANT: &str = concat!("HERDR_FORK_VARIANT=", env!("HERDR_FORK_VARIANT"), ";");
+
+/// Link-level anchor for the variant marker; see [`FORK_PROVENANCE_MARKER`] for
+/// why `#[used]` and not `#[no_mangle]`.
+#[used]
+#[allow(dead_code)]
+static FORK_VARIANT_MARKER: &[u8] = FORK_VARIANT.as_bytes();
+
+/// Which variant of the fork this binary is, e.g. `noimages`. `None` for a
+/// plain build, which is the overwhelmingly common case.
+pub fn fork_variant() -> Option<&'static str> {
+    // `black_box` for the same reason as in `fork_provenance`: without it the
+    // const chain folds away and the literal never reaches the binary.
+    std::hint::black_box(FORK_VARIANT)
+        .split_once('=')
+        .map(|(_, value)| value.trim_end_matches(';'))
+        .and_then(|value| non_empty(Some(value)))
+}
+
 /// `git describe --tags --long` for the tree this binary was built from, e.g.
 /// `v0.7.5-114-g87556c79`. `None` for a build with no git provenance.
 pub fn fork_provenance() -> Option<&'static str> {
@@ -125,6 +153,25 @@ mod tests {
     #[test]
     fn provenance_marker_is_self_describing_so_it_can_be_scraped_from_a_stopped_binary() {
         assert!(super::FORK_PROVENANCE.starts_with("HERDR_FORK_PROVENANCE="));
+        assert!(super::FORK_PROVENANCE.ends_with(';'));
+    }
+
+    #[test]
+    fn variant_marker_is_its_own_literal_and_never_rides_on_the_provenance_value() {
+        assert!(super::FORK_VARIANT.starts_with("HERDR_FORK_VARIANT="));
+        assert!(super::FORK_VARIANT.ends_with(';'));
+        // The whole point of the split: whatever the variant is, the provenance
+        // string must still end in `g<sha>` so `fork_commit_count` can parse it.
+        assert!(!super::FORK_PROVENANCE.contains("HERDR_FORK_VARIANT"));
+    }
+
+    #[test]
+    fn an_unset_variant_is_none_rather_than_an_empty_name() {
+        // This crate is built without HERDR_FORK_VARIANT, so the plain-build
+        // path is the one under test here.
+        if option_env!("HERDR_FORK_VARIANT").unwrap_or("").is_empty() {
+            assert_eq!(super::fork_variant(), None);
+        }
     }
 
     #[test]
