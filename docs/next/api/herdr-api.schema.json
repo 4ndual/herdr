@@ -1299,6 +1299,62 @@
           ],
           "type": "object"
         },
+        "AgentSpawnParams": {
+          "properties": {
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "split": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/SplitDirection"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tab_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "argv"
+          ],
+          "type": "object"
+        },
         "AgentStartParams": {
           "properties": {
             "args": {
@@ -4949,6 +5005,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentStartParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.spawn",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentSpawnParams"
             }
           },
           "required": [
@@ -9013,22 +9085,6 @@
                 },
                 "type": {
                   "const": "agent_info",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "type",
-                "agent"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "agent": {
-                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
-                },
-                "type": {
-                  "const": "agent_prompted",
                   "type": "string"
                 }
               },
