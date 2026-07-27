@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::common::{AgentStatus, ReadFormat, ReadSource};
+use super::common::{AgentStatus, ReadFormat, ReadSource, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentReadParams {
@@ -175,6 +175,32 @@ pub struct AgentStartParams {
     /// Startup timeout in milliseconds. Values must be greater than 3000 and at most 300000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+}
+
+// fork(0.7.5-merge): pre-0.7.5 `agent start <name> --cwd PATH --workspace ID
+// --tab ID --split right|down --env KEY=VALUE -- <argv...>` spawned a brand new
+// pane and ran `argv` in it. Upstream's 0.7.5 merge reused the `agent start`
+// name and the `AgentStartParams`/`Method::AgentStart` wire shape for an
+// unrelated feature (adopt an already-running CLI agent into an existing
+// pane). Rather than widen or repurpose the upstream-owned params, this is a
+// parallel, additive wire method (`agent.spawn`) carrying the pre-0.7.5
+// contract unchanged, kept for callers that still depend on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSpawnParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split: Option<SplitDirection>,
+    #[serde(default)]
+    pub focus: bool,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentSpawnParams, AgentStartParams,
+    AgentTarget, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -50,6 +50,21 @@ impl App {
         let (agent, argv) = match self.start_agent(params) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
+        };
+
+        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    // fork(0.7.5-merge): additive alongside `handle_agent_start` — see
+    // `AgentSpawnParams` for why this is a separate wire method.
+    pub(super) fn handle_agent_spawn(&mut self, id: String, params: AgentSpawnParams) -> String {
+        let extra_env = match super::env::normalize_launch_env(params.env.clone()) {
+            Ok(env) => env,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        let (agent, argv) = match self.spawn_agent(params, extra_env) {
+            Ok(started) => started,
+            Err(err) => return encode_error_body(id, self.agent_spawn_error_body(err)),
         };
 
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
