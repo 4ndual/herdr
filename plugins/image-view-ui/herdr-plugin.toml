@@ -1,0 +1,47 @@
+id = "builtin.image-view"
+name = "Image View"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Paints the newest cached agent image onto the focused pane through the bridge API (wasm guest; no host image code)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "image"
+title = "Image View"
+description = "Renders an image into a pane via pane.graphics.set, chosen per frame by the guest"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/image_view_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+# pane_graphics is the whole point: it is what makes this an off-switchable
+# feature rather than host code. `plugin disable` drops the capability and the
+# host clears this owner's layers, so the image goes away without a rebuild.
+# api_read is only for `pane.list`, to learn which pane is focused.
+# layout_read + focused_session are what deliver the per-frame `frame` event
+# carrying HERDR_PLUGIN_UI_INPUT_JSON.
+capabilities = ["layout_read", "focused_session", "api_read", "pane_graphics"]
+# The guest cannot read files: a wasm32 module here has no WASI and no host
+# imports. So the out-of-process collector picks the image and measures it, and
+# the guest only ever handles a PATH plus its pixel dimensions. Image BYTES
+# never enter the guest — the host reads them, gated by graphics_roots below.
+ui_input_file = "image_input.json"
+# The only directories a `pane.graphics.set { source_path }` from this module may
+# name. Declared here, visible in `plugin list` before anyone enables it, and
+# enforced after canonicalising both sides so no symlink or `..` escapes.
+graphics_roots = ["~/.claude/image-cache"]
+
+[ui_modules.placement]
+# One carved row: the guest's own surface is a status line, not the image. The
+# image is painted into a PANE via the graphics API, which is not a plugin
+# surface at all — that separation is why the image can outlive a redraw of the
+# strip and why the pane keeps its own layer list.
+region = "bottom"
+align = "start"
+size = "1"
+z = 54
