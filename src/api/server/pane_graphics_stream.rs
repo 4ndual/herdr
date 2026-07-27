@@ -119,6 +119,19 @@ fn serve_with_timeouts(
         return Ok(());
     }
 
+    // Register BEFORE acknowledging the open, so that a client which has seen
+    // the ack is guaranteed to be visible to `cancel_inactive_streams`.
+    //
+    // Registering afterwards left a window in which the stream was live and
+    // acknowledged but absent from the registry, and the sweep early-returns
+    // while `REGISTERED_STREAM_COUNT` is zero. A cancellation landing in that
+    // window did not merely arrive late — it matched nothing and was dropped,
+    // so the stream was never cancelled at all and survived until its own read
+    // timeouts expired. The window is short, which is what made it look like
+    // flakiness under load rather than a lost cancellation.
+    let stream_active = Arc::new(AtomicBool::new(true));
+    register_stream(&owner, &stream_active);
+
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
@@ -126,6 +139,7 @@ fn serve_with_timeouts(
             result: ResponseResult::Ok {},
         },
     ) {
+        unregister_stream(&owner);
         clear_layer(&pane_id, &owner, api_tx);
         if is_connection_closed_error(&err) {
             return Ok(());
@@ -133,8 +147,6 @@ fn serve_with_timeouts(
         return Err(err);
     }
 
-    let stream_active = Arc::new(AtomicBool::new(true));
-    register_stream(&owner, &stream_active);
     let result = serve_frames(
         &mut stream,
         &request_id,
@@ -262,6 +274,16 @@ fn serve_frames(
 
 fn stream_registry() -> &'static Mutex<HashMap<String, Weak<AtomicBool>>> {
     REGISTERED_STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn stream_is_registered(owner: &str) -> bool {
+    // Owner-scoped rather than a count: the registry is process-global and the
+    // test binary runs these threads in parallel, so any total is another
+    // test's business as much as this one's.
+    stream_registry()
+        .lock()
+        .is_ok_and(|streams| streams.contains_key(owner))
 }
 
 fn register_stream(owner: &str, active: &Arc<AtomicBool>) {
@@ -942,6 +964,67 @@ mod tests {
 
         assert!(result.is_none());
         stopper.join().unwrap();
+    }
+
+    /// The ack must imply registration.
+    ///
+    /// `cancel_inactive_streams` early-returns while the registry is empty, so
+    /// if a stream can be acknowledged before it is registered, a cancellation
+    /// arriving in that window matches nothing and is silently dropped — the
+    /// stream is never cancelled, rather than cancelled late. This asserts the
+    /// ordering directly instead of racing it: a client holding the ack can rely
+    /// on the sweep being able to see its stream.
+    #[test]
+    fn stream_is_registered_before_the_open_is_acknowledged() {
+        let (mut client, server, _path) = local_stream_pair("graphics-register-order");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_thread = std::thread::spawn(move || {
+            serve_with_timeouts(
+                server,
+                "stream-register".into(),
+                PaneGraphicsStreamParams {
+                    pane_id: "pane_1".into(),
+                    owner: String::new(),
+                },
+                &api_tx,
+                &server_running,
+                Duration::from_secs(1),
+                READ_TIMEOUTS,
+            )
+        });
+
+        let open = api_rx.blocking_recv().unwrap();
+        let Method::PaneGraphicsStreamOpen(open_params) = open.request.method.clone() else {
+            panic!("expected a pane.graphics.stream open request");
+        };
+        let owner = open_params.owner;
+        open.respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: open.request.id,
+                    result: ResponseResult::Ok {},
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let ack: SuccessResponse = serde_json::from_str(&read_response_line(&mut client)).unwrap();
+        assert_eq!(ack.id, "stream-register");
+
+        // No sleep and no retry: the moment the ack is readable the registry
+        // must already know about this stream. Before the ordering fix this
+        // observed the owner absent whenever the server thread had not yet
+        // reached `register_stream`, which is exactly the window in which a
+        // cancellation matched nothing and was dropped.
+        assert!(
+            stream_is_registered(&owner),
+            "a stream that has been acknowledged must be visible to cancel_inactive_streams"
+        );
+
+        running.store(false, Ordering::Release);
+        drop(client);
+        let _ = server_thread.join();
     }
 
     #[test]
