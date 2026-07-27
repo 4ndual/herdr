@@ -382,6 +382,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentSpawn(_) => "agent.spawn",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",

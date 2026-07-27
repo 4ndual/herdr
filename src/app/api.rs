@@ -1053,6 +1053,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentSpawn(params) => return self.handle_agent_spawn(request.id, params),
             Method::AgentPrompt(params) => return self.handle_agent_prompt(request.id, params),
             Method::AgentWait(_) => {
                 return responses::encode_error(

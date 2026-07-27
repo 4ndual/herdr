@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
     AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, Method,
-    ReadFormat, ReadSource, Request,
+    AgentSendKeysParams, AgentSpawnParams, AgentStartParams, AgentTarget, AgentWaitParams,
+    EmptyParams, Method, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
@@ -274,6 +275,16 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]");
         return Ok(2);
     };
+    // fork(0.7.5-merge): pre-0.7.5 `agent start` used a different contract —
+    // spawn a new pane and run <argv> in it via --cwd/--workspace/--tab/--split/
+    // --env -- <argv>. Upstream's 0.7.5 `agent start` reuses the same
+    // subcommand name for an unrelated feature (adopt an already-running CLI
+    // agent into an existing pane, identified by --kind/--pane). Dispatch on
+    // --kind's presence so both contracts keep working unchanged under the
+    // same `herdr agent start` entry point.
+    if !args[1..].iter().any(|arg| arg == "--kind") {
+        return agent_spawn_legacy(name, &args[1..]);
+    }
     let separator = args
         .iter()
         .position(|arg| arg == "--")
@@ -372,6 +383,109 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             print_agent_transport_error(err, "cli:agent:start", "agent_start_transport_failed")
         }
     }
+}
+
+// fork(0.7.5-merge): pre-0.7.5 `agent start` contract, kept working unchanged
+// as an alias dispatched from `agent_start` above when `--kind` is absent.
+// `args` here is everything after `<name>`. Wire method is `agent.spawn`
+// (`AgentSpawnParams`) rather than the upstream `agent.start`/`AgentStartParams`
+// pair, so this does not touch upstream-owned request/response shapes.
+fn agent_spawn_legacy(name: &str, args: &[String]) -> std::io::Result<i32> {
+    let usage = "usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>";
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        eprintln!("{usage}");
+        return Ok(2);
+    };
+    if separator == args.len() - 1 {
+        eprintln!("agent start requires argv after --");
+        return Ok(2);
+    }
+
+    let mut cwd = None;
+    let mut workspace_id = None;
+    let mut tab_id = None;
+    let mut split = None;
+    let mut focus = false;
+    let mut env = HashMap::new();
+
+    let mut index = 0;
+    while index < separator {
+        match args[index].as_str() {
+            "--cwd" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --cwd");
+                    return Ok(2);
+                };
+                cwd = Some(value.clone());
+                index += 2;
+            }
+            "--workspace" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --workspace");
+                    return Ok(2);
+                };
+                workspace_id = Some(super::normalize_workspace_id(value));
+                index += 2;
+            }
+            "--tab" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --tab");
+                    return Ok(2);
+                };
+                tab_id = Some(super::normalize_tab_id(value));
+                index += 2;
+            }
+            "--split" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --split");
+                    return Ok(2);
+                };
+                split = Some(super::parse_split_direction(value)?);
+                index += 2;
+            }
+            "--focus" => {
+                focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                focus = false;
+                index += 1;
+            }
+            "--env" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --env");
+                    return Ok(2);
+                };
+                let (key, value) = match super::parse_env_assignment(value) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return Ok(2);
+                    }
+                };
+                env.insert(key, value);
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:start".into(),
+        method: Method::AgentSpawn(AgentSpawnParams {
+            name: name.to_string(),
+            cwd,
+            workspace_id,
+            tab_id,
+            split,
+            focus,
+            argv: args[separator + 1..].to_vec(),
+            env,
+        }),
+    })?)
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -799,6 +913,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+    );
+    eprintln!(
+        "  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>  (legacy: no --kind)"
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(

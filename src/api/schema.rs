@@ -126,6 +126,11 @@ pub enum Method {
     AgentFocus(AgentTarget),
     #[serde(rename = "agent.start")]
     AgentStart(AgentStartParams),
+    // fork(0.7.5-merge): additive alongside `AgentStart` — see the comment on
+    // `AgentSpawnParams` for why this exists as a separate method rather than
+    // widening `AgentStartParams`.
+    #[serde(rename = "agent.spawn")]
+    AgentSpawn(AgentSpawnParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
     #[serde(rename = "agent.wait")]
