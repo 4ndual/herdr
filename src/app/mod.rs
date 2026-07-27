@@ -1262,6 +1262,19 @@ impl App {
     /// disabled, non-Ghostty terminal, or tmux); it works on any terminal since
     /// it emits only colored `▀` cells. Covers both plugin-panel images and
     /// Claude `[Image #N]` previews.
+    ///
+    /// fork: compiled out unless `--features host-images`. The no-op keeps the
+    /// call sites (here and `src/server/headless.rs`) untouched so an upstream
+    /// merge never collides with a deleted method.
+    #[cfg(not(feature = "host-images"))]
+    pub(crate) fn paint_halfblock_images(
+        &self,
+        _frame_area: ratatui::layout::Rect,
+        _buf: &mut ratatui::buffer::Buffer,
+    ) {
+    }
+
+    #[cfg(feature = "host-images")]
     pub(crate) fn paint_halfblock_images(
         &self,
         frame_area: ratatui::layout::Rect,

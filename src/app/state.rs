@@ -2057,6 +2057,12 @@ impl AppState {
     /// only covered the half-block path because the socket API that retains
     /// layers arrived later (upstream 0.7.5). Both paths now answer to this one
     /// predicate so they cannot drift apart again.
+    ///
+    /// fork: deliberately NOT `allow(dead_code)` under `not(feature =
+    /// "host-images")`. The gate's original twin of this comment assumed only the
+    /// host image renderer read this, which stopped being true once the retained
+    /// pane-graphics path in `kitty_graphics.rs` started calling it — and
+    /// `kitty_graphics` stays compiled in. It is live either way.
     pub(crate) fn overlay_suppresses_host_images(&self) -> bool {
         !matches!(self.mode, Mode::Terminal)
     }
@@ -2147,6 +2153,10 @@ impl AppState {
     /// the host image layer to resolve `[Image #N]` cache files. Lives here
     /// because it reads `crate::app::creation`, which is private to the `app`
     /// module.
+    // fork: only the host image renderer and its unit tests read this; it goes
+    // dead when the `host-images` feature is off. Kept (not gated) so an upstream
+    // merge that touches it has nothing to collide with.
+    #[cfg_attr(not(feature = "host-images"), allow(dead_code))]
     pub(crate) fn claude_session_value_for_pane(
         &self,
         ws_idx: usize,

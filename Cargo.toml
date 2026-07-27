@@ -50,6 +50,20 @@ usage-dash-core = { path = "crates/usage-dash-core" }
 wasmtime = "32.0.0"
 schemars = { version = "1.2.1", features = ["derive"] }
 
+[features]
+# fork: the host image renderer (`src/host_image.rs` — the `~/.claude/image-cache`
+# reader, Claude `[Image #N]` placeholder resolution, and the half-block mosaic
+# fallback) is compiled OUT by default on this fork. It is a feature rather than a
+# deletion so an upstream merge that touches image code still applies cleanly:
+# turning it back on is `--features host-images`, not a revert.
+#
+# NOTE: this gates `host_image` ONLY. `kitty_graphics` stays compiled in — 0.7.5
+# added the pane-graphics socket API on top of `kitty_graphics::HostCellSize`
+# (`src/api/server/pane_graphics_stream.rs`, `src/app/api/pane_graphics.rs`), so
+# removing it would break upstream API surface, not just images.
+default = []
+host-images = []
+
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
 

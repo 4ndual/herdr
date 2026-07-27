@@ -71,6 +71,8 @@ mod goal_host;
 mod handoff_runtime;
 mod harness_host;
 mod historial_host;
+// fork: off by default — see the `host-images` feature in Cargo.toml.
+#[cfg(feature = "host-images")]
 mod host_image;
 mod input;
 mod integration;
