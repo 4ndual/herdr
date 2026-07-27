@@ -66,6 +66,12 @@ impl App {
             cwd,
             &argv,
             &launch_env,
+            // fork(0.7.5-merge): upstream 0.7.5 added an `agent_detection` param
+            // to `spawn_argv_command`. The resume picker is a short-lived helper
+            // UI, not an agent pane, so detection is disabled — matching what
+            // upstream's own popup helper passes (`src/app/popup.rs`). This also
+            // stops the picker terminal from being misdetected as a live agent.
+            crate::pane::AgentDetection::Disabled,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
             self.event_tx.clone(),

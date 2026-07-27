@@ -30,6 +30,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 #[cfg(not(windows))]
 use crossterm::event::{PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
+use crossterm::terminal::{DisableLineWrap, EnableLineWrap};
 use interprocess::local_socket::traits::Stream as _;
 use interprocess::TryClone as _;
 use tracing::{debug, info, warn};
@@ -404,6 +405,8 @@ fn setup_terminal_with_capabilities(
         io::stdout().flush()?;
     }
 
+    execute!(io::stdout(), DisableLineWrap)?;
+
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
         reset_host_color_scheme_reports: host_color_scheme_reports,
@@ -453,7 +456,9 @@ fn write_terminal_restore_postlude(
 
 fn should_draw_host_cursor(mode: crate::config::HostCursorModeConfig) -> bool {
     match mode {
-        crate::config::HostCursorModeConfig::Auto => cfg!(windows),
+        crate::config::HostCursorModeConfig::Auto => {
+            crate::platform::should_draw_host_cursor_by_default()
+        }
         crate::config::HostCursorModeConfig::Native => false,
         crate::config::HostCursorModeConfig::Drawn => true,
     }
@@ -574,6 +579,7 @@ fn restore_terminal_state(
 
     let _ = execute!(
         io::stdout(),
+        EnableLineWrap,
         DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture
@@ -2198,10 +2204,10 @@ mod tests {
     }
 
     #[test]
-    fn host_cursor_policy_auto_uses_drawn_cursor_on_windows() {
+    fn host_cursor_policy_auto_uses_platform_default() {
         assert_eq!(
             should_draw_host_cursor(crate::config::HostCursorModeConfig::Auto),
-            cfg!(windows)
+            crate::platform::should_draw_host_cursor_by_default()
         );
     }
 

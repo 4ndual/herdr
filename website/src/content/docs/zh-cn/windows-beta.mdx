@@ -15,7 +15,7 @@ Windows 上的 Herdr 使用 ConPTY 和 Windows 的进程/运行时行为,而不�
 powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
 ```
 
-Windows 测试版构建只通过预览通道发布。Windows 安装器默认使用预览通道,把 `channel = "preview"` 写入 Herdr 配置,将发布版本保存在 `%USERPROFILE%\.herdr\packages\standalone\releases` 下,让 `%LOCALAPPDATA%\Programs\Herdr\bin` 指向当前版本,并保留少量旧版本,以免运行中的进程阻塞更新。
+Windows 测试版构建只通过预览通道发布。在 Windows 上,Herdr 默认使用预览通道,且不会修改你的配置。安装器将发布版本保存在 `%USERPROFILE%\.herdr\packages\standalone\releases` 下,让 `%LOCALAPPDATA%\Programs\Herdr\bin` 指向当前版本,并保留少量旧版本,以免运行中的进程阻塞更新。
 
 对于内部测试,`HERDR_MANIFEST_URL` 可以让安装器指向自定义清单,而不是 Herdr 的稳定或预览清单。
 
@@ -48,14 +48,36 @@ Windows 智能体进程检测会扫描窗格 shell 的后代进程,识别直接�
 | shell `cd` 之后的实时 cwd | 部分支持 |
 | 通过 shell 集成/OSC7 的实时 cwd | 测试版 |
 | 向智能体粘贴剪贴板图像 | 未验证 |
-| CJK 隐藏光标显示 | 测试版 |
+| CJK 输入法候选窗口定位 | 部分支持 |
 | Kitty graphics 渲染 | 未验证 |
+| 主机光标渲染 | 部分支持 |
 
 Herdr 可以在正确的目录中启动窗格,并能从你启动 Herdr 的目录创建初始工作区。启动之后 PowerShell 的目录变化则不同: Herdr 能检查的进程字段无法可靠跟踪后续的逻辑 `cd` 变化。实时 cwd 上报请使用 Herdr 集成或提示符 shell 集成。
 
 Windows Terminal 可能为特定智能体支持图像粘贴路径,但 Herdr 自己的剪贴板图像读取器尚未在 Windows 上接通。在 Windows 剪贴板桥实现并测试之前,请把 `alt+v` 图像粘贴视为未验证。远程剪贴板图像桥是独立功能,仍然绑定于 Unix/macOS 的 `herdr --remote`。
 
 Kitty graphics 仍是实验性功能,尚未宣称支持 Windows。除非你专门在 Windows Terminal 中测试图像渲染,否则保持 `experimental.kitty_graphics = false`。
+
+## 已知注意事项
+
+### 光标渲染
+
+Herdr 的原生 Windows 窗格依赖 ConPTY。当前 Windows 终端的光标处理可能会在多路复用器重绘屏幕时显示中间光标位置。因此,在持续输出期间,原生光标可能闪烁、跳动,或短暂留在旧位置。这个现象也能在其他 Windows 原生终端多路复用器以及直接连续更新 VT 光标位置的压力测试中复现,所以 Herdr 无法在保留原生光标行为的同时彻底消除它。
+
+为了优先保证视觉稳定性,默认的 `host_cursor = "auto"` 会在原生 Windows 和 WSL 上把 Herdr 光标绘制为终端单元格内容。其他 Linux 和 macOS 客户端仍使用原生终端光标。Windows 上的绘制光标稳定且不闪烁,但不会使用外层终端的原生闪烁、形状或光标颜色。
+
+绘制光标并不是 Windows 用来定位输入法预编辑文本和候选窗口的真实光标。因此,韩语、日语或中文输入法 UI 可能显示在错误位置。如果遇到这个问题,请改用外层终端光标:
+
+```toml
+[ui]
+host_cursor = "native"
+```
+
+原生模式会恢复输入法定位,但在持续输出期间可能再次出现偶发的光标闪烁、跳动或旧位置残影。这是当前 Windows 测试版中的兼容性取舍。
+
+### 键盘和鼠标
+
+Windows 终端并不都以相同形式报告带修饰键的按键。Herdr 在 Windows Terminal 和 Windows 上的 Alacritty 中保留鼠标报告和 `ctrl+j`,但 `shift+enter` 只有在外层终端把它报告为独立的修饰 Enter 键时才有效。如果 Windows 或终端把它报告为普通 Enter,Herdr 会转发普通 Enter。
 
 ## 复制与粘贴
 

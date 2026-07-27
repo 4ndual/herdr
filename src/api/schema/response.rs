@@ -97,15 +97,26 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
-    AgentPrompted {
-        agent: AgentInfo,
-    },
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
     },
+    // fork(0.7.5-merge): `AgentPrompted` was declared by BOTH the fork and
+    // upstream 0.7.5, in different regions of this enum, so git auto-merged both
+    // copies in with no conflict marker. Kept upstream's (identical shape); the
+    // fork's duplicate above `AgentStarted` was removed.
+    AgentPrompted {
+        agent: AgentInfo,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
+    },
+    AgentView {
+        active: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     PaneInfo {
         pane: PaneInfo,
@@ -154,6 +165,10 @@ pub enum ResponseResult {
     },
     PaneRead {
         read: PaneReadResult,
+    },
+    PaneGraphicsInfo {
+        cell_width_px: u32,
+        cell_height_px: u32,
     },
     AgentExplain {
         explain: serde_json::Value,

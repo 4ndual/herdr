@@ -6,6 +6,7 @@ use super::common::AgentStatus;
 use super::common::SplitDirection;
 use super::panes::PaneInfo;
 use super::workspaces::WorkspaceWorktreeInfo;
+use crate::popup_size::PopupSize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginLinkParams {
@@ -48,6 +49,8 @@ pub struct InstalledPluginInfo {
     pub platforms: Option<Vec<PluginPlatform>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build: Vec<PluginManifestBuild>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub startup: Vec<PluginManifestStartup>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<PluginManifestAction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -233,6 +236,13 @@ pub struct PluginManifestBuild {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginManifestStartup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<PluginPlatform>>,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginManifestAction {
     pub id: String,
     pub title: String,
@@ -263,6 +273,10 @@ pub struct PluginManifestPane {
     pub platforms: Option<Vec<PluginPlatform>>,
     #[serde(default)]
     pub placement: PluginPanePlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<PopupSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<PopupSize>,
     pub command: Vec<String>,
 }
 
@@ -438,7 +452,7 @@ pub enum PluginUiCapability {
     /// API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.
     ApiWrite,
     /// API v3 (§5.3): text/keystroke-injecting socket API methods via
-    /// `HostEffect::Api` (`pane.send_text`, `agent.send`).
+    /// `HostEffect::Api` (`pane.send_text`, `agent.send_keys`).
     ApiInput,
 }
 
@@ -577,6 +591,10 @@ pub struct PluginPaneOpenParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PluginPanePlacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<PopupSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<PopupSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<String>,
@@ -597,6 +615,7 @@ pub struct PluginPaneOpenParams {
 pub enum PluginPanePlacement {
     #[default]
     Overlay,
+    Popup,
     Split,
     Tab,
     Zoomed,

@@ -52,7 +52,12 @@ const WRITE_METHODS: &[&str] = &[
     "plugin.action.invoke",
 ];
 
-const INPUT_METHODS: &[&str] = &["pane.send_text", "agent.send"];
+// fork(0.7.5-merge): upstream renamed `agent.send` to `agent.send_keys` in 0.7.5.
+// Upstream's new `agent.prompt` is deliberately NOT allowed here: it accepts
+// `wait` options and can block the host inside the bridge's synchronous call
+// path, which is the same reason `events.wait` / `pane.wait_for_output` are in
+// the never-allowed list below.
+const INPUT_METHODS: &[&str] = &["pane.send_text", "agent.send_keys"];
 
 /// Host-reserved administration: exact-name denies regardless of capability.
 const DENIED_EXACT_METHODS: &[&str] = &[
@@ -189,8 +194,12 @@ mod tests {
             ApiMethodDecision::Allow(PluginUiCapability::ApiInput)
         );
         assert_eq!(
-            decide("agent.send"),
+            decide("agent.send_keys"),
             ApiMethodDecision::Allow(PluginUiCapability::ApiInput)
         );
+        // fork(0.7.5-merge): the pre-0.7.5 name must no longer be allowed, and
+        // upstream's blocking-capable `agent.prompt` stays default-denied.
+        assert_eq!(decide("agent.send"), ApiMethodDecision::Deny);
+        assert_eq!(decide("agent.prompt"), ApiMethodDecision::Deny);
     }
 }
