@@ -326,6 +326,24 @@ pub struct PluginManifestUiModule {
     /// fallback). Purely host-consumed — it never crosses the wasm guest ABI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_file: Option<String>,
+    /// fork: absolute directory roots this module may load images from at
+    /// runtime via `pane.graphics.set { source_path }`. Only meaningful together
+    /// with the `pane_graphics` capability.
+    ///
+    /// This is the dynamic generalisation of `image_file` above. `image_file` is
+    /// fixed at manifest time, which cannot serve an image whose path is chosen
+    /// per frame (a Claude session's `<session>/<N>.png`, say). `source_path`
+    /// can — so the roots it may reach have to be declared up front rather than
+    /// chosen by the guest, and they are visible in the manifest and in
+    /// `plugin list` before anyone enables the plugin.
+    ///
+    /// Empty (the default) means a plugin-owned `set` may not use `source_path`
+    /// at all. This is the whole security story of the field: a wasm guest has
+    /// no WASI and no host imports, so it cannot read a file — `source_path` is
+    /// the only way it can cause the host to read one on its behalf, and an
+    /// undeclared root makes that a refusal rather than a filesystem oracle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphics_roots: Vec<String>,
     /// fork(wave-2): optional argv naming a command the host executes on each
     /// dashboard tick to PRODUCE this module's snapshot out-of-process, so
     /// collection logic hot-reloads (rebuild the bin) without a host rebuild.
@@ -339,14 +357,18 @@ pub struct PluginManifestUiModule {
     pub collector: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginUiModuleKind {
     #[default]
     Wasm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginHotReloadMode {
     Off,
@@ -407,7 +429,9 @@ fn default_panel_min_peer() -> u16 {
     24
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPanelRegion {
     /// Share the usage-strip band: carve a slot beside the usage dash (its own
@@ -424,7 +448,9 @@ pub enum PluginPanelRegion {
     Free,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPanelAlign {
     #[default]
@@ -454,6 +480,13 @@ pub enum PluginUiCapability {
     /// API v3 (§5.3): text/keystroke-injecting socket API methods via
     /// `HostEffect::Api` (`pane.send_text`, `agent.send_keys`).
     ApiInput,
+    /// fork: `pane.graphics.*` via `HostEffect::Api` — painting an image into a
+    /// pane's cell grid. Deliberately NOT folded into `ApiWrite`: drawing over a
+    /// pane is a different power from splitting or closing one, it is the only
+    /// capability that puts pixels on screen outside the plugin's own surface,
+    /// and separating it means `plugin list` shows exactly which plugin holds
+    /// the right to draw into the user's panes.
+    PaneGraphics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

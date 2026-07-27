@@ -90,6 +90,11 @@ pub enum UiCapability {
     /// `HostEffect::Api`. Split out from `ApiWrite` because injecting text into a
     /// pane/agent is arbitrary command execution in the user's shells.
     ApiInput,
+    /// fork: `pane.graphics.set`/`.clear`/`.info` via `HostEffect::Api`. Split
+    /// out from `ApiWrite` for the same reason `ApiInput` is: it is a distinct
+    /// power — painting into a pane the module does not own — and it should be
+    /// grantable, refusable and visible on its own.
+    PaneGraphics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

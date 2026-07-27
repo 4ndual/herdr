@@ -76,13 +76,25 @@ impl App {
                 "image_width and image_height must be greater than zero",
             );
         }
-        let max_bytes = if params.data.is_some() {
+        // fork: `source_path` is capped at the STREAM limit, not the SET limit.
+        // The 512 KiB SET cap exists only because `data_base64` rides one JSON
+        // line on the socket; a host-side file read has no such constraint, and
+        // capping it at 512 KiB would exclude images that are otherwise fine
+        // (3 of the 15 files in the real Claude image cache exceed it).
+        let from_source_path = params.data.is_none() && !params.source_path.is_empty();
+        let max_bytes = if params.data.is_some() || from_source_path {
             PANE_GRAPHICS_STREAM_MAX_BYTES
         } else {
             PANE_GRAPHICS_SET_MAX_BYTES
         };
         let data = match params.data {
             Some(data) => data,
+            None if from_source_path => {
+                match self.read_pane_graphics_source(&params.source_path, owner.as_deref()) {
+                    Ok(data) => data,
+                    Err((code, message)) => return encode_error(id, code, message),
+                }
+            }
             None => match base64::engine::general_purpose::STANDARD.decode(params.data_base64) {
                 Ok(data) => data,
                 Err(_) => {
@@ -125,6 +137,82 @@ impl App {
         self.state.upsert_pane_graphics_layer(pane_id, layer);
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// fork: read the bytes for a `source_path` set, enforcing the allowlist.
+    ///
+    /// The two callers are deliberately treated differently:
+    ///
+    /// * `owner == None` — a socket API caller. Unrestricted, because it grants
+    ///   no new power: anything that can open the herdr socket can already read
+    ///   the file itself and send it as `data_base64`. Refusing here would buy
+    ///   nothing and break the efficient path for the user's own CLI.
+    /// * `owner == Some(plugin)` — a UI plugin. Restricted to the roots that
+    ///   plugin's manifest declared, because it DOES grant new power: the wasm
+    ///   guest has no WASI and no host imports, so without an allowlist this
+    ///   would turn a sandboxed module into an arbitrary-file-read primitive
+    ///   with the host as its confused deputy.
+    ///
+    /// Canonicalisation happens before the prefix comparison, on both sides, so
+    /// neither `..` nor a symlink planted inside an allowed root can escape it.
+    /// The comparison is component-wise rather than string-prefix so that a root
+    /// of `/a/img` does not accidentally admit `/a/imgsecrets/x.png`.
+    fn read_pane_graphics_source(
+        &self,
+        source_path: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<u8>, (&'static str, String)> {
+        let requested = std::path::Path::new(source_path);
+        if !requested.is_absolute() {
+            return Err((
+                "invalid_source_path",
+                "source_path must be an absolute path".to_string(),
+            ));
+        }
+        let canonical = requested.canonicalize().map_err(|_| {
+            (
+                "source_not_found",
+                "source_path does not resolve to an existing file".to_string(),
+            )
+        })?;
+        let metadata = canonical.metadata().map_err(|_| {
+            (
+                "source_not_found",
+                "source_path does not resolve to an existing file".to_string(),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err((
+                "invalid_source_path",
+                "source_path must name a regular file".to_string(),
+            ));
+        }
+        if metadata.len() > PANE_GRAPHICS_STREAM_MAX_BYTES as u64 {
+            return Err(("image_too_large", "image data is too large".to_string()));
+        }
+
+        if let Some(plugin_id) = owner.and_then(|owner| owner.strip_prefix("plugin:")) {
+            let roots = self.ui_plugins.graphics_roots_for_plugin(plugin_id);
+            let permitted = roots.iter().any(|root| {
+                std::path::Path::new(root)
+                    .canonicalize()
+                    .is_ok_and(|root| canonical.starts_with(&root))
+            });
+            if !permitted {
+                return Err((
+                    "source_not_allowed",
+                    "source_path is not under a graphics_roots entry declared by this plugin"
+                        .to_string(),
+                ));
+            }
+        }
+
+        std::fs::read(&canonical).map_err(|_| {
+            (
+                "source_not_found",
+                "source_path could not be read".to_string(),
+            )
+        })
     }
 
     pub(super) fn handle_pane_graphics_clear(
@@ -375,6 +463,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams {
                     grid_cols: 10,
                     grid_rows: 4,
@@ -420,9 +509,270 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3, 4]),
+                source_path: String::new(),
                 placement: Default::default(),
             }),
         }
+    }
+
+    /// fork: build a `UiPluginManager` holding one module of `plugin_id` that
+    /// declares `roots`, so the allowlist has something real to consult.
+    fn manager_with_graphics_roots(
+        plugin_id: &str,
+        roots: Vec<String>,
+    ) -> crate::ui_plugins::UiPluginManager {
+        let plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: plugin_id.into(),
+            name: plugin_id.into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: format!("/tmp/{plugin_id}/herdr-plugin.toml").into(),
+            plugin_root: format!("/tmp/{plugin_id}").into(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: Vec::new(),
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                id: "images".into(),
+                title: "Images".into(),
+                description: None,
+                platforms: None,
+                kind: Default::default(),
+                api_version: 2,
+                module: "dist/images.wasm".into(),
+                hot_reload: Default::default(),
+                surfaces: vec![crate::api::schema::PluginUiSurface::Header],
+                placement: None,
+                capabilities: vec![crate::api::schema::PluginUiCapability::PaneGraphics],
+                ui_input_file: None,
+                image_file: None,
+                graphics_roots: roots,
+                collector: None,
+            }],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        };
+        crate::ui_plugins::UiPluginManager::from_installed_plugins(
+            &std::collections::HashMap::from([(plugin.plugin_id.clone(), plugin)]),
+        )
+    }
+
+    fn source_set_request(
+        id: &str,
+        pane_id: &str,
+        owner: &str,
+        source: &str,
+    ) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                pane_id: pane_id.to_string(),
+                owner: owner.to_string(),
+                format: crate::api::schema::PaneGraphicsFormat::Rgba,
+                image_width: 1,
+                image_height: 1,
+                data: None,
+                data_base64: String::new(),
+                source_path: source.to_string(),
+                placement: Default::default(),
+            }),
+        }
+    }
+
+    fn source_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr_pane_graphics_source_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The point of the allowlist. A plugin that declared no `graphics_roots`
+    /// must not be able to make the host read a file for it — the wasm guest has
+    /// no WASI, so without this check `source_path` would hand a sandboxed module
+    /// an arbitrary-file-read primitive using the host as its deputy.
+    #[test]
+    fn plugin_source_path_is_refused_without_a_declared_root() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("undeclared");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [1_u8, 2, 3, 4]).unwrap();
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared root works, and the bytes come off disk rather than the wire.
+    #[test]
+    fn plugin_source_path_is_allowed_under_a_declared_root() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        let dir = source_test_dir("declared");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [9_u8, 8, 7, 6]).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![dir.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].data, vec![9_u8, 8, 7, 6]);
+        assert_eq!(layers[0].owner.as_deref(), Some("plugin:images"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check that a string-prefix comparison would fail. A symlink planted
+    /// INSIDE an allowed root pointing outside it must not smuggle the target
+    /// through, which is why both sides are canonicalised before comparing.
+    #[test]
+    #[cfg(unix)]
+    fn plugin_source_path_cannot_escape_a_declared_root_via_symlink() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("symlink");
+        let allowed = dir.join("allowed");
+        let secret_dir = dir.join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("secret.rgba");
+        std::fs::write(&secret, [1_u8, 2, 3, 4]).unwrap();
+        let bait = allowed.join("bait.rgba");
+        std::os::unix::fs::symlink(&secret, &bait).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![allowed.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "symlink",
+            &public_pane_id,
+            "plugin:images",
+            bait.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+
+        // ..and `..` inside the request is equally dead, for the same reason.
+        let traversal = allowed.join("../secret/secret.rgba");
+        let response = app.handle_api_request(source_set_request(
+            "traversal",
+            &public_pane_id,
+            "plugin:images",
+            traversal.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sibling directory whose name merely STARTS WITH an allowed root is not
+    /// under it. `/x/img` must not admit `/x/img-secrets`.
+    #[test]
+    fn plugin_source_path_rejects_a_sibling_root_sharing_a_name_prefix() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("prefix");
+        let allowed = dir.join("img");
+        let sibling = dir.join("img-secrets");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = sibling.join("a.rgba");
+        std::fs::write(&file, [1_u8, 2, 3, 4]).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![allowed.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "prefix",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The socket caller is deliberately unrestricted: it can already read the
+    /// file itself and send it as `data_base64`, so an allowlist would cost it
+    /// the efficient path while buying no safety.
+    #[test]
+    fn socket_caller_source_path_is_unrestricted() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        let dir = source_test_dir("socket");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [4_u8, 3, 2, 1]).unwrap();
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "",
+            file.to_str().unwrap(),
+        ));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap()[0].data,
+            vec![4_u8, 3, 2, 1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative path, a directory, and a missing file are all refused before
+    /// any allowlist question is asked.
+    #[test]
+    fn source_path_rejects_relative_directory_and_missing_targets() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("shape");
+
+        let response =
+            app.handle_api_request(source_set_request("rel", &public_pane_id, "", "a/b.rgba"));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_source_path");
+
+        let response = app.handle_api_request(source_set_request(
+            "dir",
+            &public_pane_id,
+            "",
+            dir.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_source_path");
+
+        let response = app.handle_api_request(source_set_request(
+            "missing",
+            &public_pane_id,
+            "",
+            dir.join("nope.rgba").to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_found");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// fork: two plugins COEXIST on one pane, one layer each, in a deterministic
@@ -578,6 +928,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -698,6 +1049,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: public_data.clone(),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -715,6 +1067,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: public_data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -733,6 +1086,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: wrong_owner_data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -788,6 +1142,7 @@ mod tests {
                     image_height: u32::MAX,
                     data: None,
                     data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8]),
+                    source_path: String::new(),
                     placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
                 }),
             });
@@ -819,6 +1174,7 @@ mod tests {
                         data: None,
                         data_base64: base64::engine::general_purpose::STANDARD
                             .encode(vec![1_u8; data_len]),
+                        source_path: String::new(),
                         placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
                     }),
                 });
@@ -855,6 +1211,7 @@ mod tests {
                     PANE_GRAPHICS_SET_MAX_BYTES
                         + 1
                 ]),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -890,6 +1247,7 @@ mod tests {
                 image_height: 1,
                 data: Some(vec![1_u8]),
                 data_base64: String::new(),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });

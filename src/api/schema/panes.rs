@@ -281,6 +281,23 @@ pub struct PaneGraphicsSetParams {
     pub data: Option<Vec<u8>>,
     #[serde(default)]
     pub data_base64: String,
+    /// fork: absolute path to an image file the HOST reads instead of taking
+    /// bytes over the wire. Empty (the default) keeps the original `data_base64`
+    /// behaviour.
+    ///
+    /// Exists because the two callers have asymmetric power. A socket caller can
+    /// already open the file itself and base64 it, so for that caller this is
+    /// only an efficiency win and stays unrestricted. A UI-plugin caller cannot:
+    /// the wasm guest has no WASI and no imports. For that caller the path must
+    /// resolve, after canonicalisation, under one of the roots its manifest
+    /// declared in `graphics_roots` — otherwise `source_path` would hand a
+    /// sandboxed guest an arbitrary-file-read primitive.
+    ///
+    /// It also sidesteps the 512 KiB `data_base64` cap, which exists only
+    /// because that payload rides a single JSON line on the socket. A file read
+    /// has no such constraint and is capped at the streaming limit instead.
+    #[serde(default)]
+    pub source_path: String,
     #[serde(default)]
     pub placement: PaneGraphicsPlacementParams,
 }

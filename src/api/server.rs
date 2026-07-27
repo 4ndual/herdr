@@ -1342,6 +1342,7 @@ mod pane_graphics_request_tests {
                 data_base64: base64::engine::general_purpose::STANDARD
                     .encode(vec![1_u8; crate::api::schema::PANE_GRAPHICS_SET_MAX_BYTES]),
                 data: None,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         };

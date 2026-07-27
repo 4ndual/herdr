@@ -2547,6 +2547,11 @@
                 "viewport_col": 0,
                 "viewport_row": 0
               }
+            },
+            "source_path": {
+              "default": "",
+              "description": "fork: absolute path to an image file the HOST reads instead of taking\nbytes over the wire. Empty (the default) keeps the original `data_base64`\nbehaviour.\n\nExists because the two callers have asymmetric power. A socket caller can\nalready open the file itself and base64 it, so for that caller this is\nonly an efficiency win and stays unrestricted. A UI-plugin caller cannot:\nthe wasm guest has no WASI and no imports. For that caller the path must\nresolve, after canonicalisation, under one of the roots its manifest\ndeclared in `graphics_roots` — otherwise `source_path` would hand a\nsandboxed guest an arbitrary-file-read primitive.\n\nIt also sidesteps the 512 KiB `data_base64` cap, which exists only\nbecause that payload rides a single JSON line on the socket. A file read\nhas no such constraint and is capped at the streaming limit instead.",
+              "type": "string"
             }
           },
           "required": [
@@ -8467,6 +8472,13 @@
                 "null"
               ]
             },
+            "graphics_roots": {
+              "description": "fork: absolute directory roots this module may load images from at\nruntime via `pane.graphics.set { source_path }`. Only meaningful together\nwith the `pane_graphics` capability.\n\nThis is the dynamic generalisation of `image_file` above. `image_file` is\nfixed at manifest time, which cannot serve an image whose path is chosen\nper frame (a Claude session's `<session>/<N>.png`, say). `source_path`\ncan — so the roots it may reach have to be declared up front rather than\nchosen by the guest, and they are visible in the manifest and in\n`plugin list` before anyone enables the plugin.\n\nEmpty (the default) means a plugin-owned `set` may not use `source_path`\nat all. This is the whole security story of the field: a wasm guest has\nno WASI and no host imports, so it cannot read a file — `source_path` is\nthe only way it can cause the host to read one on its behalf, and an\nundeclared root makes that a refusal rather than a filesystem oracle.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "hot_reload": {
               "$ref": "#/schemas/success_response/$defs/PluginHotReloadMode",
               "default": "on"
@@ -8739,6 +8751,11 @@
             {
               "const": "api_input",
               "description": "API v3 (§5.3): text/keystroke-injecting socket API methods via\n`HostEffect::Api` (`pane.send_text`, `agent.send_keys`).",
+              "type": "string"
+            },
+            {
+              "const": "pane_graphics",
+              "description": "fork: `pane.graphics.*` via `HostEffect::Api` — painting an image into a\npane's cell grid. Deliberately NOT folded into `ApiWrite`: drawing over a\npane is a different power from splitting or closing one, it is the only\ncapability that puts pixels on screen outside the plugin's own surface,\nand separating it means `plugin list` shows exactly which plugin holds\nthe right to draw into the user's panes.",
               "type": "string"
             }
           ]

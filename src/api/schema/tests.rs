@@ -949,6 +949,7 @@ fn plugin_link_list_unlink_round_trip() {
             ],
             ui_input_file: None,
             image_file: None,
+            graphics_roots: Vec::new(),
             collector: None,
         }],
         link_handlers: vec![PluginManifestLinkHandler {
