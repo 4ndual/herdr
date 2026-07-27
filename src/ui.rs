@@ -606,6 +606,20 @@ fn layout_plugin_panels(
         // Gate on live content, exactly like the usage-strip / right-panel
         // carves: an idle panel reserves nothing.
         if content_w == 0 && content_h == 0 {
+            // A panel that vanishes here looks identical to one that was never
+            // registered: no warning, no toast, and `plugin list` still says
+            // enabled. Logging the skip is what separates "the module produced
+            // no nodes this frame" from "the module produced nodes but the
+            // region could not fit them" — the latter leaves no line here and
+            // dies in one of the region arms below instead.
+            tracing::debug!(
+                plugin_id = %entry.plugin_id,
+                module_id = %entry.module_id,
+                content_w,
+                content_h,
+                region = ?placement.region,
+                "plugin panel skipped: no content to carve for"
+            );
             continue;
         }
         let size = placement.size.as_deref();
