@@ -59,6 +59,23 @@ const WRITE_METHODS: &[&str] = &[
 // the never-allowed list below.
 const INPUT_METHODS: &[&str] = &["pane.send_text", "agent.send_keys"];
 
+/// fork: pane-graphics methods, gated on `PaneGraphics`.
+///
+/// `pane.graphics.set` is the host-side primitive the image plugin is built on:
+/// the plugin decides which image goes where, the host owns the bytes and the
+/// terminal escape emission. `.info` is read-only (cell pixel size) but lives
+/// here rather than in `READ_METHODS` so one capability covers the whole group —
+/// a module that cannot paint has no use for the cell metrics.
+///
+/// Not blocking: `set` is a synchronous state write with a 512 KiB payload cap,
+/// no waiting and no streaming. `pane.graphics.stream` is the streaming sibling
+/// and is deliberately absent — it is listed in `BLOCKING_METHODS` instead.
+const PANE_GRAPHICS_METHODS: &[&str] = &[
+    "pane.graphics.set",
+    "pane.graphics.clear",
+    "pane.graphics.info",
+];
+
 /// Host-reserved administration: exact-name denies regardless of capability.
 const DENIED_EXACT_METHODS: &[&str] = &[
     "plugin.link",
@@ -83,7 +100,19 @@ const DENIED_PREFIXES: &[&str] = &["server."];
 /// Blocking/streaming methods: MUST NOT appear in any allow row regardless of
 /// capability (§5.3) — run synchronously in-process they would wedge the render
 /// thread. The bridge is strictly request/response.
-const BLOCKING_METHODS: &[&str] = &["events.wait", "events.subscribe", "pane.wait_for_output"];
+const BLOCKING_METHODS: &[&str] = &[
+    "events.wait",
+    "events.subscribe",
+    "pane.wait_for_output",
+    // fork: `pane.graphics.stream` is a multi-frame streaming upload (16 MiB
+    // budget) held open across frames. It is `#[schemars(skip)]` but NOT
+    // `#[serde(skip)]`, so it deserializes fine from a guest-supplied method
+    // name and was surviving on default-deny alone. Listing it here makes the
+    // refusal explicit and load-bearing rather than incidental — the moment
+    // `PaneGraphics` exists, the streaming sibling of an allowed method is
+    // exactly the thing someone would reach for next.
+    "pane.graphics.stream",
+];
 
 /// Decides whether `method` may be invoked through `HostEffect::Api`, and if so
 /// which capability is required. Default-deny: anything matching no row is
@@ -111,6 +140,9 @@ pub(crate) fn decide(method: &str) -> ApiMethodDecision {
     if INPUT_METHODS.contains(&method) {
         return ApiMethodDecision::Allow(PluginUiCapability::ApiInput);
     }
+    if PANE_GRAPHICS_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::PaneGraphics);
+    }
     ApiMethodDecision::Deny
 }
 
@@ -123,6 +155,7 @@ mod tests {
             .iter()
             .chain(WRITE_METHODS.iter())
             .chain(INPUT_METHODS.iter())
+            .chain(PANE_GRAPHICS_METHODS.iter())
             .copied()
     }
 
@@ -160,7 +193,8 @@ mod tests {
             assert!(
                 !READ_METHODS.contains(name)
                     && !WRITE_METHODS.contains(name)
-                    && !INPUT_METHODS.contains(name),
+                    && !INPUT_METHODS.contains(name)
+                    && !PANE_GRAPHICS_METHODS.contains(name),
                 "{name} must not appear in any allow row"
             );
         }
@@ -201,5 +235,44 @@ mod tests {
         // upstream's blocking-capable `agent.prompt` stays default-denied.
         assert_eq!(decide("agent.send"), ApiMethodDecision::Deny);
         assert_eq!(decide("agent.prompt"), ApiMethodDecision::Deny);
+    }
+
+    /// fork: the three pane-graphics methods resolve to their own capability,
+    /// not to `ApiWrite`. Painting into a pane is a distinct power from
+    /// splitting one, so a module granted `api_write` must NOT inherit it.
+    #[test]
+    fn pane_graphics_methods_require_their_own_capability() {
+        for method in [
+            "pane.graphics.set",
+            "pane.graphics.clear",
+            "pane.graphics.info",
+        ] {
+            assert_eq!(
+                decide(method),
+                ApiMethodDecision::Allow(PluginUiCapability::PaneGraphics),
+                "{method} must resolve to PaneGraphics"
+            );
+        }
+        assert!(!WRITE_METHODS.contains(&"pane.graphics.set"));
+        assert!(!READ_METHODS.contains(&"pane.graphics.info"));
+    }
+
+    /// fork: the streaming variant must stay denied even for a module that holds
+    /// `PaneGraphics`. It is reachable by name (`#[schemars(skip)]` hides it from
+    /// the generated schema but serde still accepts the tag), so default-deny is
+    /// not enough on its own once the sibling methods are allowed.
+    #[test]
+    fn pane_graphics_stream_is_denied_even_with_the_capability() {
+        assert_eq!(decide("pane.graphics.stream"), ApiMethodDecision::Deny);
+        assert!(BLOCKING_METHODS.contains(&"pane.graphics.stream"));
+        assert!(
+            serde_json::from_value::<crate::api::schema::Method>(serde_json::json!({
+                "method": "pane.graphics.stream",
+            }))
+            .err()
+            .map(|err| !err.to_string().contains("unknown variant"))
+            .unwrap_or(true),
+            "pane.graphics.stream is reachable by name, so the deny must be explicit"
+        );
     }
 }

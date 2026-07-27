@@ -184,7 +184,10 @@ mod tests {
         )
     }
 
-    fn usage_module(ui_input_file: Option<&str>, collector: Option<Vec<String>>) -> PluginManifestUiModule {
+    fn usage_module(
+        ui_input_file: Option<&str>,
+        collector: Option<Vec<String>>,
+    ) -> PluginManifestUiModule {
         PluginManifestUiModule {
             id: "usage".into(),
             title: "Usage".into(),
@@ -199,6 +202,7 @@ mod tests {
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: ui_input_file.map(str::to_string),
             image_file: None,
+            graphics_roots: Vec::new(),
             collector,
         }
     }
@@ -217,6 +221,7 @@ mod tests {
                 enabled,
                 platforms: None,
                 build: vec![],
+                startup: Vec::new(),
                 actions: vec![],
                 events: vec![],
                 panes: vec![],
@@ -263,7 +268,10 @@ mod tests {
         install_usage_plugin(
             &mut app,
             true,
-            usage_module(Some("usage_input.json"), Some(vec!["/nonexistent/collector".into()])),
+            usage_module(
+                Some("usage_input.json"),
+                Some(vec!["/nonexistent/collector".into()]),
+            ),
         );
         // Sentinel snapshot the built-in refresh (agent=None -> Clear) would wipe.
         app.usage_snapshot = Some(UsageSnapshot::empty(Cli::Claude));

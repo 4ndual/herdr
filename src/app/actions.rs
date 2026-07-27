@@ -3273,13 +3273,14 @@ mod tests {
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {
         state.pane_graphics_layers.insert(
             pane_id,
-            crate::app::state::PaneGraphicsLayer::new(
+            vec![crate::app::state::PaneGraphicsLayer::new(
                 crate::api::schema::PaneGraphicsFormat::Rgba,
                 1,
                 1,
                 vec![1, 2, 3, 4],
                 crate::api::schema::PaneGraphicsPlacementParams::default(),
-            ),
+                None,
+            )],
         );
     }
 
@@ -5603,12 +5604,11 @@ mod tests {
         {
             let terminal = state.terminals.get_mut(&terminal_id).unwrap();
             terminal.cwd = std::path::PathBuf::from("/tmp/work");
-            terminal.persisted_agent_session =
-                Some(crate::agent_resume::PersistedAgentSession {
-                    source: "herdr:claude".into(),
-                    agent: "claude".into(),
-                    session_ref: crate::agent_resume::AgentSessionRef::id("sess-9").unwrap(),
-                });
+            terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-9").unwrap(),
+            });
         }
 
         state.close_selected_workspace();

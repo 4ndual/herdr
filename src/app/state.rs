@@ -27,6 +27,16 @@ pub(crate) struct PaneGraphicsLayer {
     pub data: Vec<u8>,
     pub data_fingerprint: u64,
     pub render: crate::api::schema::PaneGraphicsPlacementParams,
+    /// Who set this layer, as `plugin:<plugin_id>` for a layer set through the
+    /// UI-plugin bridge, or `None` for one set directly over the socket API by
+    /// a CLI or script.
+    ///
+    /// It is the layer's IDENTITY within a pane: one layer per owner, so a `set`
+    /// replaces the caller's own layer and leaves everyone else's alone. It also
+    /// drives cleanup when that plugin is disabled or unlinked, and composite
+    /// order within the pane. A `None` owner is deliberately privileged — the
+    /// user driving the CLI outranks any plugin and may clear anything.
+    pub owner: Option<String>,
 }
 
 impl PaneGraphicsLayer {
@@ -36,6 +46,7 @@ impl PaneGraphicsLayer {
         image_height: u32,
         data: Vec<u8>,
         render: crate::api::schema::PaneGraphicsPlacementParams,
+        owner: Option<String>,
     ) -> Self {
         let data_fingerprint = pane_graphics_data_fingerprint(&data);
         Self {
@@ -45,6 +56,7 @@ impl PaneGraphicsLayer {
             data,
             data_fingerprint,
             render,
+            owner,
         }
     }
 }
@@ -1735,7 +1747,15 @@ pub struct AppState {
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
     /// Runtime image layers owned by API clients and composited over panes.
-    pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, PaneGraphicsLayer>,
+    ///
+    /// fork: a LIST per pane, not one layer. Each distinct owner holds at most
+    /// one layer on a pane, and layers coexist instead of evicting each other,
+    /// so an image plugin and the user's CLI (or two plugins) can paint the same
+    /// pane. The vec is kept in composite order, bottom first: the socket
+    /// caller's layer (`owner == None`) sits at the bottom and plugin layers
+    /// follow sorted by owner, so the paint order is deterministic across
+    /// frames rather than dependent on hash iteration order.
+    pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, Vec<PaneGraphicsLayer>>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2022,8 +2042,96 @@ impl AppState {
     /// drawn on top of the panes — the resume-search popup, settings, global
     /// menu, confirm dialogs, etc. Every mode except `Terminal` draws such an
     /// overlay, so any non-`Terminal` mode suppresses host images.
+    ///
+    /// fork: this also gates the retained `pane_graphics_layers` set through
+    /// `pane.graphics.set`. Those are host-painted after the frame exactly like
+    /// the half-block mosaic, so they bled over overlays too — the original fix
+    /// only covered the half-block path because the socket API that retains
+    /// layers arrived later (upstream 0.7.5). Both paths now answer to this one
+    /// predicate so they cannot drift apart again.
     pub(crate) fn overlay_suppresses_host_images(&self) -> bool {
         !matches!(self.mode, Mode::Terminal)
+    }
+
+    /// Drop every retained pane-graphics layer belonging to `owner`, returning
+    /// how many were removed. Bumps the graphics revision only when something
+    /// actually changed, so an owner with no layers costs nothing.
+    ///
+    /// Exists because a UI plugin gets **no unload or disable event** — there is
+    /// no `UiEvent` variant for it — so a disabled plugin cannot clear its own
+    /// images. Without this, `plugin disable <id>` would leave the plugin's last
+    /// image painted on the pane: an off-switch that reports success and has not
+    /// switched anything off. Called from the plugin disable and unlink paths
+    /// alongside the existing `clear_agent_view_for_source` cleanup, and keyed
+    /// the same way (`plugin:<plugin_id>`) so both cleanups share one convention.
+    pub(crate) fn clear_pane_graphics_layers_for_owner(&mut self, owner: &str) -> usize {
+        let mut removed = 0_usize;
+        for layers in self.pane_graphics_layers.values_mut() {
+            let before = layers.len();
+            layers.retain(|layer| layer.owner.as_deref() != Some(owner));
+            removed += before - layers.len();
+        }
+        // Drop panes whose last layer just went away so `is_empty()` still means
+        // "nothing is painted" — the headless render gate reads it that way.
+        self.pane_graphics_layers
+            .retain(|_, layers| !layers.is_empty());
+        if removed > 0 {
+            self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// fork: insert or replace `layer` on `pane_id`, keyed by its owner, keeping
+    /// the vec in composite order (socket layer bottom, then plugins by owner).
+    ///
+    /// Returns true when this replaced an existing layer of the same owner
+    /// rather than adding a new one — callers use it only for logging; both
+    /// outcomes are success.
+    pub(crate) fn upsert_pane_graphics_layer(
+        &mut self,
+        pane_id: PaneId,
+        layer: PaneGraphicsLayer,
+    ) -> bool {
+        let layers = self.pane_graphics_layers.entry(pane_id).or_default();
+        let replaced = match layers.iter_mut().find(|held| held.owner == layer.owner) {
+            Some(held) => {
+                *held = layer;
+                true
+            }
+            None => {
+                layers.push(layer);
+                false
+            }
+        };
+        layers.sort_by(|a, b| a.owner.cmp(&b.owner));
+        self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        replaced
+    }
+
+    /// fork: remove layers from `pane_id`. `owner` of `None` is the privileged
+    /// socket caller and clears the whole pane; a plugin owner clears only its
+    /// own layer. Returns how many layers went away.
+    pub(crate) fn clear_pane_graphics_layers(
+        &mut self,
+        pane_id: PaneId,
+        owner: Option<&str>,
+    ) -> usize {
+        let Some(layers) = self.pane_graphics_layers.get_mut(&pane_id) else {
+            return 0;
+        };
+        let before = layers.len();
+        match owner {
+            None => layers.clear(),
+            Some(owner) => layers.retain(|layer| layer.owner.as_deref() != Some(owner)),
+        }
+        let removed = before - layers.len();
+        if layers.is_empty() {
+            self.pane_graphics_layers.remove(&pane_id);
+        }
+        if removed > 0 {
+            self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        }
+        removed
     }
 
     /// The Claude Code session UUID backing `pane_id`, or `None` when the pane

@@ -83,8 +83,18 @@ struct HostPlacement {
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 enum HostSourceKey {
-    Terminal { pane_id: PaneId, image_id: u32 },
-    PaneLayer { pane_id: PaneId },
+    Terminal {
+        pane_id: PaneId,
+        image_id: u32,
+    },
+    /// fork: `owner` discriminates COEXISTING layers on one pane. Without it two
+    /// layers of the same pane hash to the same `host_placement_id`, so the
+    /// encoder's diff treats them as one placement and the second silently
+    /// replaces the first instead of compositing over it.
+    PaneLayer {
+        pane_id: PaneId,
+        owner: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -274,11 +284,22 @@ pub(crate) fn has_visible_pane_graphics(
 
     for info in surface.pane_infos {
         let empty_uploaded = HashMap::new();
-        if app.pane_graphics_layers.get(&info.id).is_some_and(|layer| {
-            let host_placement =
-                pane_graphics_host_placement(info, cell_size, layer, &empty_uploaded, false);
-            clipped_placement(&host_placement).is_some()
-        }) {
+        if app
+            .pane_graphics_layers
+            .get(&info.id)
+            .is_some_and(|layers| {
+                layers.iter().any(|layer| {
+                    let host_placement = pane_graphics_host_placement(
+                        info,
+                        cell_size,
+                        layer,
+                        &empty_uploaded,
+                        false,
+                    );
+                    clipped_placement(&host_placement).is_some()
+                })
+            })
+        {
             return true;
         }
 
@@ -568,16 +589,33 @@ fn collect_visible_placements(
         pane_infos_len = surface.pane_infos.len(),
         "collect_visible_placements: starting iteration"
     );
+    // fork: a retained `pane.graphics.set` layer is host-painted after the
+    // frame, so while an overlay is open it draws straight over the dialog —
+    // the same bug `overlay_suppresses_host_images` already fixed for the
+    // half-block path. Dropping the layer from the collected set is enough to
+    // remove it from the screen: the encoder diffs against what it previously
+    // uploaded and emits the delete (see
+    // `removed_pane_layer_deletes_unreferenced_host_image`), and the layer is
+    // re-collected unchanged when the overlay closes.
+    let suppress_host_layers = app.overlay_suppresses_host_images();
     let mut placements = Vec::new();
     for info in surface.pane_infos {
-        if let Some(layer) = app.pane_graphics_layers.get(&info.id) {
-            placements.push(pane_graphics_host_placement(
-                info,
-                cell_size,
-                layer,
-                uploaded_images,
-                true,
-            ));
+        if let Some(layers) = app
+            .pane_graphics_layers
+            .get(&info.id)
+            .filter(|_| !suppress_host_layers)
+        {
+            // Already in composite order (see `pane_graphics_layers`), so pushing
+            // in vec order paints bottom-to-top.
+            for layer in layers {
+                placements.push(pane_graphics_host_placement(
+                    info,
+                    cell_size,
+                    layer,
+                    uploaded_images,
+                    true,
+                ));
+            }
         }
 
         let runtime = match app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
@@ -854,7 +892,10 @@ fn pane_graphics_host_placement(
         pane_id: info.id,
         area: info.inner_rect,
         cell_size,
-        source_key: HostSourceKey::PaneLayer { pane_id: info.id },
+        source_key: HostSourceKey::PaneLayer {
+            pane_id: info.id,
+            owner: pane_graphics_owner_key(layer.owner.as_deref()),
+        },
         scrollback_offset: 0,
         placement: KittyImagePlacement {
             image_id: 1,
@@ -920,13 +961,26 @@ fn pane_graphics_host_image_id(pane_id: PaneId, signature: ImageSignature) -> u3
     PANE_GRAPHICS_IMAGE_ID_BIT | ((hasher.finish() as u32) & !PANE_GRAPHICS_IMAGE_ID_BIT)
 }
 
+/// fork: stable hash of a layer owner, used to keep coexisting layers on one
+/// pane distinct in `HostSourceKey`. The socket caller (`None`) gets its own
+/// value rather than colliding with any plugin id.
+fn pane_graphics_owner_key(owner: Option<&str>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    match owner {
+        None => "\0socket".hash(&mut hasher),
+        Some(owner) => owner.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
 fn host_placement_id(source_key: HostSourceKey, placement: &KittyImagePlacement) -> u32 {
     let mut hasher = DefaultHasher::new();
     match source_key {
         HostSourceKey::Terminal { pane_id, .. } => pane_id.raw().hash(&mut hasher),
-        HostSourceKey::PaneLayer { pane_id } => {
+        HostSourceKey::PaneLayer { pane_id, owner } => {
             "pane.graphics".hash(&mut hasher);
             pane_id.raw().hash(&mut hasher);
+            owner.hash(&mut hasher);
         }
     }
     placement.image_id.hash(&mut hasher);
@@ -1262,6 +1316,7 @@ mod tests {
         let mut placement = test_placement(viewport_col, viewport_row);
         placement.source_key = HostSourceKey::PaneLayer {
             pane_id: placement.pane_id,
+            owner: pane_graphics_owner_key(None),
         };
         placement
     }
@@ -1283,6 +1338,7 @@ mod tests {
             host_placement_id(
                 HostSourceKey::PaneLayer {
                     pane_id: placement.pane_id,
+                    owner: pane_graphics_owner_key(None),
                 },
                 &placement.placement,
             ),
@@ -1327,6 +1383,127 @@ mod tests {
         assert_eq!(clipped.source_y, 10);
     }
 
+    /// fork: a retained `pane.graphics.set` layer must vanish while a modal is
+    /// open. The half-block path has answered to `overlay_suppresses_host_images`
+    /// since the original overlay fix; the retained layers arrived later with
+    /// upstream 0.7.5 and were never wired to it, so they painted straight over
+    /// dialogs. Asserted on `collect_visible_placements` rather than on the mode
+    /// predicate alone, because the predicate was already correct — the bug was
+    /// that nothing on this path consulted it.
+    #[test]
+    fn overlay_mode_suppresses_retained_pane_graphics_layer() {
+        let pane_id = PaneId::from_raw(9);
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 12, 5),
+            inner_rect: Rect::new(0, 0, 12, 5),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        };
+        let mut app = crate::app::AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("img")];
+        app.active = Some(0);
+        app.pane_graphics_layers.insert(
+            pane_id,
+            vec![crate::app::state::PaneGraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                8,
+                8,
+                vec![255; 8 * 8 * 4],
+                crate::api::schema::PaneGraphicsPlacementParams::default(),
+                None,
+            )],
+        );
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let pane_infos = [info];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &pane_infos,
+            split_borders: &[],
+        };
+        let cell_size = HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+
+        app.mode = crate::app::Mode::Terminal;
+        let visible =
+            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        assert_eq!(
+            visible.len(),
+            1,
+            "layer must be collected while no overlay is open"
+        );
+
+        app.mode = crate::app::Mode::GlobalMenu;
+        let suppressed =
+            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        assert!(
+            suppressed.is_empty(),
+            "layer must not be collected while an overlay is open"
+        );
+    }
+
+    /// fork: two owners on one pane must produce two INDEPENDENT placements.
+    ///
+    /// The failure this guards is silent: `host_placement_id` hashes the source
+    /// key, so before `HostSourceKey::PaneLayer` carried an owner both layers
+    /// hashed alike, the encoder's diff treated them as one placement, and the
+    /// second layer replaced the first instead of compositing over it — two
+    /// plugins painting, one image visible, no error anywhere.
+    #[test]
+    fn two_owners_on_one_pane_produce_two_distinct_placements() {
+        let pane_id = PaneId::from_raw(9);
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 12, 5),
+            inner_rect: Rect::new(0, 0, 12, 5),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        };
+        let mut app = crate::app::AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("img")];
+        app.active = Some(0);
+        for (owner, fill) in [(None, 255_u8), (Some("plugin:a".to_string()), 128_u8)] {
+            app.upsert_pane_graphics_layer(
+                pane_id,
+                crate::app::state::PaneGraphicsLayer::new(
+                    crate::api::schema::PaneGraphicsFormat::Rgba,
+                    8,
+                    8,
+                    vec![fill; 8 * 8 * 4],
+                    crate::api::schema::PaneGraphicsPlacementParams::default(),
+                    owner,
+                ),
+            );
+        }
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let pane_infos = [info];
+        let surface = crate::ui::TabSurfaceView {
+            pane_infos: &pane_infos,
+            split_borders: &[],
+        };
+        let cell_size = HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        };
+        app.mode = crate::app::Mode::Terminal;
+
+        let visible =
+            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        assert_eq!(visible.len(), 2, "both layers must be collected");
+
+        let ids: Vec<u32> = visible
+            .iter()
+            .map(|placement| host_placement_id(placement.source_key, &placement.placement))
+            .collect();
+        assert_ne!(
+            ids[0], ids[1],
+            "coexisting layers must not collapse to one placement id"
+        );
+    }
+
     #[test]
     fn pane_graphics_layer_defaults_to_full_pane_grid() {
         let info = PaneInfo {
@@ -1343,6 +1520,7 @@ mod tests {
             30,
             vec![255; 80 * 30 * 4],
             crate::api::schema::PaneGraphicsPlacementParams::default(),
+            None,
         );
 
         let placement = pane_graphics_host_placement(

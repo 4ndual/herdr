@@ -29,13 +29,14 @@ fn enable_graphics_and_render(
 fn set_graphics_layer(server: &mut HeadlessServer, pane_id: crate::layout::PaneId, data: Vec<u8>) {
     server.app.state.pane_graphics_layers.insert(
         pane_id,
-        crate::app::state::PaneGraphicsLayer::new(
+        vec![crate::app::state::PaneGraphicsLayer::new(
             api::schema::PaneGraphicsFormat::Png,
             1,
             1,
             data,
             api::schema::PaneGraphicsPlacementParams::default(),
-        ),
+            None,
+        )],
     );
 }
 
@@ -74,6 +75,7 @@ fn stream_set_message(
                         image_height: 1,
                         data: Some(data),
                         data_base64: String::new(),
+                        source_path: String::new(),
                         placement: api::schema::PaneGraphicsPlacementParams::default(),
                     },
                 ),
@@ -274,6 +276,7 @@ fn stream_set_has_graphics_only_render_impact() {
                 image_height: 1,
                 data: Some(vec![1, 2, 3]),
                 data_base64: String::new(),
+                source_path: String::new(),
                 placement: api::schema::PaneGraphicsPlacementParams::default(),
             }),
         },
@@ -305,6 +308,7 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
                 image_height: 1,
                 data: Some(vec![1, 2, 3]),
                 data_base64: String::new(),
+                source_path: String::new(),
                 placement: api::schema::PaneGraphicsPlacementParams::default(),
             }),
         },

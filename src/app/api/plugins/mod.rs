@@ -133,7 +133,18 @@ impl App {
             self.state
                 .plugin_panes
                 .retain(|_, record| record.plugin_id != plugin_id);
-            self.clear_agent_view_for_source(&format!("plugin:{plugin_id}"));
+            let source = format!("plugin:{plugin_id}");
+            self.clear_agent_view_for_source(&source);
+            // Same reason as the disable path: an unlinked plugin cannot clean
+            // up after itself, so the host drops the images it left behind.
+            let cleared = self.state.clear_pane_graphics_layers_for_owner(&source);
+            if cleared > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared,
+                    "cleared pane graphics layers owned by unlinked plugin"
+                );
+            }
         }
         if removed {
             // fork(wave-2): unmount the unlinked plugin's UI modules from the
@@ -769,7 +780,20 @@ impl App {
         // a toggled plugin's UI modules load/unload without a server restart.
         self.resync_ui_plugins_after_lifecycle_change();
         if !enabled {
-            self.clear_agent_view_for_source(&format!("plugin:{plugin_id}"));
+            let source = format!("plugin:{plugin_id}");
+            self.clear_agent_view_for_source(&source);
+            // A disabled plugin gets no unload event and so cannot clear the
+            // images it painted; without this its last image stays on the pane
+            // and `plugin disable` reports success while the plugin is still
+            // visibly on screen.
+            let cleared = self.state.clear_pane_graphics_layers_for_owner(&source);
+            if cleared > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared,
+                    "cleared pane graphics layers owned by disabled plugin"
+                );
+            }
         }
         if enabled {
             encode_success(id, ResponseResult::PluginEnabled { plugin })
@@ -3550,6 +3574,8 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_PAYLOAD_JSON\" > {}"]
                 plugin_id: "example.payload-pane".into(),
                 entrypoint: "board".into(),
                 placement: Some(PluginPanePlacement::Overlay),
+                width: None,
+                height: None,
                 workspace_id: None,
                 target_pane_id: None,
                 direction: None,

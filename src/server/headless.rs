@@ -4808,6 +4808,7 @@ mod tests {
             Rect::new(0, 0, 100, 30),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            None,
         );
         let rendered = buffer
             .content
@@ -8267,6 +8268,7 @@ next_tab = ""
             ratatui::layout::Rect::new(0, 0, 80, 24),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            None,
         );
         let (_, inner) =
             crate::ui::popup_pane_rects(&server.app.state, server.app.state.view.terminal_area)
@@ -8307,6 +8309,7 @@ next_tab = ""
             ratatui::layout::Rect::new(0, 0, 80, 24),
             true,
             crate::kitty_graphics::HostCellSize::default(),
+            None,
         );
 
         assert_eq!(

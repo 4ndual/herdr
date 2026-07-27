@@ -52,7 +52,14 @@ impl App {
                 "pane already has an active graphics stream",
             );
         }
-        self.set_pane_graphics_layer(id, pane_id, params)
+        // fork: no owner-exclusivity check. Layers COEXIST, one per owner, so a
+        // `set` replaces the caller's own layer and leaves other owners' layers
+        // untouched. This supersedes the earlier `owner_conflict` refusal, which
+        // assumed one layer per pane; with a list per pane there is nothing to
+        // conflict over, and refusing would stop an image plugin and the user's
+        // CLI from painting the same pane for no benefit.
+        let owner = layer_owner(&params.owner);
+        self.set_pane_graphics_layer(id, pane_id, params, owner)
     }
 
     fn set_pane_graphics_layer(
@@ -60,6 +67,7 @@ impl App {
         id: String,
         pane_id: PaneId,
         params: PaneGraphicsSetParams,
+        owner: Option<String>,
     ) -> String {
         if params.image_width == 0 || params.image_height == 0 {
             return encode_error(
@@ -68,13 +76,25 @@ impl App {
                 "image_width and image_height must be greater than zero",
             );
         }
-        let max_bytes = if params.data.is_some() {
+        // fork: `source_path` is capped at the STREAM limit, not the SET limit.
+        // The 512 KiB SET cap exists only because `data_base64` rides one JSON
+        // line on the socket; a host-side file read has no such constraint, and
+        // capping it at 512 KiB would exclude images that are otherwise fine
+        // (3 of the 15 files in the real Claude image cache exceed it).
+        let from_source_path = params.data.is_none() && !params.source_path.is_empty();
+        let max_bytes = if params.data.is_some() || from_source_path {
             PANE_GRAPHICS_STREAM_MAX_BYTES
         } else {
             PANE_GRAPHICS_SET_MAX_BYTES
         };
         let data = match params.data {
             Some(data) => data,
+            None if from_source_path => {
+                match self.read_pane_graphics_source(&params.source_path, owner.as_deref()) {
+                    Ok(data) => data,
+                    Err((code, message)) => return encode_error(id, code, message),
+                }
+            }
             None => match base64::engine::general_purpose::STANDARD.decode(params.data_base64) {
                 Ok(data) => data,
                 Err(_) => {
@@ -112,11 +132,87 @@ impl App {
             params.image_height,
             data,
             params.placement,
+            owner,
         );
-        self.state.pane_graphics_layers.insert(pane_id, layer);
-        self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
+        self.state.upsert_pane_graphics_layer(pane_id, layer);
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    /// fork: read the bytes for a `source_path` set, enforcing the allowlist.
+    ///
+    /// The two callers are deliberately treated differently:
+    ///
+    /// * `owner == None` — a socket API caller. Unrestricted, because it grants
+    ///   no new power: anything that can open the herdr socket can already read
+    ///   the file itself and send it as `data_base64`. Refusing here would buy
+    ///   nothing and break the efficient path for the user's own CLI.
+    /// * `owner == Some(plugin)` — a UI plugin. Restricted to the roots that
+    ///   plugin's manifest declared, because it DOES grant new power: the wasm
+    ///   guest has no WASI and no host imports, so without an allowlist this
+    ///   would turn a sandboxed module into an arbitrary-file-read primitive
+    ///   with the host as its confused deputy.
+    ///
+    /// Canonicalisation happens before the prefix comparison, on both sides, so
+    /// neither `..` nor a symlink planted inside an allowed root can escape it.
+    /// The comparison is component-wise rather than string-prefix so that a root
+    /// of `/a/img` does not accidentally admit `/a/imgsecrets/x.png`.
+    fn read_pane_graphics_source(
+        &self,
+        source_path: &str,
+        owner: Option<&str>,
+    ) -> Result<Vec<u8>, (&'static str, String)> {
+        let requested = std::path::Path::new(source_path);
+        if !requested.is_absolute() {
+            return Err((
+                "invalid_source_path",
+                "source_path must be an absolute path".to_string(),
+            ));
+        }
+        let canonical = requested.canonicalize().map_err(|_| {
+            (
+                "source_not_found",
+                "source_path does not resolve to an existing file".to_string(),
+            )
+        })?;
+        let metadata = canonical.metadata().map_err(|_| {
+            (
+                "source_not_found",
+                "source_path does not resolve to an existing file".to_string(),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err((
+                "invalid_source_path",
+                "source_path must name a regular file".to_string(),
+            ));
+        }
+        if metadata.len() > PANE_GRAPHICS_STREAM_MAX_BYTES as u64 {
+            return Err(("image_too_large", "image data is too large".to_string()));
+        }
+
+        if let Some(plugin_id) = owner.and_then(|owner| owner.strip_prefix("plugin:")) {
+            let roots = self.ui_plugins.graphics_roots_for_plugin(plugin_id);
+            let permitted = roots.iter().any(|root| {
+                std::path::Path::new(root)
+                    .canonicalize()
+                    .is_ok_and(|root| canonical.starts_with(&root))
+            });
+            if !permitted {
+                return Err((
+                    "source_not_allowed",
+                    "source_path is not under a graphics_roots entry declared by this plugin"
+                        .to_string(),
+                ));
+            }
+        }
+
+        std::fs::read(&canonical).map_err(|_| {
+            (
+                "source_not_found",
+                "source_path could not be read".to_string(),
+            )
+        })
     }
 
     pub(super) fn handle_pane_graphics_clear(
@@ -137,9 +233,13 @@ impl App {
                 "pane already has an active graphics stream",
             );
         }
-        if self.state.pane_graphics_layers.remove(&pane_id).is_some() {
-            self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
-        }
+        // fork: a plugin clears only its own layer; the socket caller (`None`)
+        // clears the whole pane. That asymmetry is deliberate and matches the
+        // owner doc on `PaneGraphicsLayer`: the user at the CLI outranks any
+        // plugin and needs one call that reliably wipes a pane, while a plugin
+        // must never be able to erase another plugin's image.
+        self.state
+            .clear_pane_graphics_layers(pane_id, layer_owner(&params.owner).as_deref());
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -166,7 +266,12 @@ impl App {
             }
             None => return encode_error(id, "stream_closed", "pane graphics stream is not active"),
         }
-        self.set_pane_graphics_layer(id, pane_id, params)
+        // The stream's `owner` is a caller-chosen CLAIM TOKEN on the stream, not
+        // a layer owner: it is validated against `pane_graphics_streams` above
+        // and must not leak into the layer, whose owner means "which plugin may
+        // replace or clear this". A stream already has exclusive use of the pane
+        // (`stream_conflict` on every other path), so its layer needs no owner.
+        self.set_pane_graphics_layer(id, pane_id, params, None)
     }
 
     pub(super) fn handle_pane_graphics_stream_open(
@@ -197,6 +302,14 @@ impl App {
         self.state
             .pane_graphics_streams
             .insert(pane_id, params.owner);
+        // fork: a stream is an EXCLUSIVE claim on the pane, so opening one drops
+        // every owner's layer, not just the opener's — including layers plugins
+        // set earlier, which get no notification. That is deliberate and
+        // unchanged from upstream: `stream_conflict` already refuses every other
+        // `set`/`clear` while a stream is active, so co-existing layers cannot be
+        // kept coherent with a stream anyway. Nothing can be added back until the
+        // stream closes, which is why the close path can still remove the whole
+        // pane entry rather than a single owner's layer.
         self.state.pane_graphics_layers.remove(&pane_id);
         self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
 
@@ -255,6 +368,23 @@ fn pane_graphics_expected_data_len(
         .and_then(|bytes| usize::try_from(bytes).ok())
         .map(Some)
         .ok_or(())
+}
+
+/// The layer owner carried by a `set`/`clear` request, or `None` when the call
+/// came in over the socket API rather than the UI-plugin bridge.
+///
+/// `owner` is `#[serde(skip)]` on both params structs, so it can never be
+/// supplied by a caller — not by a CLI, not by a wasm guest's JSON. The only
+/// writer is `App::execute_ui_plugin_api_call`, which stamps the calling
+/// module's plugin id after deserialization. That is what makes the ownership
+/// check below a real boundary rather than an honour system.
+fn layer_owner(owner: &str) -> Option<String> {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner.to_string())
+    }
 }
 
 fn pane_not_found(id: String, pane_id: &str) -> String {
@@ -333,6 +463,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams {
                     grid_cols: 10,
                     grid_rows: 4,
@@ -343,26 +474,442 @@ mod tests {
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
 
-        let layer = app
+        let layers = app
             .state
             .pane_graphics_layers
             .get(&pane_id)
             .expect("graphics layer stored");
-        assert_eq!(layer.image_width, 1);
-        assert_eq!(layer.image_height, 1);
-        assert_eq!(layer.render.grid_cols, 10);
-        assert_eq!(layer.render.grid_rows, 4);
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].image_width, 1);
+        assert_eq!(layers[0].image_height, 1);
+        assert_eq!(layers[0].render.grid_cols, 10);
+        assert_eq!(layers[0].render.grid_rows, 4);
         assert!(!app.state.session_dirty);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id,
+                owner: String::new(),
             }),
         });
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert!(matches!(success.result, ResponseResult::Ok {}));
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
+    }
+
+    fn set_request(id: &str, pane_id: &str, owner: &str) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                pane_id: pane_id.to_string(),
+                owner: owner.to_string(),
+                format: crate::api::schema::PaneGraphicsFormat::Rgba,
+                image_width: 1,
+                image_height: 1,
+                data: None,
+                data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3, 4]),
+                source_path: String::new(),
+                placement: Default::default(),
+            }),
+        }
+    }
+
+    /// fork: build a `UiPluginManager` holding one module of `plugin_id` that
+    /// declares `roots`, so the allowlist has something real to consult.
+    fn manager_with_graphics_roots(
+        plugin_id: &str,
+        roots: Vec<String>,
+    ) -> crate::ui_plugins::UiPluginManager {
+        let plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: plugin_id.into(),
+            name: plugin_id.into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: format!("/tmp/{plugin_id}/herdr-plugin.toml").into(),
+            plugin_root: format!("/tmp/{plugin_id}").into(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: Vec::new(),
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                id: "images".into(),
+                title: "Images".into(),
+                description: None,
+                platforms: None,
+                kind: Default::default(),
+                api_version: 2,
+                module: "dist/images.wasm".into(),
+                hot_reload: Default::default(),
+                surfaces: vec![crate::api::schema::PluginUiSurface::Header],
+                placement: None,
+                capabilities: vec![crate::api::schema::PluginUiCapability::PaneGraphics],
+                ui_input_file: None,
+                image_file: None,
+                graphics_roots: roots,
+                collector: None,
+            }],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        };
+        crate::ui_plugins::UiPluginManager::from_installed_plugins(
+            &std::collections::HashMap::from([(plugin.plugin_id.clone(), plugin)]),
+        )
+    }
+
+    fn source_set_request(
+        id: &str,
+        pane_id: &str,
+        owner: &str,
+        source: &str,
+    ) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.into(),
+            method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                pane_id: pane_id.to_string(),
+                owner: owner.to_string(),
+                format: crate::api::schema::PaneGraphicsFormat::Rgba,
+                image_width: 1,
+                image_height: 1,
+                data: None,
+                data_base64: String::new(),
+                source_path: source.to_string(),
+                placement: Default::default(),
+            }),
+        }
+    }
+
+    fn source_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr_pane_graphics_source_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The point of the allowlist. A plugin that declared no `graphics_roots`
+    /// must not be able to make the host read a file for it — the wasm guest has
+    /// no WASI, so without this check `source_path` would hand a sandboxed module
+    /// an arbitrary-file-read primitive using the host as its deputy.
+    #[test]
+    fn plugin_source_path_is_refused_without_a_declared_root() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("undeclared");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [1_u8, 2, 3, 4]).unwrap();
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared root works, and the bytes come off disk rather than the wire.
+    #[test]
+    fn plugin_source_path_is_allowed_under_a_declared_root() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        let dir = source_test_dir("declared");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [9_u8, 8, 7, 6]).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![dir.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].data, vec![9_u8, 8, 7, 6]);
+        assert_eq!(layers[0].owner.as_deref(), Some("plugin:images"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check that a string-prefix comparison would fail. A symlink planted
+    /// INSIDE an allowed root pointing outside it must not smuggle the target
+    /// through, which is why both sides are canonicalised before comparing.
+    #[test]
+    #[cfg(unix)]
+    fn plugin_source_path_cannot_escape_a_declared_root_via_symlink() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("symlink");
+        let allowed = dir.join("allowed");
+        let secret_dir = dir.join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("secret.rgba");
+        std::fs::write(&secret, [1_u8, 2, 3, 4]).unwrap();
+        let bait = allowed.join("bait.rgba");
+        std::os::unix::fs::symlink(&secret, &bait).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![allowed.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "symlink",
+            &public_pane_id,
+            "plugin:images",
+            bait.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+
+        // ..and `..` inside the request is equally dead, for the same reason.
+        let traversal = allowed.join("../secret/secret.rgba");
+        let response = app.handle_api_request(source_set_request(
+            "traversal",
+            &public_pane_id,
+            "plugin:images",
+            traversal.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sibling directory whose name merely STARTS WITH an allowed root is not
+    /// under it. `/x/img` must not admit `/x/img-secrets`.
+    #[test]
+    fn plugin_source_path_rejects_a_sibling_root_sharing_a_name_prefix() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("prefix");
+        let allowed = dir.join("img");
+        let sibling = dir.join("img-secrets");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = sibling.join("a.rgba");
+        std::fs::write(&file, [1_u8, 2, 3, 4]).unwrap();
+        app.ui_plugins =
+            manager_with_graphics_roots("images", vec![allowed.to_string_lossy().to_string()]);
+
+        let response = app.handle_api_request(source_set_request(
+            "prefix",
+            &public_pane_id,
+            "plugin:images",
+            file.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_allowed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The socket caller is deliberately unrestricted: it can already read the
+    /// file itself and send it as `data_base64`, so an allowlist would cost it
+    /// the efficient path while buying no safety.
+    #[test]
+    fn socket_caller_source_path_is_unrestricted() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        let dir = source_test_dir("socket");
+        let file = dir.join("a.rgba");
+        std::fs::write(&file, [4_u8, 3, 2, 1]).unwrap();
+
+        let response = app.handle_api_request(source_set_request(
+            "set",
+            &public_pane_id,
+            "",
+            file.to_str().unwrap(),
+        ));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap()[0].data,
+            vec![4_u8, 3, 2, 1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative path, a directory, and a missing file are all refused before
+    /// any allowlist question is asked.
+    #[test]
+    fn source_path_rejects_relative_directory_and_missing_targets() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let dir = source_test_dir("shape");
+
+        let response =
+            app.handle_api_request(source_set_request("rel", &public_pane_id, "", "a/b.rgba"));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_source_path");
+
+        let response = app.handle_api_request(source_set_request(
+            "dir",
+            &public_pane_id,
+            "",
+            dir.to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_source_path");
+
+        let response = app.handle_api_request(source_set_request(
+            "missing",
+            &public_pane_id,
+            "",
+            dir.join("nope.rgba").to_str().unwrap(),
+        ));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "source_not_found");
+        assert!(app.state.pane_graphics_layers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// fork: two plugins COEXIST on one pane, one layer each, in a deterministic
+    /// composite order. This replaces the earlier `owner_conflict` refusal — that
+    /// rule existed only because a pane held a single layer, and with a list per
+    /// pane it would block the ordinary case (an image plugin and something else
+    /// painting the same pane) to prevent a collision that can no longer happen.
+    #[test]
+    fn api_pane_graphics_layers_from_two_plugins_coexist_on_one_pane() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        let response = app.handle_api_request(set_request("first", &public_pane_id, "plugin:b"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let response = app.handle_api_request(set_request("second", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 2, "both plugins must hold a layer");
+        // Composite order is by owner, not by arrival, so the paint order is
+        // stable across frames instead of following insertion or hash order.
+        assert_eq!(
+            layers
+                .iter()
+                .map(|layer| layer.owner.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["plugin:a".to_string(), "plugin:b".to_string()]
+        );
+
+        // A second `set` from one plugin replaces ITS layer only.
+        let response = app.handle_api_request(set_request("again", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap().len(),
+            2
+        );
+    }
+
+    /// fork: a plugin's `clear` must not erase another plugin's image, while the
+    /// socket caller's `clear` wipes the pane. Same asymmetry as `owner`.
+    #[test]
+    fn api_pane_graphics_clear_is_scoped_to_the_calling_plugin() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        for owner in ["plugin:a", "plugin:b", ""] {
+            let response = app.handle_api_request(set_request("set", &public_pane_id, owner));
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        }
+        assert_eq!(
+            app.state.pane_graphics_layers.get(&pane_id).unwrap().len(),
+            3
+        );
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear-a".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id.clone(),
+                owner: "plugin:a".into(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let layers = app.state.pane_graphics_layers.get(&pane_id).unwrap();
+        assert_eq!(layers.len(), 2, "only the calling plugin's layer goes away");
+        assert!(layers
+            .iter()
+            .all(|layer| layer.owner.as_deref() != Some("plugin:a")));
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "clear-cli".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id,
+                owner: String::new(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(
+            app.state.pane_graphics_layers.is_empty(),
+            "the socket caller clears the whole pane"
+        );
+    }
+
+    /// The socket API outranks any plugin: the user at the CLI must always be
+    /// able to take a pane back.
+    #[test]
+    fn api_pane_graphics_socket_caller_may_replace_and_clear_a_plugin_layer() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+
+        let response = app.handle_api_request(set_request("plugin", &public_pane_id, "plugin:a"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let response = app.handle_api_request(set_request("cli", &public_pane_id, ""));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "cli-clear".into(),
+            method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                pane_id: public_pane_id,
+                owner: String::new(),
+            }),
+        });
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(app.state.pane_graphics_layers.is_empty());
+    }
+
+    /// A plugin gets no unload event, so the host must drop its images when it
+    /// is disabled. Without this `plugin disable` succeeds while the plugin's
+    /// last image stays painted on the pane.
+    #[test]
+    fn disabling_a_plugin_clears_only_its_own_pane_graphics_layers() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.kitty_graphics_enabled = true;
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+
+        let response = app.handle_api_request(set_request("set", &public_pane_id, "plugin:images"));
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let revision_before = app.state.pane_graphics_revision;
+
+        assert_eq!(
+            app.state
+                .clear_pane_graphics_layers_for_owner("plugin:other"),
+            0,
+            "an unrelated plugin must not clear this layer"
+        );
+        assert_eq!(app.state.pane_graphics_revision, revision_before);
+        assert!(app.state.pane_graphics_layers.contains_key(&pane_id));
+
+        assert_eq!(
+            app.state
+                .clear_pane_graphics_layers_for_owner("plugin:images"),
+            1
+        );
+        assert!(app.state.pane_graphics_layers.is_empty());
+        assert_ne!(app.state.pane_graphics_revision, revision_before);
     }
 
     #[test]
@@ -381,6 +928,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -392,6 +940,7 @@ mod tests {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id,
+                owner: String::new(),
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -500,6 +1049,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: public_data.clone(),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -517,6 +1067,7 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: public_data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -535,13 +1086,14 @@ mod tests {
                 image_height: 1,
                 data: None,
                 data_base64: wrong_owner_data,
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "stream_conflict");
         assert_eq!(
-            app.state.pane_graphics_layers.get(&pane_id).unwrap().data,
+            app.state.pane_graphics_layers.get(&pane_id).unwrap()[0].data,
             vec![1_u8, 2, 3, 4]
         );
 
@@ -549,6 +1101,7 @@ mod tests {
             id: "graphics-clear-public".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
                 pane_id: public_pane_id.clone(),
+                owner: String::new(),
             }),
         });
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
@@ -589,6 +1142,7 @@ mod tests {
                     image_height: u32::MAX,
                     data: None,
                     data_base64: base64::engine::general_purpose::STANDARD.encode([1_u8]),
+                    source_path: String::new(),
                     placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
                 }),
             });
@@ -620,6 +1174,7 @@ mod tests {
                         data: None,
                         data_base64: base64::engine::general_purpose::STANDARD
                             .encode(vec![1_u8; data_len]),
+                        source_path: String::new(),
                         placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
                     }),
                 });
@@ -656,6 +1211,7 @@ mod tests {
                     PANE_GRAPHICS_SET_MAX_BYTES
                         + 1
                 ]),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
@@ -691,6 +1247,7 @@ mod tests {
                 image_height: 1,
                 data: Some(vec![1_u8]),
                 data_base64: String::new(),
+                source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });

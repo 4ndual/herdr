@@ -46,6 +46,11 @@ pub(crate) struct RegisteredUiModule {
     /// half-block fallback). Purely host-consumed — never crosses the wasm ABI.
     /// `None` when the module declares no image.
     pub image_file: Option<String>,
+    /// Manifest `graphics_roots` (fork): absolute directory roots this module may
+    /// load images from via `pane.graphics.set { source_path }`. Empty means the
+    /// module may not use `source_path` at all. Stored unresolved; the host
+    /// canonicalises at use time so a root that appears later still works.
+    pub graphics_roots: Vec<String>,
 }
 
 /// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
@@ -502,6 +507,7 @@ impl UiPluginManager {
                     requested_capabilities: module.capabilities.clone(),
                     ui_input_file: module.ui_input_file.clone(),
                     image_file: module.image_file.clone(),
+                    graphics_roots: module.graphics_roots.clone(),
                 };
                 let key = module_key(&registered);
                 if let Some(mtime) = old_mtimes.get(&registered.module_path).copied() {
@@ -806,11 +812,18 @@ impl UiPluginManager {
             if !self.loaded_updates.contains_key(&module_key(module)) {
                 continue;
             }
-            let Some(surface) = module.surfaces.first().map(|declared| map_surface(*declared))
+            let Some(surface) = module
+                .surfaces
+                .first()
+                .map(|declared| map_surface(*declared))
             else {
                 continue;
             };
-            let Some(path) = module.manifest_path.parent().map(|dir| dir.join(image_file)) else {
+            let Some(path) = module
+                .manifest_path
+                .parent()
+                .map(|dir| dir.join(image_file))
+            else {
                 continue;
             };
             out.push((
@@ -994,6 +1007,30 @@ impl UiPluginManager {
             .iter()
             .find(|module| module.plugin_id == plugin_id && module.module_id == module_id)
             .is_some_and(|module| module.requests(capability))
+    }
+
+    /// fork: every `graphics_roots` entry declared by any still-registered module
+    /// of `plugin_id`, as the allowlist for a plugin-owned
+    /// `pane.graphics.set { source_path }`.
+    ///
+    /// Unioned across the plugin's modules on purpose: the layer `owner` tag is
+    /// `plugin:<plugin_id>`, not per-module, because `plugin disable` is the
+    /// off-switch and it operates on whole plugins. Scoping the roots more
+    /// narrowly than the ownership they protect would be false precision — two
+    /// modules of one plugin already share a state dir and a process identity.
+    ///
+    /// An unlinked plugin has no modules and so gets an empty list, which the
+    /// caller treats as a refusal.
+    pub(crate) fn graphics_roots_for_plugin(&self, plugin_id: &str) -> Vec<String> {
+        let mut roots: Vec<String> = self
+            .modules
+            .iter()
+            .filter(|module| module.plugin_id == plugin_id)
+            .flat_map(|module| module.graphics_roots.iter().cloned())
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     /// API v3 (§4): dispatch a resolved click's `Action` event to the one
@@ -1430,6 +1467,7 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::ApiRead => UiCapability::ApiRead,
         crate::api::schema::PluginUiCapability::ApiWrite => UiCapability::ApiWrite,
         crate::api::schema::PluginUiCapability::ApiInput => UiCapability::ApiInput,
+        crate::api::schema::PluginUiCapability::PaneGraphics => UiCapability::PaneGraphics,
     }
 }
 
@@ -1457,6 +1495,7 @@ mod tests {
             requested_capabilities: Vec::new(),
             ui_input_file: None,
             image_file: None,
+            graphics_roots: Vec::new(),
         };
         let effect = HostEffect::SetSurfaceCollapsed {
             surface: UiSurface::UsageStrip,
@@ -1505,6 +1544,7 @@ mod tests {
             enabled: true,
             platforms: None,
             build: vec![],
+            startup: Vec::new(),
             actions: vec![],
             events: vec![],
             panes: vec![],
@@ -1525,6 +1565,7 @@ mod tests {
                 ],
                 ui_input_file: None,
                 image_file: None,
+                graphics_roots: Vec::new(),
                 collector: None,
             }],
             link_handlers: vec![],

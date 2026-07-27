@@ -126,6 +126,10 @@ struct RawPluginManifestUiModule {
     // fork: optional host-consumed image filename (see PluginManifestUiModule::image_file).
     #[serde(default)]
     image_file: Option<String>,
+    // fork: optional absolute roots for runtime `source_path` image loads
+    // (see PluginManifestUiModule::graphics_roots).
+    #[serde(default)]
+    graphics_roots: Vec<String>,
     // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
     #[serde(default)]
     collector: Option<Vec<String>>,
@@ -579,6 +583,11 @@ fn normalize_manifest_ui_module(
         Some(name) => Some(normalize_image_file(&name)?),
         None => None,
     };
+    // fork: graphics_roots are absolute directories OUTSIDE the plugin dir, so
+    // the single-segment guard above does not apply. They are validated for
+    // shape here and canonicalised at use time (a root may legitimately not
+    // exist yet when the manifest loads).
+    let graphics_roots = normalize_graphics_roots(module.graphics_roots)?;
     // fork(wave-2): a declared collector is an argv the host will execute, so it
     // is normalized through the same non-empty-argv check as event/action/pane
     // commands (`normalize_command`), keeping the gate identical.
@@ -600,6 +609,7 @@ fn normalize_manifest_ui_module(
         capabilities: module.capabilities,
         ui_input_file,
         image_file,
+        graphics_roots,
         collector,
     })
 }
@@ -621,6 +631,54 @@ fn normalize_image_file(name: &str) -> Result<String, (&'static str, String)> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+/// fork: validate a module's `graphics_roots`. Each entry must be an absolute
+/// directory path with a leading `~` expanded, and must contain no `..`
+/// component.
+///
+/// Rejecting `..` at manifest load is belt-and-braces, not the real defence: the
+/// runtime check canonicalises both the root and the requested file before
+/// comparing them, so a `..` that survived here still could not escape. It is
+/// refused anyway because a root containing `..` is never intentional, and a
+/// manifest that says what it means is the point of declaring roots at all.
+fn normalize_graphics_roots(roots: Vec<String>) -> Result<Vec<String>, (&'static str, String)> {
+    let mut normalized = Vec::with_capacity(roots.len());
+    for root in roots {
+        let trimmed = root.trim();
+        let expanded = match trimmed.strip_prefix("~/") {
+            Some(rest) => match std::env::var("HOME") {
+                Ok(home) if !home.is_empty() => {
+                    std::path::Path::new(&home).join(rest).display().to_string()
+                }
+                _ => {
+                    return Err((
+                        "invalid_plugin_ui_graphics_root",
+                        "ui module graphics_roots uses ~ but HOME is not set".to_string(),
+                    ));
+                }
+            },
+            None => trimmed.to_string(),
+        };
+        let path = std::path::Path::new(&expanded);
+        if expanded.is_empty() || !path.is_absolute() {
+            return Err((
+                "invalid_plugin_ui_graphics_root",
+                "ui module graphics_roots entries must be absolute paths".to_string(),
+            ));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err((
+                "invalid_plugin_ui_graphics_root",
+                "ui module graphics_roots entries must not contain `..`".to_string(),
+            ));
+        }
+        normalized.push(expanded);
+    }
+    Ok(normalized)
 }
 
 /// Validate a module's `ui_input_file` (spec §7.1): a single non-empty path
@@ -830,6 +888,7 @@ mod tests {
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
             image_file: None,
+            graphics_roots: Vec::new(),
             collector: None,
         })
         .unwrap_err();
@@ -849,6 +908,7 @@ mod tests {
             capabilities: vec![PluginUiCapability::FocusedSession],
             ui_input_file: None,
             image_file: None,
+            graphics_roots: Vec::new(),
             collector: None,
         })
         .unwrap_err();
@@ -882,6 +942,7 @@ mod tests {
             ],
             ui_input_file: None,
             image_file: None,
+            graphics_roots: Vec::new(),
             collector: None,
         })
         .unwrap();
@@ -908,6 +969,7 @@ mod tests {
             capabilities: vec![PluginUiCapability::LayoutRead],
             ui_input_file: Some(name.into()),
             image_file: None,
+            graphics_roots: Vec::new(),
             collector: None,
         }
     }
@@ -982,8 +1044,7 @@ mod tests {
 
         let mut raw = ui_module_with_input_file("usage_input.json");
         raw.collector = Some(vec!["".into()]);
-        let err =
-            normalize_manifest_ui_module(raw).expect_err("blank collector argv0 is rejected");
+        let err = normalize_manifest_ui_module(raw).expect_err("blank collector argv0 is rejected");
         assert_eq!(err.0, "invalid_plugin_command");
     }
 }

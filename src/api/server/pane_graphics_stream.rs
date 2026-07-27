@@ -245,6 +245,7 @@ fn serve_frames(
                     image_height: header.image_height,
                     data: Some(data),
                     data_base64: String::new(),
+                    source_path: String::new(),
                     placement: header.placement,
                 }),
             },

@@ -132,7 +132,10 @@ fn build_historial_rows(
             let restorable = record.restorable();
             let is_subagent = crate::pane_close_history::is_subagent_record(&record);
             // No detected agent -> "terminal" (replaces the old "shell").
-            let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
+            let agent = record
+                .agent
+                .clone()
+                .unwrap_or_else(|| "terminal".to_string());
             // Pane label only; empty when absent so the guest applies its
             // first-prompt / folder fallback.
             let label = record
@@ -2146,7 +2149,9 @@ impl App {
     /// clean), and refreshes derived render state so stale overlays clear on the
     /// next frame.
     pub(crate) fn resync_ui_plugins_after_lifecycle_change(&mut self) {
-        let removed = self.ui_plugins.sync_to_registry(&self.state.installed_plugins);
+        let removed = self
+            .ui_plugins
+            .sync_to_registry(&self.state.installed_plugins);
         for (plugin_id, module_id) in &removed {
             let key = crate::plugin_collector::module_key(plugin_id, module_id);
             self.collectors_in_flight.remove(&key);
@@ -2174,7 +2179,13 @@ impl App {
                 .installed_plugins
                 .values()
                 .filter(|plugin| std::path::PathBuf::from(&plugin.manifest_path) == manifest_path)
-                .map(|plugin| (plugin.plugin_id.clone(), plugin.enabled, plugin.source.clone()))
+                .map(|plugin| {
+                    (
+                        plugin.plugin_id.clone(),
+                        plugin.enabled,
+                        plugin.source.clone(),
+                    )
+                })
                 .collect();
             for (plugin_id, enabled, source) in affected {
                 match crate::app::api::plugins::load_plugin_manifest(&manifest_str, enabled) {
@@ -2864,7 +2875,7 @@ impl App {
             "method": method,
             "params": params,
         });
-        let request: crate::api::schema::Request = match serde_json::from_value(request_value) {
+        let mut request: crate::api::schema::Request = match serde_json::from_value(request_value) {
             Ok(request) => request,
             Err(err) => {
                 self.ui_plugins.dispatch_api_result(
@@ -2878,6 +2889,22 @@ impl App {
                 return;
             }
         };
+
+        // Stamp the calling plugin onto pane-graphics writes. This is the ONLY
+        // writer of `owner` on either params struct — both fields are
+        // `#[serde(skip)]`, so a guest cannot forge one through its JSON and a
+        // CLI cannot supply one at all. Done after deserialization for exactly
+        // that reason. The value matches the key the plugin disable/unlink
+        // cleanup uses, so a layer set here is findable when the plugin goes.
+        match &mut request.method {
+            crate::api::schema::Method::PaneGraphicsSet(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            crate::api::schema::Method::PaneGraphicsClear(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            _ => {}
+        }
 
         let started = std::time::Instant::now();
         let response_json = self.handle_api_request_after_internal_events_drained(request);
@@ -3188,8 +3215,20 @@ mod tests {
     fn build_historial_rows_dedups_and_caps_at_limit() {
         let mut records = Vec::new();
         // Two records for the same session value must collapse to one.
-        records.push(historial_record(1000, "dup", Some("claude"), Some("same-sid"), true));
-        records.push(historial_record(999, "dup", Some("claude"), Some("same-sid"), true));
+        records.push(historial_record(
+            1000,
+            "dup",
+            Some("claude"),
+            Some("same-sid"),
+            true,
+        ));
+        records.push(historial_record(
+            999,
+            "dup",
+            Some("claude"),
+            Some("same-sid"),
+            true,
+        ));
         // Then more than HISTORIAL_ROW_LIMIT distinct restorable sessions.
         for i in 0..(HISTORIAL_ROW_LIMIT + 10) {
             let sid = format!("sid-{i}");
@@ -3274,8 +3313,12 @@ mod tests {
             .installed_plugins
             .insert(info.plugin_id.clone(), info);
         app.resync_ui_plugins_after_lifecycle_change();
-        let has_dash =
-            |app: &App| app.ui_plugins.all().iter().any(|m| m.plugin_id == "example.dash");
+        let has_dash = |app: &App| {
+            app.ui_plugins
+                .all()
+                .iter()
+                .any(|m| m.plugin_id == "example.dash")
+        };
         assert!(has_dash(&app));
 
         // A collector is mid-flight for this module.
@@ -3351,6 +3394,7 @@ mod tests {
                 enabled: true,
                 platforms: None,
                 build: vec![],
+                startup: Vec::new(),
                 actions: vec![],
                 events: vec![],
                 panes: vec![],
