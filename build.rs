@@ -29,6 +29,43 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+/// Bake this build's own git provenance into the binary.
+///
+/// WHY: the version strip renders a `+N` local-changes marker that Andres uses
+/// to see how far the running thing is from the released tag. It used to be
+/// computed once from the working tree at `~/Projects/herdr` and stamped onto
+/// EVERY token, so a binary that was never built from that tree still displayed
+/// its count — an upstream 0.7.5 with zero fork commits in it rendered `+113`.
+/// The count has to be a property of the BINARY, not of whatever tree happens to
+/// be checked out when the collector runs, so it is baked here and read back out
+/// of the file. A binary without this stamp (upstream, or built before this
+/// change) reports nothing and must render as unknown rather than borrowing a
+/// number from somewhere else.
+fn emit_fork_provenance(manifest_dir: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=HERDR_FORK_PROVENANCE");
+    // A git dir change (new commit, checkout) must re-stamp the binary.
+    for path in ["/.git/HEAD", "/.git"] {
+        println!("cargo:rerun-if-changed={}{}", manifest_dir.display(), path);
+    }
+    let provenance = env::var("HERDR_FORK_PROVENANCE").ok().or_else(|| {
+        Command::new("git")
+            .arg("-C")
+            .arg(manifest_dir)
+            .args(["describe", "--tags", "--long", "--always", "--dirty"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|desc| !desc.is_empty())
+    });
+    // Always emit: `env!` in build_info.rs must resolve on every build, including
+    // a source tarball with no git dir. "unknown" is the honest fallback.
+    println!(
+        "cargo:rustc-env=HERDR_FORK_PROVENANCE={}",
+        provenance.as_deref().unwrap_or("unknown")
+    );
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -48,6 +85,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    emit_fork_provenance(&manifest_dir);
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);
