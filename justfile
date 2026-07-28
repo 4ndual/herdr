@@ -7,6 +7,11 @@ test:
     just integration-assets-test
     just plugin-marketplace-test
 
+# Fast regression suite for the fork + plugins (scope: host | plugin:<name> | all)
+# Never uses the repo's default cargo target dir (would relink the live server).
+test-fast scope="all":
+    bash scripts/test-fast/test-fast.sh --scope {{scope}}
+
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never

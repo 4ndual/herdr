@@ -108,6 +108,40 @@ pub struct HarnessSection {
     pub rows: Vec<HarnessRow>,
 }
 
+/// One selectable harness profile for the tab-3 profile picker: the plain
+/// "daily" `~/.claude`, each `~/.claude-code-router/profiles/<name>`, and each
+/// ccp-managed `~/claude-hub/profiles/<name>`. Backward-compatible (absent in
+/// old inputs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileRef {
+    /// Profile name (dir name, or "daily" for `~/.claude`).
+    pub name: String,
+    /// Display root (e.g. "~/.claude" or "~/claude-hub/profiles/v1-mac").
+    #[serde(default)]
+    pub root: String,
+    /// Whether this is the profile driving the focused session.
+    #[serde(default)]
+    pub active: bool,
+    /// Short origin tag: "daily" | "ccr" | "ccp".
+    #[serde(default)]
+    pub kind: String,
+}
+
+/// A profile's GLOBAL harness view (tabs 2 and 3): what a profile configures
+/// profile-wide, independent of any live session — hooks, skills, agents,
+/// plugins, and the profile-level context files, with if-loaded costs rather
+/// than per-session "loaded now" numbers. No SESSION section, no session-scoped
+/// rows. Backward-compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileView {
+    /// Which profile this view describes.
+    pub name: String,
+    /// Display root of the profile's config.
+    #[serde(default)]
+    pub root: String,
+    pub sections: Vec<HarnessSection>,
+}
+
 /// Full render model the host publishes each tick to `harness_input.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HarnessRenderModel {
@@ -116,6 +150,22 @@ pub struct HarnessRenderModel {
     #[serde(default)]
     pub target: String,
     pub sections: Vec<HarnessSection>,
+    /// Tab-3 profile picker list (daily + ccr + ccp profiles). Empty in old
+    /// inputs; the guest then shows only the session tab.
+    #[serde(default)]
+    pub profiles: Vec<ProfileRef>,
+    /// Tab-2 global view of the ACTIVE profile (always present once a target is
+    /// focused; built from the profile driving the session).
+    #[serde(default)]
+    pub profile_view: Option<ProfileView>,
+    /// Tab-3 current selection echoed by the host (defaults to the active
+    /// profile). The guest marks this row selected in the picker.
+    #[serde(default)]
+    pub selected_profile: Option<String>,
+    /// Tab-3 selected profile's global view. `None` when the selection is the
+    /// active profile (the guest then reuses [`Self::profile_view`]).
+    #[serde(default)]
+    pub selected_view: Option<ProfileView>,
 }
 
 impl HarnessRenderModel {
@@ -155,6 +205,7 @@ mod tests {
                     scope: Some("global".to_string()),
                 }],
             }],
+            ..Default::default()
         };
         let json = serde_json::to_string(&model).expect("serialize");
         let back: HarnessRenderModel = serde_json::from_str(&json).expect("deserialize");

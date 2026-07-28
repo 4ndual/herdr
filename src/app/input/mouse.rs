@@ -48,6 +48,8 @@ fn parse_harness_action(action_id: &str) -> Option<crate::app::state::PendingHar
         (HarnessActionKind::DisableSession, key)
     } else if let Some(key) = action_id.strip_prefix("harness:disable_profile:") {
         (HarnessActionKind::DisableProfile, key)
+    } else if let Some(key) = action_id.strip_prefix("harness:profile:") {
+        (HarnessActionKind::ViewProfile, key)
     } else {
         return None;
     };

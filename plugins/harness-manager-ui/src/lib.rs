@@ -51,6 +51,9 @@ static MENU: Mutex<Option<render::MenuState>> = Mutex::new(None);
 /// wheel over the panel, clamped to the clipped range, and reset to 0 whenever
 /// the focused target changes.
 static SCROLL: AtomicUsize = AtomicUsize::new(0);
+/// Active tab index (0=session, 1=profile, 2=profiles). Guest-owned; switched by
+/// clicking the tab row. Reset to session on a focused-target change.
+static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(0);
 /// Body lines scrolled per wheel notch.
 const SCROLL_STEP: usize = 3;
 
@@ -141,12 +144,12 @@ fn line_at(
     if col < x || col >= x.saturating_add(width) {
         return None;
     }
-    let first = y + 2;
+    let first = y + render::BODY_TOP;
     if row < first {
         return None;
     }
     let on_screen = (row - first) as usize;
-    let max_lines = (height - 2) as usize;
+    let max_lines = height.saturating_sub(render::BODY_TOP) as usize;
     if on_screen >= max_lines {
         return None;
     }
@@ -162,13 +165,23 @@ fn collapsed_snapshot() -> Vec<String> {
         .clone()
 }
 
+/// The currently active tab.
+fn active_tab() -> render::Tab {
+    render::Tab::from_index(ACTIVE_TAB.load(Ordering::SeqCst))
+}
+
+/// Number of body lines the active tab currently shows (profile picker + the
+/// tab's sections).
+fn body_line_count(model: &HarnessRenderModel, collapsed: &[String]) -> usize {
+    let (profiles, sections) = render::view_slices(model, active_tab());
+    render::body_lines(profiles, sections, collapsed).len()
+}
+
 /// Clamp the raw scroll offset to the clipped range for the current model/area.
 fn clamped_scroll(model: &HarnessRenderModel, height: u16) -> usize {
-    let visible = (height as usize).saturating_sub(2);
+    let visible = (height as usize).saturating_sub(render::BODY_TOP as usize);
     let collapsed = collapsed_snapshot();
-    let max_scroll = render::body_lines(model, &collapsed)
-        .len()
-        .saturating_sub(visible);
+    let max_scroll = body_line_count(model, &collapsed).saturating_sub(visible);
     SCROLL.load(Ordering::SeqCst).min(max_scroll)
 }
 
@@ -186,7 +199,16 @@ fn render_from_cache() -> Option<UiUpdate> {
     let scroll = clamped_scroll(model, height);
     let collapsed = collapsed_snapshot();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, menu.as_ref(), scroll, &collapsed);
+    let hits = render::render(
+        model,
+        area,
+        &mut buf,
+        hovered,
+        menu.as_ref(),
+        scroll,
+        &collapsed,
+        active_tab(),
+    );
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -211,10 +233,7 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
                 .map(|m| {
                     let height = area.map(|(_, _, _, h)| h).unwrap_or(0);
                     let collapsed = collapsed_snapshot();
-                    (
-                        render::body_lines(m, &collapsed).len(),
-                        clamped_scroll(m, height),
-                    )
+                    (body_line_count(m, &collapsed), clamped_scroll(m, height))
                 })
                 .unwrap_or((0, 0));
             let next = area.and_then(|a| line_at(a, lines, scroll, mouse.column, mouse.row));
@@ -241,11 +260,9 @@ fn adjust_scroll(delta: isize) {
         .expect("model mutex poisoned")
         .as_ref()
         .map(|m| {
-            let visible = (height as usize).saturating_sub(2);
+            let visible = (height as usize).saturating_sub(render::BODY_TOP as usize);
             let collapsed = collapsed_snapshot();
-            render::body_lines(m, &collapsed)
-                .len()
-                .saturating_sub(visible)
+            body_line_count(m, &collapsed).saturating_sub(visible)
         })
         .unwrap_or(0);
     let cur = SCROLL.load(Ordering::SeqCst) as isize;
@@ -295,6 +312,7 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
         // target's sections. Refreshes of the SAME target preserve it (R14).
         if target_changed {
             SCROLL.store(0, Ordering::SeqCst);
+            ACTIVE_TAB.store(0, Ordering::SeqCst);
             COLLAPSED_SECTIONS
                 .lock()
                 .expect("collapsed mutex poisoned")
@@ -316,7 +334,7 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
             // Hover holds an absolute body-line index; drop it if it no longer
             // exists in the (possibly shrunk) view.
             let collapsed = collapsed_snapshot();
-            if i >= render::body_lines(&model, &collapsed).len() {
+            if i >= body_line_count(&model, &collapsed) {
                 *hov = None;
             }
         }
@@ -434,6 +452,16 @@ fn handle_action(action_id: &str, kind: UiActionKind, row: u16) -> UiUpdate {
         toggle_section(title);
         return render_from_cache().unwrap_or_default();
     }
+    // Clicking a tab switches the active view (guest-owned; the host does not
+    // resolve `harness:tab:` ids). Reset scroll so the new view starts at top.
+    if let Some(slug) = action_id.strip_prefix(render::ACTION_TAB_PREFIX) {
+        if let Some(tab) = render::Tab::from_slug(slug) {
+            ACTIVE_TAB.store(tab.index(), Ordering::SeqCst);
+            SCROLL.store(0, Ordering::SeqCst);
+            *HOVERED.lock().expect("hover mutex poisoned") = None;
+        }
+        return render_from_cache().unwrap_or_default();
+    }
     // Open / disable-option left-clicks are resolved host-side and never reach
     // the guest; the only remaining guest-owned left-click is the collapse
     // toggle.
@@ -521,6 +549,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            ..Default::default()
         }
     }
 
@@ -602,19 +631,19 @@ mod tests {
 
     #[test]
     fn line_at_maps_screen_row_to_scrolled_body_index() {
-        // area (x=0,y=0,w=44,h=6): body starts at screen row 2, 4 visible rows.
-        let area = (0u16, 0u16, 44u16, 6u16);
-        // No scroll: screen row 2 is body line 0.
-        assert_eq!(line_at(area, 10, 0, 1, 2), Some(0));
-        assert_eq!(line_at(area, 10, 0, 1, 5), Some(3));
-        // Scrolled by 2: screen row 2 now maps to body line 2.
-        assert_eq!(line_at(area, 10, 2, 1, 2), Some(2));
-        assert_eq!(line_at(area, 10, 2, 1, 5), Some(5));
+        // area (x=0,y=0,w=44,h=10): body starts at screen row BODY_TOP=5, 5 rows.
+        let area = (0u16, 0u16, 44u16, 10u16);
+        // No scroll: screen row 5 is body line 0.
+        assert_eq!(line_at(area, 10, 0, 1, 5), Some(0));
+        assert_eq!(line_at(area, 10, 0, 1, 9), Some(4));
+        // Scrolled by 2: screen row 5 now maps to body line 2.
+        assert_eq!(line_at(area, 10, 2, 1, 5), Some(2));
+        assert_eq!(line_at(area, 10, 2, 1, 9), Some(6));
         // Past the last real body line resolves to None even if on-screen.
-        assert_eq!(line_at(area, 4, 2, 1, 5), None);
+        assert_eq!(line_at(area, 4, 2, 1, 9), None);
         // Above the body and past the visible window are both None.
-        assert_eq!(line_at(area, 10, 0, 1, 1), None);
-        assert_eq!(line_at(area, 10, 0, 1, 6), None);
+        assert_eq!(line_at(area, 10, 0, 1, 4), None);
+        assert_eq!(line_at(area, 10, 0, 1, 10), None);
     }
 
     #[test]
@@ -656,6 +685,42 @@ mod tests {
                 .expect("frame parses");
         let _ = handle_event(&reexpanded);
         assert_eq!(SCROLL.load(Ordering::SeqCst), 0, "re-expand resets to top");
+    }
+
+    #[test]
+    fn tab_click_switches_active_view() {
+        let _state = state_guard();
+        let mut model = test_model();
+        model.profile_view = Some(harness_manager_model::ProfileView {
+            name: "daily".to_string(),
+            root: "~/.claude".to_string(),
+            sections: vec![HarnessSection {
+                title: "AGENTS".to_string(),
+                summary: "1".to_string(),
+                agg: None,
+                collapsed_default: false,
+                rows: Vec::new(),
+            }],
+        });
+        let frame: UiEvent =
+            serde_json::from_str(&frame_json(&model_env(&model), 44)).expect("frame parses");
+        let _ = handle_event(&frame);
+        // Session tab shows the HOOKS section, not AGENTS.
+        assert_eq!(ACTIVE_TAB.load(Ordering::SeqCst), 0);
+        // Click the profile tab: active view becomes the profile-global sections.
+        let click: UiEvent =
+            serde_json::from_str(&action_json("harness:tab:profile", "left_down", 4))
+                .expect("action parses");
+        let update = handle_event(&click);
+        assert_eq!(ACTIVE_TAB.load(Ordering::SeqCst), 1);
+        assert!(update.layers[0]
+            .hits
+            .iter()
+            .any(|h| h.action_id == "harness:section:AGENTS"));
+        assert!(!update.layers[0]
+            .hits
+            .iter()
+            .any(|h| h.action_id == "harness:section:HOOKS"));
     }
 
     #[test]

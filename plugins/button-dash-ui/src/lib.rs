@@ -114,6 +114,16 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "refresh-cx-token",
+        label: "Refresh cx token",
+        emoji: "\u{1F511}",            // 🔑
+        shortcut: "\u{2303}\u{2325}T", // ⌃⌥T
+        color: "cyan",
+        description: "Re-sync the CCR gateway's Claude token from the Keychain — fixes a live cx session 401ing, no relaunch",
+        action_id: "refresh-cx-token",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "resume-search",
         label: "Resume search",
         emoji: "\u{1F50E}", // 🔎

@@ -1,0 +1,23 @@
+{
+  "builtin.archive-dash::archive-ui": {
+    "align": "end",
+    "min_peer": 24,
+    "region": "bottom_band",
+    "size": "30%",
+    "z": 50
+  },
+  "builtin.button-dash::button-ui": {
+    "align": "end",
+    "min_peer": 24,
+    "region": "bottom_band",
+    "size": "45",
+    "z": 60
+  },
+  "builtin.version-dash::version": {
+    "align": "start",
+    "min_peer": null,
+    "region": "bottom",
+    "size": "1",
+    "z": 55
+  }
+}

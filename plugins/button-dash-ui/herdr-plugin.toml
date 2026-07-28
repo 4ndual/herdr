@@ -87,6 +87,30 @@ title = "Remote"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
 
+# refresh-cx-token: re-sync the CCR gateway's Claude-Plan OAuth token from the
+# daily Keychain credential. CCR has no Anthropic refresh executor, so when its
+# copied access token expires every Claude-via-gateway request 401s and a LIVE cx
+# session cannot recover — the only other re-sync runs at cx launch. This button
+# is the manual in-place fix (the underlying script is documented MANUAL ONLY;
+# never schedule it). Daily `claude` is direct-to-Anthropic and unaffected; the
+# token value is never printed. Detached like the siblings: it does RPC work only
+# and kills nothing, but detaching keeps the action runner free while the gateway
+# hot-swaps its config (~1s).
+#
+# Invokes the Bun script DIRECTLY (2026-07-28): the former scripts/refresh-cx-token.sh
+# wrapper only resolved the herdr binary, toasted and logged — all of which now live
+# in the script itself behind `--toast`, so the wrapper was a layer that could drift
+# out of sync with the thing it wrapped. `--quiet` keeps stdout silent on the
+# idempotent no-op; the toast/log carry the outcome. `sh -lc` remains for nohup
+# detachment and to pick up bun from the login PATH (the pkg-guard shim), with a
+# literal fallback so a PATH-less action environment still works. CMIX_REFRESH_TOKEN
+# overrides the script path; the script is owned by the cmix repo, not by herdr.
+[[actions]]
+id = "refresh-cx-token"
+title = "Refresh cx token"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", '''nohup "$(command -v bun || echo "$HOME/.bun/bin/bun")" "${CMIX_REFRESH_TOKEN:-$HOME/cmix/scripts/refresh-claude-token.ts}" --toast --quiet >/dev/null 2>&1 &''']
+
 # draw-screenshot: toggle a BLANK draw-on-screen overlay (our own scripts/
 # draw-overlay helper — floats over ANY Space incl. native fullscreen), then
 # capture the annotated screen and fully close it (see scripts/draw-screenshot.sh).

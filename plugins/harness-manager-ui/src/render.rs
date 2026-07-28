@@ -15,7 +15,9 @@
 //! one dim group header per contiguous `group` run. Rows are dense: dot + scope
 //! marker + label + host meta + compact token cost on a single line.
 
-use harness_manager_model::{HarnessRenderModel, HarnessRow, HarnessSection, RowState};
+use harness_manager_model::{
+    HarnessRenderModel, HarnessRow, HarnessSection, ProfileRef, RowState,
+};
 use herdr_ui_plugin_api::UiHitRect;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -37,6 +39,59 @@ pub const ACTION_DISABLE_SESSION_PREFIX: &str = "harness:disable_session:";
 pub const ACTION_DISABLE_PROFILE_PREFIX: &str = "harness:disable_profile:";
 /// Closes the disable menu (guest-owned).
 pub const ACTION_MENU_CANCEL: &str = "harness:menu_cancel";
+/// Tab switch (guest-owned): `harness:tab:session|profile|profiles`.
+pub const ACTION_TAB_PREFIX: &str = "harness:tab:";
+/// Tab-3 profile pick (host-resolved: publishes that profile's global view).
+pub const ACTION_PROFILE_PREFIX: &str = "harness:profile:";
+
+/// The three panel tabs. Tab 1 is the live session view; tabs 2 and 3 show
+/// profile-global config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// Live session inspection (the original view).
+    Session,
+    /// The active profile's global config.
+    Profile,
+    /// A profile picker + the selected profile's global config.
+    Profiles,
+}
+
+impl Tab {
+    pub fn from_index(i: usize) -> Tab {
+        match i {
+            1 => Tab::Profile,
+            2 => Tab::Profiles,
+            _ => Tab::Session,
+        }
+    }
+    pub fn index(self) -> usize {
+        match self {
+            Tab::Session => 0,
+            Tab::Profile => 1,
+            Tab::Profiles => 2,
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            Tab::Session => "session",
+            Tab::Profile => "profile",
+            Tab::Profiles => "profiles",
+        }
+    }
+    pub fn from_slug(s: &str) -> Option<Tab> {
+        match s {
+            "session" => Some(Tab::Session),
+            "profile" => Some(Tab::Profile),
+            "profiles" => Some(Tab::Profiles),
+            _ => None,
+        }
+    }
+}
+
+/// Fixed rows above the scrollable body: title, target/identity, the legend,
+/// and the tab row. Body line `i` renders at `area.y + BODY_TOP + i`.
+const LEGEND_ROWS: u16 = 2;
+pub const BODY_TOP: u16 = 2 + LEGEND_ROWS + 1;
 
 const PANEL_TITLE: &str = "HARNESS";
 const COLLAPSE_BTN: &str = "[<]";
@@ -60,6 +115,8 @@ pub struct MenuState {
 /// that share a `group`. Collapsed sections contribute only their `Section` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyLine {
+    /// Tab-3 profile-picker row (index into the profiles slice).
+    Profile(usize),
     Section(usize),
     Group(usize, String),
     Row(usize, usize),
@@ -70,12 +127,20 @@ fn is_collapsed(collapsed: &[String], title: &str) -> bool {
     collapsed.iter().any(|t| t == title)
 }
 
-/// Flatten sections and (expanded) rows into visible body lines. Collapsed
-/// sections contribute only their header; expanded sections emit one dim group
-/// header per contiguous `group` run, then the rows beneath it.
-pub fn body_lines(model: &HarnessRenderModel, collapsed: &[String]) -> Vec<BodyLine> {
+/// Flatten the current view's profile-picker rows (tab 3 only), sections, and
+/// (expanded) rows into visible body lines. Collapsed sections contribute only
+/// their header; expanded sections emit one dim group header per contiguous
+/// `group` run, then the rows beneath it. `profiles` is empty on tabs 1 and 2.
+pub fn body_lines(
+    profiles: &[ProfileRef],
+    sections: &[HarnessSection],
+    collapsed: &[String],
+) -> Vec<BodyLine> {
     let mut lines = Vec::new();
-    for (si, section) in model.sections.iter().enumerate() {
+    for pi in 0..profiles.len() {
+        lines.push(BodyLine::Profile(pi));
+    }
+    for (si, section) in sections.iter().enumerate() {
         lines.push(BodyLine::Section(si));
         if is_collapsed(collapsed, &section.title) {
             continue;
@@ -97,17 +162,74 @@ pub fn body_lines(model: &HarnessRenderModel, collapsed: &[String]) -> Vec<BodyL
     lines
 }
 
-fn row_at<'m>(model: &'m HarnessRenderModel, line: &BodyLine) -> Option<&'m HarnessRow> {
+fn row_at<'m>(sections: &'m [HarnessSection], line: &BodyLine) -> Option<&'m HarnessRow> {
     match line {
-        BodyLine::Row(si, ri) => model.sections.get(*si).and_then(|s| s.rows.get(*ri)),
+        BodyLine::Row(si, ri) => sections.get(*si).and_then(|s| s.rows.get(*ri)),
         _ => None,
+    }
+}
+
+/// The (profiles, sections) slices the given `tab` shows. Tabs 1 and 2 have no
+/// profile-picker rows; tab 3 lists profiles and shows the selected profile's
+/// sections (falling back to the active profile's view).
+pub fn view_slices(model: &HarnessRenderModel, tab: Tab) -> (&[ProfileRef], &[HarnessSection]) {
+    match tab {
+        Tab::Session => (&[], &model.sections),
+        Tab::Profile => (
+            &[],
+            model
+                .profile_view
+                .as_ref()
+                // The host drops `profile_view` under its ui-input byte budget
+                // when a non-active profile is selected on tab 3; fall back to
+                // that selected view so tab 2 shows a profile rather than blank.
+                .or(model.selected_view.as_ref())
+                .map(|v| v.sections.as_slice())
+                .unwrap_or(&[]),
+        ),
+        Tab::Profiles => (
+            &model.profiles,
+            model
+                .selected_view
+                .as_ref()
+                .or(model.profile_view.as_ref())
+                .map(|v| v.sections.as_slice())
+                .unwrap_or(&[]),
+        ),
+    }
+}
+
+/// The identity line (row 1) for the active `tab`: the session target on tab 1,
+/// the profile root on tabs 2 and 3.
+fn identity_line(model: &HarnessRenderModel, tab: Tab) -> String {
+    match tab {
+        Tab::Session => {
+            if model.target.is_empty() {
+                EMPTY_HINT.to_string()
+            } else {
+                model.target.clone()
+            }
+        }
+        Tab::Profile => model
+            .profile_view
+            .as_ref()
+            .or(model.selected_view.as_ref())
+            .map(|v| format!("profile · {} · {}", v.name, v.root))
+            .unwrap_or_else(|| "no profile config".to_string()),
+        Tab::Profiles => model
+            .selected_view
+            .as_ref()
+            .or(model.profile_view.as_ref())
+            .map(|v| format!("profile · {} · {}", v.name, v.root))
+            .unwrap_or_else(|| "select a profile below".to_string()),
     }
 }
 
 /// Render the panel into `buf`. Returns the frame's clickable hit rects.
 /// `hovered` is the index (into [`body_lines`]) of the line whose tooltip should
 /// be drawn beneath it; suppressed while `menu` is open. `collapsed` is the set
-/// of section titles currently collapsed.
+/// of section titles currently collapsed. `tab` selects which view to draw.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     model: &HarnessRenderModel,
     area: Rect,
@@ -116,6 +238,7 @@ pub fn render(
     menu: Option<&MenuState>,
     scroll: usize,
     collapsed: &[String],
+    tab: Tab,
 ) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -123,7 +246,110 @@ pub fn render(
     if area.width <= 3 {
         return render_handle(area, buf);
     }
-    render_full(model, area, buf, hovered, menu, scroll, collapsed)
+    render_full(model, area, buf, hovered, menu, scroll, collapsed, tab)
+}
+
+/// Draw the compact dim legend (rows 2..2+LEGEND_ROWS) explaining the symbols.
+fn render_legend(area: Rect, buf: &mut Buffer) {
+    let dim = Style::default().fg(Color::DarkGray);
+    // Line 1: state dots + scope letters, each glyph in its live color.
+    let line1 = Line::from(vec![
+        Span::styled("\u{25CF}", Style::default().fg(Color::Green)),
+        Span::styled(" on ", dim),
+        Span::styled("\u{25CF}", Style::default().fg(Color::Red)),
+        Span::styled(" fired ", dim),
+        Span::styled("\u{25CB}", dim),
+        Span::styled(" off  ", dim),
+        Span::styled("G", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Span::styled(" global ", dim),
+        Span::styled("S", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" session", dim),
+    ]);
+    Paragraph::new(line1).render(line_rect(area, area.y + 2), buf);
+    // Line 2: label color = load timing.
+    let line2 = Line::from(vec![
+        Span::styled("name: ", dim),
+        Span::styled("start", Style::default().fg(Color::Green)),
+        Span::styled(" ", dim),
+        Span::styled("loaded", Style::default().fg(Color::Cyan)),
+        Span::styled(" ", dim),
+        Span::styled("on-demand/off", dim),
+    ]);
+    Paragraph::new(line2).render(line_rect(area, area.y + 3), buf);
+}
+
+/// Draw the tab row `[1 session][2 profile][3 profiles]` on `y`, highlighting
+/// `active`, and declare a hit-rect per tab label.
+fn render_tabs(area: Rect, y: u16, buf: &mut Buffer, active: Tab, hits: &mut Vec<UiHitRect>) {
+    let labels = [
+        (Tab::Session, "1 session"),
+        (Tab::Profile, "2 profile"),
+        (Tab::Profiles, "3 profiles"),
+    ];
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
+    for (tab, label) in labels {
+        let text = format!(" {label} ");
+        let w = text.width() as u16;
+        let style = if tab == active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(text, style));
+        if x < area.x + area.width {
+            hits.push(UiHitRect {
+                x,
+                y,
+                width: w.min((area.x + area.width).saturating_sub(x)),
+                height: 1,
+                action_id: format!("{ACTION_TAB_PREFIX}{}", tab.slug()),
+            });
+        }
+        x = x.saturating_add(w);
+    }
+    Paragraph::new(Line::from(spans)).render(line_rect(area, y), buf);
+}
+
+/// Render a tab-3 profile-picker row: a dot + name + root, marking the active
+/// and selected profiles. Declares a `harness:profile:<name>` hit-rect.
+fn render_profile_row(
+    profile: &ProfileRef,
+    selected: bool,
+    area: Rect,
+    y: u16,
+    buf: &mut Buffer,
+    hits: &mut Vec<UiHitRect>,
+    suppress_hits: bool,
+) {
+    let marker = if selected { "\u{25B8} " } else { "  " };
+    let name_style = if profile.active {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let mut spans = vec![
+        Span::styled(marker, Style::default().fg(Color::Cyan)),
+        Span::styled(profile.name.clone(), name_style),
+    ];
+    let mut tag = format!(" [{}]", profile.kind);
+    if profile.active {
+        tag.push_str(" active");
+    }
+    spans.push(Span::styled(tag, Style::default().fg(Color::DarkGray)));
+    Paragraph::new(Line::from(spans)).render(line_rect(area, y), buf);
+    if !suppress_hits {
+        hits.push(UiHitRect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+            action_id: format!("{ACTION_PROFILE_PREFIX}{}", profile.name),
+        });
+    }
 }
 
 /// Slim collapsed handle: a single ">" glyph near the top, clickable to expand.
@@ -166,8 +392,11 @@ fn render_full(
     menu: Option<&MenuState>,
     scroll: usize,
     collapsed: &[String],
+    tab: Tab,
 ) -> Vec<UiHitRect> {
     let mut hits = Vec::new();
+    let (profiles, sections) = view_slices(model, tab);
+    let selected_name = model.selected_profile.as_deref();
 
     // While the disable menu is open the panel is modal: suppress every body
     // hit-rect (rows AND section headers) so the menu's own rects are the only
@@ -209,35 +438,46 @@ fn render_full(
         return hits;
     }
 
-    // Row 1: target identity (or the focus hint when there is no target yet).
-    let target = if model.target.is_empty() {
-        EMPTY_HINT
-    } else {
-        model.target.as_str()
-    };
+    // Row 1: identity (session target on tab 1, profile root on tabs 2/3).
     Paragraph::new(Line::from(Span::styled(
-        truncate_to(target, area.width as usize),
+        truncate_to(&identity_line(model, tab), area.width as usize),
         Style::default().fg(Color::DarkGray),
     )))
     .render(line_rect(area, area.y + 1), buf);
 
-    // Body lines from y+2, starting at `scroll` (clamped defensively to match
-    // the guest's clamp so hover/menu line-index math stays consistent).
-    let lines = body_lines(model, collapsed);
-    let max_lines = area.height.saturating_sub(2) as usize;
+    // Rows 2..2+LEGEND_ROWS: legend. Row 2+LEGEND_ROWS: the tab row.
+    if area.height > 2 {
+        render_legend(area, buf);
+    }
+    let tab_y = area.y + 2 + LEGEND_ROWS;
+    if tab_y < area.y + area.height {
+        render_tabs(area, tab_y, buf, tab, &mut hits);
+    }
+
+    // Body lines from y+BODY_TOP, starting at `scroll` (clamped defensively to
+    // match the guest's clamp so hover/menu line-index math stays consistent).
+    let lines = body_lines(profiles, sections, collapsed);
+    let max_lines = area.height.saturating_sub(BODY_TOP) as usize;
     let scroll = scroll.min(lines.len().saturating_sub(max_lines));
     for (i, line) in lines.iter().skip(scroll).take(max_lines).enumerate() {
-        let y = area.y + 2 + i as u16;
+        let y = area.y + BODY_TOP + i as u16;
         match line {
+            BodyLine::Profile(pi) => {
+                if let Some(p) = profiles.get(*pi) {
+                    let sel = selected_name == Some(p.name.as_str())
+                        || (selected_name.is_none() && p.active);
+                    render_profile_row(p, sel, area, y, buf, &mut hits, menu_open);
+                }
+            }
             BodyLine::Section(si) => {
-                if let Some(section) = model.sections.get(*si) {
+                if let Some(section) = sections.get(*si) {
                     let sec_collapsed = is_collapsed(collapsed, &section.title);
                     render_section_header(section, area, y, buf, sec_collapsed, &mut hits, menu_open);
                 }
             }
             BodyLine::Group(_, name) => render_group_header(name, area, y, buf),
             BodyLine::Row(si, ri) => {
-                if let Some(row) = model.sections.get(*si).and_then(|s| s.rows.get(*ri)) {
+                if let Some(row) = sections.get(*si).and_then(|s| s.rows.get(*ri)) {
                     render_row(row, area, y, buf, &mut hits, menu_open);
                 }
             }
@@ -246,7 +486,7 @@ fn render_full(
 
     // "▼ more" indicator on the last body line when lines are clipped below.
     if max_lines > 0 && scroll + max_lines < lines.len() {
-        render_more_indicator(area, area.y + 2 + (max_lines as u16 - 1), buf);
+        render_more_indicator(area, area.y + BODY_TOP + (max_lines as u16 - 1), buf);
     }
 
     // Right-click disable menu overlays everything (tooltip suppressed).
@@ -259,9 +499,9 @@ fn render_full(
     // body-line index; draw only when it lies inside the visible window.
     if let Some(idx) = hovered {
         if idx >= scroll && idx < (scroll + max_lines).min(lines.len()) {
-            if let Some(row) = row_at(model, &lines[idx]) {
+            if let Some(row) = row_at(sections, &lines[idx]) {
                 if !tooltip_lines(row).is_empty() {
-                    let start_y = area.y + 3 + (idx - scroll) as u16;
+                    let start_y = area.y + BODY_TOP + 1 + (idx - scroll) as u16;
                     render_tooltip(row, area, start_y, buf);
                 }
             }
@@ -679,6 +919,7 @@ mod tests {
                     ],
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -686,7 +927,7 @@ mod tests {
     fn declares_open_and_row_hits() {
         let area = Rect::new(0, 0, 44, 16);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model(), area, &mut buf, None, None, 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &[], Tab::Session);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"harness:toggle_panel"));
         assert!(ids.iter().any(|id| *id == "harness:open:ctx:0"));
@@ -697,7 +938,7 @@ mod tests {
     fn declares_section_header_hits() {
         let area = Rect::new(0, 0, 44, 16);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model(), area, &mut buf, None, None, 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &[], Tab::Session);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"harness:section:CONTEXT"));
         assert!(ids.contains(&"harness:section:HOOKS"));
@@ -707,7 +948,7 @@ mod tests {
     fn row_hit_rect_spans_full_width() {
         let area = Rect::new(0, 0, 44, 16);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model(), area, &mut buf, None, None, 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &[], Tab::Session);
         let open = hits
             .iter()
             .find(|h| h.action_id == "harness:open:ctx:0")
@@ -719,7 +960,7 @@ mod tests {
     #[test]
     fn collapsed_section_hides_rows_but_keeps_header() {
         let collapsed = vec!["HOOKS".to_string()];
-        let lines = body_lines(&model(), &collapsed);
+        let lines = body_lines(&[], &model().sections, &collapsed);
         // CONTEXT header + its row, then HOOKS header only (no group/rows).
         assert!(lines.contains(&BodyLine::Section(1)));
         assert!(!lines.iter().any(|l| matches!(l, BodyLine::Row(1, _))));
@@ -733,7 +974,7 @@ mod tests {
         let area = Rect::new(0, 0, 44, 16);
         let mut buf = Buffer::empty(area);
         let collapsed = vec!["HOOKS".to_string()];
-        let hits = render(&model(), area, &mut buf, None, None, 0, &collapsed);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &collapsed, Tab::Session);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"harness:section:HOOKS"));
         assert!(!ids.iter().any(|id| id.starts_with("harness:row:hook")));
@@ -741,7 +982,7 @@ mod tests {
 
     #[test]
     fn contiguous_group_emits_one_header() {
-        let lines = body_lines(&model(), &[]);
+        let lines = body_lines(&[], &model().sections, &[]);
         let groups: Vec<_> = lines
             .iter()
             .filter(|l| matches!(l, BodyLine::Group(_, _)))
@@ -791,14 +1032,14 @@ mod tests {
 
     #[test]
     fn scroll_offset_shifts_visible_body_lines() {
-        let area = Rect::new(0, 0, 44, 4); // header + target + 2 body rows
+        let area = Rect::new(0, 0, 44, 8); // BODY_TOP fixed rows + 3 body rows
         let mut buf = Buffer::empty(area);
-        let hits = render(&model(), area, &mut buf, None, None, 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &[], Tab::Session);
         assert!(hits.iter().any(|h| h.action_id == "harness:section:CONTEXT"));
         // Scroll down two lines: CONTEXT header + its row scroll off, the HOOKS
         // header (body line 2) becomes the first visible line.
         let mut buf2 = Buffer::empty(area);
-        let hits2 = render(&model(), area, &mut buf2, None, None, 2, &[]);
+        let hits2 = render(&model(), area, &mut buf2, None, None, 2, &[], Tab::Session);
         assert!(hits2.iter().any(|h| h.action_id == "harness:section:HOOKS"));
         assert!(!hits2.iter().any(|h| h.action_id == "harness:section:CONTEXT"));
     }
@@ -811,7 +1052,7 @@ mod tests {
             key: "hook:0".to_string(),
             anchor_y: 4,
         };
-        let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[], Tab::Session);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"harness:disable_session:hook:0"));
         assert!(ids.contains(&"harness:disable_profile:hook:0"));
@@ -829,8 +1070,9 @@ mod tests {
             !ids.iter().any(|id| id.starts_with(ACTION_SECTION_PREFIX)),
             "section hits must be suppressed while menu open: {ids:?}"
         );
-        // Only the header toggle + the 3 menu entries remain.
-        assert_eq!(hits.len(), 4, "{ids:?}");
+        // Only the header chrome (toggle + 3 tab switches) + the 3 menu entries
+        // remain; the tab row is fixed header, not a suppressible body hit.
+        assert_eq!(hits.len(), 7, "{ids:?}");
     }
 
     #[test]
@@ -842,7 +1084,7 @@ mod tests {
             key: "hook:0".to_string(),
             anchor_y,
         };
-        let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[]);
+        let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[], Tab::Session);
         let start_y = anchor_y + 1;
         for (i, id) in [
             "harness:disable_session:hook:0",
@@ -867,14 +1109,14 @@ mod tests {
     fn collapsed_handle_declares_toggle() {
         let area = Rect::new(0, 0, 3, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&HarnessRenderModel::default(), area, &mut buf, None, None, 0, &[]);
+        let hits = render(&HarnessRenderModel::default(), area, &mut buf, None, None, 0, &[], Tab::Session);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "harness:toggle_panel");
     }
 
     #[test]
     fn body_lines_flatten_sections_groups_and_rows() {
-        let lines = body_lines(&model(), &[]);
+        let lines = body_lines(&[], &model().sections, &[]);
         // CONTEXT(sec) + ctx row + HOOKS(sec) + PreToolUse(group) + 2 hook rows.
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[0], BodyLine::Section(0));
@@ -882,5 +1124,99 @@ mod tests {
         assert_eq!(lines[2], BodyLine::Section(1));
         assert_eq!(lines[3], BodyLine::Group(1, "PreToolUse".to_string()));
         assert_eq!(lines[4], BodyLine::Row(1, 0));
+    }
+
+    fn profiles_model() -> HarnessRenderModel {
+        let mut m = model();
+        m.profiles = vec![
+            ProfileRef {
+                name: "daily".to_string(),
+                root: "~/.claude".to_string(),
+                active: true,
+                kind: "daily".to_string(),
+            },
+            ProfileRef {
+                name: "v1-mac".to_string(),
+                root: "~/claude-hub/profiles/v1-mac".to_string(),
+                active: false,
+                kind: "ccp".to_string(),
+            },
+        ];
+        m.profile_view = Some(harness_manager_model::ProfileView {
+            name: "daily".to_string(),
+            root: "~/.claude".to_string(),
+            sections: vec![HarnessSection {
+                title: "SKILLS".to_string(),
+                summary: "2".to_string(),
+                agg: None,
+                collapsed_default: false,
+                rows: vec![row("pskill:0", "telegram", None)],
+            }],
+        });
+        m.selected_profile = Some("daily".to_string());
+        m
+    }
+
+    #[test]
+    fn tab_row_declares_switch_hits() {
+        let area = Rect::new(0, 0, 44, 16);
+        let mut buf = Buffer::empty(area);
+        let hits = render(&model(), area, &mut buf, None, None, 0, &[], Tab::Session);
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        assert!(ids.contains(&"harness:tab:session"));
+        assert!(ids.contains(&"harness:tab:profile"));
+        assert!(ids.contains(&"harness:tab:profiles"));
+    }
+
+    #[test]
+    fn profiles_tab_lists_picker_and_selected_view() {
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            &profiles_model(),
+            area,
+            &mut buf,
+            None,
+            None,
+            0,
+            &[],
+            Tab::Profiles,
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        // Both profiles are pickable, and the active-profile SKILLS section
+        // header (from profile_view) renders as the selected view.
+        assert!(ids.contains(&"harness:profile:daily"));
+        assert!(ids.contains(&"harness:profile:v1-mac"));
+        assert!(ids.contains(&"harness:section:SKILLS"));
+    }
+
+    #[test]
+    fn profile_tab_shows_profile_view_not_session() {
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            &profiles_model(),
+            area,
+            &mut buf,
+            None,
+            None,
+            0,
+            &[],
+            Tab::Profile,
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        // The profile view has no SESSION section and no picker rows.
+        assert!(ids.contains(&"harness:section:SKILLS"));
+        assert!(!ids.iter().any(|id| id.starts_with("harness:profile:")));
+    }
+
+    #[test]
+    fn profiles_tab_body_lines_include_picker_rows() {
+        let m = profiles_model();
+        let (profiles, sections) = view_slices(&m, Tab::Profiles);
+        let lines = body_lines(profiles, sections, &[]);
+        assert_eq!(lines[0], BodyLine::Profile(0));
+        assert_eq!(lines[1], BodyLine::Profile(1));
+        assert!(lines.iter().any(|l| matches!(l, BodyLine::Section(_))));
     }
 }
