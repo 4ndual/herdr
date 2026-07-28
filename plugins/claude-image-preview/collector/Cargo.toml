@@ -1,0 +1,22 @@
+# fork(+127): out-of-process collector for the Claude image-preview plugin. A
+# member of the ROOT herdr workspace (not the sibling wasm
+# `claude-image-preview-ui` nested workspace) so it builds into
+# `<workspace>/target/release/claude-image-preview-collector`, which the plugin
+# manifest's `collector` argv points at via a plugin-root-relative path.
+[package]
+name = "claude-image-preview-collector"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Override directory-based workspace discovery: the parent
+# `claude-image-preview` dir is itself a (wasm) workspace root, so pin
+# membership to the repo-root workspace.
+workspace = "../../.."
+
+[[bin]]
+name = "claude-image-preview-collector"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

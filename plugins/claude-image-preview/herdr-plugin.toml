@@ -1,0 +1,79 @@
+id = "builtin.claude-image-preview"
+name = "Claude Image Preview"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Renders Claude Code [Image #N] placeholders as in-pane previews, entirely from a plugin (no host image code)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the wasm guest. The collector is a separate nested workspace built into
+# the ROOT target dir; see the `collector` argv below.
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "images"
+title = "Claude Image Preview"
+description = "Parses [Image #N] from the focused pane and paints each one through pane.graphics.set"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/claude_image_preview_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+
+# This is the whole point of +127. Before it, `[Image #N]` previews were host
+# code in `src/host_image.rs` and could only be removed by rebuilding herdr;
+# now `herdr plugin disable builtin.claude-image-preview` removes them at
+# runtime and the host drops this owner's layers.
+#
+#   pane_graphics   — set/clear owner-tagged layers on a pane.
+#   api_read        — `pane.list` (which pane is focused, and its agent session)
+#                     and `pane.read` (the text the placeholders live in).
+#   layout_read +
+#   focused_session — deliver the per-frame `frame` event carrying
+#                     HERDR_PLUGIN_UI_INPUT_JSON.
+#
+# There is deliberately NO api_write here: this plugin only overlays. It cannot
+# edit the pane text, which is why the untouched buffer keeps working for
+# search, copy and agent-resume. Text mutation is a separate capability
+# (deferred to +128); see .local/prd/127-plugin-owned-images.md.
+capabilities = ["layout_read", "focused_session", "api_read", "pane_graphics"]
+
+# The generic §7.1 transport. The host reads this file from the module's
+# HERDR_PLUGIN_STATE_DIR each frame (size-capped, mtime-cached) and injects it
+# as HERDR_PLUGIN_UI_INPUT_JSON. The host neither parses nor understands the
+# contents; the schema below is entirely this plugin's business.
+#
+#   { "session_id": "<focused agent session>",
+#     "images": [{ "number": 1, "path": "/abs/1.png",
+#                  "width": 1920, "height": 1080 }] }
+ui_input_file = "image_input.json"
+
+# The out-of-process collector. It exists because a wasm32 guest here has no
+# WASI and no host imports: it cannot list a directory, stat a file, or read a
+# PNG header. Knowing that Claude keeps its images in ~/.claude/image-cache,
+# named after the N in [Image #N], is Claude POLICY — which is exactly the thing
+# that must not live in herdr. argv[0] is resolved against plugin_root; the bin
+# lands in the ROOT workspace target dir (this plugin is a nested wasm
+# workspace, so ../../target escapes it to <repo>/target).
+collector = ["../../target/release/claude-image-preview-collector"]
+
+# The only directories a `pane.graphics.set { source_path }` from this module may
+# name. Declared here, visible in `herdr plugin list` BEFORE anyone enables it,
+# and enforced after canonicalising both sides so no symlink or `..` escapes. A
+# plugin must not silently gain reach it did not declare.
+graphics_roots = ["~/.claude/image-cache"]
+
+# Ceiling on retained layers per pane for this module. A pane showing a hundred
+# placeholders must cost a bounded amount of host memory. The guest enforces the
+# same number so it is never the thing that trips this limit.
+max_layers_per_pane = 8
+
+[ui_modules.placement]
+# One carved row. The guest's own surface is a STATUS LINE, not the image: the
+# images are painted into a PANE through the graphics API, which is not a plugin
+# surface at all. That separation is why a preview survives a redraw of the strip
+# and why the pane keeps its own layer list.
+region = "bottom"
+align = "start"
+size = "1"
+z = 55

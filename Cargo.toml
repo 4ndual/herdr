@@ -89,5 +89,5 @@ windows-sys = { version = "0.61.2", features = [
 wat = "1"
 
 [workspace]
-members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api", "crates/historial-dash-model", "crates/harness-manager-model", "crates/version-dash-model", "plugins/usage-dash-ui/collector", "plugins/version-dash-ui/collector"]
+members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api", "crates/historial-dash-model", "crates/harness-manager-model", "crates/version-dash-model", "plugins/usage-dash-ui/collector", "plugins/version-dash-ui/collector", "plugins/claude-image-preview/collector"]
 resolver = "2"
