@@ -341,6 +341,7 @@ impl App {
             crate::usage_host::tick(self);
             crate::goal_host::tick(self);
             crate::historial_host::tick(self);
+            crate::collector_host::tick(self);
             crate::harness_host::tick(self);
             // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
             // capabilities, ui_input_file, collector argv) before the wasm

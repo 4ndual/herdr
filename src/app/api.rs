@@ -155,7 +155,11 @@ impl App {
                 Ok(outcome) if plugin_id == super::USAGE_DASH_PLUGIN_ID => {
                     crate::usage_host::apply_collector_outcome(self, outcome)
                 }
-                Ok(_) => Ok(()),
+                // Every other plugin's collector snapshot is written verbatim into
+                // its own ui_input_file by the generic collector host.
+                Ok(outcome) => {
+                    crate::collector_host::apply_outcome(self, &plugin_id, &module_id, outcome)
+                }
                 Err(message) => Err(message.clone()),
             };
             match apply_result {

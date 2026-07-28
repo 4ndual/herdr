@@ -154,6 +154,16 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "detach",
+        label: "Detach",
+        emoji: "\u{23CF}\u{FE0F}",     // ⏏️
+        shortcut: "\u{2303}\u{2325}D", // ⌃⌥D
+        color: "lavender",
+        description: "Move this conversation into an external tmux session that survives herdr restarts (resume, not fork)",
+        action_id: "detach",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "archive",
         label: "Archive pane",
         emoji: "\u{1F5C4}\u{FE0F}",   // 🗄️

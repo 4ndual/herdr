@@ -1,0 +1,60 @@
+id = "builtin.detached-dash"
+name = "Detached Sessions Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Lists live external tmux sessions holding detached conversations; right-click to restore into herdr or open in a new window"
+platforms = ["linux", "macos"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+# restore: kill the detached tmux wrapper and resume the conversation as a NORMAL
+# herdr pane (cx-resume in a fresh tab's root pane — never nested inside tmux). The
+# right-clicked entry is delivered as HERDR_PLUGIN_PAYLOAD_JSON (agent/session/cwd).
+[[actions]]
+id = "restore"
+title = "Restore into herdr"
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/restore-detached.sh\" >/dev/null 2>&1 &"]
+
+# open-window: attach the detached tmux session in a new Ghostty window (no
+# osascript). The right-clicked entry is delivered as HERDR_PLUGIN_PAYLOAD_JSON.
+[[actions]]
+id = "open-window"
+title = "Open in new window"
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-detached-window.sh\" >/dev/null 2>&1 &"]
+
+[[ui_modules]]
+id = "detached"
+title = "Detached Sessions"
+description = "Live detached tmux sessions, carved from the LEFT of the usage band"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/detached_dash_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+# layout_read: needed for Frame events (rect + injected ui_input). mouse_all: the
+# entry rows resolve left/right clicks from declarative hit-rects (Action path).
+# plugin_actions: emit HostEffect::InvokePluginAction to run the restore /
+# open-window scripts with the selected entry as payload. toasts: user feedback.
+capabilities = ["layout_read", "mouse_all", "plugin_actions", "toasts"]
+
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame and
+# injects it as HERDR_PLUGIN_UI_INPUT_JSON. It is produced by the out-of-process
+# `collector` below (generic collector path in src/collector_host.rs), so dead
+# tmux sessions vanish within one poll with no host rebuild.
+ui_input_file = "detached_input.json"
+# Poll tmux for herdr-detached-* sessions once per dashboard tick. argv[0] is a
+# bare command (resolved on PATH); the script path is relative to plugin_root
+# (the collector runs with cwd = plugin_root).
+collector = ["bash", "scripts/collect-detached.sh"]
+
+# Placement: carve a slot from the LEFT (start) of the bottom usage band so it
+# never collides with the end-anchored archive-dash (z=50) and button-dash (z=60).
+[ui_modules.placement]
+region = "bottom_band"
+align = "start"
+size = "34"
+min_peer = 24
+z = 55

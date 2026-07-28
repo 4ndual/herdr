@@ -107,6 +107,17 @@ title = "Draw + screenshot (region)"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" region >/dev/null 2>&1 &"]
 
+# detach: move the CURRENT pane's conversation OUT of herdr into a standalone
+# external tmux session (herdr-detached-<slug>) that survives herdr restarts. The
+# pane is closed and the SAME session is resumed (no fork) so exactly one live
+# process remains (see scripts/detach-conversation.sh). Reads the source pane from
+# the inherited HERDR_PANE_ID. Detached so it outlives the action runner.
+[[actions]]
+id = "detach"
+title = "Detach to tmux"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/detach-conversation.sh\" >/dev/null 2>&1 &"]
+
 [[ui_modules]]
 id = "button-ui"
 title = "Button Dash"

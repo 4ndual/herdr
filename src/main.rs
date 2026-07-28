@@ -63,6 +63,7 @@ mod bundled_plugins;
 mod checksum;
 mod cli;
 mod client;
+mod collector_host;
 mod config;
 mod detect;
 mod events;

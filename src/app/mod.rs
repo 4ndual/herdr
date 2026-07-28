@@ -183,6 +183,18 @@ fn write_ui_input_atomic(
     Ok(())
 }
 
+/// Write `contents` into a plugin module's `ui_input_file` under that plugin's
+/// state dir (spec §7.1 writer side). Used by the generic collector host
+/// ([`crate::collector_host`]) to publish a non-usage collector's snapshot.
+pub(crate) fn write_plugin_ui_input(
+    plugin_id: &str,
+    filename: &str,
+    contents: &str,
+) -> std::io::Result<()> {
+    let state_dir = crate::plugin_paths::plugin_state_dir(plugin_id);
+    write_ui_input_atomic(&state_dir, filename, contents)
+}
+
 /// Resolve and read a module's `ui_input_file` under `state_dir` (spec §7.1),
 /// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached in `cache`. Returns
 /// the current contents, or `None` when the name is not a single path segment,

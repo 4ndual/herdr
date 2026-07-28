@@ -997,6 +997,7 @@ fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
         "mauve" | "magenta" => Style::default().fg(app.palette.mauve),
         "subtext" | "gray" => Style::default().fg(app.palette.subtext0),
         "peach" => Style::default().fg(app.palette.peach),
+        "lavender" => Style::default().fg(app.palette.overlay1),
         "panel" => Style::default()
             .fg(app.palette.text)
             .bg(app.palette.panel_bg),
