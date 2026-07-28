@@ -95,6 +95,14 @@ pub enum UiCapability {
     /// power — painting into a pane the module does not own — and it should be
     /// grantable, refusable and visible on its own.
     PaneGraphics,
+    /// fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Split out
+    /// from `ApiWrite` because a module holding it can turn OTHER modules off,
+    /// including ones the user relies on — so it must be declared, visible in
+    /// the manifest, and refusable on its own rather than riding along with
+    /// ordinary structural writes. `plugin.link`/`plugin.unlink` stay
+    /// host-reserved: installing code from a path is a strictly larger power
+    /// than flipping an already-installed plugin's enabled bit.
+    PluginAdmin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -577,6 +577,14 @@ pub enum PluginUiCapability {
     /// and separating it means `plugin list` shows exactly which plugin holds
     /// the right to draw into the user's panes.
     PaneGraphics,
+    /// fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Kept out of
+    /// `ApiWrite` for the same reason as the two above: a module holding this
+    /// can switch OTHER modules off, so it has to be declared and visible in
+    /// `plugin list` rather than arriving as a side effect of ordinary writes.
+    /// `plugin.link`/`plugin.unlink` remain host-reserved — installing code from
+    /// a path is a strictly larger power than flipping an installed plugin's
+    /// enabled bit, and nothing in-guest needs it.
+    PluginAdmin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

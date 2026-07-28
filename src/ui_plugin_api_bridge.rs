@@ -80,12 +80,23 @@ const PANE_GRAPHICS_METHODS: &[&str] = &[
     "pane.graphics.info",
 ];
 
+/// fork: flip an already-installed plugin's enabled bit, gated on `PluginAdmin`.
+///
+/// These were host-reserved denies until the plugin-manager pane needed them.
+/// They are an allow row rather than a `WRITE_METHODS` entry because a module
+/// holding this can switch OTHER modules off — including the one drawing the
+/// user's images — so it has to be declared in the manifest and visible in
+/// `plugin list`, not folded into ordinary structural writes.
+///
+/// `plugin.link`/`plugin.unlink` stay denied below and are NOT part of this
+/// capability: installing code from a filesystem path is a strictly larger
+/// power than toggling something the user already chose to install.
+const PLUGIN_ADMIN_METHODS: &[&str] = &["plugin.enable", "plugin.disable"];
+
 /// Host-reserved administration: exact-name denies regardless of capability.
 const DENIED_EXACT_METHODS: &[&str] = &[
     "plugin.link",
     "plugin.unlink",
-    "plugin.enable",
-    "plugin.disable",
     "integration.install",
     "integration.uninstall",
     "worktree.create",
@@ -147,6 +158,9 @@ pub(crate) fn decide(method: &str) -> ApiMethodDecision {
     if PANE_GRAPHICS_METHODS.contains(&method) {
         return ApiMethodDecision::Allow(PluginUiCapability::PaneGraphics);
     }
+    if PLUGIN_ADMIN_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::PluginAdmin);
+    }
     ApiMethodDecision::Deny
 }
 
@@ -160,6 +174,7 @@ mod tests {
             .chain(WRITE_METHODS.iter())
             .chain(INPUT_METHODS.iter())
             .chain(PANE_GRAPHICS_METHODS.iter())
+            .chain(PLUGIN_ADMIN_METHODS.iter())
             .copied()
     }
 
@@ -210,6 +225,39 @@ mod tests {
         assert_eq!(decide("server.live_handoff"), ApiMethodDecision::Deny);
         assert_eq!(decide("plugin.link"), ApiMethodDecision::Deny);
         assert_eq!(decide("worktree.create"), ApiMethodDecision::Deny);
+    }
+
+    /// fork: toggling an installed plugin is reachable, installing one is not.
+    /// These two live one method-namespace apart, so the split has to be
+    /// asserted directly — moving `plugin.enable` out of the deny list must not
+    /// drag `plugin.link` along with it.
+    #[test]
+    fn plugin_toggle_needs_its_own_capability_while_link_stays_host_reserved() {
+        assert_eq!(
+            decide("plugin.enable"),
+            ApiMethodDecision::Allow(PluginUiCapability::PluginAdmin)
+        );
+        assert_eq!(
+            decide("plugin.disable"),
+            ApiMethodDecision::Allow(PluginUiCapability::PluginAdmin)
+        );
+        assert_eq!(decide("plugin.link"), ApiMethodDecision::Deny);
+        assert_eq!(decide("plugin.unlink"), ApiMethodDecision::Deny);
+    }
+
+    /// The toggle must NOT be reachable by holding `ApiWrite`, which almost
+    /// every plugin that touches panes already declares. If it ever resolves to
+    /// `ApiWrite`, a plugin that only asked to split panes silently gains the
+    /// power to switch off the user's other plugins.
+    #[test]
+    fn plugin_toggle_is_not_reachable_through_ordinary_api_write() {
+        for method in ["plugin.enable", "plugin.disable"] {
+            assert_ne!(
+                decide(method),
+                ApiMethodDecision::Allow(PluginUiCapability::ApiWrite),
+                "{method} must not ride along with ApiWrite"
+            );
+        }
     }
 
     #[test]

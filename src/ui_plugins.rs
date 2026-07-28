@@ -1512,6 +1512,7 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::ApiWrite => UiCapability::ApiWrite,
         crate::api::schema::PluginUiCapability::ApiInput => UiCapability::ApiInput,
         crate::api::schema::PluginUiCapability::PaneGraphics => UiCapability::PaneGraphics,
+        crate::api::schema::PluginUiCapability::PluginAdmin => UiCapability::PluginAdmin,
     }
 }
 
