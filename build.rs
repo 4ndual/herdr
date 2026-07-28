@@ -51,7 +51,26 @@ fn emit_fork_provenance(manifest_dir: &std::path::Path) {
         Command::new("git")
             .arg("-C")
             .arg(manifest_dir)
-            .args(["describe", "--tags", "--long", "--always", "--dirty"])
+            // `--match v*` pins the base to RELEASE tags. Without it, `describe`
+            // takes any tag reachable from HEAD, so an unrelated tag sitting on
+            // the tip silently rewrites this string: a preservation tag named
+            // `fork/pre-decouple-v0.7.5-138` produced
+            // `fork/pre-decouple-v0.7.5-138-0-g2b012356` instead of
+            // `v0.7.5-138-g2b012356`. That fails quietly -- the build is clean
+            // and the string looks plausible -- but `fork_commit_count()` parses
+            // it right-to-left and would have read the `0` as the count, so the
+            // version strip rendered `+0` instead of `+138` on the exact glyph
+            // used to identify a build. Archival tags must not be able to do
+            // that; only `v*` release tags may set the base.
+            .args([
+                "describe",
+                "--tags",
+                "--match",
+                "v*",
+                "--long",
+                "--always",
+                "--dirty",
+            ])
             .output()
             .ok()
             .filter(|out| out.status.success())
