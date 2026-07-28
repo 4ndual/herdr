@@ -1196,6 +1196,7 @@
             },
             "text": {
               "type": "string"
+<<<<<<< HEAD
             },
             "wait": {
               "anyOf": [
@@ -1231,6 +1232,15 @@
               "type": "array"
             }
           },
+||||||| 299dd416
+=======
+            }
+          },
+          "required": [
+            "target",
+            "text"
+          ],
+>>>>>>> task/wave1-integration
           "type": "object"
         },
         "AgentReadParams": {
@@ -3235,6 +3245,12 @@
                 "null"
               ]
             },
+            "plugin_payload_json": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "selected_text": {
               "type": [
                 "string",
@@ -3566,6 +3582,18 @@
             "detection"
           ],
           "type": "string"
+        },
+        "ResumePickerOpenParams": {
+          "description": "Open the resume-search picker as an in-app overlay. `wrapper` is the\nabsolute path to `resume-picker-overlay.sh` (the caller — the button script —\nresolves it from `$HERDR_PLUGIN_ROOT`, keeping plugin layout out of the host).",
+          "properties": {
+            "wrapper": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "wrapper"
+          ],
+          "type": "object"
         },
         "ServerLiveHandoffParams": {
           "properties": {
@@ -4862,6 +4890,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.prompt",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.rename",
               "type": "string"
             },
@@ -5731,6 +5775,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "resume_picker.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ResumePickerOpenParams"
             }
           },
           "required": [
@@ -6941,9 +7001,16 @@
                 "kind": "local"
               }
             },
+<<<<<<< HEAD
             "startup": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/PluginManifestStartup"
+||||||| 299dd416
+=======
+            "ui_modules": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginManifestUiModule"
+>>>>>>> task/wave1-integration
               },
               "type": "array"
             },
@@ -8001,6 +8068,13 @@
           ],
           "type": "string"
         },
+        "PluginHotReloadMode": {
+          "enum": [
+            "off",
+            "on"
+          ],
+          "type": "string"
+        },
         "PluginInvocationContext": {
           "properties": {
             "clicked_url": {
@@ -8050,6 +8124,12 @@
               ]
             },
             "link_handler_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plugin_payload_json": {
               "type": [
                 "string",
                 "null"
@@ -8290,6 +8370,7 @@
           ],
           "type": "object"
         },
+<<<<<<< HEAD
         "PluginManifestStartup": {
           "properties": {
             "command": {
@@ -8310,6 +8391,101 @@
           },
           "required": [
             "command"
+||||||| 299dd416
+=======
+        "PluginManifestUiModule": {
+          "properties": {
+            "api_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "capabilities": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginUiCapability"
+              },
+              "type": "array"
+            },
+            "collector": {
+              "description": "fork(wave-2): optional argv naming a command the host executes on each\ndashboard tick to PRODUCE this module's snapshot out-of-process, so\ncollection logic hot-reloads (rebuild the bin) without a host rebuild.\nRelative `argv[0]` is resolved against `plugin_root` at exec time. The\nhost gates and spawns it exactly like a plugin `event`/`action` command\n(same executor path); the child receives `HERDR_PLUGIN_STATE_DIR` and\n`HERDR_FOCUS_JSON`, and answers on stdout with the sticky snapshot\nprotocol (`{\"outcome\":\"replace\",\"snapshot\":{…}}` | `{\"outcome\":\"keep\"}`\n| `{\"outcome\":\"clear\"}`). Only meaningful together with `ui_input_file`.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hot_reload": {
+              "$ref": "#/schemas/success_response/$defs/PluginHotReloadMode",
+              "default": "on"
+            },
+            "id": {
+              "type": "string"
+            },
+            "image_file": {
+              "description": "fork: optional single path segment naming an image file under this\nmodule's plugin directory. When declared, the HOST loads it and paints\nit over the module's surface `Rect` (kitty transmit path, or half-block\nfallback). Purely host-consumed — it never crosses the wasm guest ABI.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/schemas/success_response/$defs/PluginUiModuleKind",
+              "default": "wasm"
+            },
+            "module": {
+              "type": "string"
+            },
+            "placement": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PluginPanelPlacement"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Data-driven placement for this module's `Panel` surface. Only consulted\nwhen the module declares the `panel` surface; ignored otherwise. `None`\nfalls back to the `PluginPanelPlacement` default (free overlay)."
+            },
+            "platforms": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginPlatform"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "surfaces": {
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/PluginUiSurface"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": "string"
+            },
+            "ui_input_file": {
+              "description": "Optional single path segment (no separators, no `..`) naming a file under\nthis module's `HERDR_PLUGIN_STATE_DIR`. When declared, the host reads the\nfile each frame (size-capped, mtime-cached) and injects its contents as\n`HERDR_PLUGIN_UI_INPUT_JSON` in the module's frame env (spec §7.1). The\nplugin's own process side writes the file; the host never interprets it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "api_version",
+            "module"
+>>>>>>> task/wave1-integration
           ],
           "type": "object"
         },
@@ -8341,6 +8517,84 @@
             "zoomed"
           ],
           "type": "string"
+        },
+        "PluginPanelAlign": {
+          "enum": [
+            "start",
+            "center",
+            "end"
+          ],
+          "type": "string"
+        },
+        "PluginPanelPlacement": {
+          "description": "Data-driven placement for a `Panel` surface (schema mirror of the host's\ngeneric panel layout). Every field is manifest DATA, so a plugin controls\nwhere it renders with no host/enum change. Defaults reproduce a free overlay\nwith a snug (content-sized) box.",
+          "properties": {
+            "align": {
+              "$ref": "#/schemas/success_response/$defs/PluginPanelAlign",
+              "default": "start",
+              "description": "Where the panel sits along the carve axis of its region. Meaningful for\n`bottom_band` (which side of the usage band) and `free` (anchor within\nthe pane area); edge regions (`left`/`right`/`top`/`bottom`) already\nencode their edge."
+            },
+            "min_peer": {
+              "default": 24,
+              "description": "Cells (columns for vertical bands, rows for horizontal bands) the peer\nregion keeps: the panel is only carved when the peer keeps at least this\nmuch, so a secondary panel never squeezes the primary content unreadable.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "region": {
+              "$ref": "#/schemas/success_response/$defs/PluginPanelRegion",
+              "default": "free",
+              "description": "Which region the panel occupies / carves from."
+            },
+            "size": {
+              "description": "Extent along the carved dimension: `\"auto\"` (snug to content, default),\na cell count (`\"30\"`), or a percent of the available span (`\"30%\"`).\nParsed host-side; unparseable values fall back to `auto`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "z": {
+              "default": 0,
+              "description": "Draw/hit z-order among panels and other layers (higher is on top).",
+              "format": "int16",
+              "maximum": 32767,
+              "minimum": -32768,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "PluginPanelRegion": {
+          "oneOf": [
+            {
+              "enum": [
+                "right",
+                "bottom"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "bottom_band",
+              "description": "Share the usage-strip band: carve a slot beside the usage dash (its own\nrect + hit-rects). This is what button-dash uses.",
+              "type": "string"
+            },
+            {
+              "const": "left",
+              "description": "Carve a column band from the left/right of the pane area (panes shrink).",
+              "type": "string"
+            },
+            {
+              "const": "top",
+              "description": "Carve a row band from the top/bottom of the pane area (panes shrink).",
+              "type": "string"
+            },
+            {
+              "const": "free",
+              "description": "Overlay the pane area without carving; anchored by `align`.",
+              "type": "string"
+            }
+          ]
         },
         "PluginPlatform": {
           "enum": [
@@ -8410,6 +8664,7 @@
           ],
           "type": "string"
         },
+<<<<<<< HEAD
         "PopupSize": {
           "oneOf": [
             {
@@ -8421,6 +8676,72 @@
             {
               "description": "Outer popup size as a percentage of the terminal area, for example 80%.",
               "pattern": "^(100|[1-9][0-9]?)%$",
+||||||| 299dd416
+=======
+        "PluginUiCapability": {
+          "oneOf": [
+            {
+              "enum": [
+                "focused_session",
+                "theme_read",
+                "layout_read",
+                "mouse_all",
+                "keyboard_input",
+                "context_menu_augment",
+                "clipboard_write",
+                "pane_input",
+                "toasts",
+                "open_plugin_panes",
+                "plugin_actions"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "api_read",
+              "description": "API v3 (§5.3): read-only socket API methods via `HostEffect::Api`.",
+              "type": "string"
+            },
+            {
+              "const": "api_write",
+              "description": "API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.",
+              "type": "string"
+            },
+            {
+              "const": "api_input",
+              "description": "API v3 (§5.3): text/keystroke-injecting socket API methods via\n`HostEffect::Api` (`pane.send_text`, `agent.send`).",
+              "type": "string"
+            }
+          ]
+        },
+        "PluginUiModuleKind": {
+          "enum": [
+            "wasm"
+          ],
+          "type": "string"
+        },
+        "PluginUiSurface": {
+          "oneOf": [
+            {
+              "enum": [
+                "header",
+                "footer",
+                "tab_bar",
+                "sidebar",
+                "right_panel",
+                "overlay",
+                "context_menu"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "usage_strip",
+              "description": "The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.",
+              "type": "string"
+            },
+            {
+              "const": "panel",
+              "description": "A generic, plugin-placed panel whose rect the host lays out from the\nmodule manifest `placement` spec (region/align/size/min_peer/z) rather\nthan a hardcoded per-variant match. Adding/moving/resizing a panel is a\npure manifest edit (hot-reload), no host rebuild.",
+>>>>>>> task/wave1-integration
               "type": "string"
             }
           ]
@@ -8720,6 +9041,22 @@
                 },
                 "type": {
                   "const": "agent_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                },
+                "type": {
+                  "const": "agent_prompted",
                   "type": "string"
                 }
               },

@@ -1,5 +1,7 @@
 use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::ui_plugins::UiSurfaceLayer;
 use crossterm::event::{KeyCode, KeyModifiers};
+use herdr_ui_plugin_api::UiActionRef;
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
 use std::hash::{Hash, Hasher};
@@ -787,6 +789,58 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    /// Plugin UI surface geometry, computed in `compute_view` and published to
+    /// WASM UI modules via the layout blob. The bottom usage strip is carved
+    /// when the strip is enabled; the right panel has no host consumer in wave 1
+    /// and stays `Rect::default()` (empty, a dormant surface) until a
+    /// plugin-driven dock lands.
+    pub usage_strip_rect: Rect,
+    pub right_panel_rect: Rect,
+    /// Resolved rects for each plugin `Panel` surface, keyed by owning module
+    /// identity, computed by the generic panel layout in `compute_view` from the
+    /// module's manifest `placement` DATA. Each rect is disjoint from the pane
+    /// area and from other panels (edge/band regions carve; free overlays sit
+    /// inside the pane area), so a panel gets its own hit-rects and never steals
+    /// usage-dash or pane input. Empty vec when no panel module renders content.
+    pub panel_rects: Vec<PanelRect>,
+    /// Vertical icon rail for the right-panel plugins, when one or more of them
+    /// renders content and the panel is expanded (not in `collapsed_surfaces`).
+    /// One icon per right-panel plugin; clicking an icon expands that plugin's
+    /// panel (or collapses it when it is already the active one). Empty when no
+    /// right-panel plugin has content or the panel is collapsed to its handle.
+    pub right_panel_rail_icons: Vec<RightPanelRailIcon>,
+}
+
+/// One clickable icon in the right-panel rail: the plugin it selects, its rect,
+/// and whether that plugin is the currently expanded one. Purely TUI-presentation
+/// state (client layer), not a shared runtime fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RightPanelRailIcon {
+    pub plugin_id: String,
+    pub rect: Rect,
+    pub active: bool,
+}
+
+/// One resolved plugin `Panel` rect, tagged with the owning module identity so
+/// hit-testing, rendering, frame dispatch, and the layout blob can each look up
+/// the geometry for a specific `(plugin_id, module_id)` panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelRect {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub rect: Rect,
+}
+
+impl ViewState {
+    /// The resolved rect for the given module's `Panel` surface, or an empty
+    /// `Rect` when no panel is currently carved for it (no content / no slot).
+    pub fn panel_rect(&self, plugin_id: &str, module_id: &str) -> Rect {
+        self.panel_rects
+            .iter()
+            .find(|p| p.plugin_id == plugin_id && p.module_id == module_id)
+            .map(|p| p.rect)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,6 +865,10 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+    /// The resume-search picker, hosted as a floating bordered overlay that
+    /// paints a hidden PTY (the resume-picker TUI) into a centered popup while
+    /// the rest of the UI stays visible around it. See [`ResumePickerOverlay`].
+    ResumePicker,
 }
 
 impl Mode {
@@ -1223,10 +1281,88 @@ pub struct ContextMenuState {
     pub x: u16,
     pub y: u16,
     pub list: MenuListState,
+    pub plugin_items: Vec<UiActionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPluginActionInvocation {
+    pub plugin_id: String,
+    pub action_id: String,
+    pub context_menu_kind: Option<ContextMenuKind>,
+}
+
+/// API v3 (§4): a resolved `UiHitRect` click on a negotiated-v3 module, queued by
+/// `AppState::handle_mouse` (pure state, no wasmtime access) for `App` to
+/// dispatch as a `UiEvent::Action` once it has the runtime `UiPluginManager`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPluginUiAction {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub action_id: String,
+    pub surface: herdr_ui_plugin_api::UiSurface,
+    pub column: u16,
+    pub row: u16,
+    pub kind: herdr_ui_plugin_api::UiActionKind,
+}
+
+/// A host-resolved historial row action (restore / fork / delete), queued by
+/// `AppState::handle_mouse` from a click on the historial plugin's declared
+/// hit-rects. The historial plugin is a pure renderer; the HOST owns the
+/// pane-close log and the resume machinery, so it — not the guest — executes
+/// these. `App::apply_pending_historial_action` drains it once it has runtime
+/// access to spawn tabs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHistorialAction {
+    pub kind: HistorialActionKind,
+    /// The row's stable key `"<ts_unix_ms>:<pane_id>"` (the suffix of the clicked
+    /// `historial:<verb>:<key>` action id).
+    pub key: String,
+}
+
+/// A host-resolved harness-manager row action (open / disable), queued by
+/// `AppState::handle_mouse` from a click on the harness plugin's declared
+/// hit-rects. The harness plugin is a pure renderer; the HOST owns pane
+/// spawning and the Claude settings files, so it — not the guest — executes
+/// these. `App::apply_pending_harness_action` drains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingHarnessAction {
+    pub kind: HarnessActionKind,
+    /// The row's stable key (`"ctx:<n>"` / `"hook:<n>"` / …), the suffix of the
+    /// clicked `harness:<verb>:<key>` action id.
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessActionKind {
+    /// Open the row's file in a new editor tab.
+    Open,
+    /// Disable the entry in the settings file that defines it (session-facing).
+    DisableSession,
+    /// Disable the entry AND its ccp profile source (profile-wide).
+    DisableProfile,
+    /// Select a profile for the tab-3 global view (host scans it and publishes
+    /// its [`harness_manager_model::ProfileView`] into the render model).
+    ViewProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorialActionKind {
+    /// Resume the closed session in a new tab.
+    Restore,
+    /// Fork (branch) the closed session into a new tab.
+    Fork,
+    /// Delete the row from the pane-close log.
+    Delete,
 }
 
 impl ContextMenuState {
-    pub fn items(&self) -> &'static [&'static str] {
+    pub fn items(&self) -> Vec<&str> {
+        let mut items = self.builtin_items().iter().copied().collect::<Vec<_>>();
+        items.extend(self.plugin_items.iter().map(|item| item.label.as_str()));
+        items
+    }
+
+    pub fn builtin_items(&self) -> &'static [&'static str] {
         match self.kind {
             ContextMenuKind::Workspace { .. } => &["Rename", "Close"],
             ContextMenuKind::GitWorkspace {
@@ -1262,7 +1398,7 @@ impl ContextMenuState {
                 "Open worktree...",
                 "Collapse",
             ],
-            ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
+            ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Fork", "Archive", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 source_pane_id: Some(_),
@@ -1312,6 +1448,11 @@ impl ContextMenuState {
                 "Close pane",
             ],
         }
+    }
+
+    pub fn plugin_item(&self, idx: usize) -> Option<&UiActionRef> {
+        idx.checked_sub(self.builtin_items().len())
+            .and_then(|idx| self.plugin_items.get(idx))
     }
 }
 
@@ -1398,6 +1539,19 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+/// Request to invoke a plugin action, scoped to a specific pane.
+///
+/// Set by UI interactions (such as the tab context menu) that need to run a
+/// plugin action through the App/plugin-runtime layer, which is not reachable
+/// from pure `AppState`. The outer App/event loop takes this and dispatches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginActionRequest {
+    pub plugin_id: String,
+    pub action_id: String,
+    pub ws_idx: usize,
+    pub pane_id: PaneId,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1424,6 +1578,9 @@ pub struct AppState {
     pub request_open_existing_worktree: Option<usize>,
     pub request_new_workspace_cwd: Option<std::path::PathBuf>,
     pub request_remove_linked_worktree: Option<usize>,
+    /// Set when a UI interaction (e.g. the tab context menu "Fork" item) asks
+    /// the outer App/event loop to invoke a plugin action for a specific pane.
+    pub request_plugin_action: Option<PluginActionRequest>,
     pub request_submit_worktree_create: bool,
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
@@ -1487,6 +1644,20 @@ pub struct AppState {
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
+    /// Whether the persistent native usage strip is enabled (feat/native-dashes).
+    /// Honors `[ui] usage_strip` at startup; `compute_view` skips carving the
+    /// strip rect when false, so panes reclaim the full height.
+    pub usage_strip_enabled: bool,
+    /// Surfaces collapsed at runtime via `HostEffect::SetSurfaceCollapsed`
+    /// (wasm-ui v3 §7.2). `compute_view` shrinks a collapsed surface's reserve
+    /// to a single row so panes reclaim the space. Pure data, not persisted.
+    pub collapsed_surfaces: std::collections::HashSet<herdr_ui_plugin_api::UiSurface>,
+    /// Which right-panel plugin is currently expanded in the icon rail (by plugin
+    /// id). At most one right-panel plugin shows its content at a time; the others
+    /// collapse to their rail icon. `None` until the first right-panel plugin with
+    /// content appears, at which point `compute_view` defaults it to the first.
+    /// Pure TUI-presentation state (client layer), not persisted.
+    pub active_right_panel: Option<String>,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
@@ -1573,6 +1744,23 @@ pub struct AppState {
     pub(crate) popup_pane: Option<PopupPaneState>,
     /// Recent plugin action/event command executions.
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
+    /// Context-menu items surfaced by loaded UI plugins.
+    pub(crate) ui_context_menu_items: Vec<UiActionRef>,
+    /// Static surface layers surfaced by loaded UI plugins, each tagged with its
+    /// owning `(plugin_id, module_id)` and negotiated API version (§4 identity
+    /// threading). Ordered `(z_index desc, plugin_id asc, module_id asc)`.
+    pub(crate) ui_surface_layers: Vec<UiSurfaceLayer>,
+    /// Deferred plugin action invocations requested by UI/plugin surfaces.
+    pub(crate) pending_plugin_action_invocation: Option<PendingPluginActionInvocation>,
+    /// API v3 (§4): a resolved click awaiting `UiEvent::Action` dispatch by
+    /// `App` (which owns the runtime `UiPluginManager`).
+    pub(crate) pending_plugin_ui_action: Option<PendingPluginUiAction>,
+    /// A historial row action (restore/fork/delete) recorded by `handle_mouse`,
+    /// drained by the runtime layer (`AppState` can't spawn tabs / touch the log).
+    pub(crate) pending_historial_action: Option<PendingHistorialAction>,
+    /// A harness-manager row action (open/disable) recorded by `handle_mouse`,
+    /// drained by the runtime layer (`AppState` can't spawn tabs / edit config).
+    pub(crate) pending_harness_action: Option<PendingHarnessAction>,
     pub(crate) next_plugin_command_log_id: u64,
     pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
@@ -1586,11 +1774,158 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// Pane-close history records staged by close paths (pure), drained and
+    /// appended to the durable log by the runtime layer. Never persisted in the
+    /// session snapshot.
+    pub(crate) pane_close_log_pending: Vec<crate::pane_close_history::PaneCloseRecord>,
+    /// Present while the resume-search picker overlay is open. Holds the pure
+    /// metadata for the hidden PTY runtime (the live runtime itself lives in the
+    /// `App`'s terminal registry, keyed by `terminal_id`). Drained by the runtime
+    /// layer on the picker's `PaneDied` to read the result file and resume.
+    pub(crate) resume_picker: Option<ResumePickerOverlay>,
+}
+
+/// Pure metadata for an open resume-search picker overlay.
+///
+/// The overlay hosts a hidden PTY that runs the existing resume-picker TUI
+/// (byte-for-byte). The picker renders to stderr (painted into the popup) and,
+/// on Enter/click, writes the resolved `exec cx …` command to `result_file`
+/// (its stdout, redirected by the overlay wrapper). On the picker's exit the
+/// runtime layer reads `result_file`; a non-empty command is opened in a new
+/// focused tab (`sh -lc <command>`), mirroring the picker's own
+/// `exec sh -c "$CMD"` — never clobbering the pane that was focused.
+#[derive(Debug, Clone)]
+pub(crate) struct ResumePickerOverlay {
+    /// Registry key for the hidden PTY runtime.
+    pub terminal_id: crate::terminal::TerminalId,
+    /// Reserved pane id the PTY was spawned with, so `PaneDied { pane_id }`
+    /// routes back to this overlay. Never part of any tab layout.
+    pub pane_id: PaneId,
+    /// File the picker's stdout (the resolved command) is redirected to.
+    pub result_file: std::path::PathBuf,
 }
 
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Clear `active_right_panel` if the plugin it names no longer renders content
+    /// (so a rail selection can't point at a vanished plugin). The panel defaults
+    /// to an icon-only rail — nothing is auto-expanded — so a `None` selection is
+    /// left as-is. Called from `compute_view` each frame; pure and unit-tested.
+    pub(crate) fn ensure_active_right_panel(&mut self, rail_plugins: &[String]) {
+        if let Some(active) = self.active_right_panel.as_deref() {
+            if !rail_plugins.iter().any(|p| p == active) {
+                self.active_right_panel = None;
+            }
+        }
+    }
+
+    /// Toggle the right-panel rail selection for `plugin_id`: clicking the icon of
+    /// the already-expanded plugin collapses the panel to its handle; clicking any
+    /// other icon expands that plugin (and un-collapses the panel). Pure and
+    /// unit-tested.
+    pub(crate) fn toggle_right_panel(&mut self, plugin_id: &str) {
+        let collapsed = self
+            .collapsed_surfaces
+            .contains(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        let is_active = self.active_right_panel.as_deref() == Some(plugin_id);
+        if is_active && !collapsed {
+            self.collapsed_surfaces
+                .insert(herdr_ui_plugin_api::UiSurface::RightPanel);
+        } else {
+            self.active_right_panel = Some(plugin_id.to_string());
+            self.collapsed_surfaces
+                .remove(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        }
+    }
+
+    /// Whether the given right-panel plugin is the one currently expanded (so its
+    /// layer should be painted and hit-tested). Others — and every plugin while the
+    /// panel is force-collapsed to its rail — are hidden behind their rail icon.
+    pub(crate) fn right_panel_layer_visible(&self, plugin_id: &str) -> bool {
+        !self
+            .collapsed_surfaces
+            .contains(&herdr_ui_plugin_api::UiSurface::RightPanel)
+            && self.active_right_panel.as_deref() == Some(plugin_id)
+    }
+
+    /// The plugin id of the right-panel rail icon at `(col, row)`, if any. Used by
+    /// the mouse handler to route a rail click to `toggle_right_panel`.
+    pub(crate) fn right_panel_rail_icon_at(&self, col: u16, row: u16) -> Option<String> {
+        self.view
+            .right_panel_rail_icons
+            .iter()
+            .find(|icon| {
+                col >= icon.rect.x
+                    && col < icon.rect.x.saturating_add(icon.rect.width)
+                    && row >= icon.rect.y
+                    && row < icon.rect.y.saturating_add(icon.rect.height)
+            })
+            .map(|icon| icon.plugin_id.clone())
+    }
+
+    /// Build a pane-close history record for a pane that is about to be torn
+    /// down. Must be called *before* the pane/terminal is removed, while the
+    /// pane still resolves to its `TerminalState`. Returns `None` when the pane
+    /// or its terminal metadata cannot be resolved.
+    pub(crate) fn build_pane_close_record(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::pane_close_history::PaneCloseRecord> {
+        let ws = self.workspaces.get(ws_idx)?;
+        let workspace_id = ws.id.clone();
+        let pane_number = ws.public_pane_number(pane_id)?;
+        let public_pane_id = crate::workspace::public_pane_id_for_number(&ws.id, pane_number);
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id)?;
+        let terminal = self.terminals.get(&terminal_id)?;
+
+        let session = crate::app::creation::terminal_agent_session_info(terminal);
+        let agent = session
+            .as_ref()
+            .map(|info| info.agent.clone())
+            .or_else(|| terminal.effective_display_agent())
+            .or_else(|| terminal.effective_agent_label().map(str::to_string));
+
+        Some(crate::pane_close_history::PaneCloseRecord {
+            ts_unix_ms: crate::pane_close_history::now_unix_ms(),
+            pane_id: public_pane_id,
+            // Human pane name: the OSC/agent title if any, else the manual label
+            // (e.g. "codeword"). `show_agent_labels=false` so the agent name is
+            // not folded in here — the historial row renders the agent separately.
+            label: terminal.border_label(false),
+            agent,
+            session_source: session.as_ref().map(|info| info.source.clone()),
+            session_kind: session.as_ref().map(|info| match info.kind {
+                crate::agent_resume::AgentSessionRefKind::Id => "id".to_string(),
+                crate::agent_resume::AgentSessionRefKind::Path => "path".to_string(),
+            }),
+            session_value: session.as_ref().map(|info| info.value.clone()),
+            cwd: terminal.cwd.display().to_string(),
+            workspace_id,
+            workspace_name: Some(ws.display_name()),
+            // Prompts are extracted from the (filesystem) transcript by the
+            // runtime flush path, not here in pure `AppState`.
+            first_prompt: None,
+            last_prompt: None,
+        })
+    }
+
+    /// Stage pane-close history records for `pane_ids` in workspace `ws_idx`,
+    /// before those panes are removed. Records are drained and written to the
+    /// durable log by the runtime layer (see `App::flush_pane_close_history`).
+    pub(crate) fn stage_pane_close_history(
+        &mut self,
+        ws_idx: usize,
+        pane_ids: impl IntoIterator<Item = crate::layout::PaneId>,
+    ) {
+        for pane_id in pane_ids {
+            if let Some(record) = self.build_pane_close_record(ws_idx, pane_id) {
+                self.pane_close_log_pending.push(record);
+            }
+        }
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1679,6 +2014,32 @@ impl AppState {
         } else {
             (24, 80)
         }
+    }
+
+    /// True when a modal/overlay mode is active, so the host image layer must
+    /// not paint pane or plugin images. Those images render after the frame
+    /// (kitty re-emit or half-block mosaic) and would bleed over any overlay
+    /// drawn on top of the panes — the resume-search popup, settings, global
+    /// menu, confirm dialogs, etc. Every mode except `Terminal` draws such an
+    /// overlay, so any non-`Terminal` mode suppresses host images.
+    pub(crate) fn overlay_suppresses_host_images(&self) -> bool {
+        !matches!(self.mode, Mode::Terminal)
+    }
+
+    /// The Claude Code session UUID backing `pane_id`, or `None` when the pane
+    /// is not a Claude agent (pi/omp and non-agent panes are excluded). Used by
+    /// the host image layer to resolve `[Image #N]` cache files. Lives here
+    /// because it reads `crate::app::creation`, which is private to the `app`
+    /// module.
+    pub(crate) fn claude_session_value_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<String> {
+        let terminal_id = self.terminal_id_for_pane(ws_idx, pane_id)?;
+        let terminal = self.terminals.get(&terminal_id)?;
+        let session = crate::app::creation::terminal_agent_session_info(terminal)?;
+        (session.agent == "claude").then_some(session.value)
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
@@ -1798,6 +2159,7 @@ impl AppState {
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
+            request_plugin_action: None,
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
@@ -1841,6 +2203,10 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                usage_strip_rect: Rect::default(),
+                right_panel_rect: Rect::default(),
+                panel_rects: Vec::new(),
+                right_panel_rail_icons: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -1867,6 +2233,9 @@ impl AppState {
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            usage_strip_enabled: true,
+            collapsed_surfaces: std::collections::HashSet::new(),
+            active_right_panel: None,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
@@ -1937,6 +2306,12 @@ impl AppState {
             pane_graphics_revision: 0,
             popup_pane: None,
             plugin_command_logs: Vec::new(),
+            ui_context_menu_items: Vec::new(),
+            ui_surface_layers: Vec::new(),
+            pending_plugin_action_invocation: None,
+            pending_plugin_ui_action: None,
+            pending_historial_action: None,
+            pending_harness_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),
@@ -1944,6 +2319,8 @@ impl AppState {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            pane_close_log_pending: Vec::new(),
+            resume_picker: None,
         }
     }
 
@@ -2298,6 +2675,98 @@ mod tests {
     use crossterm::event::KeyEvent;
 
     #[test]
+    fn overlay_suppresses_host_images_only_in_terminal_mode() {
+        let mut state = AppState::test_new();
+
+        // Terminal mode is the only mode with no overlay drawn on top of the
+        // panes, so host images are allowed to paint.
+        state.mode = Mode::Terminal;
+        assert!(
+            !state.overlay_suppresses_host_images(),
+            "terminal mode must allow host images"
+        );
+
+        // Every overlay/modal mode must suppress the host image layer so it
+        // cannot bleed over the overlay (the resume-search popup, settings,
+        // global menu, confirm dialogs, etc.).
+        for mode in [
+            Mode::ResumePicker,
+            Mode::Settings,
+            Mode::GlobalMenu,
+            Mode::ContextMenu,
+            Mode::ConfirmClose,
+            Mode::Navigator,
+            Mode::KeybindHelp,
+            Mode::Onboarding,
+        ] {
+            state.mode = mode;
+            assert!(
+                state.overlay_suppresses_host_images(),
+                "overlay mode {mode:?} must suppress host images"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_active_right_panel_only_clears_invalid_never_auto_expands() {
+        let mut state = AppState::test_new();
+        // Nothing auto-expands: a None selection stays None even with content.
+        state.ensure_active_right_panel(&["a".to_string(), "b".to_string()]);
+        assert_eq!(state.active_right_panel, None);
+        // A still-valid selection is kept.
+        state.active_right_panel = Some("b".to_string());
+        state.ensure_active_right_panel(&["a".to_string(), "b".to_string()]);
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        // A selection whose plugin no longer has content is cleared.
+        state.ensure_active_right_panel(&["a".to_string()]);
+        assert_eq!(state.active_right_panel, None);
+    }
+
+    #[test]
+    fn toggle_right_panel_switches_and_collapses() {
+        let mut state = AppState::test_new();
+        let right = herdr_ui_plugin_api::UiSurface::RightPanel;
+        // First click expands that plugin.
+        state.toggle_right_panel("a");
+        assert_eq!(state.active_right_panel.as_deref(), Some("a"));
+        assert!(!state.collapsed_surfaces.contains(&right));
+        assert!(state.right_panel_layer_visible("a"));
+        assert!(!state.right_panel_layer_visible("b"));
+        // Clicking a different plugin's icon switches to it.
+        state.toggle_right_panel("b");
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        assert!(!state.collapsed_surfaces.contains(&right));
+        // Clicking the active plugin's icon collapses the panel to its handle.
+        state.toggle_right_panel("b");
+        assert_eq!(state.active_right_panel.as_deref(), Some("b"));
+        assert!(state.collapsed_surfaces.contains(&right));
+        // Clicking it again re-expands.
+        state.toggle_right_panel("b");
+        assert!(!state.collapsed_surfaces.contains(&right));
+    }
+
+    #[test]
+    fn right_panel_rail_icon_at_hits_the_icon_rect() {
+        let mut state = AppState::test_new();
+        state.view.right_panel_rail_icons = vec![
+            RightPanelRailIcon {
+                plugin_id: "a".to_string(),
+                rect: Rect::new(100, 5, 3, 1),
+                active: true,
+            },
+            RightPanelRailIcon {
+                plugin_id: "b".to_string(),
+                rect: Rect::new(100, 6, 3, 1),
+                active: false,
+            },
+        ];
+        assert_eq!(state.right_panel_rail_icon_at(101, 5).as_deref(), Some("a"));
+        assert_eq!(state.right_panel_rail_icon_at(102, 6).as_deref(), Some("b"));
+        assert_eq!(state.right_panel_rail_icon_at(103, 5), None);
+        assert_eq!(state.right_panel_rail_icon_at(101, 7), None);
+    }
+
+    #[test]
     fn agent_terminal_keeps_final_child_cursor_exposed() {
         let mut state = AppState::test_new();
         let ws = crate::workspace::Workspace::test_new("test");
@@ -2468,11 +2937,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            vec!["Rename", "Close", "Delete worktree checkout..."]
         );
     }
 
@@ -2488,11 +2958,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "New worktree", "Open worktree..."]
+            vec!["Rename", "Close", "New worktree", "Open worktree..."]
         );
     }
 
@@ -2508,11 +2979,12 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
 
         assert_eq!(
             menu.items(),
-            &[
+            vec![
                 "Rename",
                 "Close group",
                 "New worktree",

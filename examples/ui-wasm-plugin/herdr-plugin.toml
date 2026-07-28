@@ -1,0 +1,31 @@
+id = "example.ui-wasm"
+name = "UI WASM Example"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Hot-reloadable native UI surfaces powered by a local WASM module"
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[actions]]
+id = "fork"
+title = "Fork"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "printf 'fork action from %s\npayload %s\n' \"${HERDR_PLUGIN_CONTEXT_JSON:-unknown}\" \"${HERDR_PLUGIN_PAYLOAD_JSON:-none}\""]
+
+[[ui_modules]]
+id = "goal-ui"
+title = "Goal UI"
+description = "v3 API bridge demo: stateful counter, gated api read/write, arbitrary action routing"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
+hot_reload = "on"
+surfaces = ["header", "footer", "right_panel", "usage_strip"]
+capabilities = [
+  "layout_read",
+  "toasts",
+  "api_read",
+  "api_write",
+]

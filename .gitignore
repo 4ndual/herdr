@@ -19,5 +19,21 @@ __pycache__/
 /result
 /result-*
 
+# goal-dash runtime artifacts (not part of the fork)
+.goal.json
+.goal.history/
+.goal.prompts.jsonl
+logs/
+
+# BACKUP-SECRET-GUARD (pre-format 2026-07-08)
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+.vault-key
+node_modules/
+.DS_Store
 /.wrangler/
 **/.wrangler/

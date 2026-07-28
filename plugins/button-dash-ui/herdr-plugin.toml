@@ -1,0 +1,147 @@
+id = "builtin.button-dash"
+name = "Button Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Clickable quick-reference of keyboard-shortcut actions in the bottom dash (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+# restart-hr: fully kill & relaunch this herdr instance, restoring the session.
+# The host runs actions with cwd = plugin_root and the server's full env inherited
+# (HERDR_PLUGIN_ROOT + the server's own HERDR_SESSION / XDG_CONFIG_HOME, verified
+# in src/app/api/plugins/runtime.rs — no env_clear). The script resolves WHICH
+# instance to restart from that inherited HERDR_SESSION + XDG_CONFIG_HOME, so no
+# instance arg is needed here. `nohup ... &` detaches it so it survives the
+# server process it is about to kill (the script also self-detaches internally;
+# macOS has no `setsid`, so we rely on nohup + the script's own re-exec). The
+# script itself is owned by the restart-button agent at scripts/restart-herdr.sh.
+[[actions]]
+id = "restart-hr"
+title = "Restart hr"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/restart-herdr.sh\" >/dev/null 2>&1 &"]
+
+# full-restart: HARD restart — kill tmux + Claude Code + server (reclaim all RAM)
+# and relaunch fresh, resuming the session. Same detach model as the soft button
+# (nohup + the script's own guarded re-exec; macOS has no `setsid`). The script is
+# owned by the full-restart agent at scripts/full-restart-herdr.sh and resolves
+# WHICH instance from the inherited HERDR_SESSION + XDG_CONFIG_HOME.
+[[actions]]
+id = "full-restart"
+title = "Full restart"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/full-restart-herdr.sh\" >/dev/null 2>&1 &"]
+
+# fork: fork the CURRENT pane's agent conversation into a NEW TAB (current
+# workspace). Works for claude/cx/codex/pi by reusing herdr's own resume
+# convention + each agent's fork flag (see scripts/fork-conversation.sh). The
+# script reads the source pane from the inherited HERDR_PANE_ID and resolves the
+# agent/session/cwd live via `herdr pane get`. Detached so it outlives the action
+# runner (it does socket work only; nothing is killed, unlike the restart buttons).
+[[actions]]
+id = "fork"
+title = "Fork → tab"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" tab >/dev/null 2>&1 &"]
+
+# fork-workspace: same fork, but into a NEW WORKSPACE instead of a new tab.
+[[actions]]
+id = "fork-workspace"
+title = "Fork → workspace"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" workspace >/dev/null 2>&1 &"]
+
+# resume-in-cx: fork the CURRENT claude pane's conversation into a NEW TAB running
+# UNDER cx (GPT-via-CCR gateway), leaving the original conversation untouched (see
+# scripts/resume-in-cx.sh). Claude-family panes only; codex/pi/terminal get a toast.
+# Detached so it outlives the action runner (socket work only; nothing is killed).
+[[actions]]
+id = "resume-in-cx"
+title = "Resume in cx"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/resume-in-cx.sh\" >/dev/null 2>&1 &"]
+
+# resume-search: open the resume-search picker (searches ALL claude-family
+# transcripts) in a NEW TAB whose root pane runs the picker; on Enter/click it
+# execs the resumed session into that same pane (see
+# ../resume-picker/bin/resume-picker.sh). A plain terminal pane runs it in place.
+# Detached so it outlives the action runner (socket work only; nothing is killed).
+[[actions]]
+id = "resume-search"
+title = "Resume search"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-resume-picker.sh\" >/dev/null 2>&1 &"]
+
+# remote: enable Claude Code Remote Control on the CURRENT pane's LIVE conversation
+# so it can be continued from the phone / claude.ai. For a claude orchestrator it
+# types the `/remote-control` slash command into the running agent; codex/cx/pi
+# panes get a toast (the phone can't bridge into a non-claude orchestrator). See
+# scripts/remote-control.sh. Detached so it outlives the action runner.
+[[actions]]
+id = "remote"
+title = "Remote"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
+
+# draw-screenshot: toggle a BLANK draw-on-screen overlay (our own scripts/
+# draw-overlay helper — floats over ANY Space incl. native fullscreen), then
+# capture the annotated screen and fully close it (see scripts/draw-screenshot.sh).
+# Press once to start drawing on-screen; press again (or RETURN) to screenshot +
+# close, ESC cancels. Detached so it outlives the action runner. Needs Screen
+# Recording (screencapture) permission for the herdr process.
+[[actions]]
+id = "draw-screenshot"
+title = "Draw + screenshot"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" >/dev/null 2>&1 &"]
+
+# draw-screenshot-region: same toggle, but the finishing capture is an
+# interactive drag-selection (screencapture -i) instead of instant fullscreen.
+[[actions]]
+id = "draw-screenshot-region"
+title = "Draw + screenshot (region)"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" region >/dev/null 2>&1 &"]
+
+[[ui_modules]]
+id = "button-ui"
+title = "Button Dash"
+description = "Data-driven clickable shortcut buttons rendered in the bottom-dash slot beside the usage strip"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/herdr_button_dash_ui.wasm"
+hot_reload = "on"
+# Generic, data-driven placement: render in a slot carved from the usage band
+# (its own rect + hit-rects), never stacked on the usage_strip surface. WHERE it
+# renders is pure manifest DATA now — edit the `[ui_modules.placement]` table
+# below and the panel moves/resizes on the next tick with NO host rebuild.
+surfaces = ["panel"]
+# mouse_all: the buttons resolve clicks AND hover (for the emoji tooltip) from
+# the raw mouse stream instead of declarative hit-rects — the host suppresses raw
+# mouse (incl. hover Move) over a module's own hit-rects (F5 dedupe), so hover
+# tooltips REQUIRE the raw path. This keeps the whole feature a guest hot-reload.
+capabilities = ["layout_read", "toasts", "api_read", "api_write", "mouse_all"]
+
+# Placement spec (see .local/prd/generic-plugin-panel-placement.md):
+#   region   = bottom_band | left | right | top | bottom | free
+#   align    = start | center | end   (side within bottom_band / anchor for free)
+#   size     = "auto" | "<cells>" | "<pct>%"   (extent along the carved axis)
+#   min_peer = cells the peer region always keeps (so the usage dash stays usable)
+# This reproduces the old BottomDash result exactly: a snug slot on the RIGHT of
+# the usage band, leaving the usage dash at least 24 columns.
+[ui_modules.placement]
+# Fixed width (not "auto"): the compact GRID wraps 4 buttons per row (~43
+# cells wide); a fixed 45-cell slot means the panel NEVER resizes when a hover tooltip /
+# expanded list appears, so the buttons can't shift horizontally on hover (the
+# tooltip rows are kept narrower than the strip — see detail_spans). "auto"
+# regrew the panel to the widest row each frame, which moved the buttons under
+# the cursor. Bump this if you add buttons.
+region = "bottom_band"
+align = "end"
+size = "45"
+min_peer = 24
+z = 60

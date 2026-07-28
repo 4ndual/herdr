@@ -4,7 +4,7 @@ use crossterm::terminal;
 
 use super::{
     background_update_check_enabled, repeat_key_identity, App, Mode, ANIMATION_INTERVAL,
-    AUTO_UPDATE_CHECK_INTERVAL, GIT_REMOTE_STATUS_REFRESH_INTERVAL, MIN_RENDER_INTERVAL,
+    AUTO_UPDATE_CHECK_INTERVAL, DASH_TICK_INTERVAL, GIT_REMOTE_STATUS_REFRESH_INTERVAL, MIN_RENDER_INTERVAL,
     RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
 use crate::events::AppEvent;
@@ -66,6 +66,31 @@ impl App {
                 runtime.shutdown();
             }
         }
+        self.flush_pane_close_history();
+    }
+
+    /// Drain any pane-close history records staged by the close paths and append
+    /// them to the durable log. Best-effort; never blocks the close path.
+    pub(crate) fn flush_pane_close_history(&mut self) {
+        if self.state.pane_close_log_pending.is_empty() {
+            return;
+        }
+        let mut records = std::mem::take(&mut self.state.pane_close_log_pending);
+        // Enrich each record with the first/last user prompt from its agent
+        // transcript once, here in the runtime layer (filesystem I/O stays out
+        // of pure `AppState`), before the record is persisted.
+        for record in &mut records {
+            let (first, last) = crate::pane_close_history::extract_prompts(record);
+            record.first_prompt = first;
+            record.last_prompt = last;
+            // Relabel cx sessions (Claude Code routed through the CCR gateway)
+            // as "cx" — the runtime reports them as "claude" since cx *is* Claude
+            // Code, but their transcript location distinguishes the two.
+            if let Some(agent) = crate::pane_close_history::resolve_display_agent(record) {
+                record.agent = Some(agent);
+            }
+        }
+        crate::pane_close_history::append_records(&records);
     }
 
     pub(crate) fn drain_api_requests(&mut self) -> bool {
@@ -334,6 +359,49 @@ impl App {
             self.sync_pending_agent_resume_deadline(now);
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
+
+        changed |= self.tick_auto_continue_after_restart(now);
+
+        // feat/native-dashes: refresh the dashboard cores from disk + run the
+        // goal observer on a flat poll, then repaint so the strip/panel reflect
+        // the focused pane. Skipped entirely when no dashboard is showing live
+        // data so an idle, agent-less herdr does no per-second work (TC13).
+        if self.dashboards_need_tick() && now >= self.next_dash_tick {
+            crate::usage_host::tick(self);
+            crate::goal_host::tick(self);
+            crate::historial_host::tick(self);
+            crate::harness_host::tick(self);
+            // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
+            // capabilities, ui_input_file, collector argv) before the wasm
+            // mtime watch, so a manifest change re-syncs the manager the same
+            // tick its metadata is read for frame dispatch.
+            self.hot_reload_ui_plugin_manifests();
+            let changed_ui_modules = self.ui_plugins.detect_changed_modules();
+            let changed_reload = if changed_ui_modules.is_empty() {
+                false
+            } else {
+                self.ui_plugins.dispatch_reload_requested()
+            };
+            let changed_ui_events = self.ui_plugins.dispatch_tick() || changed_reload;
+            let has_pending = self.ui_plugins.has_pending_updates();
+            if !changed_ui_modules.is_empty() || changed_ui_events || has_pending {
+                self.refresh_ui_plugin_state_from_manager();
+                self.apply_ui_plugin_notifications();
+                self.apply_ui_plugin_effects();
+                tracing::info!(
+                    count = changed_ui_modules.len(),
+                    modules = ?changed_ui_modules
+                        .iter()
+                        .map(|module| format!("{}:{}", module.plugin_id, module.module_id))
+                        .collect::<Vec<_>>(),
+                    changed_ui_events,
+                    "updated ui plugin modules on scheduled tick"
+                );
+            }
+            self.next_dash_tick = now + DASH_TICK_INTERVAL;
+            changed = true;
+        }
+
         self.sync_animation_timer(now);
         changed
     }
@@ -575,6 +643,15 @@ impl App {
             .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
     }
 
+    /// feat/native-dashes: whether a foreground dashboard is showing live data that
+    /// a ~1 Hz tick would update — a focused agent (the usage strip) or any
+    /// registered UI plugin. When false, the dash tick is neither scheduled nor
+    /// executed, so an idle, agent-less herdr does no per-second work (TC13).
+    pub(crate) fn dashboards_need_tick(&self) -> bool {
+        crate::plugin_focus::focus_input(&self.state).agent != herdr_ui_plugin_api::AgentKind::None
+            || self.ui_plugins.has_modules()
+    }
+
     pub(crate) fn next_loop_deadline(&self, now: Instant, needs_render: bool) -> Option<Instant> {
         self.next_loop_deadline_with_resize_poll(now, needs_render, true, true)
     }
@@ -618,9 +695,14 @@ impl App {
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
+            self.auto_continue_deadline,
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            // feat/native-dashes: only wake ~1 Hz for the dashboard refresh in a
+            // foreground render context where a dashboard shows live data. Headless
+            // clients and idle, agent-less layouts stay idle (TC13).
+            (include_resize_poll && self.dashboards_need_tick()).then_some(self.next_dash_tick),
             render_deadline,
         ]
         .into_iter()

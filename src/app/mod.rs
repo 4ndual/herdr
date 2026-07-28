@@ -14,7 +14,12 @@ mod config_io;
 mod creation;
 mod ids;
 mod input;
+<<<<<<< HEAD
 mod popup;
+||||||| 299dd416
+=======
+mod resume_picker;
+>>>>>>> task/wave1-integration
 mod runtime;
 mod runtime_mutations;
 mod session;
@@ -37,6 +42,9 @@ pub(crate) const HEADLESS_ANIMATION_INTERVAL: Duration = Duration::from_millis(1
 pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = 8;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// feat/native-dashes: how often the dashboard cores refresh from disk and run
+/// the goal observer. P4 may make this focus-change-driven instead of a flat poll.
+pub(crate) const DASH_TICK_INTERVAL: Duration = Duration::from_millis(1000);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
@@ -45,6 +53,199 @@ const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
+/// Max bytes read from a module's `ui_input_file` (spec §7.1). Matches the
+/// existing guest memory-read bounds; larger files are truncated with a WARN.
+const MAX_UI_INPUT_BYTES: u64 = 64 * 1024;
+
+/// Plugin id and `ui_input_file` name for the interim host-side usage writer
+/// (item C). The filename MUST equal `ui_input_file` in plugins/usage-dash-ui's
+/// manifest, and the id MUST equal the id the usage module registers under, so
+/// item B's generic reader resolves the same `HERDR_PLUGIN_STATE_DIR` file. This
+/// whole writer relocates into the usage-dash plugin's own collector process in
+/// items D/E — it is the last usage-specific code path in core after item C.
+pub(crate) const USAGE_DASH_PLUGIN_ID: &str = "builtin.usage-dash";
+const USAGE_DASH_INPUT_FILE: &str = "usage_input.json";
+
+/// Plugin id and `ui_input_file` name for the interim host-side goal writer
+/// (mirrors the usage pair above). The filename MUST equal `ui_input_file` in
+/// plugins/goal-dash-ui's manifest, and the id MUST equal the id the goal module
+/// registers under, so the generic reader resolves the same
+/// `HERDR_PLUGIN_STATE_DIR` file. This whole writer relocates into the goal-dash
+/// plugin's own collector process in wave 2 (see [`crate::goal_host`]).
+const GOAL_DASH_PLUGIN_ID: &str = "builtin.goal-dash";
+const GOAL_DASH_INPUT_FILE: &str = "goal_input.json";
+
+/// Plugin id and `ui_input_file` name for the interim host-side historial writer
+/// (mirrors the usage/goal pairs above). The filename MUST equal `ui_input_file`
+/// in plugins/historial-dash-ui's manifest, and the id MUST equal the id the
+/// historial module registers under, so the generic reader resolves the same
+/// `HERDR_PLUGIN_STATE_DIR` file. Driven each dash tick by
+/// [`crate::historial_host`].
+pub(crate) const HISTORIAL_DASH_PLUGIN_ID: &str = "builtin.historial-dash";
+const HISTORIAL_DASH_INPUT_FILE: &str = "historial_input.json";
+
+/// Plugin id and `ui_input_file` name for the harness-manager writer (mirrors
+/// the pairs above). The filename MUST equal `ui_input_file` in
+/// plugins/harness-manager-ui's manifest, and the id MUST equal the id the
+/// harness module registers under. Driven each dash tick by
+/// [`crate::harness_host`].
+pub(crate) const HARNESS_PLUGIN_ID: &str = "builtin.harness-manager";
+const HARNESS_INPUT_FILE: &str = "harness_input.json";
+
+/// How many recent (subagent-excluded, resumable/terminal) closed panes the
+/// historial panel shows (newest first). The panel is content-height sized, so
+/// it draws only as many of these as fit the available screen rows.
+const HISTORIAL_ROW_LIMIT: usize = 40;
+
+/// How many raw log records to scan back through when building the panel model.
+/// Larger than [`HISTORIAL_ROW_LIMIT`] because subagent and non-resumable
+/// records are filtered out after the read, so we need headroom to still surface
+/// a full page of useful rows.
+const HISTORIAL_READ_LIMIT: usize = 400;
+
+/// Project newest-first pane-close `records` into the wasm-safe historial rows
+/// the guest renders. Pure over `(records, now)` so it is unit-testable without a
+/// live log. Applies, in order: subagent exclusion, non-resumable-agent
+/// exclusion, session/pane dedup, and the [`HISTORIAL_ROW_LIMIT`] cap.
+fn build_historial_rows(
+    records: Vec<crate::pane_close_history::PaneCloseRecord>,
+    now: u64,
+) -> Vec<historial_dash_model::HistorialRow> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    records
+        .into_iter()
+        // Subagent runs (TaskCreate / Agent-tool workers, `agent-*.jsonl`) are
+        // pure noise in the historial — excluded at the source, no toggle.
+        .filter(|record| !crate::pane_close_history::is_subagent_record(record))
+        // Drop non-resumable *agent* rows: a claude/cx/codex/pi pane whose
+        // session ref could not be captured can't be resumed or forked, so it is
+        // dead weight. Plain terminals (agent = None) are kept — the `[t]` toggle
+        // governs their visibility in the guest.
+        .filter(|record| record.agent.is_none() || record.restorable())
+        // Deduplicate so the same session (or, for sessionless terminals, the
+        // same pane) appears once — keeping the most-recent record (first seen).
+        .filter(|record| {
+            let dedup_key = record
+                .session_value
+                .clone()
+                .unwrap_or_else(|| format!("pane:{}", record.pane_id));
+            seen.insert(dedup_key)
+        })
+        .take(HISTORIAL_ROW_LIMIT)
+        .map(|record| {
+            let restorable = record.restorable();
+            let is_subagent = crate::pane_close_history::is_subagent_record(&record);
+            // No detected agent -> "terminal" (replaces the old "shell").
+            let agent = record.agent.clone().unwrap_or_else(|| "terminal".to_string());
+            // Pane label only; empty when absent so the guest applies its
+            // first-prompt / folder fallback.
+            let label = record
+                .label
+                .clone()
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_default();
+            // Last 4 chars of the session value (char-safe), empty when none.
+            let sid4 = record
+                .session_value
+                .as_deref()
+                .map(|v| {
+                    let chars: Vec<char> = v.chars().collect();
+                    let start = chars.len().saturating_sub(4);
+                    chars[start..].iter().collect::<String>()
+                })
+                .unwrap_or_default();
+            historial_dash_model::HistorialRow {
+                key: format!("{}:{}", record.ts_unix_ms, record.pane_id),
+                agent,
+                label,
+                sid4,
+                reltime: crate::pane_close_history::relative_time(record.ts_unix_ms, now),
+                cwd: record.cwd,
+                restorable,
+                workspace_name: record.workspace_name.unwrap_or_default(),
+                first_prompt: record.first_prompt.unwrap_or_default(),
+                last_prompt: record.last_prompt.unwrap_or_default(),
+                is_subagent,
+            }
+        })
+        .collect()
+}
+
+/// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
+/// side): write a sibling temp file then rename it into place, so item B's
+/// mtime-cached reader never observes a torn file. Creates `state_dir` when
+/// missing. Pure over its inputs so it is testable against a temp dir.
+fn write_ui_input_atomic(
+    state_dir: &std::path::Path,
+    filename: &str,
+    contents: &str,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let final_path = state_dir.join(filename);
+    let tmp_path = state_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, contents.as_bytes())?;
+    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Resolve and read a module's `ui_input_file` under `state_dir` (spec §7.1),
+/// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached in `cache`. Returns
+/// the current contents, or `None` when the name is not a single path segment,
+/// or the file is missing/empty. Pure over its inputs so it is testable without
+/// the host's real state dir. The bytes are opaque — the host never parses them.
+fn read_ui_input_blob(
+    state_dir: &std::path::Path,
+    ui_input_file: &str,
+    key: (String, String),
+    cache: &mut HashMap<(String, String), (std::time::SystemTime, std::sync::Arc<str>)>,
+) -> Option<String> {
+    // Defense in depth: the manifest loader already rejects non-segment names,
+    // but never resolve one that slipped through outside the state dir.
+    if ui_input_file.is_empty()
+        || ui_input_file == "."
+        || ui_input_file == ".."
+        || ui_input_file.contains('/')
+        || ui_input_file.contains('\\')
+    {
+        tracing::warn!(
+            plugin_id = %key.0,
+            module_id = %key.1,
+            ui_input_file,
+            "ignoring ui_input_file: not a single path segment"
+        );
+        return None;
+    }
+    let path = state_dir.join(ui_input_file);
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    if let Some((cached_mtime, cached)) = cache.get(&key) {
+        if *cached_mtime == mtime {
+            let cached = cached.to_string();
+            return (!cached.is_empty()).then_some(cached);
+        }
+    }
+    use std::io::Read;
+    let file = std::fs::File::open(&path).ok()?;
+    let mut buf = Vec::new();
+    if file.take(MAX_UI_INPUT_BYTES).read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    if meta.len() > MAX_UI_INPUT_BYTES {
+        tracing::warn!(
+            plugin_id = %key.0,
+            module_id = %key.1,
+            len = meta.len(),
+            cap = MAX_UI_INPUT_BYTES,
+            "ui_input_file exceeds cap; truncating"
+        );
+    }
+    let contents = String::from_utf8_lossy(&buf).into_owned();
+    cache.insert(key, (mtime, std::sync::Arc::from(contents.as_str())));
+    (!contents.is_empty()).then_some(contents)
+}
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -97,6 +298,29 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Native usage dashboard interaction state (expand/collapse/scroll/hover +
+    /// last frame's hit-rects) and the latest resolved snapshot.
+    pub(crate) usage_view: usage_dash_core::UsageView,
+    pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
+    /// fork(wave-2): module keys (see [`crate::plugin_collector::module_key`])
+    /// whose out-of-process collector run is currently in flight, so the host
+    /// launches at most one process per module per tick.
+    pub(crate) collectors_in_flight: std::collections::HashSet<String>,
+    /// fork(wave-2): last distinct failure reason per collector module key, so a
+    /// repeated failure is warned about only once (until it changes or recovers).
+    pub(crate) collector_last_error: std::collections::HashMap<String, String>,
+    /// Native goal-panel core backing the WASM goal-dash plugin. The host ticks
+    /// it (~1 Hz) and projects it into the plugin input file; see
+    /// [`crate::goal_host`]. Not pinned to a session — it adopts the focused one.
+    pub(crate) goal_dash: goal_dash_core::App,
+    /// Registered hot-reloadable UI plugin modules discovered from the plugin registry.
+    pub(crate) ui_plugins: crate::ui_plugins::UiPluginManager,
+    pub(crate) last_ui_plugin_focus: Option<herdr_ui_plugin_api::FocusInput>,
+    /// Per-module mtime cache for `ui_input_file` reads (spec §7.1): keyed by
+    /// `(plugin_id, module_id)`, holds the last-seen mtime and file contents so
+    /// an unchanged file costs one `stat` and no re-read per frame.
+    pub(crate) ui_input_cache:
+        HashMap<(String, String), (std::time::SystemTime, std::sync::Arc<str>)>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -121,6 +345,8 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
+    /// feat/native-dashes: next time [`crate::usage_host::tick`] refreshes the cores.
+    pub(crate) next_dash_tick: Instant,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -128,6 +354,13 @@ pub struct App {
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
+    /// Whether restart auto-continue is enabled (config `session.auto_continue_on_restore`).
+    pub(crate) auto_continue_on_restore: bool,
+    /// Whether this server boot was triggered by a restart (a fresh restart
+    /// sentinel was present at startup). Gates auto-continue to genuine restarts.
+    pub(crate) restart_restore_detected: bool,
+    /// Next time the auto-continue tick should run its readiness/stall sweep.
+    pub(crate) auto_continue_deadline: Option<Instant>,
     pub(crate) selection_autoscroll_deadline: Option<Instant>,
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
@@ -203,8 +436,57 @@ fn repeat_key_identity(
     (key.code, key.modifiers)
 }
 
+/// How recent a restart sentinel must be to count as "this boot came from a
+/// restart". The restart script drops the sentinel just before killing the old
+/// server and lets it age out via TTL, so a fresh boot sees a very recent file;
+/// a stale sentinel from an older restart is ignored.
+const RESTART_SENTINEL_MAX_AGE: Duration = Duration::from_secs(90);
+
+/// Whether a fresh restart sentinel (`.restart-request-<session>`, written by
+/// restart-herdr.sh into the state dir before the kill) is present. Read-only:
+/// the sentinel is left in place for the launcher's self-heal loop and ages out
+/// via TTL. Best-effort; any IO error means "not a restart".
+fn detect_fresh_restart_sentinel() -> bool {
+    let dir = crate::config::state_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(".restart-request-") {
+            continue;
+        }
+        let fresh = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age <= RESTART_SENTINEL_MAX_AGE);
+        if fresh {
+            return true;
+        }
+    }
+    false
+}
+
 fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
+}
+
+/// Absolute reset-time string for a rate-limit window, computed host-side (the
+/// usage WASM plugin has no process access). Mirrors the former native
+/// `usage_dash_core::render::abs_time`: `+%a` (weekday) for the weekly window,
+/// `+%H:%M` (clock) for the 5-hour window.
+fn host_abs_time(epoch: i64, weekly: bool) -> String {
+    let fmt = if weekly { "+%a" } else { "+%H:%M" };
+    std::process::Command::new("date")
+        .args(["-r", &epoch.to_string(), fmt])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 fn background_update_check_enabled(no_session: bool, check_enabled: bool) -> bool {
@@ -527,6 +809,7 @@ impl App {
             request_open_existing_worktree: None,
             request_new_workspace_cwd: None,
             request_remove_linked_worktree: None,
+            request_plugin_action: None,
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
@@ -579,6 +862,10 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                usage_strip_rect: Rect::default(),
+                right_panel_rect: Rect::default(),
+                panel_rects: Vec::new(),
+                right_panel_rail_icons: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -604,7 +891,16 @@ impl App {
             mobile_width_threshold: config.ui.mobile_width_threshold,
             sidebar_width_source,
             sidebar_width_auto: false,
+<<<<<<< HEAD
             sidebar_collapsed: config.ui.sidebar_start_collapsed,
+||||||| 299dd416
+            sidebar_collapsed: false,
+=======
+            sidebar_collapsed: false,
+            usage_strip_enabled: config.ui.usage_strip,
+            collapsed_surfaces: std::collections::HashSet::new(),
+            active_right_panel: None,
+>>>>>>> task/wave1-integration
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
             agent_panel_sort,
@@ -666,6 +962,12 @@ impl App {
             pane_graphics_revision: 0,
             popup_pane: None,
             plugin_command_logs: Vec::new(),
+            ui_context_menu_items: Vec::new(),
+            ui_surface_layers: Vec::new(),
+            pending_plugin_action_invocation: None,
+            pending_plugin_ui_action: None,
+            pending_historial_action: None,
+            pending_harness_action: None,
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,
             global_menu: state::MenuListState::new(0),
@@ -673,6 +975,8 @@ impl App {
             host_cell_size: crate::kitty_graphics::HostCellSize::default(),
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            pane_close_log_pending: Vec::new(),
+            resume_picker: None,
         };
 
         state.terminals = restored_terminals;
@@ -702,6 +1006,17 @@ impl App {
             });
         }
 
+        // The usage strip is rendered exclusively by a bundled WASM UI plugin
+        // (no native fallback). Auto-link it from its shipped manifest so the
+        // surface always has a renderer, exactly as a user `plugin link` would —
+        // no synthetic in-core plugin definition.
+        crate::bundled_plugins::merge_bundled_ui_plugins(&mut state.installed_plugins);
+
+        let ui_plugins =
+            crate::ui_plugins::UiPluginManager::from_installed_plugins(&state.installed_plugins);
+        state.ui_context_menu_items = ui_plugins.context_menu_items();
+        state.ui_surface_layers = ui_plugins.surface_layers();
+
         let last_focus = state.active.and_then(|idx| {
             state
                 .workspaces
@@ -716,6 +1031,14 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
+            usage_view: usage_dash_core::UsageView::default(),
+            usage_snapshot: None,
+            collectors_in_flight: std::collections::HashSet::new(),
+            collector_last_error: std::collections::HashMap::new(),
+            goal_dash: goal_dash_core::App::new(None),
+            ui_plugins,
+            last_ui_plugin_focus: None,
+            ui_input_cache: HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -730,6 +1053,7 @@ impl App {
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
+            next_dash_tick: Instant::now(),
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -739,6 +1063,9 @@ impl App {
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
+            auto_continue_on_restore: config.session.auto_continue_on_restore,
+            restart_restore_detected: detect_fresh_restart_sentinel(),
+            auto_continue_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,
             detached_custom_command_children: Vec::new(),
@@ -887,6 +1214,105 @@ impl App {
         self.prefix_input_source = source;
     }
 
+    /// feat/native-dashes: request an immediate repaint after a dashboard input
+    /// event (which produces no pane output to otherwise trigger a render).
+    pub(crate) fn request_render(&self) {
+        self.render_dirty.store(true, Ordering::Release);
+        self.render_notify.notify_one();
+    }
+
+    /// Resolve each plugin module that declared a manifest `image_file` to the
+    /// absolute screen `Rect` of its surface plus the image path, for the host
+    /// image layer. Empty when no module declares an image.
+    pub(crate) fn resolve_plugin_surface_images(
+        &self,
+        frame_area: ratatui::layout::Rect,
+    ) -> Vec<(ratatui::layout::Rect, std::path::PathBuf)> {
+        self.ui_plugins
+            .surface_images()
+            .into_iter()
+            .map(|(plugin_id, module_id, surface, path)| {
+                let rect = crate::ui::ui_plugin_owner_surface_rect(
+                    &self.state,
+                    frame_area,
+                    surface,
+                    &plugin_id,
+                    &module_id,
+                );
+                (rect, path)
+            })
+            .collect()
+    }
+
+    /// Paint host images as a half-block mosaic directly into the frame buffer.
+    /// This is the fallback used when kitty graphics are unavailable (kitty
+    /// disabled, non-Ghostty terminal, or tmux); it works on any terminal since
+    /// it emits only colored `▀` cells. Covers both plugin-panel images and
+    /// Claude `[Image #N]` previews.
+    pub(crate) fn paint_halfblock_images(
+        &self,
+        frame_area: ratatui::layout::Rect,
+        buf: &mut ratatui::buffer::Buffer,
+    ) {
+        if self.state.overlay_suppresses_host_images() {
+            return;
+        }
+        for (rect, path) in self.resolve_plugin_surface_images(frame_area) {
+            crate::host_image::paint_halfblock_image(&path, rect, buf);
+        }
+
+        let Some(ws_idx) = self.state.active else {
+            return;
+        };
+        let Some(cache_root) = crate::host_image::default_image_cache_root() else {
+            return;
+        };
+        for info in &self.state.view.pane_infos {
+            let Some(session) = self.state.claude_session_value_for_pane(ws_idx, info.id) else {
+                continue;
+            };
+            let Some(runtime) =
+                self.state
+                    .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, info.id)
+            else {
+                continue;
+            };
+            let rows: Vec<String> = runtime.visible_text().lines().map(str::to_string).collect();
+            for (placeholder, path) in
+                crate::host_image::resolve_pane_placeholders(&cache_root, &session, &rows)
+            {
+                if placeholder.col as u32 >= info.inner_rect.width as u32
+                    || placeholder.row as u32 >= info.inner_rect.height as u32
+                {
+                    continue;
+                }
+                let x = info.inner_rect.x + placeholder.col;
+                let y = info.inner_rect.y + placeholder.row;
+                // Scale to the pane's budget instead of a fixed thumbnail so the
+                // image reads at chat scale. Width is whatever remains to the
+                // right edge; height is capped to ~80% of the pane so text above
+                // and below the image stays visible, and never past the bottom.
+                let max_cols = info.inner_rect.right().saturating_sub(x);
+                let height_budget = (info.inner_rect.height as u32 * 8 / 10) as u16;
+                let max_rows = info
+                    .inner_rect
+                    .bottom()
+                    .saturating_sub(y)
+                    .min(height_budget.max(1));
+                let Some((cols, rows)) =
+                    crate::host_image::halfblock_image_box(&path, max_cols, max_rows)
+                else {
+                    continue;
+                };
+                if cols == 0 || rows == 0 {
+                    continue;
+                }
+                let box_rect = ratatui::layout::Rect::new(x, y, cols, rows);
+                crate::host_image::paint_halfblock_image(&path, box_rect, buf);
+            }
+        }
+    }
+
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.input_rx.is_none() {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
@@ -990,6 +1416,11 @@ impl App {
                 needs_render = true;
             }
 
+            if let Some(request) = self.state.request_plugin_action.take() {
+                self.dispatch_requested_plugin_action(request);
+                needs_render = true;
+            }
+
             if self.state.request_submit_worktree_create {
                 self.state.request_submit_worktree_create = false;
                 self.submit_worktree_create_via_api();
@@ -1014,6 +1445,10 @@ impl App {
                 needs_render = true;
             }
 
+            if self.drain_pending_plugin_ui_actions() {
+                needs_render = true;
+            }
+
             if self.ensure_default_workspace() {
                 needs_render = true;
             }
@@ -1034,8 +1469,11 @@ impl App {
                     self.full_redraw_pending = false;
                 }
                 let mut cell_size = crate::kitty_graphics::HostCellSize::default();
+                #[allow(unused_assignments)]
+                let mut frame_area = ratatui::layout::Rect::default();
                 terminal.draw(|frame| {
                     let area = frame.area();
+                    frame_area = area;
                     if kitty_graphics_enabled {
                         let observed_cell_size =
                             crate::kitty_graphics::HostCellSize::try_from_terminal(area);
@@ -1058,17 +1496,24 @@ impl App {
                             area,
                         );
                     }
+                    self.sync_ui_plugin_focus_event();
+                    self.dispatch_ui_plugin_frame_events();
                     crate::ui::render_with_runtime_registry(
                         &self.state,
                         &self.terminal_runtimes,
                         frame,
                     );
+                    if !kitty_graphics_enabled {
+                        self.paint_halfblock_images(area, frame.buffer_mut());
+                    }
                 })?;
                 if kitty_graphics_enabled {
+                    let plugin_images = self.resolve_plugin_surface_images(frame_area);
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
                         &self.terminal_runtimes,
                         cell_size,
+                        &plugin_images,
                     )?;
                 }
                 self.sync_pending_agent_resume_deadline(now);
@@ -1652,6 +2097,933 @@ impl App {
         }
     }
 
+    /// Drains the plugin actions that `AppState::handle_mouse` (pure data) could
+    /// only record while resolving a click. Only here, with access to the runtime
+    /// `UiPluginManager`, can they take effect: the legacy `pending_plugin_action_invocation`
+    /// invokes a manifest-declared process action, and the §4
+    /// `pending_plugin_ui_action` is dispatched as a v3 `Action` event with its
+    /// resulting effects applied. Runs from BOTH the interactive `run()` loop and
+    /// the headless server input path — herdr runs headless in production, so
+    /// without the headless call v3 plugin buttons would be dead. Returns true if
+    /// any pending action was drained (the caller should re-render).
+    pub(crate) fn drain_pending_plugin_ui_actions(&mut self) -> bool {
+        let mut acted = false;
+        if let Some(request) = self.state.pending_plugin_action_invocation.take() {
+            if let Err(err) = self.invoke_plugin_action_from_ui_surface(
+                request.plugin_id,
+                request.action_id,
+                request.context_menu_kind,
+            ) {
+                tracing::warn!(err = %err, "failed to invoke ui-surface plugin action");
+            }
+            acted = true;
+        }
+        if let Some(action) = self.state.pending_plugin_ui_action.take() {
+            if self.ui_plugins.dispatch_action(
+                &action.plugin_id,
+                &action.module_id,
+                action.action_id,
+                action.surface,
+                action.column,
+                action.row,
+                action.kind,
+            ) {
+                self.refresh_ui_plugin_state_from_manager();
+                self.apply_ui_plugin_notifications();
+                self.apply_ui_plugin_effects();
+            }
+            acted = true;
+        }
+        if self.apply_pending_historial_action() {
+            acted = true;
+        }
+        if self.apply_pending_harness_action() {
+            acted = true;
+        }
+        acted
+    }
+
+    pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {
+        self.state.ui_context_menu_items = self.ui_plugins.context_menu_items();
+        self.state.ui_surface_layers = self.ui_plugins.surface_layers();
+        self.sync_usage_view_hits_from_layers();
+    }
+
+    /// fork(wave-2): re-sync the live `UiPluginManager` against the installed-plugins
+    /// registry after a lifecycle change (enable / disable / link / unlink) so it
+    /// applies without a server restart. Reconciles modules, drops per-module
+    /// collector bookkeeping for anything removed (so a later re-enable starts
+    /// clean), and refreshes derived render state so stale overlays clear on the
+    /// next frame.
+    pub(crate) fn resync_ui_plugins_after_lifecycle_change(&mut self) {
+        let removed = self.ui_plugins.sync_to_registry(&self.state.installed_plugins);
+        for (plugin_id, module_id) in &removed {
+            let key = crate::plugin_collector::module_key(plugin_id, module_id);
+            self.collectors_in_flight.remove(&key);
+        }
+        self.refresh_ui_plugin_state_from_manager();
+    }
+
+    /// fork(wave-2): hot-apply `herdr-plugin.toml` edits to a running server. For
+    /// each manifest whose mtime advanced, re-parse it; on success replace that
+    /// plugin's registry entry (preserving its enabled + source state) and re-sync
+    /// the manager so new surfaces / capabilities / `ui_input_file` / collector argv
+    /// take effect on the next tick; on parse failure keep the last-good entry and
+    /// toast once (the mtime is already advanced, so a broken manifest never
+    /// re-fires). Returns true if any manifest was successfully re-applied.
+    pub(crate) fn hot_reload_ui_plugin_manifests(&mut self) -> bool {
+        let changed = self.ui_plugins.detect_changed_manifests();
+        if changed.is_empty() {
+            return false;
+        }
+        let mut applied = false;
+        for manifest_path in changed {
+            let manifest_str = manifest_path.display().to_string();
+            let affected: Vec<(String, bool, crate::api::schema::PluginSourceInfo)> = self
+                .state
+                .installed_plugins
+                .values()
+                .filter(|plugin| std::path::PathBuf::from(&plugin.manifest_path) == manifest_path)
+                .map(|plugin| (plugin.plugin_id.clone(), plugin.enabled, plugin.source.clone()))
+                .collect();
+            for (plugin_id, enabled, source) in affected {
+                match crate::app::api::plugins::load_plugin_manifest(&manifest_str, enabled) {
+                    Ok(mut info) => {
+                        info.source = source;
+                        // A manifest whose `id` changed re-keys the entry; drop the
+                        // stale key so the registry never carries a ghost plugin.
+                        if info.plugin_id != plugin_id {
+                            self.state.installed_plugins.remove(&plugin_id);
+                        }
+                        self.state
+                            .installed_plugins
+                            .insert(info.plugin_id.clone(), info);
+                        applied = true;
+                    }
+                    Err((code, message)) => {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            manifest = %manifest_str,
+                            code,
+                            error = %message,
+                            "ui plugin manifest reload failed; keeping last-good"
+                        );
+                        self.ui_plugins.push_notification(format!(
+                            "ui plugin {plugin_id} manifest reload failed: {message}"
+                        ));
+                    }
+                }
+            }
+        }
+        if applied {
+            self.resync_ui_plugins_after_lifecycle_change();
+        }
+        self.apply_ui_plugin_notifications();
+        applied
+    }
+
+    /// feat/native-dashes: the usage strip is rendered by the WASM plugin, which
+    /// returns its clickable hit-rects (expand/stats toggles) on the UsageStrip
+    /// layer. Mirror them onto `usage_view.hits` so `usage_host::route_mouse` resolves
+    /// clicks the same way the native renderer used to (which wrote `hits` back
+    /// onto the view each frame). When the plugin reports no expandable state
+    /// hit, drop stale expand/scroll — exactly the old `render()` cleanup.
+    fn sync_usage_view_hits_from_layers(&mut self) {
+        use ratatui::layout::Rect;
+        let mut hits = usage_dash_core::Hits::default();
+        for entry in &self.state.ui_surface_layers {
+            if entry.layer.surface != herdr_ui_plugin_api::UiSurface::UsageStrip {
+                continue;
+            }
+            for hit in &entry.layer.hits {
+                let rect = Rect::new(hit.x, hit.y, hit.width, hit.height);
+                match hit.action_id.as_str() {
+                    "usage:toggle_expand" => hits.state = Some(rect),
+                    "usage:toggle_stats" => hits.stats = Some(rect),
+                    _ => {}
+                }
+            }
+        }
+        if hits.state.is_none() {
+            self.usage_view.expanded = false;
+            self.usage_view.scroll = 0;
+        }
+        self.usage_view.hits = hits;
+    }
+
+    pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
+        let focus = crate::plugin_focus::focus_input(&self.state);
+        if self.last_ui_plugin_focus.as_ref().is_some_and(|last| {
+            last.session_id == focus.session_id
+                && last.session_ref == focus.session_ref
+                && last.cwd == focus.cwd
+                && last.agent == focus.agent
+                && last.is_self_focus == focus.is_self_focus
+        }) {
+            return;
+        }
+        self.last_ui_plugin_focus = Some(focus.clone());
+        if self.ui_plugins.dispatch_focus_changed(focus) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_notifications();
+            self.apply_ui_plugin_effects();
+        }
+    }
+
+    pub(crate) fn dispatch_ui_plugin_frame_events(&mut self) {
+        let focus = crate::plugin_focus::focus_input(&self.state);
+        let plugin_context = self.current_plugin_context("ui_frame");
+        let plugin_context_json = serde_json::to_string(&plugin_context).ok();
+        // §7: computed once per frame and shared across every module/surface
+        // event dispatched this frame, not recomputed per surface.
+        let layout_json = self.ui_plugin_layout_json(&plugin_context);
+        let modules = self
+            .ui_plugins
+            .all()
+            .iter()
+            .map(|module| {
+                (
+                    module.plugin_id.clone(),
+                    module.module_id.clone(),
+                    module.negotiated_version,
+                    module.surfaces.clone(),
+                    serde_json::to_string(&module.manifest_ref()).ok(),
+                    module.ui_input_file.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (plugin_id, module_id, negotiated_version, surfaces, manifest_json, ui_input_file) in
+            modules
+        {
+            // §7.1: read the module's input file once per frame (mtime-cached),
+            // shared across all its surface events like `HERDR_LAYOUT_JSON`.
+            let ui_input_json = ui_input_file
+                .as_deref()
+                .and_then(|file| self.read_ui_input_json(&plugin_id, &module_id, file));
+            for surface in surfaces {
+                let surface = match surface {
+                    crate::api::schema::PluginUiSurface::Header => {
+                        herdr_ui_plugin_api::UiSurface::Header
+                    }
+                    crate::api::schema::PluginUiSurface::Footer => {
+                        herdr_ui_plugin_api::UiSurface::Footer
+                    }
+                    crate::api::schema::PluginUiSurface::TabBar => {
+                        herdr_ui_plugin_api::UiSurface::TabBar
+                    }
+                    crate::api::schema::PluginUiSurface::Sidebar => {
+                        herdr_ui_plugin_api::UiSurface::Sidebar
+                    }
+                    crate::api::schema::PluginUiSurface::RightPanel => {
+                        herdr_ui_plugin_api::UiSurface::RightPanel
+                    }
+                    crate::api::schema::PluginUiSurface::Overlay => {
+                        herdr_ui_plugin_api::UiSurface::Overlay
+                    }
+                    crate::api::schema::PluginUiSurface::ContextMenu => {
+                        herdr_ui_plugin_api::UiSurface::ContextMenu
+                    }
+                    crate::api::schema::PluginUiSurface::UsageStrip => {
+                        herdr_ui_plugin_api::UiSurface::UsageStrip
+                    }
+                    crate::api::schema::PluginUiSurface::Panel => {
+                        herdr_ui_plugin_api::UiSurface::Panel
+                    }
+                };
+                // Identity-aware so the generic `Panel` surface resolves to THIS
+                // module's placement rect; the guest reads `frame.rect` as its
+                // absolute origin, keeping it agnostic of any layout-blob key.
+                let rect = crate::ui::ui_plugin_owner_surface_rect(
+                    &self.state,
+                    crate::ui::ui_plugin_frame_area(&self.state),
+                    surface,
+                    &plugin_id,
+                    &module_id,
+                );
+                if surface == herdr_ui_plugin_api::UiSurface::UsageStrip {
+                    tracing::info!(
+                        ?rect,
+                        usage_area = ?self.state.view.usage_strip_rect,
+                        has_snapshot = self.usage_snapshot.is_some(),
+                        "usage frame dispatch"
+                    );
+                }
+                let env = self.build_ui_plugin_frame_env(
+                    &plugin_id,
+                    &module_id,
+                    manifest_json.as_deref(),
+                    plugin_context_json.as_deref(),
+                    &plugin_context,
+                    &focus,
+                    (negotiated_version == 3).then_some(layout_json.as_str()),
+                    ui_input_json.as_deref(),
+                );
+                changed |= self.ui_plugins.dispatch_frame(
+                    &plugin_id,
+                    &module_id,
+                    surface,
+                    herdr_ui_plugin_api::UiLayoutRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height,
+                    },
+                    false,
+                    focus.clone(),
+                    env,
+                );
+            }
+        }
+        if changed {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_notifications();
+            self.apply_ui_plugin_effects();
+        }
+        let usage_nodes: usize = self
+            .state
+            .ui_surface_layers
+            .iter()
+            .filter(|entry| entry.layer.surface == herdr_ui_plugin_api::UiSurface::UsageStrip)
+            .map(|entry| entry.layer.nodes.len())
+            .sum();
+        tracing::info!(
+            changed,
+            usage_nodes,
+            layers = self.state.ui_surface_layers.len(),
+            "frame events done"
+        );
+    }
+
+    /// Spec §7: builds the `HERDR_LAYOUT_JSON` blob delivered to v3 modules'
+    /// frame env — a cheap read-slice of the query API's layout basics so a
+    /// plugin doesn't need a socket round trip just to learn geometry/focus
+    /// that changes every frame. Any zero-width/height area (e.g.
+    /// `right_panel_rect` when the panel is hidden) is emitted as `null` per
+    /// spec. `dispatch_ui_plugin_frame_events` runs once against the shared
+    /// `AppState`, not per attached client, so `client.is_foreground` is
+    /// always `true` and `client.pinned_to` is always `null` here — true
+    /// multi-client pinning (the F11 fix in `server/clients.rs`'s
+    /// foreground-client tracking) is out of this pass's scope.
+    fn ui_plugin_layout_json(
+        &self,
+        plugin_context: &crate::api::schema::PluginInvocationContext,
+    ) -> String {
+        fn area_or_null(rect: ratatui::layout::Rect) -> serde_json::Value {
+            if rect.width == 0 || rect.height == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height})
+            }
+        }
+
+        let sidebar = self.state.view.sidebar_rect;
+        let terminal = self.state.view.terminal_area;
+        let client_width = sidebar.width.max(terminal.x.saturating_add(terminal.width));
+        let client_height = terminal
+            .y
+            .saturating_add(terminal.height)
+            .max(sidebar.y.saturating_add(sidebar.height));
+
+        let blob = serde_json::json!({
+            "active_workspace_id": plugin_context.workspace_id,
+            "active_tab_id": plugin_context.tab_id,
+            "focused_pane_id": plugin_context.focused_pane_id,
+            "terminal_area": area_or_null(terminal),
+            // The `*_dash_area` JSON keys are the frozen v3 layout-blob field
+            // names (spec §7) and stay dash-named for wave-1 compatibility even
+            // though the host rects were renamed to generic surface geometry.
+            "usage_dash_area": area_or_null(self.state.view.usage_strip_rect),
+            "goal_dash_area": area_or_null(self.state.view.right_panel_rect),
+            // Generic per-module panel geometry, keyed by `plugin_id:module_id`.
+            // A panel guest can read its own rect here for absolute hit-offset,
+            // though it can equivalently just use its frame `rect` (same value).
+            // Empty object when no panel is currently carved.
+            "panel_areas": self.ui_plugin_panel_areas(),
+            "client": {
+                "is_foreground": true,
+                "width": client_width,
+                "height": client_height,
+                "pinned_to": serde_json::Value::Null,
+            },
+        });
+        serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Generic per-module panel geometry for the layout blob's `panel_areas`
+    /// key: a `{ "plugin_id:module_id": {x,y,w,h} }` object over every currently
+    /// carved plugin `Panel` rect. Zero-sized rects are omitted. This is the
+    /// data-driven successor to the old fixed `bottom_dash_area` key — no panel
+    /// position is hardcoded here.
+    fn ui_plugin_panel_areas(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for panel in &self.state.view.panel_rects {
+            let rect = panel.rect;
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            map.insert(
+                format!("{}:{}", panel.plugin_id, panel.module_id),
+                serde_json::json!({"x": rect.x, "y": rect.y, "w": rect.width, "h": rect.height}),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    pub(crate) fn build_ui_plugin_frame_env(
+        &self,
+        plugin_id: &str,
+        module_id: &str,
+        manifest_json: Option<&str>,
+        plugin_context_json: Option<&str>,
+        plugin_context: &crate::api::schema::PluginInvocationContext,
+        focus: &herdr_ui_plugin_api::FocusInput,
+        layout_json: Option<&str>,
+        ui_input_json: Option<&str>,
+    ) -> std::collections::HashMap<String, String> {
+        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::from([
+            ("HERDR_PLUGIN_ID".to_string(), plugin_id.to_string()),
+            ("HERDR_UI_MODULE_ID".to_string(), module_id.to_string()),
+            (
+                "HERDR_THEME_NAME".to_string(),
+                self.state.theme_name.clone(),
+            ),
+            (
+                crate::api::SOCKET_PATH_ENV_VAR.to_string(),
+                crate::api::socket_path().display().to_string(),
+            ),
+        ]);
+        if let Ok(current_exe) = std::env::current_exe() {
+            env.insert(
+                "HERDR_BIN_PATH".to_string(),
+                current_exe.display().to_string(),
+            );
+        }
+        if let Some(plugin) = self.state.installed_plugins.get(plugin_id) {
+            env.insert("HERDR_PLUGIN_ROOT".to_string(), plugin.plugin_root.clone());
+            env.insert(
+                "HERDR_PLUGIN_CONFIG_DIR".to_string(),
+                crate::plugin_paths::plugin_config_dir(&plugin.plugin_id)
+                    .display()
+                    .to_string(),
+            );
+            env.insert(
+                "HERDR_PLUGIN_STATE_DIR".to_string(),
+                crate::plugin_paths::plugin_state_dir(&plugin.plugin_id)
+                    .display()
+                    .to_string(),
+            );
+        }
+        if let Some(manifest_json) = manifest_json {
+            env.insert(
+                "HERDR_UI_MODULE_MANIFEST_JSON".to_string(),
+                manifest_json.to_string(),
+            );
+        }
+        if let Some(plugin_context_json) = plugin_context_json {
+            env.insert(
+                "HERDR_PLUGIN_CONTEXT_JSON".to_string(),
+                plugin_context_json.to_string(),
+            );
+        }
+        if let Some(workspace_id) = plugin_context.workspace_id.as_ref() {
+            env.insert("HERDR_WORKSPACE_ID".to_string(), workspace_id.clone());
+        }
+        if let Some(tab_id) = plugin_context.tab_id.as_ref() {
+            env.insert("HERDR_TAB_ID".to_string(), tab_id.clone());
+        }
+        if let Some(pane_id) = plugin_context.focused_pane_id.as_ref() {
+            env.insert("HERDR_PANE_ID".to_string(), pane_id.clone());
+        }
+        if let Some(selected_text) = plugin_context.selected_text.as_ref() {
+            env.insert("HERDR_SELECTED_TEXT".to_string(), selected_text.clone());
+        }
+        if let Some(session_id) = focus.session_id.as_ref() {
+            env.insert("HERDR_FOCUS_SESSION_ID".to_string(), session_id.clone());
+        }
+        if let Some(session_ref) = focus.session_ref.as_ref() {
+            env.insert("HERDR_FOCUS_SESSION_REF".to_string(), session_ref.clone());
+        }
+        if let Some(cwd) = focus.cwd.as_ref() {
+            env.insert("HERDR_FOCUS_CWD".to_string(), cwd.display().to_string());
+        }
+        env.insert(
+            "HERDR_FOCUS_AGENT".to_string(),
+            format!("{:?}", focus.agent).to_lowercase(),
+        );
+        if let Some(layout_json) = layout_json {
+            env.insert("HERDR_LAYOUT_JSON".to_string(), layout_json.to_string());
+        }
+        // §7.1: a module that declares `ui_input_file` gets its state-dir file's
+        // current contents as an opaque blob. The host does not parse it.
+        if let Some(ui_input_json) = ui_input_json {
+            env.insert(
+                "HERDR_PLUGIN_UI_INPUT_JSON".to_string(),
+                ui_input_json.to_string(),
+            );
+        }
+        env
+    }
+
+    /// Read a module's declared `ui_input_file` from its state dir (spec §7.1),
+    /// size-capped at [`MAX_UI_INPUT_BYTES`] and mtime-cached. Returns the
+    /// current contents, or `None` when the module declares no file, the name is
+    /// not a single path segment, or the file is missing/empty. The host never
+    /// interprets the bytes — it moves an opaque UTF-8 blob from disk to the
+    /// guest via `HERDR_PLUGIN_UI_INPUT_JSON`.
+    fn read_ui_input_json(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        ui_input_file: &str,
+    ) -> Option<String> {
+        let state_dir = crate::plugin_paths::plugin_state_dir(plugin_id);
+        let key = (plugin_id.to_string(), module_id.to_string());
+        read_ui_input_blob(&state_dir, ui_input_file, key, &mut self.ui_input_cache)
+    }
+
+    /// Serialize the live [`usage_dash_core::model::UsageRenderInput`] for the
+    /// usage WASM plugin: the current snapshot plus the host-owned view toggles
+    /// and the absolute reset-time strings (the guest can't run `date`).
+    fn usage_render_input_json(&self) -> Option<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (five_hour_abs, weekly_abs) = match self.usage_snapshot.as_ref() {
+            Some(snap) => (
+                snap.five_hour
+                    .resets_at
+                    .map(|e| host_abs_time(e, false))
+                    .unwrap_or_default(),
+                snap.weekly
+                    .resets_at
+                    .map(|e| host_abs_time(e, true))
+                    .unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let input = usage_dash_core::model::UsageRenderInput {
+            snapshot: self.usage_snapshot.clone(),
+            expanded: self.usage_view.expanded,
+            collapsed: self.usage_view.collapsed,
+            stats_shown: self.usage_view.stats_shown,
+            scroll: self.usage_view.scroll,
+            now,
+            five_hour_abs,
+            weekly_abs,
+        };
+        serde_json::to_string(&input).ok()
+    }
+
+    /// Interim item-C writer: serialize the live usage render input and
+    /// atomically write it to the usage-dash module's state dir as
+    /// `usage_input.json`, where item B's generic `ui_input_file` reader surfaces
+    /// it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the dash tick
+    /// (~1 Hz), matching today's per-frame freshness. A failed write is logged
+    /// and swallowed so it never stalls or panics the render loop. This is the
+    /// last usage-specific path in core after item C; it relocates into the
+    /// usage-dash plugin's own collector process in items D/E.
+    pub(crate) fn write_usage_input_file(&self) {
+        let Some(json) = self.usage_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(USAGE_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, USAGE_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = USAGE_DASH_PLUGIN_ID,
+                "failed to write usage input file for the usage-dash plugin"
+            );
+        }
+    }
+
+    /// Serialize the live goal core into its wasm-safe per-frame render model
+    /// ([`goal_dash_model::GoalRenderModel`]) for the goal WASM plugin. All
+    /// chrono/filesystem-derived labels are precomputed by `build_render_model`
+    /// (the guest can't reach a clock or the disk).
+    fn goal_render_input_json(&self) -> Option<String> {
+        match serde_json::to_string(&self.goal_dash.build_render_model()) {
+            Ok(json) => Some(json),
+            // Surface the failure: a silently skipped write leaves the panel
+            // permanently empty with no trace (serde_json rejects e.g. NaN).
+            Err(err) => {
+                tracing::warn!(error = %err, "goal render model failed to serialize; goal_input.json not written");
+                None
+            }
+        }
+    }
+
+    /// Interim writer (mirrors [`Self::write_usage_input_file`]): serialize the
+    /// live goal render model and atomically write it to the goal-dash module's
+    /// state dir as `goal_input.json`, where the generic `ui_input_file` reader
+    /// surfaces it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the
+    /// dash tick (~1 Hz) from [`crate::goal_host::tick`]. A failed write is
+    /// logged and swallowed so it never stalls or panics the render loop. This
+    /// relocates into the goal-dash plugin's own collector process in wave 2.
+    pub(crate) fn write_goal_input_file(&self) {
+        let Some(json) = self.goal_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(GOAL_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, GOAL_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = GOAL_DASH_PLUGIN_ID,
+                "failed to write goal input file for the goal-dash plugin"
+            );
+        }
+    }
+
+    /// Project the recent pane-close log into the wasm-safe historial render
+    /// model. Every display string (agent, label, compact relative time) and the
+    /// per-row restorability is precomputed here host-side, since the historial
+    /// guest can reach neither a clock nor the disk. Pure over the log + `now`.
+    fn historial_render_input_json(&self) -> Option<String> {
+        let now = crate::pane_close_history::now_unix_ms();
+        let rows = build_historial_rows(
+            crate::pane_close_history::read_recent(HISTORIAL_READ_LIMIT),
+            now,
+        );
+        let model = historial_dash_model::HistorialRenderModel { rows };
+        match serde_json::to_string(&model) {
+            Ok(json) => Some(json),
+            Err(err) => {
+                tracing::warn!(error = %err, "historial render model failed to serialize; historial_input.json not written");
+                None
+            }
+        }
+    }
+
+    /// Interim writer (mirrors [`Self::write_goal_input_file`]): serialize the
+    /// live historial render model and atomically write it to the historial-dash
+    /// module's state dir as `historial_input.json`, where the generic
+    /// `ui_input_file` reader surfaces it to the guest as
+    /// `HERDR_PLUGIN_UI_INPUT_JSON`. Called on the dash tick (~1 Hz) from
+    /// [`crate::historial_host::tick`]. A failed write is logged and swallowed so
+    /// it never stalls or panics the render loop.
+    pub(crate) fn write_historial_input_file(&self) {
+        let Some(json) = self.historial_render_input_json() else {
+            return;
+        };
+        let state_dir = crate::plugin_paths::plugin_state_dir(HISTORIAL_DASH_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, HISTORIAL_DASH_INPUT_FILE, &json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = HISTORIAL_DASH_PLUGIN_ID,
+                "failed to write historial input file for the historial-dash plugin"
+            );
+        }
+    }
+
+    /// Atomically write the harness-manager render model JSON (built by
+    /// [`crate::harness_host::tick`]) to the harness module's state dir as
+    /// `harness_input.json`, where the generic `ui_input_file` reader surfaces
+    /// it to the guest as `HERDR_PLUGIN_UI_INPUT_JSON`. A failed write is
+    /// logged and swallowed so it never stalls the render loop.
+    pub(crate) fn write_harness_input_file(&self, json: &str) {
+        let state_dir = crate::plugin_paths::plugin_state_dir(HARNESS_PLUGIN_ID);
+        if let Err(err) = write_ui_input_atomic(&state_dir, HARNESS_INPUT_FILE, json) {
+            tracing::warn!(
+                error = %err,
+                plugin_id = HARNESS_PLUGIN_ID,
+                "failed to write harness input file for the harness-manager plugin"
+            );
+        }
+    }
+
+    pub(crate) fn apply_ui_plugin_notifications(&mut self) {
+        for message in self.ui_plugins.take_pending_notifications() {
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::Finished,
+                title: message,
+                context: "ui plugin".into(),
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
+        }
+    }
+
+    /// API v3 (§5.4): at most this many chained rounds of `HostEffect::Api`
+    /// execution run per host turn. Each round delivers `ApiResult` back to the
+    /// emitting module, which may itself enqueue another `Api` call for the
+    /// next round; capping this prevents a plugin that keeps chaining calls
+    /// from wedging the host turn. Anything still queued once the cap is hit is
+    /// parked (never dropped) for the next tick.
+    const MAX_API_BRIDGE_ROUNDS_PER_TURN: usize = 4;
+
+    pub(crate) fn apply_ui_plugin_effects(&mut self) {
+        self.apply_ui_plugin_host_effects();
+        for _ in 0..Self::MAX_API_BRIDGE_ROUNDS_PER_TURN {
+            let pending = self.ui_plugins.take_pending_api_effects();
+            if pending.is_empty() {
+                return;
+            }
+            for effect in pending {
+                self.execute_ui_plugin_api_call(effect);
+            }
+            // Delivering each ApiResult above may have enqueued plain host
+            // effects (e.g. a plugin action.invoke reacting to its own read);
+            // flush those before checking for another chained round.
+            self.apply_ui_plugin_host_effects();
+        }
+        let overflow = self.ui_plugins.take_pending_api_effects();
+        if !overflow.is_empty() {
+            tracing::warn!(
+                count = overflow.len(),
+                "ui plugin api bridge: chained-round budget exhausted, parking for next tick"
+            );
+            self.ui_plugins.park_pending_api_effects(overflow);
+        }
+    }
+
+    /// API v3 (§5.3/§5.4): resolve one `HostEffect::Api` call end to end —
+    /// per-update budget check, capability-policy check (`ui_plugin_api_bridge`),
+    /// synchronous execution via `handle_api_request_after_internal_events_drained`
+    /// (never `handle_api_request`, which would re-drain internal events
+    /// re-entrantly from inside a UI-plugin dispatch), and delivery of the
+    /// `ApiResult` back to the emitting module. Every call resolves to exactly
+    /// one `ApiResult`, or is silently discarded by `dispatch_api_result` if the
+    /// module was unlinked before delivery (§5.4).
+    fn execute_ui_plugin_api_call(&mut self, effect: crate::ui_plugins::PendingApiEffect) {
+        /// The spec does not pin an exact wall-clock bound for a single bridge
+        /// method call; 250ms is chosen so a slow call is logged loudly (the
+        /// render thread is blocked for its duration) without adding a second
+        /// timeout/cancellation mechanism beyond the existing per-update and
+        /// chained-round caps.
+        const API_METHOD_WALL_CLOCK_BUDGET: std::time::Duration =
+            std::time::Duration::from_millis(250);
+
+        let crate::ui_plugins::PendingApiEffect {
+            plugin_id,
+            module_id,
+            request_id,
+            method,
+            params,
+            budget_exhausted,
+        } = effect;
+
+        if budget_exhausted {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                request_id = %request_id,
+                method = %method,
+                "ui plugin api call refused: per-update budget exhausted"
+            );
+            self.ui_plugins.dispatch_api_result(
+                &plugin_id,
+                &module_id,
+                request_id,
+                false,
+                None,
+                Some("api_budget_exhausted".to_string()),
+            );
+            return;
+        }
+
+        let capability = match crate::ui_plugin_api_bridge::decide(&method) {
+            crate::ui_plugin_api_bridge::ApiMethodDecision::Deny => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    module_id = %module_id,
+                    request_id = %request_id,
+                    method = %method,
+                    "ui plugin api call denied by policy"
+                );
+                self.ui_plugins.dispatch_api_result(
+                    &plugin_id,
+                    &module_id,
+                    request_id,
+                    false,
+                    None,
+                    Some("method_not_permitted".to_string()),
+                );
+                return;
+            }
+            crate::ui_plugin_api_bridge::ApiMethodDecision::Allow(capability) => capability,
+        };
+
+        if !self
+            .ui_plugins
+            .module_requests(&plugin_id, &module_id, capability)
+        {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                request_id = %request_id,
+                method = %method,
+                ?capability,
+                "ui plugin api call denied: module lacks required capability"
+            );
+            self.ui_plugins.dispatch_api_result(
+                &plugin_id,
+                &module_id,
+                request_id,
+                false,
+                None,
+                Some("capability_not_granted".to_string()),
+            );
+            return;
+        }
+
+        let request_value = serde_json::json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        });
+        let request: crate::api::schema::Request = match serde_json::from_value(request_value) {
+            Ok(request) => request,
+            Err(err) => {
+                self.ui_plugins.dispatch_api_result(
+                    &plugin_id,
+                    &module_id,
+                    request_id,
+                    false,
+                    None,
+                    Some(format!("invalid_params: {err}")),
+                );
+                return;
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let response_json = self.handle_api_request_after_internal_events_drained(request);
+        let elapsed = started.elapsed();
+        if elapsed > API_METHOD_WALL_CLOCK_BUDGET {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                module_id = %module_id,
+                method = %method,
+                elapsed_ms = elapsed.as_millis(),
+                "ui plugin api call exceeded wall-clock budget"
+            );
+        }
+
+        let (ok, response, error) = match serde_json::from_str::<serde_json::Value>(&response_json)
+        {
+            Ok(value) if value.get("error").is_some() => {
+                let message = value
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(|message| message.as_str())
+                    .unwrap_or("api call failed")
+                    .to_string();
+                (false, None, Some(message))
+            }
+            Ok(value) => (true, value.get("result").cloned(), None),
+            Err(err) => (false, None, Some(format!("malformed response: {err}"))),
+        };
+
+        self.ui_plugins
+            .dispatch_api_result(&plugin_id, &module_id, request_id, ok, response, error);
+    }
+
+    /// Applies the plain (non-`Api`) `HostEffect`s a UI plugin update queued.
+    /// `HostEffect::Api` never reaches this queue — `dispatch_event_for_module`
+    /// (ui_plugins.rs) routes it into `pending_api_effects` instead, handled by
+    /// `apply_ui_plugin_effects`/`execute_ui_plugin_api_call` above.
+    fn apply_ui_plugin_host_effects(&mut self) {
+        for effect in self.ui_plugins.take_pending_effects() {
+            match effect {
+                herdr_ui_plugin_api::HostEffect::CopyText(text) => {
+                    self.state.request_clipboard_write = Some(text.into_bytes());
+                }
+                herdr_ui_plugin_api::HostEffect::SendPaneKeys { lines } => {
+                    let Some(ws_idx) = self.state.active else {
+                        continue;
+                    };
+                    let Some(runtime) = self
+                        .state
+                        .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+                    else {
+                        continue;
+                    };
+                    for mut line in lines {
+                        line.push('\r');
+                        let _ = runtime.try_send_bytes(bytes::Bytes::from(line.into_bytes()));
+                    }
+                }
+                herdr_ui_plugin_api::HostEffect::ShowToast { message } => {
+                    let previous_toast = self.state.toast.clone();
+                    self.state.toast = Some(crate::app::state::ToastNotification {
+                        kind: crate::app::state::ToastKind::Finished,
+                        title: message,
+                        context: "ui plugin".into(),
+                        position: None,
+                        target: None,
+                    });
+                    self.sync_toast_deadline(previous_toast);
+                }
+                herdr_ui_plugin_api::HostEffect::OpenPluginPane {
+                    plugin_id,
+                    entrypoint,
+                    payload_json,
+                } => {
+                    let mut env = std::collections::HashMap::new();
+                    if let Some(payload_json) = payload_json {
+                        env.insert("HERDR_PLUGIN_PAYLOAD_JSON".to_string(), payload_json);
+                    }
+                    let _ = self.handle_api_request(crate::api::schema::Request {
+                        id: "ui-plugin-effect".into(),
+                        method: crate::api::schema::Method::PluginPaneOpen(
+                            crate::api::schema::PluginPaneOpenParams {
+                                plugin_id,
+                                entrypoint,
+                                placement: None,
+                                workspace_id: None,
+                                target_pane_id: None,
+                                direction: None,
+                                cwd: None,
+                                focus: true,
+                                env,
+                            },
+                        ),
+                    });
+                }
+                herdr_ui_plugin_api::HostEffect::InvokePluginAction {
+                    plugin_id,
+                    action_id,
+                    payload_json,
+                } => {
+                    let _ = self.handle_api_request(crate::api::schema::Request {
+                        id: "ui-plugin-effect".into(),
+                        method: crate::api::schema::Method::PluginActionInvoke(
+                            crate::api::schema::PluginActionInvokeParams {
+                                action_id,
+                                plugin_id: Some(plugin_id),
+                                context: Some(crate::api::schema::PluginInvocationContext {
+                                    plugin_payload_json: payload_json,
+                                    ..Default::default()
+                                }),
+                            },
+                        ),
+                    });
+                }
+                herdr_ui_plugin_api::HostEffect::SetSurfaceCollapsed { surface, collapsed } => {
+                    // Own-surface guard already enforced at queue time
+                    // (ui_plugins::filter_effects_for_module, §7.2).
+                    if collapsed {
+                        self.state.collapsed_surfaces.insert(surface);
+                    } else {
+                        self.state.collapsed_surfaces.remove(&surface);
+                    }
+                }
+                herdr_ui_plugin_api::HostEffect::Api {
+                    request_id, method, ..
+                } => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        method = %method,
+                        "ui plugin api effect reached the host-effect queue unexpectedly; dropping (should have been routed to pending_api_effects)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Handles a key event in non-terminal mode for the headless server.
     ///
     /// Uses the standalone handler functions that work on `&mut AppState`
@@ -1719,6 +3091,9 @@ impl App {
             Mode::Navigator => {
                 input::handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event);
             }
+            Mode::ResumePicker => {
+                self.handle_resume_picker_key(key);
+            }
             Mode::Terminal => {
                 // Should not be called in terminal mode.
             }
@@ -1757,6 +3132,82 @@ mod tests {
         )
     }
 
+    fn historial_record(
+        ts: u64,
+        pane: &str,
+        agent: Option<&str>,
+        session_value: Option<&str>,
+        restorable: bool,
+    ) -> crate::pane_close_history::PaneCloseRecord {
+        // A record is restorable iff it carries source+kind+value; drive that via
+        // the `restorable` flag so tests read intention-first.
+        let (source, kind, value) = if restorable {
+            (
+                Some("herdr:claude".to_string()),
+                Some("id".to_string()),
+                session_value.map(str::to_string),
+            )
+        } else {
+            (None, None, session_value.map(str::to_string))
+        };
+        crate::pane_close_history::PaneCloseRecord {
+            ts_unix_ms: ts,
+            pane_id: pane.to_string(),
+            label: Some("lbl".to_string()),
+            agent: agent.map(str::to_string),
+            session_source: source,
+            session_kind: kind,
+            session_value: value,
+            cwd: "/home/dev/herdr".to_string(),
+            workspace_id: "ws-1".to_string(),
+            workspace_name: Some("herdr".to_string()),
+            first_prompt: None,
+            last_prompt: None,
+        }
+    }
+
+    #[test]
+    fn build_historial_rows_excludes_subagents_and_nonrestorable_agents() {
+        let records = vec![
+            // Newest-first: a real restorable claude session (kept).
+            historial_record(100, "p1", Some("claude"), Some("11112222-aaaa"), true),
+            // A subagent run (agent-* session value) — excluded entirely.
+            historial_record(90, "p2", Some("claude"), Some("agent-deadbeef"), true),
+            // A non-restorable agent row (no session ref) — excluded as noise.
+            historial_record(80, "p3", Some("cx"), None, false),
+            // A plain terminal (no agent) — kept (guest `[t]` toggle governs it).
+            historial_record(70, "p4", None, None, false),
+        ];
+        let rows = build_historial_rows(records, 200);
+        let agents: Vec<&str> = rows.iter().map(|r| r.agent.as_str()).collect();
+        assert_eq!(agents, vec!["claude", "terminal"]);
+        assert!(rows.iter().all(|r| !r.is_subagent));
+    }
+
+    #[test]
+    fn build_historial_rows_dedups_and_caps_at_limit() {
+        let mut records = Vec::new();
+        // Two records for the same session value must collapse to one.
+        records.push(historial_record(1000, "dup", Some("claude"), Some("same-sid"), true));
+        records.push(historial_record(999, "dup", Some("claude"), Some("same-sid"), true));
+        // Then more than HISTORIAL_ROW_LIMIT distinct restorable sessions.
+        for i in 0..(HISTORIAL_ROW_LIMIT + 10) {
+            let sid = format!("sid-{i}");
+            records.push(historial_record(
+                500 - i as u64,
+                &format!("pane-{i}"),
+                Some("claude"),
+                Some(&sid),
+                true,
+            ));
+        }
+        let rows = build_historial_rows(records, 100_000);
+        assert_eq!(rows.len(), HISTORIAL_ROW_LIMIT);
+        // The deduped session appears exactly once.
+        let dup_count = rows.iter().filter(|r| r.sid4 == "-sid").count();
+        assert_eq!(dup_count, 1);
+    }
+
     fn release_notes_state() -> state::ReleaseNotesState {
         state::ReleaseNotesState {
             version: "0.1.0".into(),
@@ -1775,6 +3226,449 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    // fork(wave-2): materialize a plugin (valid manifest + static-update wasm) in a
+    // fresh temp dir so the manifest hot-reload / lifecycle tests exercise the real
+    // parse + instantiate path (no mocking).
+    fn write_plugin_dir(surfaces: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-app-plugin-hot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        let json = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"hi","role":"accent"}]}]}]}"#;
+        let data = json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            "(module (memory (export \"memory\") 1) (data (i32.const 0) \"{data}\") (func (export \"herdr_ui_api_version\") (result i32) i32.const 2) (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0) (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {}) )",
+            json.len()
+        );
+        std::fs::write(root.join("dist/dash.wasm"), wat::parse_str(&wat).unwrap()).unwrap();
+        write_plugin_manifest(&root, surfaces);
+        root
+    }
+
+    fn write_plugin_manifest(root: &std::path::Path, surfaces: &str) {
+        let toml = format!(
+            "id = \"example.dash\"\nname = \"Dash\"\nversion = \"0.1.0\"\nmin_herdr_version = \"{}\"\n\n[[ui_modules]]\nid = \"dash\"\ntitle = \"Dash\"\napi_version = 2\nmodule = \"dist/dash.wasm\"\nsurfaces = [{surfaces}]\n",
+            crate::build_info::BASE_VERSION
+        );
+        std::fs::write(root.join("herdr-plugin.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn resync_clears_collector_bookkeeping_for_removed_module() {
+        let root = write_plugin_dir("\"header\"");
+        let manifest = root.join("herdr-plugin.toml").display().to_string();
+        let info = crate::app::api::plugins::load_plugin_manifest(&manifest, true).unwrap();
+        let mut app = test_app();
+        app.state
+            .installed_plugins
+            .insert(info.plugin_id.clone(), info);
+        app.resync_ui_plugins_after_lifecycle_change();
+        let has_dash =
+            |app: &App| app.ui_plugins.all().iter().any(|m| m.plugin_id == "example.dash");
+        assert!(has_dash(&app));
+
+        // A collector is mid-flight for this module.
+        let key = crate::plugin_collector::module_key("example.dash", "dash");
+        app.collectors_in_flight.insert(key.clone());
+
+        // Disable the plugin and re-sync: the module (and its in-flight
+        // bookkeeping) is dropped so a later re-enable starts clean.
+        app.state
+            .installed_plugins
+            .get_mut("example.dash")
+            .unwrap()
+            .enabled = false;
+        app.resync_ui_plugins_after_lifecycle_change();
+        assert!(!has_dash(&app));
+        assert!(!app.collectors_in_flight.contains(&key));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hot_reload_applies_manifest_edit_and_keeps_last_good_on_parse_error() {
+        let root = write_plugin_dir("\"header\"");
+        let manifest = root.join("herdr-plugin.toml").display().to_string();
+        let info = crate::app::api::plugins::load_plugin_manifest(&manifest, true).unwrap();
+        let mut app = test_app();
+        app.state
+            .installed_plugins
+            .insert(info.plugin_id.clone(), info);
+        app.resync_ui_plugins_after_lifecycle_change();
+        use crate::api::schema::PluginUiSurface;
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 0);
+
+        // Edit the manifest to declare a new surface; the hot-reload applies it.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_plugin_manifest(&root, "\"header\", \"footer\"");
+        assert!(app.hot_reload_ui_plugin_manifests());
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 1);
+        assert_eq!(
+            app.state.installed_plugins["example.dash"].ui_modules[0].surfaces,
+            vec![PluginUiSurface::Header, PluginUiSurface::Footer]
+        );
+
+        // A subsequent BROKEN manifest keeps the last-good metadata and toasts.
+        app.state.toast = None;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(root.join("herdr-plugin.toml"), "this is = = not toml").unwrap();
+        assert!(!app.hot_reload_ui_plugin_manifests());
+        assert_eq!(app.ui_plugins.for_surface(PluginUiSurface::Footer).len(), 1);
+        assert!(app
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.title.contains("manifest reload failed")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_exposes_plugin_and_focus_context() {
+        let mut app = test_app();
+        app.state.theme_name = "test-theme".into();
+        app.state.installed_plugins.insert(
+            "example.ui".into(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.ui".into(),
+                name: "Example UI".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: crate::build_info::BASE_VERSION.into(),
+                description: None,
+                manifest_path: "/tmp/example.ui/herdr-plugin.toml".into(),
+                plugin_root: "/tmp/example.ui".into(),
+                enabled: true,
+                platforms: None,
+                build: vec![],
+                actions: vec![],
+                events: vec![],
+                panes: vec![],
+                ui_modules: vec![],
+                link_handlers: vec![],
+                source: Default::default(),
+                warnings: vec![],
+            },
+        );
+
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "goal-ui",
+            Some("{\"module\":true}"),
+            Some("{\"context\":true}"),
+            &crate::api::schema::PluginInvocationContext {
+                workspace_id: Some("w1".into()),
+                tab_id: Some("w1:t1".into()),
+                focused_pane_id: Some("w1:p1".into()),
+                selected_text: Some("hello".into()),
+                ..Default::default()
+            },
+            &herdr_ui_plugin_api::FocusInput {
+                session_id: Some("sid-1".into()),
+                session_ref: Some("ref-1".into()),
+                cwd: Some(std::path::PathBuf::from("/tmp/repo")),
+                agent: herdr_ui_plugin_api::AgentKind::Claude,
+                is_self_focus: false,
+                subagent: None,
+            },
+            None,
+            None,
+        );
+
+        assert!(!env.contains_key("HERDR_LAYOUT_JSON"));
+        assert_eq!(
+            env.get("HERDR_PLUGIN_ID").map(String::as_str),
+            Some("example.ui")
+        );
+        assert_eq!(
+            env.get("HERDR_UI_MODULE_ID").map(String::as_str),
+            Some("goal-ui")
+        );
+        assert_eq!(
+            env.get("HERDR_UI_MODULE_MANIFEST_JSON").map(String::as_str),
+            Some("{\"module\":true}")
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_CONTEXT_JSON").map(String::as_str),
+            Some("{\"context\":true}")
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_ROOT").map(String::as_str),
+            Some("/tmp/example.ui")
+        );
+        assert_eq!(
+            env.get("HERDR_THEME_NAME").map(String::as_str),
+            Some("test-theme")
+        );
+        assert_eq!(
+            env.get("HERDR_WORKSPACE_ID").map(String::as_str),
+            Some("w1")
+        );
+        assert_eq!(env.get("HERDR_TAB_ID").map(String::as_str), Some("w1:t1"));
+        assert_eq!(env.get("HERDR_PANE_ID").map(String::as_str), Some("w1:p1"));
+        assert_eq!(
+            env.get("HERDR_SELECTED_TEXT").map(String::as_str),
+            Some("hello")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_SESSION_ID").map(String::as_str),
+            Some("sid-1")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_SESSION_REF").map(String::as_str),
+            Some("ref-1")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_CWD").map(String::as_str),
+            Some("/tmp/repo")
+        );
+        assert_eq!(
+            env.get("HERDR_FOCUS_AGENT").map(String::as_str),
+            Some("claude")
+        );
+        assert!(env.contains_key("HERDR_PLUGIN_CONFIG_DIR"));
+        assert!(env.contains_key("HERDR_PLUGIN_STATE_DIR"));
+        assert!(env.contains_key("HERDR_BIN_PATH"));
+        assert!(env.contains_key(crate::api::SOCKET_PATH_ENV_VAR));
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_injects_layout_json_only_when_provided() {
+        let app = test_app();
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "v3-ui",
+            None,
+            None,
+            &crate::api::schema::PluginInvocationContext::default(),
+            &herdr_ui_plugin_api::FocusInput::default(),
+            Some("{\"active_workspace_id\":null}"),
+            None,
+        );
+        assert_eq!(
+            env.get("HERDR_LAYOUT_JSON").map(String::as_str),
+            Some("{\"active_workspace_id\":null}")
+        );
+        assert!(!env.contains_key("HERDR_PLUGIN_UI_INPUT_JSON"));
+    }
+
+    #[test]
+    fn build_ui_plugin_frame_env_injects_ui_input_json_when_provided() {
+        let app = test_app();
+        let env = app.build_ui_plugin_frame_env(
+            "example.ui",
+            "usage",
+            None,
+            None,
+            &crate::api::schema::PluginInvocationContext::default(),
+            &herdr_ui_plugin_api::FocusInput::default(),
+            None,
+            Some("{\"snapshot\":null}"),
+        );
+        assert_eq!(
+            env.get("HERDR_PLUGIN_UI_INPUT_JSON").map(String::as_str),
+            Some("{\"snapshot\":null}")
+        );
+    }
+
+    #[test]
+    fn read_ui_input_blob_reads_present_omits_absent_and_caps_size() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-ui-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp state dir");
+        let key = ("plug".to_string(), "mod".to_string());
+        let mut cache = HashMap::new();
+
+        // Absent file ⇒ no key.
+        assert_eq!(
+            read_ui_input_blob(&dir, "missing.json", key.clone(), &mut cache),
+            None
+        );
+
+        // Present file ⇒ contents.
+        std::fs::write(dir.join("in.json"), b"{\"v\":1}").expect("write input");
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key.clone(), &mut cache).as_deref(),
+            Some("{\"v\":1}")
+        );
+
+        // Path traversal / separators ⇒ rejected, no read.
+        assert_eq!(
+            read_ui_input_blob(&dir, "../escape", key.clone(), &mut cache),
+            None
+        );
+
+        // Oversized file ⇒ truncated to the cap.
+        let big = "a".repeat((MAX_UI_INPUT_BYTES as usize) + 4096);
+        std::fs::write(dir.join("big.json"), big.as_bytes()).expect("write big input");
+        let got = read_ui_input_blob(&dir, "big.json", key, &mut cache).expect("some");
+        assert_eq!(got.len(), MAX_UI_INPUT_BYTES as usize);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_ui_input_blob_skips_reread_on_unchanged_mtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-ui-input-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp state dir");
+        let key = ("plug".to_string(), "mod".to_string());
+        let mut cache = HashMap::new();
+
+        std::fs::write(dir.join("in.json"), b"v1").expect("write input");
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key.clone(), &mut cache).as_deref(),
+            Some("v1")
+        );
+
+        // Poison the cache entry under the same mtime: an unchanged file must be
+        // served from cache without re-reading disk.
+        let (mtime, _) = cache.get(&key).cloned().expect("cached");
+        cache.insert(key.clone(), (mtime, std::sync::Arc::from("CACHED")));
+        assert_eq!(
+            read_ui_input_blob(&dir, "in.json", key, &mut cache).as_deref(),
+            Some("CACHED")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_input_written_atomically_is_surfaced_by_generic_reader() {
+        // Item C end-to-end on the host side: the interim writer serializes the
+        // live usage render input and writes it to the module's state dir; item
+        // B's generic ui_input_file reader must surface the exact bytes the guest
+        // will parse (which are then injected as HERDR_PLUGIN_UI_INPUT_JSON).
+        let app = test_app();
+        let json = app
+            .usage_render_input_json()
+            .expect("render input serializes");
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-usage-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        write_ui_input_atomic(&dir, USAGE_DASH_INPUT_FILE, &json).expect("atomic write succeeds");
+        assert!(
+            !dir.join(format!(
+                ".{USAGE_DASH_INPUT_FILE}.{}.tmp",
+                std::process::id()
+            ))
+            .exists(),
+            "the temp file is renamed into place, never left behind"
+        );
+
+        let mut cache = HashMap::new();
+        let surfaced = read_ui_input_blob(
+            &dir,
+            USAGE_DASH_INPUT_FILE,
+            (USAGE_DASH_PLUGIN_ID.to_string(), "usage".to_string()),
+            &mut cache,
+        )
+        .expect("generic reader surfaces the written file");
+        assert_eq!(surfaced, json, "reader returns the exact written bytes");
+
+        let parsed: usage_dash_core::model::UsageRenderInput =
+            serde_json::from_str(&surfaced).expect("surfaced bytes parse as the guest wire type");
+        assert_eq!(parsed.stats_shown, app.usage_view.stats_shown);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goal_input_written_atomically_is_surfaced_by_generic_reader() {
+        // Goal-dash host path (mirrors the usage test): the interim writer
+        // serializes the live goal render model and writes it to the module's
+        // state dir; the generic ui_input_file reader must surface the exact
+        // bytes the guest will parse (injected as HERDR_PLUGIN_UI_INPUT_JSON).
+        let app = test_app();
+        let json = app
+            .goal_render_input_json()
+            .expect("goal render model serializes");
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-goal-input-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        write_ui_input_atomic(&dir, GOAL_DASH_INPUT_FILE, &json).expect("atomic write succeeds");
+        assert!(
+            !dir.join(format!(
+                ".{GOAL_DASH_INPUT_FILE}.{}.tmp",
+                std::process::id()
+            ))
+            .exists(),
+            "the temp file is renamed into place, never left behind"
+        );
+
+        let mut cache = HashMap::new();
+        let surfaced = read_ui_input_blob(
+            &dir,
+            GOAL_DASH_INPUT_FILE,
+            (GOAL_DASH_PLUGIN_ID.to_string(), "goal".to_string()),
+            &mut cache,
+        )
+        .expect("generic reader surfaces the written file");
+        assert_eq!(surfaced, json, "reader returns the exact written bytes");
+
+        let parsed: goal_dash_model::GoalRenderModel =
+            serde_json::from_str(&surfaced).expect("surfaced bytes parse as the guest wire type");
+        assert_eq!(
+            parsed.has_session,
+            app.goal_dash.build_render_model().has_session
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ui_plugin_layout_json_emits_null_for_zero_size_areas() {
+        let mut app = test_app();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(26, 1, 194, 42);
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 1, 26, 42);
+        app.state.view.usage_strip_rect = ratatui::layout::Rect::new(26, 43, 194, 7);
+        app.state.view.right_panel_rect = ratatui::layout::Rect::default();
+
+        let context = crate::api::schema::PluginInvocationContext {
+            workspace_id: Some("w1".into()),
+            ..Default::default()
+        };
+        let json = app.ui_plugin_layout_json(&context);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(value["active_workspace_id"], "w1");
+        assert!(value["goal_dash_area"].is_null());
+        assert!(!value["usage_dash_area"].is_null());
+        assert_eq!(value["client"]["is_foreground"], true);
+        assert!(value["client"]["pinned_to"].is_null());
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -5068,6 +6962,7 @@ last_pane = "prefix+tab"
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(state::ContextMenuState {
+            plugin_items: Vec::new(),
             kind: state::ContextMenuKind::Workspace { ws_idx: 1 },
             x: 2,
             y: 2,

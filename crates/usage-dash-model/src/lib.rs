@@ -1,0 +1,295 @@
+//! wasm-safe serde data model for the usage dashboard.
+//!
+//! Extracted from `usage-dash-core::model` so it can be shared, unchanged, by
+//! both the native host (data collection) and the WASM render plugin. This crate
+//! is a pure-data leaf: **no I/O, no ratatui, no chrono** — only `serde`. Color
+//! mapping lives in the renderer (here every type carries plain data; the plugin
+//! maps `ThreadState` etc. to role strings).
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Cli {
+    Claude,
+    Codex,
+    Pi,
+}
+
+impl Cli {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Cli::Claude => "Claude",
+            Cli::Codex => "Codex",
+            Cli::Pi => "Pi",
+        }
+    }
+}
+
+/// What the focused agent's main thread is doing, inferred from its transcript
+/// tail (see `usage-dash-core::state`). Color mapping lives in the renderer.
+/// Invariant: never `Done` while anything is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ThreadState {
+    Working,
+    Waiting,
+    AwaitingReview,
+    Blocked,
+    Degraded,
+    Done,
+    #[default]
+    Unknown,
+}
+
+impl ThreadState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ThreadState::Working => "Working",
+            ThreadState::Waiting => "Waiting",
+            ThreadState::AwaitingReview => "Awaiting Review",
+            ThreadState::Blocked => "Blocked",
+            ThreadState::Degraded => "Degraded",
+            ThreadState::Done => "Done",
+            ThreadState::Unknown => "—",
+        }
+    }
+}
+
+/// One rolling rate-limit window (5-hour or weekly).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Window {
+    pub used_pct: Option<f32>,
+    pub resets_at: Option<i64>, // unix seconds
+    pub shared: bool,           // true when mirrored from another CLI (pi ← codex)
+}
+
+/// Per-session statistics derived from the focused session's own transcript
+/// (NOT global account usage). Every count is for *this session only*. Built
+/// incrementally in `usage-dash-core::stats`; `None` on `UsageSnapshot` when
+/// unavailable (e.g. Codex/pi) so the view renders dashes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionStats {
+    pub autocompacts: u32,      // AC — count of compact_boundary events
+    pub freed_tokens: u64,      // Σ (preTokens - postTokens) across compactions
+    pub agents_running: u32,    // AR — Agent/Task tool_use with no result yet
+    pub agents_done: u32,       // AD — toolUseResult records with an agentId
+    pub agent_types: u32,       // AU — distinct agentType values seen
+    pub out_tokens: u64,        // Σ assistant message.usage.output_tokens
+    pub ctx_tokens: u64,        // latest assistant context size (in+cache)
+    pub cache_pct: Option<f32>, // cache_read / (cache_read + cache_creation)
+    pub assistant_turns: u32,
+    pub user_turns: u32,
+    pub tool_calls: u32,
+    pub age_secs: u64, // last_ts - first_ts
+    pub busy_secs: u64,
+    pub idle_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageSnapshot {
+    pub cli: Cli,
+    pub model: Option<String>,
+    pub ctx_used_tokens: Option<u64>,
+    pub ctx_window: Option<u64>,
+    pub ctx_used_pct: Option<f32>,
+    pub ctx_approx: bool,
+    pub five_hour: Window,
+    pub weekly: Window,
+    /// Percentage points of the 100% weekly cap consumed *today* (delta since
+    /// midnight baseline). Target: stay under `DAILY_BUDGET_PCT` (12%).
+    pub daily_used_pct: Option<f32>,
+    pub plan: Option<String>,
+    pub source_age_secs: u64,
+    /// State of the focused agent's main thread (inferred from its transcript).
+    pub state: ThreadState,
+    /// Short human-readable note: what it's running / waiting for / errors seen.
+    pub state_note: Option<String>,
+    /// Untruncated status text (the full last message) shown when the state row
+    /// is expanded via click. `None` when there's nothing more than the brief note.
+    pub state_full: Option<String>,
+    /// Per-session STATS for the focused session. `None` when the source can't
+    /// derive them yet (Codex/pi) → STATS view renders dashes, never fabricates.
+    pub stats: Option<SessionStats>,
+}
+
+impl UsageSnapshot {
+    pub fn empty(cli: Cli) -> Self {
+        UsageSnapshot {
+            cli,
+            model: None,
+            ctx_used_tokens: None,
+            ctx_window: None,
+            ctx_used_pct: None,
+            ctx_approx: false,
+            five_hour: Window::default(),
+            weekly: Window::default(),
+            daily_used_pct: None,
+            plan: None,
+            source_age_secs: 0,
+            state: ThreadState::Unknown,
+            state_note: None,
+            state_full: None,
+            stats: None,
+        }
+    }
+
+    /// Derive ctx % from used/window when not provided natively.
+    pub fn fill_ctx_pct(&mut self) {
+        if self.ctx_used_pct.is_none() {
+            if let (Some(u), Some(w)) = (self.ctx_used_tokens, self.ctx_window) {
+                if w > 0 {
+                    self.ctx_used_pct = Some((u as f32 / w as f32) * 100.0);
+                }
+            }
+        }
+    }
+
+    /// A session whose underlying file hasn't changed in this many seconds is stale.
+    pub fn is_stale(&self) -> bool {
+        self.source_age_secs >= 600
+    }
+}
+
+/// The complete, wasm-safe render input the host hands the usage WASM module
+/// each frame (serialized to one env key). Bundles the data snapshot with the
+/// host-owned interactive view fields and the two absolute reset-time strings
+/// the host precomputes (the guest can't read the local timezone). The renderer
+/// consumes this and returns clickable hit-rects; it never reaches for I/O.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRenderInput {
+    pub snapshot: Option<UsageSnapshot>,
+    #[serde(default)]
+    pub expanded: bool,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default = "default_true")]
+    pub stats_shown: bool,
+    #[serde(default)]
+    pub scroll: u16,
+    #[serde(default)]
+    pub now: i64,
+    /// Local-time label for the 5-hour window reset (e.g. "11:57"); "" when none.
+    #[serde(default)]
+    pub five_hour_abs: String,
+    /// Local-time label for the weekly window reset (e.g. "Sat"); "" when none.
+    #[serde(default)]
+    pub weekly_abs: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ---- pure helpers (unit-tested) ----
+
+/// pi sanitizes a cwd into its sessions dir name: `/Users/andual` -> `--Users-andual--`.
+/// Each maximal run of non-alphanumeric chars collapses to a single `-`; the
+/// result is trimmed of leading/trailing `-` and wrapped in `--` … `--`.
+/// Verified against the real `~/.pi/agent/sessions/` dirs (2026-06-17).
+pub fn sanitize_cwd(cwd: &str) -> String {
+    let mut mid = String::new();
+    let mut prev_dash = false;
+    for ch in cwd.chars() {
+        if ch.is_ascii_alphanumeric() {
+            mid.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            mid.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = mid.trim_matches('-');
+    format!("--{}--", trimmed)
+}
+
+/// Self-imposed daily budget: max this % of the weekly cap per day (from claude-dash).
+pub const DAILY_BUDGET_PCT: f32 = 12.0;
+
+/// Compact token count (matches statusline.sh `fmt_k`): integer k, then M.
+/// 68000 -> "68k", 15877 -> "16k", 1_200_000 -> "1.2M".
+pub fn fmt_k(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{}k", (n as f64 / 1000.0).round() as u64)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Countdown label from now to a future unix ts: "in 2h14m", "in 3d", or "overdue".
+pub fn countdown(now: i64, resets_at: i64) -> String {
+    let d = resets_at - now;
+    if d <= 0 {
+        return "overdue".to_string();
+    }
+    let mins = d / 60;
+    if mins < 60 {
+        format!("in {}m", mins.max(1))
+    } else if mins < 60 * 24 {
+        format!("in {}h{:02}m", mins / 60, mins % 60)
+    } else {
+        format!("in {}d", mins / (60 * 24))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_cwd_matches_pi_layout() {
+        assert_eq!(sanitize_cwd("/Users/andual"), "--Users-andual--");
+        assert_eq!(
+            sanitize_cwd("/private/tmp/pi-bridge/live-monitor"),
+            "--private-tmp-pi-bridge-live-monitor--"
+        );
+    }
+
+    #[test]
+    fn fmt_k_buckets() {
+        assert_eq!(fmt_k(950), "950");
+        assert_eq!(fmt_k(15877), "16k");
+        assert_eq!(fmt_k(68000), "68k");
+        assert_eq!(fmt_k(258400), "258k");
+        assert_eq!(fmt_k(1_200_000), "1.2M");
+    }
+
+    #[test]
+    fn countdown_future_and_past() {
+        assert_eq!(countdown(1000, 1000 + 30 * 60), "in 30m");
+        assert_eq!(countdown(1000, 1000 + (2 * 60 + 14) * 60), "in 2h14m");
+        assert_eq!(countdown(1000, 1000 + 3 * 24 * 3600), "in 3d");
+        assert_eq!(countdown(1000, 500), "overdue");
+    }
+
+    #[test]
+    fn ctx_pct_derived_from_tokens() {
+        let mut s = UsageSnapshot::empty(Cli::Codex);
+        s.ctx_used_tokens = Some(15877);
+        s.ctx_window = Some(258400);
+        s.fill_ctx_pct();
+        assert!((s.ctx_used_pct.unwrap() - 6.14).abs() < 0.1);
+    }
+
+    #[test]
+    fn snapshot_json_round_trips() {
+        let mut s = UsageSnapshot::empty(Cli::Claude);
+        s.model = Some("Opus 4.8".into());
+        s.ctx_used_pct = Some(29.0);
+        s.five_hour.used_pct = Some(20.0);
+        s.weekly.used_pct = Some(8.0);
+        s.daily_used_pct = Some(6.0);
+        s.state = ThreadState::Working;
+        s.stats = Some(SessionStats {
+            autocompacts: 1,
+            agents_done: 4,
+            agent_types: 1,
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: UsageSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.model.as_deref(), Some("Opus 4.8"));
+        assert_eq!(back.state, ThreadState::Working);
+        assert_eq!(back.stats.unwrap().agents_done, 4);
+    }
+}

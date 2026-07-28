@@ -1,0 +1,67 @@
+id = "builtin.version-dash"
+name = "Version Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "At-a-glance running herdr versions (hr + herdrtest) vs latest stable release, with right-click staged updates (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest module in this plugin dir; the wasm lands at the module path
+# below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[ui_modules]]
+id = "version"
+title = "Version Dash"
+description = "Compact hr + herdrtest running-vs-latest herdr version indicator, one full-width line"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/version_dash_ui.wasm"
+hot_reload = "on"
+# Generic data-driven placement (region/align/size/min_peer/z). WHERE it renders
+# is pure manifest DATA — edit the placement table and it moves with no host
+# rebuild.
+surfaces = ["panel"]
+# layout_read + focused_session: needed to receive per-frame `frame` events
+# (which carry the injected HERDR_PLUGIN_UI_INPUT_JSON). toasts: left-click shows
+# an instance's detail as a toast. plugin_actions: right-click invokes the staged
+# update actions declared below (InvokePluginAction → plugin.action.invoke).
+capabilities = ["layout_read", "focused_session", "toasts", "plugin_actions"]
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
+# (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
+# out-of-process `version-dash-collector` writes it on a 10-minute cadence (via a
+# LaunchAgent — see scripts/), so there is NO in-host writer and NO `collector`
+# manifest field (that field routes exclusively through the usage-dash tick).
+#
+# v1 +N caveat: the `+N` local-changes count is git-source-derived
+# (`git rev-list --count v<latest>..HEAD` on the fork checkout), so it reflects
+# the SOURCE HEAD, not the exact build each binary was compiled from. Both
+# instances therefore share the same count until a version bump. Build-baked
+# per-binary accuracy is a later host-code follow-up.
+ui_input_file = "version_input.json"
+
+[ui_modules.placement]
+# A single full-width line carved from the BOTTOM edge of the pane area. This
+# replaces the V1 `bottom_band` placement, which took the whole 7-row usage band
+# height and broke the layout. `size = "1"` ⇒ exactly one row; the strip renders
+# LEFT-compact so the detached-sessions plugin can cohabit the row to its right.
+region = "bottom"
+align = "start"
+size = "1"
+z = 55
+
+# Staged-promotion update pipeline (right-click on an instance token). Commands
+# run from the plugin root with HERDR_* env set (HERDR_BIN_PATH, HERDR_PLUGIN_ID,
+# …). Each script builds/stages a binary NEXT TO its destination on the same
+# volume, then atomic-mv's over the target and restarts that instance.
+[[actions]]
+id = "update-herdrtest-from-latest"
+title = "Update herdrtest from latest (fork integration tip)"
+description = "Build the current fork integration-tip release and promote it into herdrtest"
+command = ["bash", "scripts/update-herdrtest.sh"]
+
+[[actions]]
+id = "update-hr-from-herdrtest"
+title = "Update hr from herdrtest"
+description = "Promote the EXACT build currently running in herdrtest into hr (hr may only take the test build)"
+command = ["bash", "scripts/update-hr.sh"]

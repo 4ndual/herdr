@@ -52,9 +52,18 @@ use crate::server::client_accept::{
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
+<<<<<<< HEAD
     events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
     ClientConnection, ClientConnectionMode, DeferredRender,
+||||||| 299dd416
+    events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
+    ClientConnection, ClientConnectionMode,
+=======
+    events_include_active_input, events_include_focus_gained, latest_app_client, render_targets,
+    terminal_stream_client_ids, ClientConnection, ClientConnectionMode,
+>>>>>>> task/wave1-integration
 };
+use crate::server::foreground_policy;
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
@@ -857,6 +866,13 @@ impl HeadlessServer {
             crate::render_prof::event("full_render_cause.config_reload");
         }
 
+        if let Some(request) = self.app.state.request_plugin_action.take() {
+            tracing::info!(plugin_id = %request.plugin_id, action_id = %request.action_id, "dispatching ui-requested plugin action");
+            self.app.dispatch_requested_plugin_action(request);
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_plugin_action");
+        }
+
         needs_render
     }
 
@@ -1369,11 +1385,97 @@ impl HeadlessServer {
             return false;
         };
         client.last_activity = stamp;
+        // fork: keep the wall-clock activity clock in sync with the monotonic
+        // stamp so the newly foregrounded client is not immediately eligible
+        // for hysteresis-steal or idle demotion.
+        client.last_active_at = Instant::now();
 
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
         self.sync_foreground_client_state();
         changed
+    }
+
+    // fork: foreground hysteresis + idle-demotion policy wiring. The pure
+    // decisions live in `crate::server::foreground_policy`; these helpers adapt
+    // the live client map to that policy and apply the side effects.
+    fn client_activity(&self, client_id: u64) -> Option<foreground_policy::ClientActivity> {
+        self.clients
+            .get(&client_id)
+            .map(|client| foreground_policy::ClientActivity {
+                client_id,
+                last_active_at: client.last_active_at,
+            })
+    }
+
+    fn foreground_activity(&self) -> Option<foreground_policy::ClientActivity> {
+        self.client_activity(self.foreground_client_id?)
+    }
+
+    /// Other full app clients that could receive foreground.
+    fn other_app_client_activities(&self, exclude: u64) -> Vec<foreground_policy::ClientActivity> {
+        self.clients
+            .iter()
+            .filter(|(&id, client)| id != exclude && client.is_full_app_client())
+            .map(|(&id, client)| foreground_policy::ClientActivity {
+                client_id: id,
+                last_active_at: client.last_active_at,
+            })
+            .collect()
+    }
+
+    /// Record a full app client's typing (keys/mouse/paste) at `now` and take
+    /// foreground for it only if the hysteresis policy allows. Returns whether
+    /// the foreground client changed.
+    fn note_active_input(&mut self, client_id: u64, now: Instant) -> bool {
+        let foreground = self.foreground_activity();
+        let stamp = self.allocate_activity_stamp();
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return false;
+        };
+        client.last_activity = stamp;
+        client.last_active_at = now;
+        // Terminal-attach input must not steal the shared foreground; only full
+        // app clients participate. (This path is already app-only, but guard
+        // anyway so the invariant is local.)
+        if !client.is_full_app_client() {
+            return false;
+        }
+        if !foreground_policy::should_steal_foreground(
+            foreground,
+            client_id,
+            now,
+            foreground_policy::FOREGROUND_STEAL_HYSTERESIS,
+        ) {
+            return false;
+        }
+        let changed = self.foreground_client_id != Some(client_id);
+        self.foreground_client_id = Some(client_id);
+        self.sync_foreground_client_state();
+        changed
+    }
+
+    /// Demote an idle foreground client to the most recently active other app
+    /// client, if the policy calls for it. Returns whether foreground changed.
+    fn demote_idle_foreground(&mut self, now: Instant) -> bool {
+        let Some(foreground) = self.foreground_activity() else {
+            return false;
+        };
+        let others = self.other_app_client_activities(foreground.client_id);
+        let Some(target) = foreground_policy::idle_demotion_target(
+            foreground,
+            &others,
+            now,
+            foreground_policy::FOREGROUND_IDLE_DEMOTE_AFTER,
+        ) else {
+            return false;
+        };
+        info!(
+            from = foreground.client_id,
+            to = target,
+            "demoting idle foreground client to most recently active client"
+        );
+        self.promote_client_to_foreground(target)
     }
 
     fn promote_latest_remaining_client(&mut self) -> bool {
@@ -2593,13 +2695,30 @@ impl HeadlessServer {
                 client.request_semantic_redraw_after_input();
             }
         }
+<<<<<<< HEAD
         if source_is_full_app {
             self.update_client_outer_focus_from_events(client_id, &events);
         }
         let events = events_for_app_routing(events, source_was_foreground, source_is_full_app);
         let interaction = events_include_interaction(&events);
         let foreground_changed = if interaction {
+||||||| 299dd416
+        self.update_client_outer_focus_from_events(client_id, &events);
+        let interaction = events_include_interaction(&events);
+        let foreground_changed = if interaction {
+=======
+        self.update_client_outer_focus_from_events(client_id, &events);
+        // fork: an explicit window focus-gained is an unambiguous "activate this
+        // client" signal and promotes immediately; plain typing goes through the
+        // hysteresis policy so two clients typing at once don't thrash resizes.
+        let focus_gained = events_include_focus_gained(&events);
+        let active_input = events_include_active_input(&events);
+        let interaction = focus_gained || active_input;
+        let foreground_changed = if focus_gained {
+>>>>>>> task/wave1-integration
             self.promote_client_to_foreground(client_id)
+        } else if active_input {
+            self.note_active_input(client_id, Instant::now())
         } else {
             false
         };
@@ -2612,6 +2731,16 @@ impl HeadlessServer {
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
+            self.sync_foreground_client_state();
+        }
+
+        // §4 headless mirror of the interactive `run()` drain: `route_client_events`
+        // (mouse handling) can only record a resolved click as a pending plugin
+        // action; only here can it be invoked / dispatched as an `Action` event.
+        // herdr runs headless in production (client + server), so without this
+        // mirror v3 plugin buttons and manifest ui-surface actions never fire.
+        let plugin_action_changed = self.app.drain_pending_plugin_ui_actions();
+        if plugin_action_changed {
             self.sync_foreground_client_state();
         }
 
@@ -2633,7 +2762,7 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || interaction
+            foreground_changed || theme_changed || interaction || plugin_action_changed
         }
     }
 
@@ -3580,6 +3709,7 @@ impl HeadlessServer {
                 area,
                 resize_panes,
                 crate::kitty_graphics::HostCellSize::default(),
+                None,
             );
             crate::render_prof::duration_since("full_render.render_virtual", render_started);
             self.app.full_redraw_pending = false;
@@ -3593,18 +3723,79 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
+        // fork: the shared panes are sized to `effective_size` (the foreground
+        // client). Non-foreground app clients get a badge naming that pin so
+        // any bottom-edge clipping is never silent.
+        let pinned_to_client = self.foreground_client_id;
+        let (pinned_cols, pinned_rows) = self.effective_size;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
+            let pin_badge = if is_foreground {
+                None
+            } else {
+                pinned_to_client.map(|foreground_client_id| {
+                    crate::server::render_stream::ForegroundPinBadge {
+                        foreground_client_id,
+                        cols: pinned_cols,
+                        rows: pinned_rows,
+                    }
+                })
+            };
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
+<<<<<<< HEAD
                     let render_cell_size =
+||||||| 299dd416
+                    let (buffer, cursor) =
+=======
+                    let (mut buffer, cursor) =
+>>>>>>> task/wave1-integration
                         if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
+<<<<<<< HEAD
                             cell_size
+||||||| 299dd416
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                cell_size,
+                            )
+=======
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                cell_size,
+                                pin_badge,
+                            )
+>>>>>>> task/wave1-integration
                         } else {
+<<<<<<< HEAD
                             crate::kitty_graphics::HostCellSize::default()
+||||||| 299dd416
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                crate::kitty_graphics::HostCellSize::default(),
+                            )
+=======
+                            crate::server::render_stream::render_virtual_with_runtime_registry(
+                                &mut self.app.state,
+                                &self.app.terminal_runtimes,
+                                area,
+                                is_foreground,
+                                crate::kitty_graphics::HostCellSize::default(),
+                                pin_badge,
+                            )
+>>>>>>> task/wave1-integration
                         };
+<<<<<<< HEAD
                     let (buffer, cursor) =
                         crate::server::render_stream::render_virtual_with_runtime_registry(
                             &mut self.app.state,
@@ -3613,6 +3804,16 @@ impl HeadlessServer {
                             is_foreground,
                             render_cell_size,
                         );
+||||||| 299dd416
+=======
+                    // Half-block image fallback: when kitty graphics are off,
+                    // paint host images (plugin panels + Claude `[Image #N]`)
+                    // directly into the frame buffer so every client terminal
+                    // shows them, kitty-capable or not.
+                    if !self.app.state.kitty_graphics_enabled {
+                        self.app.paint_halfblock_images(area, &mut buffer);
+                    }
+>>>>>>> task/wave1-integration
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -3673,6 +3874,17 @@ impl HeadlessServer {
                 }
             };
 
+            // Resolve plugin-panel image targets before borrowing `client`,
+            // since it needs the app plus the client's frame area.
+            let plugin_images = if is_app_client
+                && self.app.state.kitty_graphics_enabled
+                && cell_size.is_known()
+            {
+                self.app.resolve_plugin_surface_images(area)
+            } else {
+                Vec::new()
+            };
+
             let Some(client) = self.clients.get_mut(&client_id) else {
                 continue;
             };
@@ -3690,6 +3902,7 @@ impl HeadlessServer {
                         &self.app.terminal_runtimes,
                         self.app.state.view.tab_surface(),
                         cell_size,
+                        &plugin_images,
                         &mut next_graphics_cache,
                     ));
                 crate::render_prof::duration_since("full_render.graphics_encode", graphics_started);
@@ -3856,6 +4069,15 @@ impl HeadlessServer {
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
 
+        // fork: hand foreground off from a long-idle client so a stale attach
+        // can't keep the shared panes pinned to its size forever. The 250ms
+        // client-accept poll already wakes this loop, so no extra deadline is
+        // needed for this ~1s-granularity check.
+        if self.demote_idle_foreground(now) {
+            self.resize_shared_runtime_to_effective_size();
+            changed = true;
+        }
+
         if self
             .app
             .config_diagnostic_deadline
@@ -3975,6 +4197,76 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
+
+        // Drive restart auto-continue: once a resumed claude pane whose turn was
+        // interrupted by the restart becomes ready, nudge it to continue. This
+        // mirrors the hook in the direct-mode `App::handle_scheduled_tasks`; the
+        // headless server (client + server, what production always runs) needs it
+        // here or armed panes are never ticked. The 250ms client-accept poll wakes
+        // this loop, so the sweep runs at that cadence without an extra deadline.
+        changed |= self.app.tick_auto_continue_after_restart(now);
+
+        // feat/native-dashes: the server renders (clients only blit), so the
+        // dashboard cores must be refreshed here too — not just in the
+        // non-headless `App::handle_scheduled_tasks` loop used by direct mode.
+        // Gated on an actually-rendering client plus a live dashboard so a
+        // clientless or idle, agent-less server does zero per-second dash work
+        // (TC13). The 250ms client-accept poll already wakes this loop, so no
+        // extra deadline is needed for the ~1 Hz tick to fire.
+        if self.has_app_client()
+            && self.app.dashboards_need_tick()
+            && now >= self.app.next_dash_tick
+        {
+            crate::usage_host::tick(&mut self.app);
+            crate::goal_host::tick(&mut self.app);
+            crate::historial_host::tick(&mut self.app);
+            crate::harness_host::tick(&mut self.app);
+            // fork(wave-2): hot-apply herdr-plugin.toml edits (surfaces,
+            // capabilities, ui_input_file, collector argv) before the wasm
+            // mtime watch, so a manifest change re-syncs the manager the same
+            // tick its metadata is read for frame dispatch.
+            self.app.hot_reload_ui_plugin_manifests();
+            // feat/native-dashes: mirror the ui-plugin hot-reload + tick dispatch
+            // from the direct-mode `App::handle_scheduled_tasks` loop. The server
+            // owns the UiPluginManager, so without this the mtime-poll reload and
+            // periodic on-tick dispatch never run under the headless server that
+            // production always uses (client + server), and `.wasm` UI modules
+            // would only load at startup and never hot-reload.
+            let changed_ui_modules = self.app.ui_plugins.detect_changed_modules();
+            let changed_reload = if changed_ui_modules.is_empty() {
+                false
+            } else {
+                self.app.ui_plugins.dispatch_reload_requested()
+            };
+            let changed_ui_events = self.app.ui_plugins.dispatch_tick() || changed_reload;
+            let has_pending = self.app.ui_plugins.has_pending_updates();
+            if !changed_ui_modules.is_empty() || changed_ui_events || has_pending {
+                self.app.refresh_ui_plugin_state_from_manager();
+                self.app.apply_ui_plugin_notifications();
+                self.app.apply_ui_plugin_effects();
+                tracing::info!(
+                    count = changed_ui_modules.len(),
+                    modules = ?changed_ui_modules
+                        .iter()
+                        .map(|module| format!("{}:{}", module.plugin_id, module.module_id))
+                        .collect::<Vec<_>>(),
+                    changed_ui_events,
+                    "updated ui plugin modules on scheduled headless tick"
+                );
+            }
+            // feat/native-dashes: run the dash WASM plugins for this frame LAST,
+            // after the generic Tick/reload dispatch above. The dash guests only
+            // emit their layer on a Frame event (with live render env + rect);
+            // they return an empty update on Tick, so this must run after
+            // `dispatch_tick` or the empty Tick result would overwrite the real
+            // Frame layer in the manager's loaded-updates cache. The render then
+            // reads the populated UsageStrip/RightPanel layers. `dispatch_event_update`
+            // re-reads each `.wasm` from disk, so a rebuilt module hot-reloads next tick.
+            self.app.dispatch_ui_plugin_frame_events();
+            self.app.next_dash_tick = now + app::DASH_TICK_INTERVAL;
+            changed = true;
+        }
+
         self.app.sync_headless_animation_timer(now);
         changed
     }
@@ -6524,6 +6816,97 @@ next_tab = ""
         );
     }
 
+    // fork: helper for the foreground-policy wiring tests below.
+    fn insert_app_client(server: &mut HeadlessServer, client_id: u64, size: (u16, u16)) {
+        server.clients.insert(
+            client_id,
+            ClientConnection::new(
+                size,
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                client_id,
+                RenderEncoding::SemanticFrame,
+                None,
+            ),
+        );
+    }
+
+    #[test]
+    fn typing_respects_hysteresis_before_stealing_foreground() {
+        let mut server = test_headless_server();
+        let base = Instant::now();
+        insert_app_client(&mut server, 1, (160, 45));
+        insert_app_client(&mut server, 2, (80, 24));
+        server.foreground_client_id = Some(1);
+        server.clients.get_mut(&1).unwrap().last_active_at = base;
+        server.sync_foreground_client_state();
+        assert_eq!(server.effective_size, (160, 45));
+
+        // Holder typed recently: client 2's keystroke must not steal foreground.
+        let changed = server.note_active_input(2, base + Duration::from_millis(500));
+        assert!(!changed);
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+
+        // Holder has now been quiet past the hysteresis window: client 2 steals.
+        let changed =
+            server.note_active_input(2, base + foreground_policy::FOREGROUND_STEAL_HYSTERESIS);
+        assert!(changed);
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (80, 24));
+    }
+
+    #[test]
+    fn idle_foreground_is_demoted_to_most_recently_active_client() {
+        let mut server = test_headless_server();
+        let base = Instant::now();
+        insert_app_client(&mut server, 1, (160, 45));
+        insert_app_client(&mut server, 2, (80, 24));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        // Foreground idle well past the demotion window; client 2 more recent.
+        server.clients.get_mut(&1).unwrap().last_active_at = base;
+        server.clients.get_mut(&2).unwrap().last_active_at = base + Duration::from_secs(120);
+
+        let now = base + foreground_policy::FOREGROUND_IDLE_DEMOTE_AFTER + Duration::from_secs(1);
+        assert!(server.demote_idle_foreground(now));
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (80, 24));
+    }
+
+    #[test]
+    fn single_idle_client_is_not_demoted() {
+        let mut server = test_headless_server();
+        let base = Instant::now();
+        insert_app_client(&mut server, 1, (160, 45));
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.clients.get_mut(&1).unwrap().last_active_at = base;
+
+        let now = base + foreground_policy::FOREGROUND_IDLE_DEMOTE_AFTER + Duration::from_secs(60);
+        assert!(!server.demote_idle_foreground(now));
+        assert_eq!(server.foreground_client_id, Some(1));
+    }
+
+    #[test]
+    fn disconnect_while_foreground_promotes_most_recent_remaining_client() {
+        let mut server = test_headless_server();
+        insert_app_client(&mut server, 1, (160, 45));
+        insert_app_client(&mut server, 2, (100, 30));
+        insert_app_client(&mut server, 3, (80, 24));
+        // last_activity stamps: 3 is the most recently active remaining client.
+        server.clients.get_mut(&1).unwrap().last_activity = 30;
+        server.clients.get_mut(&2).unwrap().last_activity = 10;
+        server.clients.get_mut(&3).unwrap().last_activity = 20;
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+
+        assert!(server.remove_client(1));
+        assert_eq!(server.foreground_client_id, Some(3));
+        assert_eq!(server.effective_size, (80, 24));
+    }
+
     #[test]
     fn foreground_client_without_host_theme_clears_previous_host_theme() {
         let mut server = test_headless_server();
@@ -7279,6 +7662,8 @@ next_tab = ""
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        server.app.state.usage_strip_enabled = false;
 
         server.clients.insert(
             1,

@@ -33,6 +33,14 @@ Runtime action registration and native non-terminal plugin UI are not part of
 plugin v1. Actions, event hooks, panes, and link handlers are all declared in
 the manifest.
 
+`[[ui_modules]]` adds a host-rendered WASM UI layer. In that model, Herdr still
+owns terminal rendering, focus, mouse routing, and native capabilities; the
+WASM module returns lightweight layers and requested actions that the host
+validates and executes. The current exports include the static update
+entrypoints (`herdr_ui_static_update_ptr`, `herdr_ui_static_update_len`) plus
+optional event-driven exports (`herdr_ui_alloc`, `herdr_ui_on_event`,
+`herdr_ui_on_event_len`) so a linked WASM module can react to mouse, key, and
+tick events without rebuilding Herdr.
 ## Trust and security
 
 A plugin is ordinary code that runs on your machine. When you install or link
@@ -97,7 +105,32 @@ id = "github-issue"
 title = "Open GitHub issue"
 pattern = "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$"
 action = "apply"
+
+[[ui_modules]]
+id = "smoke-ui"
+title = "Smoke UI"
+kind = "wasm"
+api_version = 1
+module = "target/wasm32-unknown-unknown/release/herdr_ui_wasm_example.wasm"
+hot_reload = "on"
+surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
+capabilities = ["focused_session", "mouse_all", "keyboard_input", "context_menu_augment", "clipboard_write", "pane_input", "toasts", "plugin_actions"]
 ```
+
+If the module also exports `herdr_ui_alloc`, `herdr_ui_on_event`, and
+`herdr_ui_on_event_len`, Herdr can push normalized mouse/key/tick events into
+WASM and apply returned `effects` such as clipboard writes, pane input, toasts,
+plugin action invocations, and plugin-pane opens. UI effects
+can also attach `payload_json`, which Herdr forwards to plugin commands through
+`HERDR_PLUGIN_PAYLOAD_JSON` and `plugin_payload_json` in the invocation context.
+Frame events also carry a host snapshot with focus metadata plus normalized env
+keys such as `HERDR_PLUGIN_ID`, `HERDR_UI_MODULE_ID`,
+`HERDR_UI_MODULE_MANIFEST_JSON`, `HERDR_PLUGIN_CONTEXT_JSON`,
+`HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`, `HERDR_PLUGIN_STATE_DIR`,
+`HERDR_BIN_PATH`, `HERDR_SOCKET_PATH`, `HERDR_THEME_NAME`,
+`HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, `HERDR_PANE_ID`, `HERDR_SELECTED_TEXT`,
+`HERDR_FOCUS_SESSION_ID`, `HERDR_FOCUS_SESSION_REF`, `HERDR_FOCUS_CWD`, and
+`HERDR_FOCUS_AGENT`.
 
 Top-level `id`, `name`, `version`, and `min_herdr_version` are required.
 Set `min_herdr_version` to the oldest Herdr version that supports the plugin
@@ -106,10 +139,10 @@ or install a plugin when its minimum version is newer than the current binary.
 `description` is optional. Plugin ids may use ASCII letters, digits, dot,
 colon, underscore, and hyphen.
 
-Action ids, pane ids, and link handler ids are local ids inside the plugin.
-They may use ASCII letters, digits, colon, underscore, and hyphen, but not
-dots. Each id type must be unique inside a plugin. Herdr qualifies action ids
-as `plugin.id.action` when it needs a globally unique name.
+Action ids, pane ids, link handler ids, and ui-module ids are local ids inside
+the plugin. They may use ASCII letters, digits, colon, underscore, and hyphen,
+but not dots. Each id type must be unique inside a plugin. Herdr qualifies
+action ids as `plugin.id.action` when it needs a globally unique name.
 
 Use `platforms = ["linux", "macos", "windows"]` to declare where the plugin
 can run. Build commands, startup hooks, actions, event hooks, panes, and link
@@ -256,10 +289,21 @@ injects `HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_ENV=1`,
 `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
 `HERDR_PLUGIN_STATE_DIR`, `HERDR_PLUGIN_CONTEXT_JSON`, and any available
 `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`. Action commands also
+<<<<<<< HEAD
 receive `HERDR_PLUGIN_ACTION_ID`; startup and event hooks receive
 `HERDR_PLUGIN_EVENT` (`startup` for startup hooks), event hooks additionally
 receive `HERDR_PLUGIN_EVENT_JSON`, and pane commands receive
 `HERDR_PLUGIN_ENTRYPOINT_ID`.
+||||||| 299dd416
+receive `HERDR_PLUGIN_ACTION_ID`; event hooks receive `HERDR_PLUGIN_EVENT` and
+`HERDR_PLUGIN_EVENT_JSON`; pane commands receive `HERDR_PLUGIN_ENTRYPOINT_ID`.
+=======
+receive `HERDR_PLUGIN_ACTION_ID`; event hooks receive `HERDR_PLUGIN_EVENT` and
+`HERDR_PLUGIN_EVENT_JSON`; pane commands receive `HERDR_PLUGIN_ENTRYPOINT_ID`.
+When a caller supplies structured UI or API payload data, Herdr also forwards it
+as `HERDR_PLUGIN_PAYLOAD_JSON` and mirrors it in
+`HERDR_PLUGIN_CONTEXT_JSON.plugin_payload_json`.
+>>>>>>> task/wave1-integration
 
 `HERDR_PLUGIN_ROOT` is the installed or linked plugin directory. Do not store
 user credentials or durable state there, because GitHub-installed plugin roots
@@ -282,6 +326,60 @@ while Windows clients connect to a named pipe. CLI calls through
 `HERDR_BIN_PATH` avoid that transport difference. See the
 [CLI reference](/docs/cli-reference/) for available commands and
 [socket API](/docs/socket-api/) for raw request shapes.
+
+## WASM UI modules
+
+A plugin can ship a `.wasm` module that hot-reloads native UI layers without
+rebuilding Herdr itself.
+
+Herdr remains the owner of:
+
+- ratatui rendering
+- focus and layout
+- pane/tab/workspace identity
+- clipboard and pane input
+- headless native actions
+- plugin install/link/update safety
+
+The WASM module supplies lightweight UI layers for supported surfaces such as:
+
+- `header`
+- `footer`
+- `tab_bar`
+- `sidebar`
+- `right_panel`
+- `overlay`
+- `context_menu`
+
+A local development loop looks like:
+
+```bash
+cd examples/ui-wasm-plugin
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --release
+herdr plugin link $(pwd)
+```
+
+Then rebuild just the WASM target after edits. Herdr reloads the module on file
+change and keeps the running session alive.
+
+### Update compatibility model
+
+Local UI customizations live in three places that are deliberately outside the
+Herdr binary itself:
+
+- the linked plugin root that contains `herdr-plugin.toml` and the `.wasm`
+- `HERDR_PLUGIN_CONFIG_DIR` for user-managed config
+- `HERDR_PLUGIN_STATE_DIR` for runtime state and caches
+
+That means future Herdr binary updates do not need to rewrite the plugin code or
+wipe the plugin's user data. The host only reloads the declared module path and
+passes stable plugin-id-keyed config/state locations into actions, panes, and
+frame events.
+
+See `examples/ui-wasm-plugin/` for a minimal module that contributes header,
+footer, tab-bar, right-panel, overlay, and context-menu content, including a
+`Fork` context-menu action routed back through Herdr’s plugin action runtime.
 
 ## Panes
 

@@ -696,8 +696,9 @@ pub(super) fn apply_context_menu_action(
     menu: ContextMenuState,
     idx: usize,
 ) {
-    let item = menu.items().get(idx).copied();
-    match (menu.kind, item) {
+    let plugin_item = menu.plugin_item(idx).cloned();
+    let item = menu.builtin_items().get(idx).copied();
+    match (menu.kind.clone(), item) {
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
             state.request_new_linked_worktree = Some(ws_idx);
             leave_modal(state);
@@ -760,6 +761,48 @@ pub(super) fn apply_context_menu_action(
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
             open_rename_active_tab(state, false);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+            // Fork the conversation of this tab's focused pane into a new tab
+            // via the existing button-dash "fork" plugin action. AppState cannot
+            // reach the plugin runtime directly, so record a request the outer
+            // App/event loop dispatches.
+            if let Some(pane_id) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(tab_idx))
+                .map(|tab| tab.layout.focused())
+            {
+                state.request_plugin_action = Some(crate::app::state::PluginActionRequest {
+                    plugin_id: "builtin.button-dash".to_string(),
+                    action_id: "fork".to_string(),
+                    ws_idx,
+                    pane_id,
+                });
+            } else {
+                tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+            // Archive this tab's focused pane via the archive-dash plugin
+            // action; the outer App/event loop dispatches the request.
+            if let Some(pane_id) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(tab_idx))
+                .map(|tab| tab.layout.focused())
+            {
+                state.request_plugin_action = Some(crate::app::state::PluginActionRequest {
+                    plugin_id: "builtin.archive-dash".to_string(),
+                    action_id: "archive".to_string(),
+                    ws_idx,
+                    pane_id,
+                });
+            } else {
+                tracing::warn!(ws_idx, tab_idx, "archive context menu: no pane to archive");
+            }
+            leave_modal(state);
         }
         (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
             state.selected = ws_idx;
@@ -889,8 +932,30 @@ pub(super) fn apply_context_menu_action(
                 };
             }
         }
-        _ => leave_modal(state),
+        _ => {
+            if let Some(plugin_item) = plugin_item {
+                if let Some((plugin_id, action_id)) = plugin_action_parts(&plugin_item.id) {
+                    state.pending_plugin_action_invocation =
+                        Some(crate::app::state::PendingPluginActionInvocation {
+                            plugin_id: plugin_id.to_string(),
+                            action_id: action_id.to_string(),
+                            context_menu_kind: Some(menu.kind),
+                        });
+                    state.mode = Mode::Terminal;
+                } else {
+                    leave_modal(state);
+                }
+            } else {
+                leave_modal(state);
+            }
+        }
     }
+}
+
+fn plugin_action_parts(id: &str) -> Option<(&str, &str)> {
+    let rest = id.strip_prefix("plugin:")?;
+    let (plugin_id, action_id) = rest.split_once(':')?;
+    (!plugin_id.is_empty() && !action_id.is_empty()).then_some((plugin_id, action_id))
 }
 
 #[cfg(test)]
@@ -1125,8 +1190,8 @@ impl App {
     }
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
-        let item = menu.items().get(idx).copied();
-        match (menu.kind, item) {
+        let item = menu.items().get(idx).copied().map(str::to_owned);
+        match (menu.kind, item.as_deref()) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
                 leave_modal(&mut self.state);
@@ -1188,6 +1253,49 @@ impl App {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 open_rename_active_tab(&mut self.state, false);
+            }
+            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+                // Same fork-the-focused-pane request as the TUI apply path
+                // (`apply_context_menu_action`); the outer loop dispatches it.
+                if let Some(pane_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tabs.get(tab_idx))
+                    .map(|tab| tab.layout.focused())
+                {
+                    self.state.request_plugin_action =
+                        Some(crate::app::state::PluginActionRequest {
+                            plugin_id: "builtin.button-dash".to_string(),
+                            action_id: "fork".to_string(),
+                            ws_idx,
+                            pane_id,
+                        });
+                } else {
+                    tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+                // Same archive-the-focused-pane request as the TUI apply path.
+                if let Some(pane_id) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tabs.get(tab_idx))
+                    .map(|tab| tab.layout.focused())
+                {
+                    self.state.request_plugin_action =
+                        Some(crate::app::state::PluginActionRequest {
+                            plugin_id: "builtin.archive-dash".to_string(),
+                            action_id: "archive".to_string(),
+                            ws_idx,
+                            pane_id,
+                        });
+                } else {
+                    tracing::warn!(ws_idx, tab_idx, "archive context menu: no pane to archive");
+                }
+                leave_modal(&mut self.state);
             }
             (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
                 self.focus_workspace_idx_via_api(ws_idx);
@@ -1965,6 +2073,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
@@ -1977,6 +2086,66 @@ mod tests {
 
         assert!(state.workspaces.is_empty());
         assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn tab_context_menu_lists_fork_between_rename_and_close() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        };
+        assert_eq!(
+            menu.items(),
+            &["New tab", "Rename", "Fork", "Archive", "Close"]
+        );
+        let rename = menu.items().iter().position(|item| *item == "Rename");
+        let fork = menu.items().iter().position(|item| *item == "Fork");
+        let close = menu.items().iter().position(|item| *item == "Close");
+        assert!(rename < fork, "Fork must come after Rename");
+        assert!(fork < close, "Fork must come before Close");
+    }
+
+    #[test]
+    fn tab_context_menu_fork_requests_button_dash_plugin_action_for_focused_pane() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.active = Some(0);
+        state.selected = 0;
+        let expected_pane = state.workspaces[0].tabs[0].layout.focused();
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        };
+        // "Fork" is index 2 in ["New tab", "Rename", "Fork", "Archive", "Close"].
+        let fork_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Fork")
+            .expect("fork item present");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, fork_idx);
+
+        assert_eq!(
+            state.request_plugin_action,
+            Some(crate::app::state::PluginActionRequest {
+                plugin_id: "builtin.button-dash".to_string(),
+                action_id: "fork".to_string(),
+                ws_idx: 0,
+                pane_id: expected_pane,
+            })
+        );
     }
 
     #[test]
@@ -2010,6 +2179,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let idx = menu
             .items()
@@ -2041,6 +2211,7 @@ mod tests {
             x: 0,
             y: 0,
             list: MenuListState::new(0),
+            plugin_items: Vec::new(),
         };
         let idx = menu
             .items()
@@ -2065,6 +2236,7 @@ mod tests {
         app.state.mode = Mode::ContextMenu;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let mut menu = ContextMenuState {
+            plugin_items: Vec::new(),
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
                 tab_idx: 0,

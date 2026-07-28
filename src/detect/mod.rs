@@ -204,7 +204,68 @@ fn lookup_agent(name: &str) -> Option<Agent> {
 /// Identify which agent is running from the process name.
 /// Returns `None` for plain shells or unrecognized programs.
 pub fn identify_agent(process_name: &str) -> Option<Agent> {
+<<<<<<< HEAD
     parse_agent_label(process_name)
+||||||| 299dd416
+    let name = normalized_agent_lookup_name(process_name);
+    // Match against known binary names
+    match name.as_str() {
+        "pi" => Some(Agent::Pi),
+        "claude" | "claude-code" => Some(Agent::Claude),
+        "codex" => Some(Agent::Codex),
+        "gemini" => Some(Agent::Gemini),
+        "cursor" | "cursor-agent" => Some(Agent::Cursor),
+        "devin" | "devin-cli" | "devin cli" => Some(Agent::Devin),
+        "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
+        "cline" => Some(Agent::Cline),
+        "omp" => Some(Agent::Omp),
+        "mastracode" | "mastra-code" | "mastra code" => Some(Agent::Mastracode),
+        "opencode" | "open-code" => Some(Agent::OpenCode),
+        "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
+        "kimi" | "kimi-code" | "kimi code" => Some(Agent::Kimi),
+        "kiro" | "kiro-cli" => Some(Agent::Kiro),
+        "droid" => Some(Agent::Droid),
+        "amp" | "amp-local" => Some(Agent::Amp),
+        "grok" | "grok-build" => Some(Agent::Grok),
+        "hermes" | "hermes-agent" => Some(Agent::Hermes),
+        "kilo" | "kilo-code" | "kilo code" => Some(Agent::Kilo),
+        "qodercli" | "qoderclicn" | "qoder" | "qodercn" => Some(Agent::Qodercli),
+        _ => None,
+    }
+=======
+    let name = normalized_agent_lookup_name(process_name);
+    // Match against known binary names
+    match name.as_str() {
+        "pi" => Some(Agent::Pi),
+        "claude" | "claude-code" => Some(Agent::Claude),
+        "codex" => Some(Agent::Codex),
+        "gemini" => Some(Agent::Gemini),
+        "cursor" | "cursor-agent" => Some(Agent::Cursor),
+        "devin" | "devin-cli" | "devin cli" => Some(Agent::Devin),
+        "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
+        "cline" => Some(Agent::Cline),
+        "omp" => Some(Agent::Omp),
+        "mastracode" | "mastra-code" | "mastra code" => Some(Agent::Mastracode),
+        "opencode" | "open-code" => Some(Agent::OpenCode),
+        "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
+        "kimi" | "kimi-code" | "kimi code" => Some(Agent::Kimi),
+        "kiro" | "kiro-cli" => Some(Agent::Kiro),
+        "droid" => Some(Agent::Droid),
+        "amp" | "amp-local" => Some(Agent::Amp),
+        "grok" | "grok-build" => Some(Agent::Grok),
+        "hermes" | "hermes-agent" => Some(Agent::Hermes),
+        "kilo" | "kilo-code" | "kilo code" => Some(Agent::Kilo),
+        "qodercli" | "qoderclicn" | "qoder" | "qodercn" => Some(Agent::Qodercli),
+        // fork(wave-1): the local claude-project-router (~/.local/bin/claude)
+        // execs project-named hardlinks of the Claude Code binary
+        // (claude-meta, claude-brain, claude-y7, …) so Activity Monitor shows
+        // per-project names. Map any remaining `claude-*` process name back to
+        // Claude so process identification — and with it screen-manifest
+        // detection — keeps working for those panes.
+        name if name.starts_with("claude-") => Some(Agent::Claude),
+        _ => None,
+    }
+>>>>>>> task/wave1-integration
 }
 
 pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
@@ -655,6 +716,9 @@ mod tests {
         assert_eq!(identify_agent("pi"), Some(Agent::Pi));
         assert_eq!(identify_agent("claude"), Some(Agent::Claude));
         assert_eq!(identify_agent("claude-code"), Some(Agent::Claude));
+        // fork(wave-1): project-router hardlink names resolve to Claude
+        assert_eq!(identify_agent("claude-meta"), Some(Agent::Claude));
+        assert_eq!(identify_agent("claude-brain"), Some(Agent::Claude));
         assert_eq!(identify_agent("codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("gemini"), Some(Agent::Gemini));
         assert_eq!(identify_agent("cursor"), Some(Agent::Cursor));
@@ -796,6 +860,23 @@ mod tests {
         assert_eq!(
             identify_agent_in_job(&job),
             Some((Agent::Codex, "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_project_router_hardlink() {
+        // fork(wave-1): claude-project-router execs claude-meta/claude-brain
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 93234,
+            processes: vec![foreground_process(
+                93234,
+                "claude-meta",
+                &["/Users/andual/.local/bin/claude-meta", "--resume", "x"],
+            )],
+        };
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Claude, "claude-meta".to_string()))
         );
     }
 

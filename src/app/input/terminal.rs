@@ -387,6 +387,7 @@ mod tests {
                 }],
                 events: Vec::new(),
                 panes: Vec::new(),
+                ui_modules: Vec::new(),
                 link_handlers: vec![crate::api::schema::PluginManifestLinkHandler {
                     id: "github-issue".into(),
                     title: "Open GitHub issue".into(),
@@ -887,6 +888,7 @@ mod tests {
             ratatui::layout::Rect::new(0, 0, 106, 20),
             false,
             crate::kitty_graphics::HostCellSize::default(),
+            None,
         );
         let links =
             crate::server::render_stream::visible_hyperlinks(&app.state, &app.terminal_runtimes);

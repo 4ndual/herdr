@@ -1,0 +1,196 @@
+//! Host-side capability policy for the v3 UI plugin API bridge (spec §5.3):
+//! maps each socket API method name reachable through `HostEffect::Api` to the
+//! `PluginUiCapability` a module must hold to invoke it, plus an always-denied
+//! set (host-reserved administration) and a blocking-methods set that is never
+//! allowed regardless of capability (running them synchronously in-process
+//! would wedge the render thread).
+//!
+//! Match semantics (normative, §5.3): allow rows match by exact method name —
+//! the serde `rename` strings from `src/api/schema.rs`'s `Method` enum, which is
+//! also how `App::handle_api_request_after_internal_events_drained` dispatches.
+//! Deny rows may additionally use one trailing `.*` wildcard meaning
+//! literal-prefix. Deny wins over allow; anything matching no row is denied.
+
+use crate::api::schema::PluginUiCapability;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiMethodDecision {
+    Allow(PluginUiCapability),
+    Deny,
+}
+
+const READ_METHODS: &[&str] = &[
+    "workspace.list",
+    "workspace.get",
+    "tab.list",
+    "tab.get",
+    "pane.list",
+    "pane.get",
+    "pane.read",
+    "pane.process_info",
+    "agent.list",
+    "agent.get",
+    "agent.read",
+    "agent.explain",
+    "layout.export",
+    "plugin.list",
+    "plugin.action.list",
+];
+
+const WRITE_METHODS: &[&str] = &[
+    "pane.split",
+    "pane.resize",
+    "pane.close",
+    "tab.create",
+    "tab.close",
+    "tab.focus",
+    "tab.rename",
+    "workspace.create",
+    "workspace.focus",
+    "workspace.rename",
+    "layout.apply",
+    "plugin.action.invoke",
+];
+
+const INPUT_METHODS: &[&str] = &["pane.send_text", "agent.send"];
+
+/// Host-reserved administration: exact-name denies regardless of capability.
+const DENIED_EXACT_METHODS: &[&str] = &[
+    "plugin.link",
+    "plugin.unlink",
+    "plugin.enable",
+    "plugin.disable",
+    "integration.install",
+    "integration.uninstall",
+    "worktree.create",
+    "worktree.remove",
+    "agent.start",
+    "pane.report_agent",
+    "pane.report_agent_session",
+    "pane.report_metadata",
+    "pane.clear_agent_authority",
+    "pane.release_agent",
+];
+
+/// Literal-prefix denies (single trailing `.*`, per the deny-row wildcard rule).
+const DENIED_PREFIXES: &[&str] = &["server."];
+
+/// Blocking/streaming methods: MUST NOT appear in any allow row regardless of
+/// capability (§5.3) — run synchronously in-process they would wedge the render
+/// thread. The bridge is strictly request/response.
+const BLOCKING_METHODS: &[&str] = &["events.wait", "events.subscribe", "pane.wait_for_output"];
+
+/// Decides whether `method` may be invoked through `HostEffect::Api`, and if so
+/// which capability is required. Default-deny: anything matching no row is
+/// denied. Callers are expected to `tracing::warn!` on every denial themselves
+/// (this function is pure policy, not logging).
+pub(crate) fn decide(method: &str) -> ApiMethodDecision {
+    if BLOCKING_METHODS.contains(&method) {
+        return ApiMethodDecision::Deny;
+    }
+    if DENIED_EXACT_METHODS.contains(&method) {
+        return ApiMethodDecision::Deny;
+    }
+    if DENIED_PREFIXES
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+    {
+        return ApiMethodDecision::Deny;
+    }
+    if READ_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::ApiRead);
+    }
+    if WRITE_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::ApiWrite);
+    }
+    if INPUT_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::ApiInput);
+    }
+    ApiMethodDecision::Deny
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_allow_names() -> impl Iterator<Item = &'static str> {
+        READ_METHODS
+            .iter()
+            .chain(WRITE_METHODS.iter())
+            .chain(INPUT_METHODS.iter())
+            .copied()
+    }
+
+    /// Guard demanded by the adversarial spec review: every allow-row method
+    /// name must be a real socket API method tag (the exact
+    /// `#[serde(rename = "...")]` string on `Method` in src/api/schema.rs), not a
+    /// typo that would silently never match. `Method` is adjacently tagged
+    /// (`tag = "method", content = "params"`), so feeding a `null` params value
+    /// isolates exactly the tag-recognition step: an unknown tag fails with
+    /// "unknown variant"; a recognized tag with wrong param shape fails with a
+    /// different (type-specific) error. This gives a round-trip check against
+    /// the real enum without needing a valid params payload per method.
+    #[test]
+    fn every_allow_name_round_trips_through_the_real_method_tag() {
+        for name in all_allow_names() {
+            let probe = serde_json::json!({"method": name, "params": serde_json::Value::Null});
+            if let Err(err) = serde_json::from_value::<crate::api::schema::Method>(probe) {
+                let message = err.to_string();
+                assert!(
+                    !message.contains("unknown variant"),
+                    "policy table method '{name}' does not match any Method tag in src/api/schema.rs: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocking_methods_are_never_allowed_even_though_unlisted_as_denies() {
+        for name in BLOCKING_METHODS {
+            assert_eq!(
+                decide(name),
+                ApiMethodDecision::Deny,
+                "{name} must never be allowed"
+            );
+            assert!(
+                !READ_METHODS.contains(name)
+                    && !WRITE_METHODS.contains(name)
+                    && !INPUT_METHODS.contains(name),
+                "{name} must not appear in any allow row"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_wins_over_host_reserved_and_prefix_rows() {
+        assert_eq!(decide("server.stop"), ApiMethodDecision::Deny);
+        assert_eq!(decide("server.live_handoff"), ApiMethodDecision::Deny);
+        assert_eq!(decide("plugin.link"), ApiMethodDecision::Deny);
+        assert_eq!(decide("worktree.create"), ApiMethodDecision::Deny);
+    }
+
+    #[test]
+    fn unknown_method_defaults_denied() {
+        assert_eq!(decide("totally.unknown.method"), ApiMethodDecision::Deny);
+    }
+
+    #[test]
+    fn known_allow_rows_resolve_to_the_documented_capability() {
+        assert_eq!(
+            decide("pane.list"),
+            ApiMethodDecision::Allow(PluginUiCapability::ApiRead)
+        );
+        assert_eq!(
+            decide("pane.split"),
+            ApiMethodDecision::Allow(PluginUiCapability::ApiWrite)
+        );
+        assert_eq!(
+            decide("pane.send_text"),
+            ApiMethodDecision::Allow(PluginUiCapability::ApiInput)
+        );
+        assert_eq!(
+            decide("agent.send"),
+            ApiMethodDecision::Allow(PluginUiCapability::ApiInput)
+        );
+    }
+}

@@ -1,7 +1,9 @@
+use herdr_ui_plugin_api::{UiLayer, UiNode, UiSurface, UiTextSpan};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
-    text::Span,
+    text::{Line, Span},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -13,6 +15,7 @@ mod navigator;
 mod onboarding;
 mod panes;
 mod release_notes;
+mod resume_picker;
 mod scrollbar;
 mod settings;
 mod sidebar;
@@ -57,9 +60,16 @@ use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
+<<<<<<< HEAD
 pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };
+||||||| 299dd416
+=======
+// fork: non-foreground "panes pinned to ..." badge, drawn by the headless
+// server's per-client render path (see server::render_stream).
+pub(crate) use self::status::render_foreground_pin_badge;
+>>>>>>> task/wave1-integration
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
@@ -99,7 +109,33 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
+const COLLAPSED_WIDTH: u16 = 4;
+
+// feat/native-dashes: fixed reserve for the bottom usage strip surface. P4 will
+// derive the strip height from usage content height rather than reserving a
+// fixed band.
+const USAGE_STRIP_HEIGHT: u16 = 7;
+
+// feat/native-dashes: right-panel (goal-dash) carve width bounds, revived from
+// the pre-purge goal panel (f4fd766^ src/ui.rs). The panel auto-sizes to a
+// quarter of the terminal width, clamped to this range; panes keep a 24-col
+// minimum beside it.
+const GOAL_PANEL_MIN_WIDTH: u16 = 28;
+const GOAL_PANEL_MAX_WIDTH: u16 = 56;
+// wasm-ui v3 §7.2: a runtime-collapsed right panel keeps a slim clickable handle
+// column (an expand affordance stays reachable) and gives the rest to panes.
+// Width of the vertical icon rail drawn at the right edge of the expanded right
+// panel: one clickable icon per right-panel plugin, so the user can switch which
+// plugin's panel is expanded (or collapse the active one).
+const RIGHT_PANEL_RAIL_WIDTH: u16 = 3;
+/// Extra rows kept below a content-sized right panel so a row hover-tooltip has
+/// space to render without the panel reserving the whole column height.
+const RIGHT_PANEL_CONTENT_PAD: u16 = 4;
+
+// Absolute floor a panel's peer region always keeps along the carve axis, even
+// if a manifest declares a smaller `min_peer` — one column/row is reserved so a
+// carved panel can never consume the entire peer band.
+const PANEL_MIN_PEER_FLOOR: u16 = 1;
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -108,6 +144,22 @@ const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// We want ~8 updates/sec so divide by 8.
 pub(super) fn spinner_frame(tick: u32) -> &'static str {
     SPINNERS[(tick as usize / 8) % SPINNERS.len()]
+}
+
+/// feat/native-dashes: anchor area for desktop herdr toasts that keeps them clear
+/// of the native dashboards. The bottom usage strip sits along the window bottom
+/// and the goal panel along the right edge; a bottom/right-anchored toast drawn
+/// against the full window would overlap them and (since `usage_host::route_mouse`
+/// resolves the usage strip and goal panel before the toast) have its clicks
+/// swallowed by the strip. Shrinking the anchor by those rects moves the toast
+/// just above the strip and left of the panel so render and hit-area agree.
+fn toast_desktop_anchor_area(area: Rect, usage_strip_rect: Rect, right_panel_rect: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(right_panel_rect.width),
+        area.height.saturating_sub(usage_strip_rect.height),
+    )
 }
 
 /// Compute view geometry and reconcile pane sizes.
@@ -239,6 +291,118 @@ fn compute_view_internal(
         .map(|ws| desktop_tab_bar_and_terminal_area(app, ws, main_area))
         .unwrap_or((Rect::default(), main_area));
 
+    // feat/native-dashes: carve the persistent bottom usage strip surface out of
+    // the terminal area before panes are laid out, so panes never overlap it. It
+    // collapses to an empty Rect when there isn't room. P4 will derive the strip
+    // height from usage content instead of the fixed reserve used here.
+    // wasm-ui v3 §7.2: a runtime-collapsed strip keeps a single row (so an
+    // expand affordance stays clickable) and gives the rest back to panes.
+    let usage_strip_height = if app
+        .collapsed_surfaces
+        .contains(&herdr_ui_plugin_api::UiSurface::UsageStrip)
+    {
+        1
+    } else {
+        USAGE_STRIP_HEIGHT
+    };
+    let (terminal_area, usage_strip_rect) =
+        if app.usage_strip_enabled && terminal_area.height > usage_strip_height + 3 {
+            let [panes, strip] =
+                Layout::vertical([Constraint::Min(3), Constraint::Length(usage_strip_height)])
+                    .areas(terminal_area);
+            (panes, strip)
+        } else {
+            (terminal_area, Rect::default())
+        };
+    // feat/native-dashes: carve the right panel (goal-dash) out of the terminal
+    // area when a ui-plugin module actually declares the RightPanel surface AND
+    // currently renders a non-empty layer there — mirrors how the usage strip
+    // carve above is gated on live content, so an idle layout keeps every column
+    // for panes. A runtime-collapsed panel (RightPanel in `collapsed_surfaces`)
+    // keeps only a slim clickable handle column; the full width reuses the
+    // pre-purge goal panel sizing (f4fd766^ src/ui.rs).
+    // Distinct right-panel plugins that currently render content, in the layout's
+    // deterministic (z desc, plugin asc, module asc) order — one rail icon each.
+    let mut right_panel_plugins: Vec<String> = Vec::new();
+    for entry in app.ui_surface_layers.iter() {
+        if entry.layer.surface == herdr_ui_plugin_api::UiSurface::RightPanel
+            && !entry.layer.nodes.is_empty()
+            && !right_panel_plugins.contains(&entry.plugin_id)
+        {
+            right_panel_plugins.push(entry.plugin_id.clone());
+        }
+    }
+    // Clear a stale selection whose plugin no longer renders content. The panel
+    // starts as an icon-only rail (nothing expanded) and the user clicks an icon
+    // to expand a plugin — so we never auto-expand here (pure, unit-tested).
+    app.ensure_active_right_panel(&right_panel_plugins);
+
+    let right_panel_has_content = !right_panel_plugins.is_empty();
+    let right_panel_collapsed = app
+        .collapsed_surfaces
+        .contains(&herdr_ui_plugin_api::UiSurface::RightPanel);
+    // The expanded plugin (if any): a valid selection that isn't force-collapsed.
+    let active_right_panel = app
+        .active_right_panel
+        .as_deref()
+        .filter(|active| !right_panel_collapsed && right_panel_plugins.iter().any(|p| p == active))
+        .map(str::to_string);
+    let (terminal_area, right_panel_rect, right_panel_rail_icons) = if right_panel_has_content
+        && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
+    {
+        // The rail is always shown when a right-panel plugin has content; the
+        // content column is carved only when a plugin is expanded.
+        let rail_w = RIGHT_PANEL_RAIL_WIDTH;
+        let content_w = if active_right_panel.is_some() {
+            (terminal_area.width / 4)
+                .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
+                .min(terminal_area.width.saturating_sub(24 + rail_w))
+        } else {
+            0
+        };
+        let [panes, content, rail] = Layout::horizontal([
+            Constraint::Min(24),
+            Constraint::Length(content_w),
+            Constraint::Length(rail_w),
+        ])
+        .areas(terminal_area);
+        // Content-size the panel height: a short panel (e.g. a 7-row historial)
+        // carves a box only as tall as its current content instead of the whole
+        // column, so it no longer visually dominates. Derived from the active
+        // plugin's most-recent layer (previous frame), converging in one tick;
+        // clamped to the full column height as the sane max, so a long list still
+        // gets the whole column.
+        let content = match active_right_panel
+            .as_deref()
+            .and_then(|plugin_id| right_panel_content_height(app, plugin_id))
+        {
+            // Small padding below the content so a row hover-tooltip (drawn
+            // beneath the hovered row) has a few lines to render into without the
+            // panel having to reserve the whole column.
+            Some(h) if content_w > 0 => Rect {
+                height: h.saturating_add(RIGHT_PANEL_CONTENT_PAD).clamp(1, content.height),
+                ..content
+            },
+            _ => content,
+        };
+        let icons =
+            build_right_panel_rail(&right_panel_plugins, active_right_panel.as_deref(), rail);
+        (panes, content, icons)
+    } else {
+        (terminal_area, Rect::default(), Vec::new())
+    };
+
+    // Generic plugin-panel placement: lay out every module that declares the
+    // `Panel` surface AND currently renders content, from the DATA in its
+    // manifest `placement` spec — carving a band from the pane area (left/right/
+    // top/bottom), a slot from the usage band (bottom_band), or overlaying the
+    // pane area (free). Runs before panes are laid out so an edge/band carve
+    // shrinks the pane area cleanly, and each resolved rect is disjoint from the
+    // panes and from other panels, giving each panel its own hit-rects (never
+    // stealing usage-dash or pane input). Idle/empty panels carve nothing.
+    let (terminal_area, usage_strip_rect, panel_rects) =
+        layout_plugin_panels(app, terminal_area, usage_strip_rect);
+
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
         let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
@@ -287,12 +451,13 @@ fn compute_view_internal(
         resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
     }
 
+    let toast_anchor_area = toast_desktop_anchor_area(area, usage_strip_rect, right_panel_rect);
     let toast_hit_area = app
         .toast
         .as_ref()
         .map(|toast| {
             toast_notification_rect(
-                area,
+                toast_anchor_area,
                 toast,
                 app.config_diagnostic.is_some(),
                 toast.position.unwrap_or(app.toast_config.herdr.position),
@@ -315,8 +480,306 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        usage_strip_rect,
+        right_panel_rect,
+        panel_rects,
+        right_panel_rail_icons,
     };
     app.sync_copy_mode_search_geometry();
+}
+
+/// Content height (rows) of the active right-panel plugin's most-recent layer:
+/// `1 + index of the last node carrying any visible text`. Lets the layout carve
+/// a content-sized panel box (a short historial no longer reserves the whole
+/// column). `None` when the plugin has not rendered a non-empty layer yet, so the
+/// caller keeps the full column height until content is known. Pure over the
+/// loaded layers.
+fn right_panel_content_height(app: &AppState, plugin_id: &str) -> Option<u16> {
+    let mut last_content: Option<usize> = None;
+    for entry in app.ui_surface_layers.iter() {
+        if entry.layer.surface != herdr_ui_plugin_api::UiSurface::RightPanel
+            || entry.plugin_id != plugin_id
+        {
+            continue;
+        }
+        for (i, node) in entry.layer.nodes.iter().enumerate() {
+            let has_text = match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => {
+                    spans.iter().any(|s| !s.text.trim().is_empty())
+                }
+                _ => true,
+            };
+            if has_text {
+                last_content = Some(i);
+            }
+        }
+    }
+    last_content.map(|i| (i as u16).saturating_add(1))
+}
+
+/// Build the right-panel rail icons: one clickable 1-row rect per plugin, stacked
+/// from the top of `rail`, tagging which plugin is currently expanded. Empty when
+/// the rail has no room. Pure geometry, unit-tested.
+fn build_right_panel_rail(
+    plugins: &[String],
+    active: Option<&str>,
+    rail: Rect,
+) -> Vec<crate::app::state::RightPanelRailIcon> {
+    if rail.width == 0 || rail.height == 0 {
+        return Vec::new();
+    }
+    let mut icons = Vec::new();
+    for (i, plugin_id) in plugins.iter().enumerate() {
+        let y = rail.y + i as u16;
+        if y >= rail.y + rail.height {
+            break;
+        }
+        icons.push(crate::app::state::RightPanelRailIcon {
+            plugin_id: plugin_id.clone(),
+            rect: Rect::new(rail.x, y, rail.width, 1),
+            active: active == Some(plugin_id.as_str()),
+        });
+    }
+    icons
+}
+
+/// Glyph shown in a right-panel rail icon for a given plugin id. Falls back to a
+/// generic marker for unknown plugins.
+fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
+    match plugin_id {
+        "builtin.historial-dash" => "\u{1F553}", // 🕓
+        "builtin.harness-manager" => "\u{1F39B}", // 🎛
+        "builtin.goal-dash" => "\u{1F3AF}",      // 🎯
+        "builtin.usage-dash" => "\u{1F4CA}",     // 📊
+        _ => "\u{25A6}",                         // ▦
+    }
+}
+
+/// Draw the right-panel rail (host-owned): a vertical strip of plugin icons, the
+/// active one highlighted. Clicking an icon is routed in `handle_mouse`.
+fn render_right_panel_rail(app: &AppState, frame: &mut Frame) {
+    for icon in &app.view.right_panel_rail_icons {
+        if icon.rect.width == 0 || icon.rect.height == 0 {
+            continue;
+        }
+        let style = if icon.active {
+            Style::default()
+                .fg(app.palette.panel_bg)
+                .bg(app.palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        let glyph = right_panel_rail_glyph(&icon.plugin_id);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(" {glyph} "), style))),
+            icon.rect,
+        );
+    }
+}
+
+/// Generic plugin-panel layout: resolve a rect for every module that declares
+/// the `Panel` surface and currently renders content, driven entirely by the
+/// module's manifest `placement` DATA (no per-panel host code). Returns the
+/// (possibly shrunk) pane area, the (possibly shrunk) usage-strip rect, and the
+/// resolved per-module panel rects. Modules are processed in `ui_surface_layers`
+/// order (already `(z desc, plugin asc, module asc)`), so multiple panels in the
+/// same region carve deterministically from the remaining space and never
+/// overlap. See `.local/prd/generic-plugin-panel-placement.md`.
+fn layout_plugin_panels(
+    app: &AppState,
+    mut terminal: Rect,
+    mut usage: Rect,
+) -> (Rect, Rect, Vec<crate::app::state::PanelRect>) {
+    use crate::api::schema::{PluginPanelAlign, PluginPanelRegion};
+
+    let mut out: Vec<crate::app::state::PanelRect> = Vec::new();
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for entry in &app.ui_surface_layers {
+        if entry.layer.surface != UiSurface::Panel {
+            continue;
+        }
+        let key = (entry.plugin_id.clone(), entry.module_id.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+
+        let placement = entry.placement.clone().unwrap_or_default();
+        let (content_w, content_h) = panel_content_dims(app, &entry.plugin_id, &entry.module_id);
+        // Gate on live content, exactly like the usage-strip / right-panel
+        // carves: an idle panel reserves nothing.
+        if content_w == 0 && content_h == 0 {
+            continue;
+        }
+        let size = placement.size.as_deref();
+        let min_peer = placement.min_peer.max(PANEL_MIN_PEER_FLOOR);
+
+        let rect = match placement.region {
+            PluginPanelRegion::BottomBand => {
+                if usage.width == 0 {
+                    continue;
+                }
+                let max_slot = usage.width.saturating_sub(min_peer);
+                let slot_w = resolve_extent(size, content_w, usage.width).min(max_slot);
+                if slot_w == 0 {
+                    continue;
+                }
+                let (peer, panel) = carve_band_horizontal(usage, slot_w, placement.align);
+                usage = peer;
+                panel
+            }
+            PluginPanelRegion::Left | PluginPanelRegion::Right => {
+                if terminal.height == 0 {
+                    continue;
+                }
+                let max_slot = terminal.width.saturating_sub(min_peer);
+                let w = resolve_extent(size, content_w, terminal.width).min(max_slot);
+                if w == 0 {
+                    continue;
+                }
+                let start = matches!(placement.region, PluginPanelRegion::Left);
+                let (peer, panel) = carve_band_horizontal(
+                    terminal,
+                    w,
+                    if start {
+                        PluginPanelAlign::Start
+                    } else {
+                        PluginPanelAlign::End
+                    },
+                );
+                terminal = peer;
+                panel
+            }
+            PluginPanelRegion::Top | PluginPanelRegion::Bottom => {
+                if terminal.width == 0 {
+                    continue;
+                }
+                let max_slot = terminal.height.saturating_sub(min_peer);
+                let h = resolve_extent(size, content_h, terminal.height).min(max_slot);
+                if h == 0 {
+                    continue;
+                }
+                let start = matches!(placement.region, PluginPanelRegion::Top);
+                let (peer, panel) = carve_band_vertical(terminal, h, start);
+                terminal = peer;
+                panel
+            }
+            PluginPanelRegion::Free => {
+                // Overlay the pane area (no carve), a content-sized box anchored
+                // horizontally by `align`. Panes are untouched; the panel draws
+                // on top and owns only its own hit-rects.
+                let w = resolve_extent(size, content_w, terminal.width);
+                let h = content_h.min(terminal.height);
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                let x = match placement.align {
+                    PluginPanelAlign::Start => terminal.x,
+                    PluginPanelAlign::Center => terminal.x + terminal.width.saturating_sub(w) / 2,
+                    PluginPanelAlign::End => terminal.x + terminal.width.saturating_sub(w),
+                };
+                Rect::new(x, terminal.y, w, h)
+            }
+        };
+        out.push(crate::app::state::PanelRect {
+            plugin_id: entry.plugin_id.clone(),
+            module_id: entry.module_id.clone(),
+            rect,
+        });
+    }
+    (terminal, usage, out)
+}
+
+/// Resolve a placement `size` extent against content and available cells:
+/// `"auto"`/absent → snug to content; a bare number → that many cells; a
+/// `"NN%"` suffix → that percent of `avail`. Any unparseable value falls back to
+/// the content size. Always clamped to `avail`.
+fn resolve_extent(spec: Option<&str>, content: u16, avail: u16) -> u16 {
+    let raw = spec.unwrap_or("auto").trim();
+    let value = if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        content
+    } else if let Some(pct) = raw.strip_suffix('%') {
+        match pct.trim().parse::<u32>() {
+            Ok(p) => ((avail as u32 * p) / 100) as u16,
+            Err(_) => content,
+        }
+    } else {
+        raw.parse::<u16>().unwrap_or(content)
+    };
+    value.min(avail)
+}
+
+/// Carve a fixed-width slot from a band, keeping the rest as the peer. `align`
+/// picks the side: `Start` → slot on the left, otherwise → slot on the right.
+/// Returns `(peer, panel)`.
+fn carve_band_horizontal(
+    band: Rect,
+    slot_w: u16,
+    align: crate::api::schema::PluginPanelAlign,
+) -> (Rect, Rect) {
+    if matches!(align, crate::api::schema::PluginPanelAlign::Start) {
+        let [panel, peer] =
+            Layout::horizontal([Constraint::Length(slot_w), Constraint::Min(1)]).areas(band);
+        (peer, panel)
+    } else {
+        let [peer, panel] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(slot_w)]).areas(band);
+        (peer, panel)
+    }
+}
+
+/// Carve a fixed-height band from a rect. `top` → band on top, else on bottom.
+/// Returns `(peer, panel)`.
+fn carve_band_vertical(area: Rect, slot_h: u16, top: bool) -> (Rect, Rect) {
+    if top {
+        let [panel, peer] =
+            Layout::vertical([Constraint::Length(slot_h), Constraint::Min(1)]).areas(area);
+        (peer, panel)
+    } else {
+        let [peer, panel] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(slot_h)]).areas(area);
+        (peer, panel)
+    }
+}
+
+/// Content dimensions (widest line in cells, number of rows) across all of a
+/// module's `Panel` layers — used to size an `auto` panel snugly and to gate the
+/// carve on live content.
+fn panel_content_dims(app: &AppState, plugin_id: &str, module_id: &str) -> (u16, u16) {
+    let mut width = 0u16;
+    let mut height = 0u16;
+    for entry in &app.ui_surface_layers {
+        if entry.layer.surface != UiSurface::Panel
+            || entry.plugin_id != plugin_id
+            || entry.module_id != module_id
+        {
+            continue;
+        }
+        for node in &entry.layer.nodes {
+            width = width.max(ui_node_line_width(node));
+            height = height.saturating_add(1);
+        }
+    }
+    (width, height)
+}
+
+/// Cell width of a single node's line (span text char counts). Only Line/Status
+/// nodes carry inline text in the bottom dash; other node kinds contribute 0.
+fn ui_node_line_width(node: &UiNode) -> u16 {
+    let span_w = |spans: &[UiTextSpan]| -> u16 {
+        spans
+            .iter()
+            .map(|s| s.text.chars().count() as u16)
+            .fold(0u16, |acc, w| acc.saturating_add(w))
+    };
+    match node {
+        UiNode::Line { spans } => span_w(spans),
+        UiNode::Status { left, right } => {
+            span_w(left).saturating_add(1).saturating_add(span_w(right))
+        }
+        _ => 0,
+    }
 }
 
 fn compute_mobile_view(
@@ -378,6 +841,10 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        usage_strip_rect: Rect::default(),
+        right_panel_rect: Rect::default(),
+        panel_rects: Vec::new(),
+        right_panel_rail_icons: Vec::new(),
     };
     app.sync_copy_mode_search_geometry();
 }
@@ -410,6 +877,7 @@ pub fn render_with_runtime_registry(
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
+<<<<<<< HEAD
     if app
         .active
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
@@ -419,6 +887,13 @@ pub fn render_with_runtime_registry(
     } else {
         render_empty(app, frame, terminal_area);
     }
+||||||| 299dd416
+    render_panes(app, terminal_runtimes, frame, terminal_area);
+=======
+    render_panes(app, terminal_runtimes, frame, terminal_area);
+    render_ui_plugin_layers(app, frame);
+    render_right_panel_rail(app, frame);
+>>>>>>> task/wave1-integration
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
@@ -453,7 +928,422 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::ResumePicker => resume_picker::render_resume_picker_overlay(
+            app,
+            terminal_runtimes,
+            frame,
+            terminal_area,
+        ),
         Mode::Terminal => {}
+    }
+}
+
+pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: UiSurface) -> Rect {
+    match surface {
+        UiSurface::Header => {
+            if app.view.layout == ViewLayout::Mobile {
+                app.view.mobile_header_rect
+            } else if app.view.terminal_area.height > 0 {
+                Rect::new(
+                    app.view.terminal_area.x,
+                    app.view.terminal_area.y,
+                    app.view.terminal_area.width,
+                    1,
+                )
+            } else {
+                Rect::default()
+            }
+        }
+        UiSurface::Footer => {
+            let area = if app.view.layout == ViewLayout::Mobile {
+                app.view.terminal_area
+            } else {
+                app.view.terminal_area
+            };
+            if area.height > 0 {
+                Rect::new(
+                    area.x,
+                    area.y + area.height.saturating_sub(1),
+                    area.width,
+                    1,
+                )
+            } else {
+                Rect::default()
+            }
+        }
+        UiSurface::TabBar => app.view.tab_bar_rect,
+        UiSurface::Sidebar => app.view.sidebar_rect,
+        UiSurface::RightPanel => app.view.right_panel_rect,
+        UiSurface::UsageStrip => app.view.usage_strip_rect,
+        // A generic panel's rect depends on WHICH module owns it (data-driven
+        // placement per `(plugin_id, module_id)`), which this surface-only
+        // signature can't express — resolve it via `ui_plugin_owner_surface_rect`
+        // instead. Bare surface lookups (identity unknown) get an empty rect.
+        UiSurface::Panel => Rect::default(),
+        UiSurface::Overlay => app.view.terminal_area,
+        UiSurface::ContextMenu => frame_area,
+    }
+}
+
+/// Identity-aware surface rect: for the generic `Panel` surface, look up the
+/// resolved rect for the owning `(plugin_id, module_id)`; every other surface
+/// delegates to [`ui_plugin_surface_rect`]. Every caller that has the owning
+/// module identity in scope (frame dispatch, hit-testing, rendering, mouse
+/// routing) uses this so panels resolve to their real geometry.
+pub(crate) fn ui_plugin_owner_surface_rect(
+    app: &AppState,
+    frame_area: Rect,
+    surface: UiSurface,
+    plugin_id: &str,
+    module_id: &str,
+) -> Rect {
+    if surface == UiSurface::Panel {
+        app.view.panel_rect(plugin_id, module_id)
+    } else {
+        ui_plugin_surface_rect(app, frame_area, surface)
+    }
+}
+
+fn plugin_span_style(app: &AppState, role: Option<&str>) -> Style {
+    match role.unwrap_or_default() {
+        "accent" => Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+        "muted" => Style::default().fg(app.palette.overlay0),
+        "success" | "green" => Style::default().fg(app.palette.green),
+        "warning" | "yellow" => Style::default().fg(app.palette.yellow),
+        "danger" | "red" => Style::default().fg(app.palette.red),
+        "blue" => Style::default().fg(app.palette.blue),
+        "teal" | "cyan" => Style::default().fg(app.palette.teal),
+        "mauve" | "magenta" => Style::default().fg(app.palette.mauve),
+        "subtext" | "gray" => Style::default().fg(app.palette.subtext0),
+        "peach" => Style::default().fg(app.palette.peach),
+        "panel" => Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.panel_bg),
+        _ => Style::default().fg(app.palette.text),
+    }
+}
+
+fn plugin_line(app: &AppState, spans: &[UiTextSpan]) -> Line<'static> {
+    Line::from(
+        spans
+            .iter()
+            .map(|span| {
+                let mut style = plugin_span_style(app, span.role.as_deref());
+                if span.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if span.underline {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if span.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                Span::styled(span.text.clone(), style)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) struct UiPluginHit {
+    pub action_id: Option<String>,
+    pub consumes_mouse: bool,
+    /// Spec §4: set only when the hit resolved through a declared `UiHitRect`
+    /// (not the Menu/Tabs node-walk fallback below) — "Emitted when a resolved
+    /// click lands on a `UiHitRect` declared by a v3 module's current layers."
+    /// `(plugin_id, module_id, negotiated_version)` of the owning module.
+    pub declared_hit_owner: Option<(String, String, u32)>,
+    pub surface: UiSurface,
+}
+
+fn ui_plugin_node_action_at(
+    _app: &AppState,
+    area: Rect,
+    mut line_y: u16,
+    node: &UiNode,
+    col: u16,
+    row: u16,
+) -> (Option<String>, u16) {
+    match node {
+        UiNode::Line { .. } | UiNode::Status { .. } => (None, line_y.saturating_add(1)),
+        UiNode::Tabs { items, .. } => {
+            if row == line_y && col >= area.x && col < area.x + area.width {
+                let mut x = area.x;
+                for item in items {
+                    let label = format!(" {} ", item.label);
+                    let w = label.chars().count() as u16;
+                    if col >= x && col < x.saturating_add(w) {
+                        return (Some(item.id.clone()), line_y.saturating_add(1));
+                    }
+                    x = x.saturating_add(w + 1);
+                }
+            }
+            (None, line_y.saturating_add(1))
+        }
+        UiNode::Menu { items, .. } => {
+            line_y = line_y.saturating_add(1); // title row
+            for item in items {
+                if row == line_y && col >= area.x && col < area.x + area.width {
+                    return (Some(item.id.clone()), line_y.saturating_add(1));
+                }
+                line_y = line_y.saturating_add(1);
+            }
+            (None, line_y)
+        }
+    }
+}
+
+pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
+    let rects = [
+        app.view.sidebar_rect,
+        app.view.tab_bar_rect,
+        app.view.terminal_area,
+        app.view.mobile_header_rect,
+        app.view.right_panel_rect,
+        app.view.usage_strip_rect,
+    ];
+    let mut min_x = u16::MAX;
+    let mut min_y = u16::MAX;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    // Include every resolved plugin panel rect so a panel's hit region is inside
+    // the frame-area union used by hit-testing.
+    let panel_rects = app.view.panel_rects.iter().map(|p| p.rect);
+    for rect in rects.into_iter().chain(panel_rects) {
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+        min_x = min_x.min(rect.x);
+        min_y = min_y.min(rect.y);
+        max_x = max_x.max(rect.x + rect.width);
+        max_y = max_y.max(rect.y + rect.height);
+    }
+    if min_x == u16::MAX {
+        Rect::default()
+    } else {
+        Rect::new(
+            min_x,
+            min_y,
+            max_x.saturating_sub(min_x),
+            max_y.saturating_sub(min_y),
+        )
+    }
+}
+
+pub(crate) fn ui_plugin_hit_at(
+    app: &AppState,
+    frame_area: Rect,
+    col: u16,
+    row: u16,
+) -> Option<UiPluginHit> {
+    // §4 deterministic overlap ownership: `ui_surface_layers` is already ordered
+    // `(z_index desc, plugin_id asc, module_id asc)` by `surface_layers()`, i.e.
+    // topmost-owner-first, so walking it forward (no `.rev()`) already checks the
+    // topmost layer first.
+    for entry in app.ui_surface_layers.iter() {
+        let layer = &entry.layer;
+        // Only the expanded right-panel plugin is interactive; the others are
+        // collapsed to their rail icon (routed separately in `handle_mouse`).
+        if layer.surface == UiSurface::RightPanel
+            && !app.right_panel_layer_visible(&entry.plugin_id)
+        {
+            continue;
+        }
+        let area = ui_plugin_owner_surface_rect(
+            app,
+            frame_area,
+            layer.surface,
+            &entry.plugin_id,
+            &entry.module_id,
+        );
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height
+        {
+            continue;
+        }
+        // API v2: absolute-coordinate hit-rects the guest declared take priority
+        // over the line-walked Menu/Tabs hits. API v3 (§4): only these declared
+        // hits carry an owner, so only they can route a `UiEvent::Action`.
+        for hit in &layer.hits {
+            if col >= hit.x
+                && col < hit.x.saturating_add(hit.width)
+                && row >= hit.y
+                && row < hit.y.saturating_add(hit.height)
+            {
+                return Some(UiPluginHit {
+                    action_id: Some(hit.action_id.clone()),
+                    consumes_mouse: layer.consumes_mouse,
+                    declared_hit_owner: Some((
+                        entry.plugin_id.clone(),
+                        entry.module_id.clone(),
+                        entry.negotiated_version,
+                    )),
+                    surface: layer.surface,
+                });
+            }
+        }
+        let mut line_y = area.y;
+        for node in &layer.nodes {
+            let (action, next_line_y) = ui_plugin_node_action_at(app, area, line_y, node, col, row);
+            if action.is_some() || layer.consumes_mouse {
+                return Some(UiPluginHit {
+                    action_id: action,
+                    consumes_mouse: layer.consumes_mouse,
+                    declared_hit_owner: None,
+                    surface: layer.surface,
+                });
+            }
+            line_y = next_line_y;
+            if line_y >= area.y + area.height {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
+    let usage = app
+        .ui_surface_layers
+        .iter()
+        .find(|entry| entry.layer.surface == UiSurface::UsageStrip);
+    tracing::info!(
+        layers = app.ui_surface_layers.len(),
+        usage_nodes = usage.map(|entry| entry.layer.nodes.len()).unwrap_or(0),
+        usage_rect = ?usage.map(|entry| ui_plugin_surface_rect(app, frame.area(), entry.layer.surface)),
+        "render_ui_plugin_layers"
+    );
+    // `ui_surface_layers` is ordered topmost-owner-first (§4:
+    // `(z_index desc, plugin_id asc, module_id asc)`); paint bottom-to-top so the
+    // topmost layer ends up drawn last (visually on top), so walk it reversed.
+    for entry in app.ui_surface_layers.iter().rev() {
+        // Paint only the expanded right-panel plugin; collapsed peers show only
+        // their rail icon (drawn by `render_right_panel_rail`).
+        if entry.layer.surface == UiSurface::RightPanel
+            && !app.right_panel_layer_visible(&entry.plugin_id)
+        {
+            continue;
+        }
+        let area = ui_plugin_owner_surface_rect(
+            app,
+            frame.area(),
+            entry.layer.surface,
+            &entry.plugin_id,
+            &entry.module_id,
+        );
+        if area.width == 0 || area.height == 0 {
+            continue;
+        }
+        render_ui_plugin_layer(app, frame, area, &entry.layer);
+    }
+}
+
+fn render_ui_plugin_layer(app: &AppState, frame: &mut Frame, area: Rect, layer: &UiLayer) {
+    let mut line_y = area.y;
+    for node in &layer.nodes {
+        match node {
+            UiNode::Line { spans } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, spans)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Status { left, right } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                let mut combined = left.clone();
+                if !right.is_empty() {
+                    combined.push(UiTextSpan {
+                        text: " ".into(),
+                        role: Some("muted".into()),
+                        ..Default::default()
+                    });
+                    combined.extend(right.clone());
+                }
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, &combined)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Tabs { items, selected } => {
+                if line_y >= area.y + area.height {
+                    break;
+                }
+                let spans = items
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(idx, item)| {
+                        let role = if idx == *selected {
+                            Some("accent")
+                        } else {
+                            Some("muted")
+                        };
+                        [
+                            UiTextSpan {
+                                text: format!(" {} ", item.label),
+                                role: role.map(str::to_string),
+                                ..Default::default()
+                            },
+                            UiTextSpan {
+                                text: " ".into(),
+                                role: Some("muted".into()),
+                                ..Default::default()
+                            },
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(
+                    Paragraph::new(plugin_line(app, &spans)),
+                    Rect::new(area.x, line_y, area.width, 1),
+                );
+                line_y = line_y.saturating_add(1);
+            }
+            UiNode::Menu {
+                title,
+                items,
+                selected,
+            } => {
+                if line_y < area.y + area.height {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            title.clone(),
+                            plugin_span_style(app, Some("accent")),
+                        ))),
+                        Rect::new(area.x, line_y, area.width, 1),
+                    );
+                    line_y = line_y.saturating_add(1);
+                }
+                for (idx, item) in items.iter().enumerate() {
+                    if line_y >= area.y + area.height {
+                        break;
+                    }
+                    let role = if idx == *selected {
+                        Some("accent")
+                    } else {
+                        None
+                    };
+                    let spans = vec![UiTextSpan {
+                        text: item.label.clone(),
+                        role: role.map(str::to_string),
+                        ..Default::default()
+                    }];
+                    frame.render_widget(
+                        Paragraph::new(plugin_line(app, &spans)),
+                        Rect::new(area.x, line_y, area.width, 1),
+                    );
+                    line_y = line_y.saturating_add(1);
+                }
+            }
+        }
     }
 }
 
@@ -479,16 +1369,23 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
                 &app.palette,
             );
         } else {
+            // feat/native-dashes: keep the toast clear of the native usage strip
+            // and goal panel so render matches the hit-area set in compute_view.
+            let toast_anchor_area = toast_desktop_anchor_area(
+                frame.area(),
+                app.view.usage_strip_rect,
+                app.view.right_panel_rect,
+            );
             render_toast_notification(
                 frame,
-                frame.area(),
+                toast_anchor_area,
                 toast,
                 has_config_diagnostic,
                 toast.position.unwrap_or(app.toast_config.herdr.position),
                 &app.palette,
             );
             toast_rect = Some(toast_notification_rect(
-                frame.area(),
+                toast_anchor_area,
                 toast,
                 has_config_diagnostic,
                 toast.position.unwrap_or(app.toast_config.herdr.position),
@@ -794,6 +1691,8 @@ mod tests {
     #[test]
     fn hide_tab_bar_when_single_tab_toggles_geometry_with_tab_count() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.hide_tab_bar_when_single_tab = true;
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -828,6 +1727,8 @@ mod tests {
     #[tokio::test]
     async fn hide_tab_bar_when_single_tab_resizes_background_tabs_per_workspace() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.hide_tab_bar_when_single_tab = true;
 
         let mut one_tab_workspace = Workspace::test_new("one");
@@ -928,6 +1829,175 @@ mod tests {
     }
 
     #[test]
+    fn compute_view_collapsed_usage_strip_reserves_single_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.usage_strip_enabled = true;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_strip_rect.height, USAGE_STRIP_HEIGHT);
+        let expanded_strip_top = app.view.usage_strip_rect.y;
+
+        // wasm-ui v3 §7.2: collapsing keeps a single clickable row and gives
+        // the reclaimed rows back to the pane area above.
+        app.collapsed_surfaces
+            .insert(herdr_ui_plugin_api::UiSurface::UsageStrip);
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_strip_rect.height, 1);
+        assert!(app.view.usage_strip_rect.y > expanded_strip_top);
+
+        app.collapsed_surfaces
+            .remove(&herdr_ui_plugin_api::UiSurface::UsageStrip);
+        compute_view(&mut app, Rect::new(0, 0, 80, 24));
+        assert_eq!(app.view.usage_strip_rect.height, USAGE_STRIP_HEIGHT);
+    }
+
+    /// A single non-empty RightPanel layer registers a right-panel `UiSurfaceLayer`
+    /// for the carve tests below, mirroring the guest's goal-dash layer.
+    fn right_panel_layer(nodes: Vec<UiNode>) -> crate::ui_plugins::UiSurfaceLayer {
+        crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "builtin.goal-dash".into(),
+            module_id: "goal".into(),
+            negotiated_version: 3,
+            placement: None,
+            layer: UiLayer {
+                surface: UiSurface::RightPanel,
+                z_index: 1,
+                consumes_mouse: true,
+                nodes,
+                hits: Vec::new(),
+                data: None,
+            },
+        }
+    }
+
+    fn goal_line_node() -> UiNode {
+        UiNode::Line {
+            spans: vec![UiTextSpan {
+                text: "MAIN goal".into(),
+                role: Some("accent".into()),
+                bold: false,
+                underline: false,
+                italic: false,
+            }],
+        }
+    }
+
+    fn historial_right_panel_layer(nodes: Vec<UiNode>) -> crate::ui_plugins::UiSurfaceLayer {
+        let mut layer = right_panel_layer(nodes);
+        layer.plugin_id = "builtin.historial-dash".into();
+        layer.module_id = "historial".into();
+        layer
+    }
+
+    #[test]
+    fn compute_view_builds_rail_icons_for_each_right_panel_plugin() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![
+            right_panel_layer(vec![goal_line_node()]),
+            historial_right_panel_layer(vec![goal_line_node()]),
+        ];
+
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+
+        // One rail icon per right-panel plugin; nothing is auto-expanded, so the
+        // panel is an icon-only rail (no content column) and no layer is visible.
+        assert_eq!(app.view.right_panel_rail_icons.len(), 2);
+        assert_eq!(app.active_right_panel, None);
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(!app.view.right_panel_rail_icons.iter().any(|i| i.active));
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.historial-dash"));
+
+        // Clicking an icon expands that plugin: a content column is carved and
+        // only that plugin's layer paints / hit-tests.
+        app.toggle_right_panel("builtin.goal-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
+        assert!(app.right_panel_layer_visible("builtin.goal-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.historial-dash"));
+        // The rail still sits to the right of the content panel.
+        let rail = app.view.right_panel_rail_icons[0].rect;
+        assert!(rail.x >= app.view.right_panel_rect.x + app.view.right_panel_rect.width);
+
+        // Switching the active plugin flips which layer is visible.
+        app.toggle_right_panel("builtin.historial-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.right_panel_layer_visible("builtin.historial-dash"));
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
+    }
+
+    #[test]
+    fn compute_view_carves_right_panel_content_only_when_a_plugin_is_expanded() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        // No module renders RightPanel → dormant (0×0), every column goes to panes.
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(app.view.right_panel_rail_icons.is_empty());
+
+        // A declared-but-empty RightPanel layer carves nothing (no rail either).
+        app.ui_surface_layers = vec![right_panel_layer(Vec::new())];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert!(app.view.right_panel_rail_icons.is_empty());
+
+        // A non-empty RightPanel layer shows the rail, but no content column until
+        // the plugin is expanded.
+        app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert_eq!(app.view.right_panel_rail_icons.len(), 1);
+
+        // Expanding it carves the content panel: auto-width in the [MIN, MAX] range.
+        app.toggle_right_panel("builtin.goal-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
+        assert!(app.view.right_panel_rect.width <= GOAL_PANEL_MAX_WIDTH);
+        assert!(app.view.right_panel_rect.height > 0);
+    }
+
+    #[test]
+    fn compute_view_collapsed_right_panel_falls_back_to_icon_rail() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+
+        // Expand the plugin, then collapse it: collapsing drops the content column
+        // back to the icon-only rail and returns the columns to the pane area.
+        app.toggle_right_panel("builtin.goal-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        let expanded_w = app.view.right_panel_rect.width;
+        assert!(expanded_w >= GOAL_PANEL_MIN_WIDTH);
+
+        app.collapsed_surfaces
+            .insert(herdr_ui_plugin_api::UiSurface::RightPanel);
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert_eq!(app.view.right_panel_rail_icons.len(), 1);
+        assert!(!app.right_panel_layer_visible("builtin.goal-dash"));
+
+        app.collapsed_surfaces
+            .remove(&herdr_ui_plugin_api::UiSurface::RightPanel);
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rect.width, expanded_w);
+    }
+
+    #[test]
     fn compute_view_clamps_sidebar_width_to_configured_max() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
@@ -960,6 +2030,8 @@ mod tests {
     #[test]
     fn hidden_collapsed_sidebar_uses_full_width_terminal_area() {
         let mut app = crate::app::state::AppState::test_new();
+        // fork(wave-1): upstream test predates the usage strip carve; disable it
+        app.usage_strip_enabled = false;
         app.sidebar_collapsed = true;
         app.sidebar_collapsed_mode = crate::config::SidebarCollapsedModeConfig::Hidden;
         app.workspaces = vec![Workspace::test_new("one")];
@@ -1329,6 +2401,420 @@ mod tests {
         )
         .expect("write HEAD");
         root
+    }
+
+    #[test]
+    fn ui_plugin_hit_testing_marks_consumed_overlay() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "overlay".into(),
+            negotiated_version: 2,
+            placement: None,
+            layer: UiLayer {
+                surface: UiSurface::Overlay,
+                z_index: 99,
+                consumes_mouse: true,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: "Consumes".into(),
+                        role: Some("accent".into()),
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
+                }],
+                hits: Vec::new(),
+                data: None,
+            },
+        }];
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let frame_area = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(
+            &app,
+            frame_area,
+            app.view.terminal_area.x,
+            app.view.terminal_area.y,
+        )
+        .expect("plugin hit");
+        assert!(hit.consumes_mouse);
+        assert!(hit.action_id.is_none());
+    }
+
+    #[test]
+    fn ui_plugin_action_hit_testing_finds_tab_action() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: "example.ui-wasm".into(),
+            module_id: "header".into(),
+            negotiated_version: 2,
+            placement: None,
+            layer: UiLayer {
+                surface: UiSurface::Header,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Tabs {
+                    items: vec![herdr_ui_plugin_api::UiActionRef {
+                        id: "plugin:example.ui-wasm:fork".into(),
+                        label: "Fork".into(),
+                    }],
+                    selected: 0,
+                }],
+                hits: Vec::new(),
+                data: None,
+            },
+        }];
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let header = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(
+            &app,
+            header,
+            app.view.terminal_area.x + 1,
+            app.view.terminal_area.y,
+        )
+        .expect("plugin hit");
+        assert_eq!(
+            hit.action_id.as_deref(),
+            Some("plugin:example.ui-wasm:fork")
+        );
+    }
+
+    #[test]
+    fn ui_plugin_surface_layers_render_into_header_and_footer() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.ui_surface_layers = vec![
+            crate::ui_plugins::UiSurfaceLayer {
+                plugin_id: "example.ui-wasm".into(),
+                module_id: "header".into(),
+                negotiated_version: 2,
+                placement: None,
+                layer: UiLayer {
+                    surface: UiSurface::Header,
+                    z_index: 1,
+                    consumes_mouse: false,
+                    nodes: vec![UiNode::Line {
+                        spans: vec![UiTextSpan {
+                            text: "WASM HEADER".into(),
+                            role: Some("accent".into()),
+                            bold: false,
+                            underline: false,
+                            italic: false,
+                        }],
+                    }],
+                    hits: Vec::new(),
+                    data: None,
+                },
+            },
+            crate::ui_plugins::UiSurfaceLayer {
+                plugin_id: "example.ui-wasm".into(),
+                module_id: "footer".into(),
+                negotiated_version: 2,
+                placement: None,
+                layer: UiLayer {
+                    surface: UiSurface::Footer,
+                    z_index: 1,
+                    consumes_mouse: false,
+                    nodes: vec![UiNode::Line {
+                        spans: vec![UiTextSpan {
+                            text: "WASM FOOTER".into(),
+                            role: Some("accent".into()),
+                            bold: false,
+                            underline: false,
+                            italic: false,
+                        }],
+                    }],
+                    hits: Vec::new(),
+                    data: None,
+                },
+            },
+        ];
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20))
+            .expect("test terminal");
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("WASM HEADER"));
+        assert!(rendered.contains("WASM FOOTER"));
+    }
+
+    fn panel_placement(
+        region: crate::api::schema::PluginPanelRegion,
+        align: crate::api::schema::PluginPanelAlign,
+        size: Option<&str>,
+        min_peer: u16,
+    ) -> crate::api::schema::PluginPanelPlacement {
+        crate::api::schema::PluginPanelPlacement {
+            region,
+            align,
+            size: size.map(str::to_string),
+            min_peer,
+            z: 50,
+        }
+    }
+
+    /// A generic `Panel` layer for `plugin_id:module_id` with the given text and
+    /// placement — mirrors what button-dash (and any future panel) emits.
+    fn panel_layer(
+        plugin_id: &str,
+        module_id: &str,
+        text: &str,
+        placement: crate::api::schema::PluginPanelPlacement,
+    ) -> crate::ui_plugins::UiSurfaceLayer {
+        crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: plugin_id.into(),
+            module_id: module_id.into(),
+            negotiated_version: 3,
+            placement: Some(placement),
+            layer: UiLayer {
+                surface: UiSurface::Panel,
+                z_index: 50,
+                consumes_mouse: false,
+                nodes: vec![UiNode::Line {
+                    spans: vec![UiTextSpan {
+                        text: text.into(),
+                        role: Some("accent".into()),
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
+                }],
+                hits: Vec::new(),
+                data: None,
+            },
+        }
+    }
+
+    /// The default button-dash placement: bottom_band, align end, auto size,
+    /// min_peer 24 — reproduces the old `BottomDash` behavior from DATA.
+    fn bottom_band_layer(text: &str) -> crate::ui_plugins::UiSurfaceLayer {
+        panel_layer(
+            "builtin.button-dash",
+            "button-ui",
+            text,
+            panel_placement(
+                crate::api::schema::PluginPanelRegion::BottomBand,
+                crate::api::schema::PluginPanelAlign::End,
+                Some("auto"),
+                24,
+            ),
+        )
+    }
+
+    fn app_with_usage_strip() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.usage_strip_enabled = true;
+        app
+    }
+
+    fn only_panel_rect(app: &crate::app::state::AppState) -> Rect {
+        assert_eq!(app.view.panel_rects.len(), 1, "expected exactly one panel");
+        app.view.panel_rects[0].rect
+    }
+
+    #[test]
+    fn bottom_band_panel_carves_a_disjoint_slot_beside_usage_strip() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![bottom_band_layer("[Restart hr]  [x]")];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+
+        let usage = app.view.usage_strip_rect;
+        let dash = only_panel_rect(&app);
+        assert!(usage.width > 0, "usage strip should be carved");
+        assert!(dash.width > 0, "panel should be carved when content exists");
+        // Same bottom band (y/height), side by side, no horizontal overlap.
+        assert_eq!(usage.y, dash.y);
+        assert_eq!(usage.height, dash.height);
+        assert_eq!(
+            usage.x + usage.width,
+            dash.x,
+            "dash sits flush right of usage"
+        );
+        assert!(
+            dash.x >= usage.x + usage.width,
+            "no overlap with usage strip"
+        );
+        // Snug to content width ("[Restart hr]  [x]" = 17 cells).
+        assert_eq!(dash.width, 17);
+    }
+
+    #[test]
+    fn no_panel_slot_without_content() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = Vec::new();
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        assert!(app.view.usage_strip_rect.width > 0);
+        assert!(app.view.panel_rects.is_empty());
+    }
+
+    #[test]
+    fn bottom_band_align_start_docks_left_of_usage() {
+        // Placement is DATA: flipping align to Start moves the slot to the LEFT
+        // with NO host code change — the hot-reload proof, exercised in a test.
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![panel_layer(
+            "p",
+            "m",
+            "[go]",
+            panel_placement(
+                crate::api::schema::PluginPanelRegion::BottomBand,
+                crate::api::schema::PluginPanelAlign::Start,
+                Some("auto"),
+                24,
+            ),
+        )];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        let usage = app.view.usage_strip_rect;
+        let dash = only_panel_rect(&app);
+        // Start-aligned: the slot sits at the LEFT of the band (flush against the
+        // band's left edge, which is the pane area's left, not necessarily 0),
+        // and the usage peer takes the rest to its right.
+        assert!(dash.x < usage.x, "start-aligned slot sits left of usage");
+        assert_eq!(
+            dash.x + dash.width,
+            usage.x,
+            "usage sits flush right of slot"
+        );
+        assert_eq!(dash.y, usage.y);
+        assert_eq!(dash.height, usage.height);
+    }
+
+    #[test]
+    fn bottom_band_respects_min_peer_width() {
+        // A wide panel is clamped so the usage peer keeps at least min_peer cols.
+        let mut app = app_with_usage_strip();
+        app.usage_strip_enabled = true;
+        app.ui_surface_layers = vec![panel_layer(
+            "p",
+            "m",
+            &"X".repeat(300),
+            panel_placement(
+                crate::api::schema::PluginPanelRegion::BottomBand,
+                crate::api::schema::PluginPanelAlign::End,
+                Some("auto"),
+                40,
+            ),
+        )];
+        compute_view(&mut app, Rect::new(0, 0, 120, 40));
+        let usage = app.view.usage_strip_rect;
+        let dash = only_panel_rect(&app);
+        assert!(
+            usage.width >= 40,
+            "usage peer keeps at least min_peer=40 cols"
+        );
+        assert_eq!(usage.x + usage.width, dash.x, "no overlap");
+    }
+
+    #[test]
+    fn right_region_panel_carves_a_column_band_from_panes() {
+        // A brand-new panel docks on the RIGHT purely by manifest DATA (region),
+        // shrinking the pane area — no host enum entry, proving genericity.
+        let mut app = app_with_usage_strip();
+        let before = {
+            compute_view(&mut app, Rect::new(0, 0, 200, 40));
+            app.view.terminal_area
+        };
+        app.ui_surface_layers = vec![panel_layer(
+            "demo",
+            "side",
+            "right-dock",
+            panel_placement(
+                crate::api::schema::PluginPanelRegion::Right,
+                crate::api::schema::PluginPanelAlign::End,
+                Some("20"),
+                24,
+            ),
+        )];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        let panel = only_panel_rect(&app);
+        let panes = app.view.terminal_area;
+        assert_eq!(panel.width, 20, "size=20 cells from data");
+        assert_eq!(panes.x + panes.width, panel.x, "panel flush right of panes");
+        assert!(panes.width < before.width, "panes shrank to make room");
+        assert_eq!(panel.height, panes.height, "right band spans pane height");
+    }
+
+    #[test]
+    fn panel_placement_parses_from_manifest_toml() {
+        // The placement schema is DATA parsed from the ui_module manifest.
+        let module: crate::api::schema::PluginManifestUiModule = toml::from_str(
+            r#"
+            id = "button-ui"
+            title = "Button Dash"
+            api_version = 3
+            module = "x.wasm"
+            surfaces = ["panel"]
+            [placement]
+            region = "bottom_band"
+            align = "end"
+            size = "auto"
+            min_peer = 24
+            z = 50
+            "#,
+        )
+        .expect("manifest parses");
+        let p = module.placement.expect("placement present");
+        assert_eq!(p.region, crate::api::schema::PluginPanelRegion::BottomBand);
+        assert_eq!(p.align, crate::api::schema::PluginPanelAlign::End);
+        assert_eq!(p.size.as_deref(), Some("auto"));
+        assert_eq!(p.min_peer, 24);
+        assert_eq!(p.z, 50);
+    }
+
+    #[test]
+    fn panel_hit_is_disjoint_from_usage_strip_rect() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![bottom_band_layer("[go]")];
+        compute_view(&mut app, Rect::new(0, 0, 200, 40));
+        let dash = only_panel_rect(&app);
+        let usage = app.view.usage_strip_rect;
+        assert!(dash.width > 0);
+
+        // The real guest offsets its hit-rects by the slot origin (host
+        // hit-testing is absolute). Mirror that: declare a hit at the slot's
+        // absolute origin, then re-run hit resolution against the laid-out view.
+        app.ui_surface_layers[0].layer.hits = vec![herdr_ui_plugin_api::UiHitRect {
+            x: dash.x,
+            y: dash.y,
+            width: 4,
+            height: 1,
+            action_id: "go".into(),
+        }];
+        let frame_area = ui_plugin_frame_area(&app);
+        let hit = ui_plugin_hit_at(&app, frame_area, dash.x, dash.y).expect("panel hit");
+        assert_eq!(hit.action_id.as_deref(), Some("go"));
+        assert_eq!(hit.surface, UiSurface::Panel);
+        // A click inside the usage strip must NOT resolve to the panel action.
+        let in_usage = ui_plugin_hit_at(&app, frame_area, usage.x, usage.y);
+        assert!(
+            in_usage
+                .as_ref()
+                .map(|h| h.surface != UiSurface::Panel)
+                .unwrap_or(true),
+            "usage-strip click must not hit the panel"
+        );
     }
 
     #[test]

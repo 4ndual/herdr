@@ -15,7 +15,12 @@ mod integration;
 mod notification;
 mod pane;
 mod plugin;
+<<<<<<< HEAD
 mod protocol_guard;
+||||||| 299dd416
+=======
+mod resume_picker;
+>>>>>>> task/wave1-integration
 mod runtime;
 mod server;
 mod spec;
@@ -97,6 +102,13 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
+<<<<<<< HEAD
+||||||| 299dd416
+        "wait" => run_wait_command(&args[2..])?,
+=======
+        "resume-picker" => resume_picker::run_resume_picker_command(&args[2..])?,
+        "wait" => run_wait_command(&args[2..])?,
+>>>>>>> task/wave1-integration
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
@@ -129,6 +141,11 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: herdr channel set <stable|preview>");
         return Ok(2);
     };
+
+    if let Some(reason) = crate::update::fork_build_self_update_rejection_for_current_build() {
+        eprintln!("{reason}.");
+        return Ok(1);
+    }
 
     if let Some(reason) = channel_set_rejection(
         channel,

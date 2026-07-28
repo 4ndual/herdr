@@ -233,6 +233,8 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    #[serde(rename = "resume_picker.open")]
+    ResumePickerOpen(ResumePickerOpenParams),
 }
 
 #[cfg(test)]

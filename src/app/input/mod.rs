@@ -84,6 +84,12 @@ impl App {
             return;
         }
 
+        if self.ui_plugins.dispatch_crossterm_key_event(key_event) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+            self.request_render();
+        }
+
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
@@ -111,6 +117,7 @@ impl App {
                 Mode::Navigator => {
                     handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
                 }
+                Mode::ResumePicker => self.handle_resume_picker_key(key),
                 Mode::Terminal => unreachable!(),
             },
         }
@@ -253,11 +260,48 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+<<<<<<< HEAD
         if self.state.popup_pane.is_some() {
             self.handle_popup_mouse(mouse);
             return;
         }
+||||||| 299dd416
+=======
+        // fork(f5-mouse-dedupe): the raw MouseAll broadcast is deduped per module
+        // against each module's declared hit-rects inside the manager (see
+        // `UiPluginManager::should_deliver_raw_mouse`), so a module whose current
+        // layers own this cell does not also see the click here and via the
+        // hit-rect path in `AppState::handle_mouse`/`ui_plugin_hit_at`.
+        if self.ui_plugins.dispatch_crossterm_mouse_event(mouse) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+            self.request_render();
+        }
+
+>>>>>>> task/wave1-integration
         if self.handle_overlay_mouse(mouse) {
+            return;
+        }
+
+        // feat/native-dashes: the usage strip and goal panel are herdr UI
+        // regions, not panes — route mouse landing on them to the cores before
+        // any pane/sidebar handling.
+        //
+        // fork(wave-1): cells where a v3 module declared a `UiHitRect` are owned
+        // by that module (spec §4) and must reach the `ui_plugin_hit_at` Action
+        // routing further down — the legacy usage-core shim only swallows strip
+        // events nobody claimed. v2 declared hits (usage-dash's own controls)
+        // still resolve through the shim via `usage_view.hits`.
+        let v3_owned_cell = crate::ui::ui_plugin_hit_at(
+            &self.state,
+            crate::ui::ui_plugin_frame_area(&self.state),
+            mouse.column,
+            mouse.row,
+        )
+        .and_then(|hit| hit.declared_hit_owner)
+        .is_some_and(|(_, _, negotiated_version)| negotiated_version == 3);
+        if !v3_owned_cell && crate::usage_host::route_mouse(self, mouse) {
+            self.request_render();
             return;
         }
 

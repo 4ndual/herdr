@@ -4,6 +4,8 @@ pub(crate) mod client_accept;
 pub(crate) mod client_transport;
 pub(crate) mod clients;
 pub(crate) mod clipboard_image;
+// fork: pure foreground-assignment policy (hysteresis + idle demotion).
+pub(crate) mod foreground_policy;
 #[cfg(unix)]
 pub(crate) mod handoff;
 pub mod headless;

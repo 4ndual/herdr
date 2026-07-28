@@ -20,3 +20,13 @@ id = "board"
 title = "Board"
 placement = "overlay"
 command = ["herdr", "workspace", "list"]
+
+[[ui_modules]]
+id = "smoke-ui"
+title = "Smoke UI"
+kind = "wasm"
+api_version = 1
+module = "dist/smoke-ui.wasm"
+hot_reload = "on"
+surfaces = ["header", "footer", "tab_bar", "right_panel", "overlay", "context_menu"]
+capabilities = ["focused_session", "mouse_all", "context_menu_augment", "clipboard_write", "pane_input"]

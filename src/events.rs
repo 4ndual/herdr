@@ -152,6 +152,14 @@ pub enum AppEvent {
         stderr: String,
         error: Option<String>,
     },
+    /// fork(wave-2): an out-of-process UI-plugin collector run finished. Carries
+    /// the parsed sticky outcome (or a failure reason) for the module's snapshot;
+    /// the consumer applies it and clears the in-flight marker.
+    CollectorFinished {
+        plugin_id: String,
+        module_id: String,
+        result: Result<crate::plugin_collector::CollectorOutcome, String>,
+    },
     /// Background `git worktree add` completed.
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.

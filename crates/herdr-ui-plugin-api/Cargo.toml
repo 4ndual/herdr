@@ -1,0 +1,17 @@
+[package]
+name = "herdr-ui-plugin-api"
+version = "0.1.0"
+edition = "2021"
+description = "Versioned host/plugin contract for Herdr WASM UI modules"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = { version = "0.30", default-features = false, optional = true }
+
+[features]
+# Enabled by WASM guest crates that render with ratatui into an off-screen
+# Buffer and flatten it back to UiNode::Line rows. The host never enables it.
+guest = ["dep:ratatui"]
+

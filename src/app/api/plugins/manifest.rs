@@ -1,7 +1,18 @@
 use crate::api::schema::{
+<<<<<<< HEAD
     InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
     PluginManifestLinkHandler, PluginManifestPane, PluginManifestStartup, PluginPanePlacement,
     PluginPlatform, PluginSourceInfo, PluginSourceKind,
+||||||| 299dd416
+    InstalledPluginInfo, PluginManifestAction, PluginManifestBuild, PluginManifestEventHook,
+    PluginManifestLinkHandler, PluginManifestPane, PluginPanePlacement, PluginPlatform,
+    PluginSourceInfo, PluginSourceKind,
+=======
+    InstalledPluginInfo, PluginHotReloadMode, PluginManifestAction, PluginManifestBuild,
+    PluginManifestEventHook, PluginManifestLinkHandler, PluginManifestPane, PluginManifestUiModule,
+    PluginPanePlacement, PluginPlatform, PluginSourceInfo, PluginSourceKind, PluginUiCapability,
+    PluginUiModuleKind, PluginUiSurface,
+>>>>>>> task/wave1-integration
 };
 use crate::popup_size::PopupSize;
 
@@ -29,6 +40,8 @@ struct RawPluginManifest {
     events: Vec<RawPluginManifestEventHook>,
     #[serde(default)]
     panes: Vec<RawPluginManifestPane>,
+    #[serde(default)]
+    ui_modules: Vec<RawPluginManifestUiModule>,
     #[serde(default)]
     link_handlers: Vec<RawPluginManifestLinkHandler>,
 }
@@ -93,6 +106,39 @@ struct RawPluginManifestLinkHandler {
     action: String,
     #[serde(default)]
     platforms: Option<Vec<RawPlatform>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPluginManifestUiModule {
+    id: String,
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    platforms: Option<Vec<RawPlatform>>,
+    #[serde(default)]
+    kind: PluginUiModuleKind,
+    api_version: u32,
+    module: String,
+    #[serde(default)]
+    hot_reload: PluginHotReloadMode,
+    #[serde(default)]
+    surfaces: Vec<PluginUiSurface>,
+    // Data-driven placement for the `panel` surface; validated only at layout
+    // time (host clamps/parses region/align/size/min_peer), so it needs no
+    // normalization here.
+    #[serde(default)]
+    placement: Option<crate::api::schema::PluginPanelPlacement>,
+    #[serde(default)]
+    capabilities: Vec<PluginUiCapability>,
+    #[serde(default)]
+    ui_input_file: Option<String>,
+    // fork: optional host-consumed image filename (see PluginManifestUiModule::image_file).
+    #[serde(default)]
+    image_file: Option<String>,
+    // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
+    #[serde(default)]
+    collector: Option<Vec<String>>,
 }
 
 /// Raw string platform value from the manifest, validated before conversion.
@@ -192,6 +238,13 @@ pub(crate) fn load_plugin_manifest(
         .collect::<Result<Vec<_>, _>>()?;
     reject_duplicate_pane_ids(&panes)?;
     panes.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut ui_modules = raw
+        .ui_modules
+        .into_iter()
+        .map(normalize_manifest_ui_module)
+        .collect::<Result<Vec<_>, _>>()?;
+    reject_duplicate_ui_module_ids(&ui_modules)?;
+    ui_modules.sort_by(|a, b| a.id.cmp(&b.id));
     let link_handlers = raw
         .link_handlers
         .into_iter()
@@ -204,6 +257,7 @@ pub(crate) fn load_plugin_manifest(
     if platforms.is_none() {
         warnings.push("manifest does not declare platforms; platform support unknown".to_string());
     }
+    warnings.extend(validate_ui_module_paths(&plugin_root, &ui_modules));
 
     Ok(InstalledPluginInfo {
         plugin_id,
@@ -220,10 +274,41 @@ pub(crate) fn load_plugin_manifest(
         actions,
         events,
         panes,
+        ui_modules,
         link_handlers,
         source: Default::default(),
         warnings,
     })
+}
+
+fn validate_ui_module_paths(
+    plugin_root: &std::path::Path,
+    ui_modules: &[PluginManifestUiModule],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for module in ui_modules {
+        let path = plugin_root.join(&module.module);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => warnings.push(format!(
+                "ui module {} path is not a file: {}",
+                module.id,
+                path.display()
+            )),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => warnings.push(format!(
+                "ui module {} file not found: {}",
+                module.id,
+                path.display()
+            )),
+            Err(err) => warnings.push(format!(
+                "ui module {} could not be read at {}: {}",
+                module.id,
+                path.display(),
+                err
+            )),
+        }
+    }
+    warnings
 }
 
 fn validate_min_herdr_version(value: Option<&str>) -> Result<String, (&'static str, String)> {
@@ -347,6 +432,21 @@ fn reject_duplicate_pane_ids(panes: &[PluginManifestPane]) -> Result<(), (&'stat
     Ok(())
 }
 
+fn reject_duplicate_ui_module_ids(
+    modules: &[PluginManifestUiModule],
+) -> Result<(), (&'static str, String)> {
+    let mut seen = std::collections::HashSet::new();
+    for module in modules {
+        if !seen.insert(module.id.as_str()) {
+            return Err((
+                "duplicate_plugin_ui_module_id",
+                format!("duplicate ui module id '{}'", module.id),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_link_handler_ids(
     handlers: &[PluginManifestLinkHandler],
 ) -> Result<(), (&'static str, String)> {
@@ -440,6 +540,117 @@ fn normalize_manifest_pane(
         height: pane.height,
         command,
     })
+}
+
+fn normalize_manifest_ui_module(
+    module: RawPluginManifestUiModule,
+) -> Result<PluginManifestUiModule, (&'static str, String)> {
+    let id = normalize_action_id(&module.id).ok_or_else(|| {
+        (
+            "invalid_plugin_ui_module_id",
+            "invalid ui module id".to_string(),
+        )
+    })?;
+    let title = non_empty_trimmed(
+        &module.title,
+        "invalid_plugin_ui_module_title",
+        "ui module title is required",
+    )?;
+    let description = module
+        .description
+        .map(|description| description.trim().to_string())
+        .filter(|description| !description.is_empty());
+    let platforms = normalize_platforms(module.platforms)?;
+    let module_path = non_empty_trimmed(
+        &module.module,
+        "invalid_plugin_ui_module_path",
+        "ui module path is required",
+    )?;
+    if module.api_version == 0 {
+        return Err((
+            "invalid_plugin_ui_module_api_version",
+            "ui module api_version must be >= 1".to_string(),
+        ));
+    }
+    if module.surfaces.is_empty() {
+        return Err((
+            "invalid_plugin_ui_module_surfaces",
+            "ui module surfaces must declare at least one host surface".to_string(),
+        ));
+    }
+    let ui_input_file = match module.ui_input_file {
+        Some(name) => Some(normalize_ui_input_file(&name)?),
+        None => None,
+    };
+    // fork: image_file is a single path segment resolved against the plugin
+    // directory host-side; reuse the same single-segment guard as ui_input_file
+    // so a bad declaration can never escape the module's own directory.
+    let image_file = match module.image_file {
+        Some(name) => Some(normalize_image_file(&name)?),
+        None => None,
+    };
+    // fork(wave-2): a declared collector is an argv the host will execute, so it
+    // is normalized through the same non-empty-argv check as event/action/pane
+    // commands (`normalize_command`), keeping the gate identical.
+    let collector = match module.collector {
+        Some(command) => Some(normalize_command(command)?),
+        None => None,
+    };
+    Ok(PluginManifestUiModule {
+        id,
+        title,
+        description,
+        platforms,
+        kind: module.kind,
+        api_version: module.api_version,
+        module: module_path,
+        hot_reload: module.hot_reload,
+        surfaces: module.surfaces,
+        placement: module.placement,
+        capabilities: module.capabilities,
+        ui_input_file,
+        image_file,
+        collector,
+    })
+}
+
+/// Validate a module's `image_file`: a single non-empty path segment, no
+/// separators, no parent refs. Rejecting a bad name at manifest load keeps the
+/// host-side loader confined to the module's own directory.
+fn normalize_image_file(name: &str) -> Result<String, (&'static str, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err((
+            "invalid_plugin_ui_image_file",
+            "ui module image_file must be a single path segment".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a module's `ui_input_file` (spec §7.1): a single non-empty path
+/// segment, with no separators and no parent refs. A rejected name fails
+/// manifest load so a bad declaration can never resolve outside the module's
+/// own `HERDR_PLUGIN_STATE_DIR`.
+fn normalize_ui_input_file(name: &str) -> Result<String, (&'static str, String)> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return Err((
+            "invalid_plugin_ui_input_file",
+            "ui module ui_input_file must be a single path segment".to_string(),
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn normalize_manifest_event(
@@ -607,4 +818,182 @@ fn normalize_local_identifier(value: &str, max_chars: usize) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')))
     .then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_module_requires_surface_and_api_version() {
+        let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 0,
+            module: "dist/goal.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::RightPanel],
+            placement: None,
+            capabilities: vec![PluginUiCapability::FocusedSession],
+            ui_input_file: None,
+            image_file: None,
+            collector: None,
+        })
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
+
+        let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: "dist/goal.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![],
+            placement: None,
+            capabilities: vec![PluginUiCapability::FocusedSession],
+            ui_input_file: None,
+            image_file: None,
+            collector: None,
+        })
+        .unwrap_err();
+        assert_eq!(err.0, "invalid_plugin_ui_module_surfaces");
+    }
+
+    #[test]
+    fn ui_module_normalizes_wasm_panel_manifest() {
+        let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: " Goal UI ".into(),
+            description: Some(" Native overlays ".into()),
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: " dist/goal.wasm ".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![
+                PluginUiSurface::Header,
+                PluginUiSurface::Footer,
+                PluginUiSurface::TabBar,
+                PluginUiSurface::RightPanel,
+                PluginUiSurface::Overlay,
+                PluginUiSurface::ContextMenu,
+            ],
+            placement: None,
+            capabilities: vec![
+                PluginUiCapability::FocusedSession,
+                PluginUiCapability::MouseAll,
+                PluginUiCapability::ContextMenuAugment,
+            ],
+            ui_input_file: None,
+            image_file: None,
+            collector: None,
+        })
+        .unwrap();
+        assert_eq!(module.id, "goal-ui");
+        assert_eq!(module.title, "Goal UI");
+        assert_eq!(module.description.as_deref(), Some("Native overlays"));
+        assert_eq!(module.module, "dist/goal.wasm");
+        assert_eq!(module.api_version, 1);
+        assert_eq!(module.surfaces.len(), 6);
+    }
+
+    fn ui_module_with_input_file(name: &str) -> RawPluginManifestUiModule {
+        RawPluginManifestUiModule {
+            id: "usage".into(),
+            title: "Usage".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 3,
+            module: "dist/usage.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::UsageStrip],
+            placement: None,
+            capabilities: vec![PluginUiCapability::LayoutRead],
+            ui_input_file: Some(name.into()),
+            image_file: None,
+            collector: None,
+        }
+    }
+
+    #[test]
+    fn ui_input_file_accepts_single_segment_and_trims() {
+        let module = normalize_manifest_ui_module(ui_module_with_input_file(" usage_input.json "))
+            .expect("plain filename is accepted");
+        assert_eq!(module.ui_input_file.as_deref(), Some("usage_input.json"));
+    }
+
+    #[test]
+    fn ui_input_file_rejects_path_traversal_and_separators() {
+        for bad in [
+            "../escape.json",
+            "sub/dir.json",
+            "..",
+            ".",
+            "a\\b.json",
+            "   ",
+        ] {
+            let err = normalize_manifest_ui_module(ui_module_with_input_file(bad))
+                .expect_err("traversal/separator names must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_input_file");
+        }
+    }
+
+    // fork: image_file normalization mirrors ui_input_file's single-segment guard.
+    #[test]
+    fn image_file_accepts_single_segment_and_rejects_separators() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.image_file = Some(" demo-image.png ".to_string());
+        let module = normalize_manifest_ui_module(raw).expect("plain image filename is accepted");
+        assert_eq!(module.image_file.as_deref(), Some("demo-image.png"));
+
+        for bad in ["../escape.png", "sub/dir.png", "..", ".", "a\\b.png", "   "] {
+            let mut raw = ui_module_with_input_file("usage_input.json");
+            raw.image_file = Some(bad.to_string());
+            let err = normalize_manifest_ui_module(raw)
+                .expect_err("traversal/separator image names must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_image_file");
+        }
+    }
+
+    // fork(wave-2): collector argv parsing.
+    #[test]
+    fn collector_argv_parses_and_round_trips() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec![
+            "../../target/release/usage-dash-collector".into(),
+            "--once".into(),
+        ]);
+        let module = normalize_manifest_ui_module(raw).expect("collector argv is accepted");
+        assert_eq!(
+            module.collector.as_deref(),
+            Some(
+                [
+                    "../../target/release/usage-dash-collector".to_string(),
+                    "--once".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn collector_empty_argv_is_rejected_like_other_commands() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec![]);
+        let err = normalize_manifest_ui_module(raw).expect_err("empty collector argv is rejected");
+        assert_eq!(err.0, "invalid_plugin_command");
+
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.collector = Some(vec!["".into()]);
+        let err =
+            normalize_manifest_ui_module(raw).expect_err("blank collector argv0 is rejected");
+        assert_eq!(err.0, "invalid_plugin_command");
+    }
 }

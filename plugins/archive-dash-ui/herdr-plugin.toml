@@ -1,0 +1,224 @@
+id = "builtin.archive-dash"
+name = "Archive Dash"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Archive a pane's session and restore/fork/delete it from a compact chip widget (wasm render)"
+platforms = ["linux", "macos", "windows"]
+
+# Build the guest wasm module in this plugin dir; the wasm lands at the module
+# path below (honoring CARGO_TARGET_DIR when the environment sets one).
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+# ── archive ───────────────────────────────────────────────────────────────────
+# Close the CURRENT (focused) pane and SAVE it into the archive store. Resolves
+# the pane from HERDR_PANE_ID (falls back to the focused pane), reads its
+# agent/session/cwd/workspace via `herdr pane get`, generates a short résumé,
+# appends a JSON record to ~/.herdr-archive/archive.json, regenerates the
+# widget's state-dir input file, THEN closes the pane's tab. Detached so it
+# outlives the action runner (it closes the pane it was invoked from).
+[[actions]]
+id = "archive"
+title = "Archive pane"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-pane.sh\" >/dev/null 2>&1 &"]
+
+# ── restore / fork / delete slot actions ──────────────────────────────────────
+# Host plugin actions are param-less. The widget shows the 10 most-recent
+# archived items as chips in a fixed slot order (slot 1 = newest). A click on the
+# chip at slot N invokes the matching `<verb>-slot-N` action; the script sorts
+# ~/.herdr-archive/archive.json by ts desc and selects the Nth record. This is
+# the chosen mechanism for passing the "which entry" parameter without a guest
+# filesystem or api_input (see scripts/archive-op.sh header for the rationale).
+#   restore = resume the SAME session (no fork flag) in a new tab
+#   fork    = resume with each agent's fork flag (fresh session id) in a new tab
+#   delete  = drop the record from the store and regenerate the input file
+
+[[actions]]
+id = "restore-slot-1"
+title = "Restore #1"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 1 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-2"
+title = "Restore #2"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 2 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-3"
+title = "Restore #3"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 3 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-4"
+title = "Restore #4"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 4 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-5"
+title = "Restore #5"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 5 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-6"
+title = "Restore #6"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 6 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-7"
+title = "Restore #7"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 7 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-8"
+title = "Restore #8"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 8 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-9"
+title = "Restore #9"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 9 >/dev/null 2>&1 &"]
+[[actions]]
+id = "restore-slot-10"
+title = "Restore #10"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" restore 10 >/dev/null 2>&1 &"]
+
+[[actions]]
+id = "fork-slot-1"
+title = "Fork #1"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 1 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-2"
+title = "Fork #2"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 2 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-3"
+title = "Fork #3"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 3 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-4"
+title = "Fork #4"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 4 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-5"
+title = "Fork #5"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 5 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-6"
+title = "Fork #6"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 6 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-7"
+title = "Fork #7"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 7 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-8"
+title = "Fork #8"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 8 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-9"
+title = "Fork #9"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 9 >/dev/null 2>&1 &"]
+[[actions]]
+id = "fork-slot-10"
+title = "Fork #10"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" fork 10 >/dev/null 2>&1 &"]
+
+[[actions]]
+id = "delete-slot-1"
+title = "Delete #1"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 1 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-2"
+title = "Delete #2"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 2 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-3"
+title = "Delete #3"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 3 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-4"
+title = "Delete #4"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 4 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-5"
+title = "Delete #5"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 5 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-6"
+title = "Delete #6"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 6 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-7"
+title = "Delete #7"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 7 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-8"
+title = "Delete #8"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 8 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-9"
+title = "Delete #9"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 9 >/dev/null 2>&1 &"]
+[[actions]]
+id = "delete-slot-10"
+title = "Delete #10"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/archive-op.sh\" delete 10 >/dev/null 2>&1 &"]
+
+# ── widget module ─────────────────────────────────────────────────────────────
+[[ui_modules]]
+id = "archive-ui"
+title = "Archive Dash"
+description = "Compact chips of the 10 most-recent archived sessions; hover=résumé, left-click=restore, right-click=[fork][del]"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/herdr_archive_dash_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+# The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
+# (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. Our
+# archive/restore/delete scripts WRITE it (last-10, newest first); no collector
+# and no host writer is involved (unlike usage-dash / goal-dash).
+ui_input_file = "archive_input.json"
+# mouse_all + NO declarative hit-rects: chips resolve clicks AND hover (for the
+# résumé tooltip + the right-click [fork][del] menu) from the raw mouse stream.
+# The host suppresses raw mouse (incl. hover Move) over declared hit-rects (F5
+# dedupe), so hover REQUIRES the raw-mouse + no-hits pattern. api_read/api_write
+# are held for future guest-side API use; today all mutations go through the
+# slot-action scripts.
+capabilities = ["layout_read", "toasts", "api_read", "api_write", "mouse_all"]
+
+# Carve a slot on the LEFT (start) of the bottom band, leaving the usage dash at
+# least 24 columns. button-dash carves the RIGHT (end) of the same band; the two
+# panels don't overlap. "auto" would regrow the panel to the widest row each
+# frame — but our detail rows (tooltip / menu) are kept NARROWER than the chip
+# strip, so the strip is always the widest row and the panel width is stable on
+# hover; we still pin a percentage so a long chip strip can't starve the band.
+[ui_modules.placement]
+region = "bottom_band"
+align = "end"
+size = "30%"
+min_peer = 24
+z = 50

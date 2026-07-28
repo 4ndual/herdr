@@ -58,6 +58,8 @@ pub struct InstalledPluginInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub panes: Vec<PluginManifestPane>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_modules: Vec<PluginManifestUiModule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub link_handlers: Vec<PluginManifestLinkHandler>,
     #[serde(default)]
     pub source: PluginSourceInfo,
@@ -288,6 +290,172 @@ pub struct PluginManifestLinkHandler {
     pub platforms: Option<Vec<PluginPlatform>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginManifestUiModule {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<PluginPlatform>>,
+    #[serde(default)]
+    pub kind: PluginUiModuleKind,
+    pub api_version: u32,
+    pub module: String,
+    #[serde(default)]
+    pub hot_reload: PluginHotReloadMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<PluginUiSurface>,
+    /// Data-driven placement for this module's `Panel` surface. Only consulted
+    /// when the module declares the `panel` surface; ignored otherwise. `None`
+    /// falls back to the `PluginPanelPlacement` default (free overlay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PluginPanelPlacement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<PluginUiCapability>,
+    /// Optional single path segment (no separators, no `..`) naming a file under
+    /// this module's `HERDR_PLUGIN_STATE_DIR`. When declared, the host reads the
+    /// file each frame (size-capped, mtime-cached) and injects its contents as
+    /// `HERDR_PLUGIN_UI_INPUT_JSON` in the module's frame env (spec §7.1). The
+    /// plugin's own process side writes the file; the host never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_input_file: Option<String>,
+    /// fork: optional single path segment naming an image file under this
+    /// module's plugin directory. When declared, the HOST loads it and paints
+    /// it over the module's surface `Rect` (kitty transmit path, or half-block
+    /// fallback). Purely host-consumed — it never crosses the wasm guest ABI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file: Option<String>,
+    /// fork(wave-2): optional argv naming a command the host executes on each
+    /// dashboard tick to PRODUCE this module's snapshot out-of-process, so
+    /// collection logic hot-reloads (rebuild the bin) without a host rebuild.
+    /// Relative `argv[0]` is resolved against `plugin_root` at exec time. The
+    /// host gates and spawns it exactly like a plugin `event`/`action` command
+    /// (same executor path); the child receives `HERDR_PLUGIN_STATE_DIR` and
+    /// `HERDR_FOCUS_JSON`, and answers on stdout with the sticky snapshot
+    /// protocol (`{"outcome":"replace","snapshot":{…}}` | `{"outcome":"keep"}`
+    /// | `{"outcome":"clear"}`). Only meaningful together with `ui_input_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiModuleKind {
+    #[default]
+    Wasm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHotReloadMode {
+    Off,
+    #[default]
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiSurface {
+    Header,
+    Footer,
+    TabBar,
+    Sidebar,
+    RightPanel,
+    Overlay,
+    ContextMenu,
+    /// The multi-row usage dashboard strip (host `usage_strip_rect`). API v2.
+    UsageStrip,
+    /// A generic, plugin-placed panel whose rect the host lays out from the
+    /// module manifest `placement` spec (region/align/size/min_peer/z) rather
+    /// than a hardcoded per-variant match. Adding/moving/resizing a panel is a
+    /// pure manifest edit (hot-reload), no host rebuild.
+    Panel,
+}
+
+/// Data-driven placement for a `Panel` surface (schema mirror of the host's
+/// generic panel layout). Every field is manifest DATA, so a plugin controls
+/// where it renders with no host/enum change. Defaults reproduce a free overlay
+/// with a snug (content-sized) box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PluginPanelPlacement {
+    /// Which region the panel occupies / carves from.
+    #[serde(default)]
+    pub region: PluginPanelRegion,
+    /// Where the panel sits along the carve axis of its region. Meaningful for
+    /// `bottom_band` (which side of the usage band) and `free` (anchor within
+    /// the pane area); edge regions (`left`/`right`/`top`/`bottom`) already
+    /// encode their edge.
+    #[serde(default)]
+    pub align: PluginPanelAlign,
+    /// Extent along the carved dimension: `"auto"` (snug to content, default),
+    /// a cell count (`"30"`), or a percent of the available span (`"30%"`).
+    /// Parsed host-side; unparseable values fall back to `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// Cells (columns for vertical bands, rows for horizontal bands) the peer
+    /// region keeps: the panel is only carved when the peer keeps at least this
+    /// much, so a secondary panel never squeezes the primary content unreadable.
+    #[serde(default = "default_panel_min_peer")]
+    pub min_peer: u16,
+    /// Draw/hit z-order among panels and other layers (higher is on top).
+    #[serde(default)]
+    pub z: i16,
+}
+
+fn default_panel_min_peer() -> u16 {
+    24
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPanelRegion {
+    /// Share the usage-strip band: carve a slot beside the usage dash (its own
+    /// rect + hit-rects). This is what button-dash uses.
+    BottomBand,
+    /// Carve a column band from the left/right of the pane area (panes shrink).
+    Left,
+    Right,
+    /// Carve a row band from the top/bottom of the pane area (panes shrink).
+    Top,
+    Bottom,
+    /// Overlay the pane area without carving; anchored by `align`.
+    #[default]
+    Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPanelAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginUiCapability {
+    FocusedSession,
+    ThemeRead,
+    LayoutRead,
+    MouseAll,
+    KeyboardInput,
+    ContextMenuAugment,
+    ClipboardWrite,
+    PaneInput,
+    Toasts,
+    OpenPluginPanes,
+    PluginActions,
+    /// API v3 (§5.3): read-only socket API methods via `HostEffect::Api`.
+    ApiRead,
+    /// API v3 (§5.3): structural write socket API methods via `HostEffect::Api`.
+    ApiWrite,
+    /// API v3 (§5.3): text/keystroke-injecting socket API methods via
+    /// `HostEffect::Api` (`pane.send_text`, `agent.send`).
+    ApiInput,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct PluginActionListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,7 +528,7 @@ pub enum PluginActionContext {
     Selection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct PluginInvocationContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -392,6 +560,8 @@ pub struct PluginInvocationContext {
     pub clicked_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_handler_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

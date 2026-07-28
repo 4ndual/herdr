@@ -818,6 +818,7 @@ mod tests {
         app.state.installed_plugins.insert(
             format!("example.{name}"),
             crate::api::schema::InstalledPluginInfo {
+                ui_modules: Vec::new(),
                 plugin_id: format!("example.{name}"),
                 name: name.into(),
                 version: "0.1.0".into(),

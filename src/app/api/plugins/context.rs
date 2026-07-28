@@ -25,11 +25,13 @@ impl App {
             context.correlation_id = provided.correlation_id.or(context.correlation_id);
             context.clicked_url = provided.clicked_url.or(context.clicked_url);
             context.link_handler_id = provided.link_handler_id.or(context.link_handler_id);
+            context.plugin_payload_json =
+                provided.plugin_payload_json.or(context.plugin_payload_json);
         }
         context
     }
 
-    pub(super) fn current_plugin_context(&self, correlation_id: &str) -> PluginInvocationContext {
+    pub(crate) fn current_plugin_context(&self, correlation_id: &str) -> PluginInvocationContext {
         let Some(ws_idx) = self.state.active else {
             return empty_plugin_context(correlation_id);
         };
@@ -371,6 +373,7 @@ impl App {
             correlation_id: Some(correlation_id.to_string()),
             clicked_url: None,
             link_handler_id: None,
+            plugin_payload_json: None,
         }
     }
 
@@ -418,5 +421,6 @@ fn empty_plugin_context(correlation_id: &str) -> PluginInvocationContext {
         correlation_id: Some(correlation_id.to_string()),
         clicked_url: None,
         link_handler_id: None,
+        plugin_payload_json: None,
     }
 }

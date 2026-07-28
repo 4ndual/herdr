@@ -164,6 +164,7 @@ mod tests {
             actions: vec![],
             events: vec![],
             panes: vec![],
+            ui_modules: vec![],
             link_handlers: vec![],
             source: Default::default(),
             warnings: vec![],
@@ -251,6 +252,7 @@ mod tests {
                 actions: vec![],
                 events: vec![],
                 panes: vec![],
+                ui_modules: vec![],
                 link_handlers: vec![],
                 source: Default::default(),
                 warnings: vec![],
@@ -278,5 +280,137 @@ mod tests {
         let loaded = load_from_path(&path);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].plugin_id, "example.second");
+    }
+
+    /// A fully-populated API v3 `ui_modules` entry with every field the fork adds
+    /// set to a non-default value, so a dropped field is caught by equality.
+    fn sample_plugin_with_v3_ui_module(id: &str) -> InstalledPluginInfo {
+        use crate::api::schema::{
+            PluginHotReloadMode, PluginManifestUiModule, PluginPlatform, PluginUiCapability,
+            PluginUiModuleKind, PluginUiSurface,
+        };
+
+        let mut plugin = sample_plugin(id);
+        plugin.ui_modules = vec![PluginManifestUiModule {
+            id: format!("{id}.dash"),
+            title: "Dash".to_string(),
+            description: Some("v3 ui module".to_string()),
+            platforms: Some(vec![PluginPlatform::Macos, PluginPlatform::Linux]),
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 3,
+            module: "dash.wasm".to_string(),
+            hot_reload: PluginHotReloadMode::Off,
+            surfaces: vec![PluginUiSurface::UsageStrip, PluginUiSurface::Header],
+            placement: None,
+            capabilities: vec![
+                PluginUiCapability::ApiRead,
+                PluginUiCapability::ApiWrite,
+                PluginUiCapability::ApiInput,
+                PluginUiCapability::FocusedSession,
+            ],
+            ui_input_file: Some("input.json".to_string()),
+            image_file: None,
+            collector: None,
+        }];
+        plugin
+    }
+
+    /// Every field of a v3 `ui_modules` entry (api_version 3, api_read/api_write/
+    /// api_input capabilities, ui_input_file, usage_strip surface) must survive a
+    /// `save`/`load` round-trip through `plugins.json` unchanged. Guards against a
+    /// future fork refactor silently dropping fork-only fields on rewrite.
+    #[test]
+    fn v3_ui_modules_survive_save_load_roundtrip() {
+        let path = temp_registry_path("v3-ui-modules");
+        let original = sample_plugin_with_v3_ui_module("example.v3");
+
+        save_to_path(&path, std::slice::from_ref(&original)).unwrap();
+        let loaded = load_from_path(&path);
+
+        assert_eq!(loaded.len(), 1);
+        // Full-struct equality: any dropped or mutated field fails here.
+        assert_eq!(loaded[0], original);
+
+        // Spell out the fork-only fields so a regression names the culprit.
+        let module = &loaded[0].ui_modules[0];
+        assert_eq!(module.api_version, 3);
+        assert_eq!(module.ui_input_file.as_deref(), Some("input.json"));
+        assert!(module
+            .capabilities
+            .contains(&crate::api::schema::PluginUiCapability::ApiRead));
+        assert!(module
+            .capabilities
+            .contains(&crate::api::schema::PluginUiCapability::ApiWrite));
+        assert!(module
+            .capabilities
+            .contains(&crate::api::schema::PluginUiCapability::ApiInput));
+        assert!(module
+            .surfaces
+            .contains(&crate::api::schema::PluginUiSurface::UsageStrip));
+    }
+
+    /// Characterizes the forward-compat behavior of `InstalledPluginInfo` today:
+    /// the type does NOT use `#[serde(deny_unknown_fields)]`, so loading a
+    /// registry written by a *newer* binary (extra keys) does not error — but a
+    /// typed round-trip DROPS any key the running binary's struct does not know.
+    ///
+    /// This is the real forward-compat hazard from the fork-update-safety audit
+    /// (Finding 3): an older `herdr` binary whose `InstalledPluginInfo` lacks
+    /// `ui_modules` loads fork state fine, then rewrites `plugins.json` WITHOUT
+    /// the fork's ui modules on the next save. Here the same relationship is
+    /// exercised with a hypothetical future field standing in for `ui_modules`.
+    /// If this assertion ever flips (unknown fields start erroring or surviving),
+    /// the forward-compat contract changed and the audit must be revisited.
+    #[test]
+    fn unknown_fields_are_ignored_on_load_but_dropped_on_rewrite() {
+        let with_unknown_field = r#"[
+            {
+                "plugin_id": "example.future",
+                "name": "Future Plugin",
+                "version": "9.9.9",
+                "manifest_path": "/tmp/example.future/herdr-plugin.toml",
+                "plugin_root": "/tmp/example.future",
+                "enabled": true,
+                "ui_modules": [
+                    {
+                        "id": "example.future.dash",
+                        "title": "Dash",
+                        "api_version": 4,
+                        "module": "dash.wasm",
+                        "ui_input_file": "input.json"
+                    }
+                ],
+                "future_field_unknown_to_this_binary": {
+                    "some": "value",
+                    "count": 7
+                }
+            }
+        ]"#;
+
+        // No deny_unknown_fields: the load succeeds despite the unknown key.
+        let loaded: Vec<InstalledPluginInfo> = serde_json::from_str(with_unknown_field)
+            .expect("unknown fields must not cause a load error");
+        assert_eq!(loaded.len(), 1);
+        // Fields the struct DOES know are preserved.
+        assert_eq!(loaded[0].plugin_id, "example.future");
+        assert_eq!(loaded[0].ui_modules[0].api_version, 4);
+        assert_eq!(
+            loaded[0].ui_modules[0].ui_input_file.as_deref(),
+            Some("input.json")
+        );
+
+        // Rewriting through the typed struct DROPS the unknown key — the strip
+        // hazard the audit documents. `ui_modules` itself survives only because
+        // this binary's struct knows it; a binary lacking the field would drop it
+        // identically.
+        let rewritten = serde_json::to_string(&loaded).unwrap();
+        assert!(
+            !rewritten.contains("future_field_unknown_to_this_binary"),
+            "unknown field unexpectedly preserved on rewrite; forward-compat behavior changed"
+        );
+        assert!(
+            rewritten.contains("ui_modules"),
+            "ui_modules should survive a rewrite by a binary that knows the field"
+        );
     }
 }

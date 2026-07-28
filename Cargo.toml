@@ -26,6 +26,11 @@ clap = { version = "4.5", default-features = false, features = ["std", "help", "
 clap_complete = "4.5"
 crossterm = "0.29"
 ctrlc = "3"
+goal-dash-core = { path = "crates/goal-dash-core" }
+goal-dash-model = { path = "crates/goal-dash-model" }
+herdr-ui-plugin-api = { path = "crates/herdr-ui-plugin-api" }
+harness-manager-model = { path = "crates/harness-manager-model" }
+historial-dash-model = { path = "crates/historial-dash-model" }
 interprocess = "2.4.2"
 libc = "0.2"
 portable-pty = "=0.9.0"
@@ -41,6 +46,8 @@ toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
+usage-dash-core = { path = "crates/usage-dash-core" }
+wasmtime = "32.0.0"
 schemars = { version = "1.2.1", features = ["derive"] }
 
 [patch.crates-io]
@@ -63,3 +70,10 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+wat = "1"
+
+[workspace]
+members = ["crates/usage-dash-model", "crates/usage-dash-core", "crates/goal-dash-model", "crates/goal-dash-core", "crates/herdr-ui-plugin-api", "crates/historial-dash-model", "crates/harness-manager-model", "crates/version-dash-model", "plugins/usage-dash-ui/collector", "plugins/version-dash-ui/collector"]
+resolver = "2"

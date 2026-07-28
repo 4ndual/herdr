@@ -790,15 +790,32 @@ fn print_agent_help() {
     eprintln!("herdr agent commands:");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
+<<<<<<< HEAD
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
     eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+||||||| 299dd416
+    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent send <target> <text>");
+=======
+    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent send <target> <text>");
+    eprintln!(
+        "  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+    );
+>>>>>>> task/wave1-integration
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
+<<<<<<< HEAD
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
+||||||| 299dd416
+        "  agent send writes literal text; use pane run when you want command text plus Enter"
+=======
+        "  agent send writes literal text; agent prompt submits text plus Enter atomically"
+>>>>>>> task/wave1-integration
     );
     eprintln!("  herdr agent explain <target> [--json|--format text|json] [--verbose]");
     eprintln!(
@@ -813,4 +830,50 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settle_matches_idle_done_and_blocked() {
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Idle));
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Done));
+        assert!(agent_prompt_status_settles(&[], AgentStatus::Blocked));
+        assert!(!agent_prompt_status_settles(&[], AgentStatus::Working));
+        assert!(!agent_prompt_status_settles(&[], AgentStatus::Unknown));
+    }
+
+    #[test]
+    fn explicit_until_matches_only_requested_states() {
+        let until = vec![AgentStatus::Working];
+        assert!(agent_prompt_status_settles(&until, AgentStatus::Working));
+        assert!(!agent_prompt_status_settles(&until, AgentStatus::Idle));
+    }
+
+    #[test]
+    fn until_idle_also_accepts_done() {
+        let until = vec![AgentStatus::Idle];
+        assert!(agent_prompt_status_settles(&until, AgentStatus::Done));
+    }
+
+    #[test]
+    fn effect_code_is_timeout_only_when_caller_timeout_is_shorter() {
+        assert_eq!(agent_prompt_effect_code(None), "agent_prompt_stalled");
+        assert_eq!(agent_prompt_effect_code(Some(10_000)), "agent_prompt_stalled");
+        assert_eq!(
+            agent_prompt_effect_code(Some(AGENT_PROMPT_EFFECT_TIMEOUT_MS)),
+            "timeout"
+        );
+        assert_eq!(agent_prompt_effect_code(Some(1_000)), "timeout");
+    }
+
+    #[test]
+    fn error_payload_carries_code_and_message() {
+        let rendered = agent_prompt_error("agent_prompt_stalled", "no change");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["error"]["code"], "agent_prompt_stalled");
+        assert_eq!(value["error"]["message"], "no change");
+    }
 }

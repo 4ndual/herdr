@@ -1,0 +1,24 @@
+[package]
+name = "herdr-archive-dash-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Nested wasm workspace: isolated from the host workspace so the wasm target,
+# panic=abort profile, and opt-level=z don't collide with the host's profiles.
+# Mirrors plugins/button-dash-ui and plugins/usage-dash-ui.
+[workspace]
+
+[dependencies]
+herdr-ui-plugin-api = { path = "../../crates/herdr-ui-plugin-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1

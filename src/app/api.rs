@@ -141,6 +141,44 @@ impl App {
             return;
         }
 
+        if let AppEvent::CollectorFinished {
+            plugin_id,
+            module_id,
+            result,
+        } = ev
+        {
+            // fork(wave-2): generic collector bookkeeping — always clear the
+            // in-flight marker, then apply the outcome (usage-dash is the only
+            // module wired to a host snapshot today). Failures keep the previous
+            // snapshot and warn only once per distinct reason.
+            let key = crate::plugin_collector::module_key(&plugin_id, &module_id);
+            self.collectors_in_flight.remove(&key);
+            let apply_result = match &result {
+                Ok(outcome) if plugin_id == super::USAGE_DASH_PLUGIN_ID => {
+                    crate::usage_host::apply_collector_outcome(self, outcome)
+                }
+                Ok(_) => Ok(()),
+                Err(message) => Err(message.clone()),
+            };
+            match apply_result {
+                Ok(()) => {
+                    self.collector_last_error.remove(&key);
+                }
+                Err(message) => {
+                    if self.collector_last_error.get(&key) != Some(&message) {
+                        tracing::warn!(
+                            plugin_id = %plugin_id,
+                            module_id = %module_id,
+                            error = %message,
+                            "ui-plugin collector run failed; keeping previous snapshot"
+                        );
+                        self.collector_last_error.insert(key, message);
+                    }
+                }
+            }
+            return;
+        }
+
         if let AppEvent::WorktreeAddFinished(result) = ev {
             self.handle_worktree_add_finished(*result);
             return;
@@ -149,6 +187,15 @@ impl App {
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
             return;
+        }
+
+        // The resume-picker overlay hosts a hidden PTY that is not part of any
+        // workspace layout, so intercept its exit before the normal pane-death
+        // paths (which would fail to find it) run.
+        if let AppEvent::PaneDied { pane_id } = &ev {
+            if self.handle_resume_picker_pane_died(*pane_id) {
+                return;
+            }
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
@@ -1136,6 +1183,9 @@ impl App {
             Method::PluginPaneClose(params) => {
                 return self.handle_plugin_pane_close(request.id, params);
             }
+            Method::ResumePickerOpen(params) => {
+                return self.handle_resume_picker_open(request.id, params);
+            }
             _ => {
                 return responses::encode_error(
                     request.id,
@@ -1146,6 +1196,20 @@ impl App {
         };
 
         serde_json::to_string(&response).unwrap()
+    }
+
+    fn handle_resume_picker_open(
+        &mut self,
+        id: String,
+        params: crate::api::schema::ResumePickerOpenParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+        match self.open_resume_picker_overlay(std::path::PathBuf::from(params.wrapper)) {
+            Ok(()) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => {
+                responses::encode_error(id, "resume_picker_open_failed", err.to_string())
+            }
+        }
     }
 
     fn handle_notification_show(

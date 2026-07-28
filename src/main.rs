@@ -58,6 +58,7 @@ mod agent_resume;
 mod api;
 mod app;
 mod build_info;
+mod bundled_plugins;
 #[cfg(not(windows))]
 mod checksum;
 mod cli;
@@ -66,7 +67,11 @@ mod config;
 mod detect;
 mod events;
 mod ghostty;
+mod goal_host;
 mod handoff_runtime;
+mod harness_host;
+mod historial_host;
+mod host_image;
 mod input;
 mod integration;
 mod ipc;
@@ -76,9 +81,12 @@ mod logging;
 mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
+mod pane_close_history;
 mod persist;
 mod platform;
+mod plugin_collector;
 mod plugin_command;
+mod plugin_focus;
 mod plugin_paths;
 mod popup_size;
 mod product_announcements;
@@ -97,7 +105,10 @@ mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
 mod ui;
+mod ui_plugin_api_bridge;
+mod ui_plugins;
 mod update;
+mod usage_host;
 mod workspace;
 mod worktree;
 
@@ -375,6 +386,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+# After a restart re-resumes an agent whose previous turn was interrupted by the
+# restart, nudge it to continue where it left off. Only fires for panes whose
+# transcript shows an in-flight turn (idle panes are left alone).
+# auto_continue_on_restore = true
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
@@ -781,6 +796,17 @@ fn main() -> io::Result<()> {
         crate::terminal_modes::clear_host_mouse_reporting(&mut io::stdout())?;
         if config.ui.mouse_capture {
             execute!(io::stdout(), EnableMouseCapture)?;
+            // crossterm's EnableMouseCapture enables button + drag reporting
+            // (?1002) but not any-motion (?1003), so bare hover moves are never
+            // delivered. Enable any-motion tracking too, so UI-plugin surfaces
+            // that resolve hover from the raw Move stream (e.g. the historial
+            // panel's row tooltips) actually receive `Move` events. Teardown's
+            // `clear_host_mouse_reporting` already emits `?1003l`.
+            {
+                use std::io::Write;
+                std::io::stdout().write_all(b"\x1b[?1003h")?;
+                std::io::stdout().flush()?;
+            }
         } else {
             execute!(io::stdout(), DisableMouseCapture)?;
         }

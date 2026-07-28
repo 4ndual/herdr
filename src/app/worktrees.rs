@@ -1743,6 +1743,7 @@ mod tests {
         app.state.installed_plugins.insert(
             "example.ui-worktree-create".into(),
             crate::api::schema::InstalledPluginInfo {
+                ui_modules: Vec::new(),
                 plugin_id: "example.ui-worktree-create".into(),
                 name: "UI Worktree Create".into(),
                 version: "0.1.0".into(),

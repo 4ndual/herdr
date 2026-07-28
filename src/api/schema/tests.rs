@@ -654,7 +654,7 @@ fn session_snapshot_request_and_response_round_trip() {
         result: ResponseResult::SessionSnapshot {
             snapshot: Box::new(SessionSnapshot {
                 version: "0.1.2".into(),
-                protocol: 16,
+                protocol: 17,
                 focused_workspace_id: None,
                 focused_tab_id: None,
                 focused_pane_id: None,
@@ -922,6 +922,34 @@ fn plugin_link_list_unlink_round_trip() {
             width: None,
             height: None,
             command: vec!["bun".into(), "run".into(), "board.ts".into()],
+        }],
+        ui_modules: vec![PluginManifestUiModule {
+            id: "goal-ui".into(),
+            title: "Goal UI".into(),
+            description: Some("Hot-reloadable native panel layer".into()),
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: "dist/goal-ui.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![
+                PluginUiSurface::Header,
+                PluginUiSurface::Footer,
+                PluginUiSurface::TabBar,
+                PluginUiSurface::RightPanel,
+                PluginUiSurface::Overlay,
+                PluginUiSurface::ContextMenu,
+            ],
+            placement: None,
+            capabilities: vec![
+                PluginUiCapability::FocusedSession,
+                PluginUiCapability::MouseAll,
+                PluginUiCapability::ContextMenuAugment,
+                PluginUiCapability::ClipboardWrite,
+            ],
+            ui_input_file: None,
+            image_file: None,
+            collector: None,
         }],
         link_handlers: vec![PluginManifestLinkHandler {
             id: "github-pr".into(),

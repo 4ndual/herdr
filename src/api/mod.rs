@@ -75,6 +75,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PluginPaneOpen(_)
             | Method::PluginPaneFocus(_)
             | Method::PluginPaneClose(_)
+            | Method::ResumePickerOpen(_)
     )
 }
 

@@ -91,6 +91,37 @@ struct AgentNameOwner {
     session_ref: Option<crate::agent_resume::AgentSessionRef>,
 }
 
+/// Runtime-only tracking for restart auto-continue. Set when a restart-triggered
+/// resume re-launches an agent whose previous turn was interrupted; consumed once
+/// the resumed agent is detected ready again, at which point a one-line nudge is
+/// sent. Never persisted — it exists only for the window between resume and the
+/// first ready observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoContinueAfterRestart {
+    /// When the resume was launched; used to give up if the agent never becomes
+    /// ready so the tick does not wake forever.
+    pub armed_at: Instant,
+    /// Set once the resumed pane has been observed in a non-idle live state,
+    /// proving the resume shell actually started the agent (guards against the
+    /// idle placeholder state seeded at restore time).
+    pub saw_activity: bool,
+    /// When the continue nudge was sent, if it has been sent.
+    pub nudged_at: Option<Instant>,
+    /// Whether the bare-Enter stall retry has already been sent.
+    pub retried: bool,
+}
+
+impl AutoContinueAfterRestart {
+    pub fn armed(now: Instant) -> Self {
+        Self {
+            armed_at: now,
+            saw_activity: false,
+            nudged_at: None,
+            retried: false,
+        }
+    }
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -124,6 +155,7 @@ pub struct TerminalState {
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit_at: Option<Instant>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
+    pub auto_continue_after_restart: Option<AutoContinueAfterRestart>,
 }
 
 impl TerminalState {
@@ -156,6 +188,7 @@ impl TerminalState {
             respawn_shell_on_exit: false,
             recent_agent_process_exit_at: None,
             pending_agent_resume_plan: None,
+            auto_continue_after_restart: None,
         }
     }
 
@@ -888,7 +921,7 @@ impl TerminalState {
             })
     }
 
-    fn current_session_identity_for_persistence(
+    pub(crate) fn current_session_identity_for_persistence(
         &self,
     ) -> Option<(
         String,

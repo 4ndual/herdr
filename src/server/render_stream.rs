@@ -9,6 +9,17 @@ use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
 use crate::terminal::TerminalRuntimeRegistry;
 
+/// fork: when a client is NOT the foreground client, the shared panes are sized
+/// to a different client, so this client's bottom rows can be clipped. Passing
+/// this makes the render draw a one-line "panes pinned to ..." badge so the
+/// clipping is never silent. `None` for the foreground client (no badge).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForegroundPinBadge {
+    pub foreground_client_id: u64,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
@@ -280,6 +291,7 @@ pub(crate) fn render_virtual(
         area,
         resize_panes,
         crate::kitty_graphics::HostCellSize::default(),
+        None,
     )
 }
 
@@ -289,6 +301,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+    pin_badge: Option<ForegroundPinBadge>,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let popup_visible = app_state.popup_pane.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
@@ -308,6 +321,17 @@ pub(crate) fn render_virtual_with_runtime_registry(
     terminal
         .draw(|frame| {
             crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            // fork: badge sits on top of everything for non-foreground clients.
+            if let Some(badge) = pin_badge {
+                crate::ui::render_foreground_pin_badge(
+                    frame,
+                    area,
+                    badge.foreground_client_id,
+                    badge.cols,
+                    badge.rows,
+                    &app_state.palette,
+                );
+            }
         })
         .expect("render to TestBackend should never fail");
 
