@@ -2192,6 +2192,55 @@ impl App {
         acted
     }
 
+    /// fork(+127): run the declared `collector` of every enabled UI plugin, once
+    /// per dash tick, skipping any module whose previous run is still in flight.
+    ///
+    /// WHY this exists: `collector` was a manifest field that only ever ran for
+    /// ONE plugin. `usage_host::tick` launches it for `builtin.usage-dash` by
+    /// name; every other plugin declaring `collector` was parsed, echoed back by
+    /// `plugin list`, reported by `plugin ui status` as `collector_declared:
+    /// true` — and never executed. version-dash worked around it with an
+    /// external LaunchAgent, which reads as a design choice and was in fact a
+    /// workaround for this gap. A manifest field that silently does nothing for
+    /// everyone but one hard-coded id is precisely the "no silent failure" rule
+    /// this lane exists to enforce.
+    ///
+    /// The `CollectorFinished` side was already generic (`app/api.rs` clears the
+    /// in-flight marker for any module and only routes the OUTCOME to usage-dash,
+    /// which is correct — every other collector writes its own `ui_input_file`
+    /// and needs nothing applied to host state). Only the launch was missing.
+    ///
+    /// usage-dash is skipped here because `usage_host::tick` still owns it: its
+    /// outcome feeds a host snapshot with sticky semantics, and launching it
+    /// twice per tick would double its cost.
+    pub(crate) fn tick_plugin_collectors(&mut self) {
+        let focus = crate::plugin_focus::focus_input(&self.state);
+        // Collect first: `launch_if_idle` takes `&mut self`.
+        let due = self.collector_modules_due();
+        for (plugin_id, module) in due {
+            crate::plugin_collector::launch_if_idle(self, &plugin_id, &module, &focus);
+        }
+    }
+
+    /// Which (plugin, module) pairs [`Self::tick_plugin_collectors`] will launch.
+    /// Split out so the selection rule is testable without spawning processes.
+    pub(crate) fn collector_modules_due(
+        &self,
+    ) -> Vec<(String, crate::api::schema::PluginManifestUiModule)> {
+        self.state
+            .installed_plugins
+            .values()
+            .filter(|plugin| plugin.enabled && plugin.plugin_id != USAGE_DASH_PLUGIN_ID)
+            .flat_map(|plugin| {
+                plugin
+                    .ui_modules
+                    .iter()
+                    .filter(|module| module.collector.is_some() && module.ui_input_file.is_some())
+                    .map(|module| (plugin.plugin_id.clone(), module.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {
         self.state.ui_context_menu_items = self.ui_plugins.context_menu_items();
         self.state.ui_surface_layers = self.ui_plugins.surface_layers();
@@ -4647,6 +4696,86 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// fork(+127): `collector` used to run for exactly one hard-coded plugin id.
+    /// Every other plugin declaring it had the field parsed, echoed back by
+    /// `plugin list`, and never executed — a manifest field that silently did
+    /// nothing. This pins the selection rule: enabled, declares BOTH `collector`
+    /// and `ui_input_file`, and is not usage-dash (which `usage_host::tick` still
+    /// owns, so launching it here would double its cost).
+    #[test]
+    fn every_enabled_plugin_declaring_a_collector_is_due_except_usage_dash() {
+        fn plugin(
+            id: &str,
+            enabled: bool,
+            collector: Option<Vec<String>>,
+            input: Option<&str>,
+        ) -> crate::api::schema::InstalledPluginInfo {
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: id.into(),
+                name: id.into(),
+                version: "0.1.0".into(),
+                min_herdr_version: crate::build_info::BASE_VERSION.into(),
+                description: None,
+                manifest_path: format!("/tmp/{id}/herdr-plugin.toml"),
+                plugin_root: format!("/tmp/{id}"),
+                enabled,
+                platforms: None,
+                build: vec![],
+                startup: Vec::new(),
+                actions: vec![],
+                events: vec![],
+                panes: vec![],
+                ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                    id: "m".into(),
+                    title: "m".into(),
+                    description: None,
+                    platforms: None,
+                    kind: crate::api::schema::PluginUiModuleKind::Wasm,
+                    api_version: 3,
+                    module: "dist/m.wasm".into(),
+                    hot_reload: crate::api::schema::PluginHotReloadMode::On,
+                    surfaces: vec![crate::api::schema::PluginUiSurface::Panel],
+                    placement: None,
+                    capabilities: vec![crate::api::schema::PluginUiCapability::LayoutRead],
+                    ui_input_file: input.map(str::to_string),
+                    image_file: None,
+                    graphics_roots: Vec::new(),
+                    max_layers_per_pane: None,
+                    collector,
+                }],
+                link_handlers: vec![],
+                source: Default::default(),
+                warnings: vec![],
+            }
+        }
+
+        let mut app = test_app();
+        let argv = Some(vec!["c".to_string()]);
+        for entry in [
+            plugin("a.images", true, argv.clone(), Some("in.json")),
+            // usage-dash is owned by `usage_host::tick`.
+            plugin(USAGE_DASH_PLUGIN_ID, true, argv.clone(), Some("in.json")),
+            // disabled -> not due.
+            plugin("c.off", false, argv.clone(), Some("in.json")),
+            // no collector -> nothing to run.
+            plugin("d.nocollector", true, None, Some("in.json")),
+            // no ui_input_file -> the output would have nowhere to go.
+            plugin("e.noinput", true, argv.clone(), None),
+        ] {
+            app.state
+                .installed_plugins
+                .insert(entry.plugin_id.clone(), entry);
+        }
+
+        let mut due: Vec<String> = app
+            .collector_modules_due()
+            .into_iter()
+            .map(|(plugin_id, _)| plugin_id)
+            .collect();
+        due.sort();
+        assert_eq!(due, vec!["a.images".to_string()]);
     }
 
     /// fork(+127): switching `experimental.kitty_graphics` off is a *renderer*

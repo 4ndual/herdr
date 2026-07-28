@@ -368,6 +368,10 @@ impl App {
         // data so an idle, agent-less herdr does no per-second work (TC13).
         if self.dashboards_need_tick() && now >= self.next_dash_tick {
             crate::usage_host::tick(self);
+            // fork(+127): every OTHER plugin's declared collector. Both this and
+            // the `headless.rs` tick are required — a server+client herdr (which
+            // is what `hr` is) never runs this loop.
+            self.tick_plugin_collectors();
             crate::goal_host::tick(self);
             crate::historial_host::tick(self);
             crate::harness_host::tick(self);

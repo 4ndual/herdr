@@ -4169,6 +4169,10 @@ impl HeadlessServer {
             && now >= self.app.next_dash_tick
         {
             crate::usage_host::tick(&mut self.app);
+            // fork(+127): every OTHER plugin's declared collector. This is the
+            // call site that matters in practice — `hr` is a server+client herdr
+            // and renders/ticks here, not in the TUI loop.
+            self.app.tick_plugin_collectors();
             crate::goal_host::tick(&mut self.app);
             crate::historial_host::tick(&mut self.app);
             crate::harness_host::tick(&mut self.app);
