@@ -26,7 +26,10 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use version_dash_model::{InstanceStatus, VersionRenderInput};
+use version_dash_model::{
+    InstanceState, InstanceStatus, PipelinePhase, PipelineStage, PipelineStatus, StagedBuild,
+    Verification, VersionRenderInput,
+};
 
 /// Canonical stable release manifest URL. Mirrors
 /// `src/update.rs::STABLE_UPDATE_MANIFEST_URL` (verified 2026-07-24); kept in
@@ -44,6 +47,13 @@ const INPUT_FILE: &str = "version_input.json";
 /// age survives across runs without polluting the render model.
 const LAST_FETCH_EXT: &str = "last-fetch";
 
+/// Offline patch-notes cache for the latest release — what a click on the
+/// `latest` token opens.
+const NOTES_FILE: &str = "latest_notes.md";
+
+/// Every release's notes, newest first.
+const ARCHIVE_FILE: &str = "releases_notes.md";
+
 /// Curl wall-clock budget. A short timeout keeps a hung network from stacking
 /// collector runs; on timeout we fall back to the cached snapshot.
 const CURL_MAX_SECS: &str = "8";
@@ -60,6 +70,9 @@ const DEFAULT_GIT_REPO: &str = "Projects/herdr";
 /// Default per-instance binary + socket layout on Andres's machine. Every path is
 /// env-overridable so the sandbox E2E can point at throwaway clones.
 const DEFAULT_HR_BIN: &str = ".herdr-hr/bin/herdr";
+/// XDG roots, used to ask each instance's running server what it executes.
+const DEFAULT_HR_ROOT: &str = ".herdr-hr";
+const DEFAULT_TEST_ROOT: &str = ".herdr-test";
 const DEFAULT_TEST_BIN: &str = ".local/bin/herdrtest";
 /// hr's server socket. Used to resolve hr's LIVE executable dynamically: the
 /// running hr server does not necessarily exec the `~/.herdr-hr/bin` snapshot —
@@ -79,6 +92,33 @@ struct Manifest {
     version: String,
     #[serde(default)]
     assets: std::collections::HashMap<String, String>,
+    /// Release-notes markdown for `version`. The channel manifest carries the
+    /// full body, so patch notes never need a second network round trip — and
+    /// crucially never need one at CLICK time, which is the only moment the
+    /// user is actually waiting.
+    #[serde(default)]
+    notes: Option<String>,
+    /// Per-version notes for every published release. Present in the same
+    /// manifest, so the cache written below is a complete offline archive.
+    #[serde(default)]
+    releases: std::collections::HashMap<String, ManifestRelease>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestRelease {
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// Notes for `version`, preferring the per-release entry and falling back to the
+/// manifest's top-level body (which describes the latest release).
+fn manifest_notes(m: &Manifest, version: &str) -> Option<String> {
+    m.releases
+        .get(version)
+        .and_then(|r| r.notes.clone())
+        .or_else(|| m.notes.clone())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// One instance's fixed identity/config, resolved from env-with-default.
@@ -90,6 +130,15 @@ struct InstanceCfg {
     /// Server socket to liveness-probe. `None` ⇒ not health-checked (hr is never
     /// marked broken — if hr were down you couldn't see the strip at all).
     sock: Option<PathBuf>,
+    /// The instance's XDG root, used to ask its RUNNING server what version it
+    /// is actually executing (`herdr status server`). Without this the collector
+    /// can only read the binary on disk, which is a statement about a file.
+    root: Option<PathBuf>,
+    /// The instance's session name. Required alongside `root`: without
+    /// HERDR_SESSION the CLI resolves the DEFAULT session socket
+    /// (`config/herdr/herdr.sock`), not `config/herdr/sessions/<name>/herdr.sock`,
+    /// and reports `status: not running` for an instance that is running fine.
+    session: Option<String>,
 }
 
 fn main() {
@@ -108,6 +157,13 @@ fn main() {
     let (latest, notes_url, error) = match &manifest {
         Ok(m) => {
             let _ = write_atomic(&last_fetch_path, now.to_string().as_bytes());
+            // Cache the notes next to the input file. Written only on a
+            // SUCCESSFUL fetch, so a failed refresh leaves the last good notes
+            // in place rather than blanking them — the click must still work
+            // offline, which is the whole point of caching them at all.
+            if let Some(dir) = out_path.parent() {
+                write_notes_cache(dir, m);
+            }
             (Some(m.version.clone()), notes_url_from_manifest(m), None)
         }
         Err(err) => (
@@ -117,9 +173,23 @@ fn main() {
         ),
     };
 
+    let state_dir_for_inputs = out_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let pipeline = read_pipeline(&state_dir_for_inputs, now);
+    let staged_build = read_staged_build(&state_dir_for_inputs, now);
+
     let instances = instance_configs()
         .into_iter()
-        .map(|cfg| resolve_instance(&cfg, latest.as_deref()))
+        .map(|cfg| {
+            resolve_instance(
+                &cfg,
+                latest.as_deref(),
+                &state_dir_for_inputs,
+                pipeline.as_ref(),
+            )
+        })
         .collect::<Vec<_>>();
 
     let (age_label, stale) = if manifest.is_ok() {
@@ -133,7 +203,7 @@ fn main() {
         )
     };
 
-    let input = VersionRenderInput {
+    let mut input = VersionRenderInput {
         instances,
         latest,
         notes_url,
@@ -141,7 +211,10 @@ fn main() {
         age_label,
         stale,
         error,
+        pipeline,
+        staged_build,
     };
+    downgrade_states_the_guest_cannot_read(&mut input);
 
     match serde_json::to_vec(&input) {
         Ok(bytes) => {
@@ -160,6 +233,107 @@ fn main() {
     }
 }
 
+/// Never hand the guest a state name it does not know.
+///
+/// ── MEASURED, NOT ASSUMED ────────────────────────────────────────────────────
+/// The collector and the guest `.wasm` are separate artefacts on separate
+/// release cycles, and the host loads whichever wasm the plugin registry points
+/// at. Feeding a wasm built on 2026-07-24 (vocabulary: `up_to_date`, `behind`,
+/// `broken`, `unknown`) a newer variant was tested in a sandbox instance, and the
+/// failure mode is the worst available one: `serde_json::from_str` fails, the
+/// guest returns early, and the host KEEPS THE LAST GOOD FRAME. The strip does
+/// not blank and does not error — it silently freezes on hours-old truth while
+/// looking exactly as confident as a fresh one. That is the same class of defect
+/// as the green `✓` over a pending restart, arrived at from the other side.
+///
+/// So capability is detected from the artefact that will actually parse the
+/// JSON, and anything it cannot read is mapped DOWN to the nearest state it can,
+/// always in the safe direction:
+///
+///   verified         → up_to_date  (green ✓ — a checked build really is fine)
+///   awaiting_restart → broken      (✗ — pending, and must not look calm)
+///   unsafe_restart   → broken      (✗ — ungated binary staged; the loudest
+///                                   glyph the old vocabulary has)
+///   escalated        → broken      (✗ — needs a human)
+///   working          → unknown     (? — in flight, no verdict yet)
+///
+/// Downgrades never invent confidence: the only one that lands on green is
+/// `verified`, which is strictly stronger than the `up_to_date` it becomes.
+/// `detail` is left untouched, so the precise sentence still reaches the toast.
+///
+/// This is a bridge, not a destination. Ship the guest and the collector together
+/// and it becomes a no-op; it exists so that the ORDER of those two installs can
+/// never break the strip.
+fn downgrade_states_the_guest_cannot_read(input: &mut VersionRenderInput) {
+    let Some(vocabulary) = guest_vocabulary() else {
+        return; // Guest not locatable: assume current, change nothing.
+    };
+    let known = |state: InstanceState| vocabulary.iter().any(|v| v == state.wire_name());
+    for inst in &mut input.instances {
+        if known(inst.state) {
+            continue;
+        }
+        let fallback = match inst.state {
+            InstanceState::Verified => InstanceState::UpToDate,
+            InstanceState::Working => InstanceState::Unknown,
+            _ => InstanceState::Broken,
+        };
+        // If even the fallback is unknown to this guest, Unknown is in the
+        // original four and is always safe.
+        inst.state = if known(fallback) {
+            fallback
+        } else {
+            InstanceState::Unknown
+        };
+    }
+}
+
+/// The state names the guest wasm can actually deserialize, recovered by
+/// scanning the module for its serde variant literals. `None` when the wasm
+/// cannot be found, in which case the caller must not downgrade anything.
+fn guest_vocabulary() -> Option<Vec<String>> {
+    const REL_WASM: &str = "target/wasm32-unknown-unknown/release/version_dash_ui.wasm";
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = env_nonempty("VD_GUEST_WASM") {
+        candidates.push(PathBuf::from(explicit));
+    }
+    if let Some(root) = env_nonempty("VD_GUEST_ROOT") {
+        candidates.push(PathBuf::from(root).join(REL_WASM));
+    }
+    // Derived from the collector's OWN location, so the common case needs no
+    // configuration at all. The manifest declares the collector as
+    // `../../target/release/version-dash-collector` relative to the plugin root,
+    // so a collector at `<tree>/target/release/…` belongs to the plugin at
+    // `<tree>/plugins/version-dash-ui`. This must work unconfigured: the host
+    // supplies no env of its own, and a collector that cannot find the guest
+    // silently disables the downgrade — which re-arms the exact freeze it exists
+    // to prevent, with no visible symptom.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(tree) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+            candidates.push(tree.join("plugins/version-dash-ui").join(REL_WASM));
+        }
+    }
+    // The host runs plugin commands with the plugin root as CWD.
+    candidates.push(PathBuf::from(REL_WASM));
+    let wasm = candidates.into_iter().find(|p| p.exists())?;
+    let out = run_with_timeout(Command::new("strings").arg("-a").arg(&wasm), VERSION_TIMEOUT)?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let found: Vec<String> = InstanceState::ALL
+        .iter()
+        .filter(|state| text.contains(state.wire_name()))
+        .map(|state| state.wire_name().to_string())
+        .collect();
+    // A wasm that does not even contain the original four is not a version-dash
+    // guest — refuse to draw conclusions from it.
+    if found.len() < 4 {
+        return None;
+    }
+    Some(found)
+}
+
 /// The tracked instances, in display order (hr first, then herdrtest). Every path
 /// is env-overridable so a sandbox run can target throwaway clones without
 /// touching the live instances.
@@ -170,11 +344,17 @@ fn instance_configs() -> Vec<InstanceCfg> {
             bin: resolve_hr_bin(),
             // hr is never health-checked / never marked broken.
             sock: None,
+            root: Some(env_path("HERDR_VERSION_HR_ROOT", DEFAULT_HR_ROOT)),
+            session: Some(env_nonempty("HERDR_VERSION_HR_SESSION").unwrap_or_else(|| "hr".into())),
         },
         InstanceCfg {
             label: "test",
             bin: env_path("HERDR_VERSION_TEST_BIN", DEFAULT_TEST_BIN),
             sock: Some(env_path("HERDR_VERSION_TEST_SOCK", DEFAULT_TEST_SOCK)),
+            root: Some(env_path("HERDR_VERSION_TEST_ROOT", DEFAULT_TEST_ROOT)),
+            session: Some(
+                env_nonempty("HERDR_VERSION_TEST_SESSION").unwrap_or_else(|| "test".into()),
+            ),
         },
     ]
 }
@@ -225,34 +405,421 @@ fn live_exe_for_socket(sock: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Probe one instance: read its version, run any liveness check, classify.
-fn resolve_instance(cfg: &InstanceCfg, latest: Option<&str>) -> InstanceStatus {
-    let version = binary_version(&cfg.bin);
-    // herdrtest is "broken" when its socket won't connect OR its binary won't
-    // report a version. Instances without a socket (hr) are never broken.
-    let broken = match &cfg.sock {
-        Some(sock) => version.is_none() || !socket_connectable(sock),
-        None => false,
+/// A verification receipt written by `verify-instance.sh`.
+#[derive(Debug, Deserialize)]
+struct Receipt {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    checks: Vec<ReceiptCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReceiptCheck {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    detail: String,
+}
+
+/// Read the receipt for `label` and decide whether it still applies.
+///
+/// The receipt is honoured ONLY while its `sha256` matches the binary currently
+/// in place. That binding is what stops a stale blessing from surviving a binary
+/// swap: change the binary by any route — this pipeline, a hand `mv`, a stray
+/// `cargo` relink into the live path — and the receipt silently stops counting,
+/// so the instance falls back to the weak version-string claim instead of
+/// carrying forward a "verified" it no longer earns.
+///
+/// Returns the verdict plus a short detail line for the click toast.
+/// The one receipt check that means "everything passed, a human action is
+/// outstanding" rather than "something failed". `update-hr.sh` writes it after a
+/// successful, fully gated promotion, because the binary is installed but the
+/// instance is still executing the old one.
+const AWAITING_RESTART_CHECK: &str = "awaiting_user_restart";
+
+fn read_verification(state_dir: &Path, label: &str, bin: &Path) -> (Verification, Option<String>) {
+    let path = state_dir.join(format!("verify-{label}.json"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (Verification::None, None);
     };
-    let state = InstanceStatus::classify(version.as_deref(), latest, broken);
-    // +N = own-fork commits ahead of the instance's OWN released version tag
-    // (`git rev-list --count v<version>..HEAD`), the git-source approximation.
-    // Based on the instance version (not the latest stable) because the fork
-    // does not carry future upstream tags — the latest stable tag may not exist
-    // locally, whereas each instance's version is a real released tag it forked
-    // from. Only computed when a version resolved.
-    let local_changes = version.as_deref().and_then(git_local_changes);
+    let Ok(receipt) = serde_json::from_slice::<Receipt>(&bytes) else {
+        return (Verification::None, None);
+    };
+    let Some(current) = sha256_of(bin) else {
+        return (Verification::None, None);
+    };
+    if receipt.sha256.is_empty() || receipt.sha256 != current {
+        // Receipt is for a different build than the one installed.
+        return (
+            Verification::None,
+            Some("binary changed since it was verified".to_string()),
+        );
+    }
+    // A PENDING HUMAN ACTION IS NOT A FAILED CHECK.
+    //
+    // `update-hr.sh` writes `ok: false` with exactly one failing check —
+    // `awaiting_user_restart` — after a promotion in which every gate PASSED.
+    // Read naively that is `Verification::Failed`, which classifies as `Broken`,
+    // so a correctly gated update renders with the same red ✗ as a binary that
+    // failed verification outright. That is the mirror image of the green-tick
+    // bug: it spends the user's trust in the loud direction, and a strip that
+    // cries wolf on success stops being read at all.
+    //
+    // The distinction is safety-relevant, not cosmetic: `AwaitingRestart` means
+    // "restarting completes a verified update"; `Broken` means "do not". They
+    // must not share a glyph.
+    let failed: Vec<&ReceiptCheck> = receipt.checks.iter().filter(|c| !c.ok).collect();
+    if !receipt.ok
+        && failed.len() == 1
+        && failed[0].name == AWAITING_RESTART_CHECK
+    {
+        return (
+            Verification::Passed,
+            Some(if failed[0].detail.is_empty() {
+                "verified; restart to finish".to_string()
+            } else {
+                failed[0].detail.clone()
+            }),
+        );
+    }
+    if receipt.ok {
+        (Verification::Passed, None)
+    } else {
+        let failed = receipt
+            .checks
+            .iter()
+            .filter(|c| !c.ok)
+            .map(|c| {
+                if c.detail.is_empty() {
+                    c.name.clone()
+                } else {
+                    format!("{}: {}", c.name, c.detail)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        (
+            Verification::Failed,
+            Some(if failed.is_empty() {
+                "verification failed".to_string()
+            } else {
+                failed
+            }),
+        )
+    }
+}
+
+/// sha256 of a file, via the `shasum` CLI (no crypto dependency needed for a
+/// build-identity check that already trusts the local filesystem).
+fn sha256_of(path: &Path) -> Option<String> {
+    let out = run_with_timeout(
+        Command::new("shasum").arg("-a").arg("256").arg(path),
+        VERSION_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Read the live pipeline status written by the update scripts, recomputing the
+/// elapsed clock against the wall clock here (the guest has no clock).
+fn read_pipeline(state_dir: &Path, now: u64) -> Option<PipelineStatus> {
+    #[derive(Debug, Deserialize)]
+    struct RawPipeline {
+        #[serde(default)]
+        stage: Option<PipelineStage>,
+        #[serde(default)]
+        phase: PipelinePhase,
+        #[serde(default)]
+        step: String,
+        #[serde(default)]
+        started_unix: Option<u64>,
+        #[serde(default)]
+        updated_unix: Option<u64>,
+        #[serde(default)]
+        log_path: Option<String>,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        agent_ref: Option<String>,
+    }
+
+    let bytes = std::fs::read(state_dir.join("pipeline.json")).ok()?;
+    let raw: RawPipeline = serde_json::from_slice(&bytes).ok()?;
+
+    let mut phase = raw.phase;
+    let elapsed_secs = raw.started_unix.map(|s| now.saturating_sub(s));
+
+    // Watchdog: a "running" pipeline whose status file has not been touched for
+    // longer than the stall budget is not running, it is dead — the action
+    // process was killed, the machine slept, or a step wedged. Reporting it as
+    // Running forever would leave the strip spinning and both buttons locked,
+    // which is exactly the silent-hang failure the Working state exists to
+    // prevent. Demote it so the user can act.
+    let stall_budget = env_nonempty("HERDR_VERSION_PIPELINE_STALL_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600u64);
+    let mut error = raw.error.clone();
+    if phase == PipelinePhase::Running {
+        let staleness = raw
+            .updated_unix
+            .or(raw.started_unix)
+            .map(|t| now.saturating_sub(t))
+            .unwrap_or(u64::MAX);
+        if staleness > stall_budget {
+            phase = PipelinePhase::Failed;
+            error = Some(format!(
+                "no progress for {}; the update process is gone",
+                age_label(staleness)
+            ));
+        }
+    }
+
+    Some(PipelineStatus {
+        stage: raw.stage,
+        phase,
+        step: raw.step,
+        elapsed_label: elapsed_secs.map(clock_label).unwrap_or_default(),
+        log_path: raw.log_path,
+        exit_code: raw.exit_code,
+        error,
+        agent_ref: raw.agent_ref,
+    })
+}
+
+/// Read the background prebuild's staged-binary descriptor.
+fn read_staged_build(state_dir: &Path, now: u64) -> Option<StagedBuild> {
+    #[derive(Debug, Deserialize)]
+    struct RawStaged {
+        path: String,
+        #[serde(default)]
+        version: Option<String>,
+        #[serde(default)]
+        local_changes: Option<u32>,
+        #[serde(default)]
+        sha256: Option<String>,
+        #[serde(default)]
+        built_unix: Option<u64>,
+        #[serde(default)]
+        bridge_ok: bool,
+    }
+    let bytes = std::fs::read(state_dir.join("staged-build.json")).ok()?;
+    let raw: RawStaged = serde_json::from_slice(&bytes).ok()?;
+    // A staged binary that has since been deleted is not staged.
+    if !Path::new(&raw.path).is_file() {
+        return None;
+    }
+    Some(StagedBuild {
+        path: raw.path,
+        version: raw.version,
+        local_changes: raw.local_changes,
+        sha256: raw.sha256,
+        age_label: raw
+            .built_unix
+            .map(|t| age_label(now.saturating_sub(t)))
+            .unwrap_or_default(),
+        bridge_ok: raw.bridge_ok,
+    })
+}
+
+/// `M:SS` elapsed clock for a run in progress.
+fn clock_label(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Probe one instance: read its version, run any liveness check, classify.
+fn resolve_instance(
+    cfg: &InstanceCfg,
+    latest: Option<&str>,
+    state_dir: &Path,
+    pipeline: Option<&PipelineStatus>,
+) -> InstanceStatus {
+    let version = binary_version(&cfg.bin);
+    // BROKEN IS A PROPERTY OF THE BINARY, NOT OF A PROCESS.
+    //
+    // This used to be `version.is_none() || !socket_connectable(sock)`, so
+    // `herdrtest` rendered a red `✗` whenever its server was not running — which
+    // is its NORMAL state; it is a sandbox that is started to be tested and then
+    // stopped. Andres: "i don't care if the server is running or not, i care if
+    // the main binary of herdrtest works and was tested and everything is okay."
+    // The token was answering the wrong question, and the answer it gave was the
+    // one that blocks promotion, so a perfectly good verified build looked
+    // failed. Liveness now only reaches `detail`, never the glyph and never the
+    // gate. `broken` means the file will not tell us what it is; verification
+    // failure is carried separately by `Verification::Failed`, which
+    // `classify_running` still maps to Broken — a real failed check, not a
+    // stopped process.
+    let broken = version.is_none();
+    let offline = cfg
+        .sock
+        .as_ref()
+        .map(|sock| !socket_connectable(sock))
+        .unwrap_or(false);
+    // The sha-bound receipt for THIS instance, and any pipeline phase currently
+    // acting on it. Both outrank the version-string comparison — see
+    // InstanceStatus::classify_full for the precedence and why.
+    let (verification, verify_detail) = read_verification(state_dir, cfg.label, &cfg.bin);
+    let own_phase = pipeline.and_then(|p| {
+        if p.stage.map(|s| s.label()) == Some(cfg.label) {
+            Some(p.phase)
+        } else {
+            None
+        }
+    });
+    // What the instance is ACTUALLY executing, asked of its server. When this
+    // disagrees with the binary on disk, a restart changes the running code, and
+    // classify_running decides whether that is a pending update or a hazard.
+    let running = running_version(&cfg.bin, cfg.root.as_deref(), cfg.session.as_deref());
+    let state = InstanceStatus::classify_running(
+        version.as_deref(),
+        latest,
+        broken,
+        own_phase,
+        verification,
+        running.as_deref(),
+    );
+    // +N = the local-changes marker Andres reads to know how far the thing in
+    // front of him is from the released tag. It is BAKED INTO EACH BINARY and
+    // read back out of the file — never computed from a working tree.
+    //
+    // It used to be `git_local_changes(version)`, which asked `~/Projects/herdr`
+    // for a count and stamped the answer on every token. That tree is one fork
+    // checkout among many; it knows nothing about the binary being described. It
+    // is how an UPSTREAM 0.7.5 — a build containing zero fork commits — came to
+    // render `+113`, and how the merged 0.7.5 (really `+114`, built from a
+    // different worktree) would have rendered `+113` too. A number that does not
+    // come from the binary is decoration.
+    //
+    // No stamp (upstream builds, or fork builds predating the stamp) yields None,
+    // which the guest renders as unknown. Borrowing the tree's number to fill the
+    // gap is the exact defect being removed, so there is no fallback here.
+    // ...but ONLY when the version being displayed is the one this binary
+    // reports. When disk and running disagree the token shows the RUNNING
+    // version, and a running process cannot be asked for its provenance — the
+    // stamp is a property of the file, and the file is now a different file.
+    // Pairing the two produced `hr 0.7.3+114`: the count of a staged 0.7.5
+    // welded to the version of the 0.7.3 that is actually executing. That is the
+    // borrowed-number bug again, one scope down, so it gets the same answer —
+    // no marker rather than a wrong one.
+    let disk_is_shown = match (&version, &running) {
+        (Some(disk), Some(live)) => disk == live,
+        _ => true,
+    };
+    let local_changes = if disk_is_shown {
+        binary_fork_commits(&cfg.bin)
+    } else {
+        None
+    };
+    // Toast detail: prefer the live pipeline step, else why verification did not
+    // apply / what failed.
+    // When disk and running disagree, the token shows what is RUNNING and the
+    // detail names what is staged. Showing the disk version would repeat the
+    // original lie in a smaller font: the user is on 0.7.3, and a strip that
+    // prints 0.7.5 next to his instance is telling him he already restarted.
+    let staged_detail = match (&version, &running) {
+        (Some(disk), Some(live)) if disk != live => Some(format!(
+            "running {live}; {disk} is staged on disk but has NOT been verified \u{2014}              restarting would boot it"
+        )),
+        _ => None,
+    };
+    let shown_version = match (&version, &running) {
+        (Some(disk), Some(live)) if disk != live => Some(live.clone()),
+        _ => version.clone(),
+    };
+    // Liveness is demoted to a footnote. It is real information — it explains why
+    // a click may need to start the instance first — but it is the LAST thing
+    // consulted, so it can never overwrite a verification result or a staged
+    // hazard, and it never reaches the glyph.
+    let offline_detail = if offline {
+        Some(match verification {
+            Verification::Passed => {
+                "binary verified; server not running (normal for a sandbox)".to_string()
+            }
+            _ => "server not running".to_string(),
+        })
+    } else {
+        None
+    };
+    let detail = own_phase
+        .and_then(|_| pipeline.map(|p| p.step.clone()))
+        .filter(|s| !s.is_empty())
+        .or(staged_detail)
+        .or(verify_detail)
+        .or(offline_detail);
+
     InstanceStatus {
         label: cfg.label.to_string(),
-        version,
+        version: shown_version,
         local_changes,
         state,
+        detail,
     }
 }
 
 /// Run `<bin> --version` (prints `herdr X.Y.Z`) with a timeout; return the
 /// trailing version token, or `None` if the binary is missing / errors / times
 /// out.
+/// The version the instance's LIVE SERVER reports it is executing.
+///
+/// This exists because `binary_version` reads a FILE, and on macOS an atomic
+/// `mv` swaps the directory entry while the running process keeps the old inode
+/// — so the path still resolves, `--version` still answers, and the answer
+/// describes a binary nobody is running. Even socket→pid→exe does not help:
+/// `ps -o comm=` reports the same PATH after the swap.
+///
+/// On 2026-07-27 that gap let the strip paint `hr 0.7.5 ✓ up_to_date` while the
+/// server was executing 0.7.3, hiding a pending restart into an ungated build.
+/// Only the server can answer "what am I running", so ask it.
+fn running_version(bin: &Path, root: Option<&Path>, session: Option<&str>) -> Option<String> {
+    let root = root?;
+    let session = session?;
+    let mut cmd = Command::new(bin);
+    cmd.arg("status").arg("server");
+    // Same env discipline the pipeline scripts use: scrub inherited HERDR_*
+    // nesting vars (the collector runs as a child of a herdr instance) and pin
+    // the XDG roots, or the CLI resolves the WRONG instance's socket.
+    for k in [
+        "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH", "HERDR_SESSION",
+        "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID",
+    ] {
+        cmd.env_remove(k);
+    }
+    cmd.env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("HERDR_SESSION", session);
+    let output = run_with_timeout(&mut cmd, VERSION_TIMEOUT)?;
+    if !output.status.success() {
+        return None;
+    }
+    // `status: running` / `version: 0.7.3` / `protocol: 17` / ...
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut running = false;
+    let mut version = None;
+    for line in text.lines() {
+        let (k, v) = line.split_once(':').map(|(k, v)| (k.trim(), v.trim()))?;
+        match k {
+            "status" => running = v == "running",
+            "version" if !v.is_empty() => version = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    // A stopped server is running nothing; returning its last version would
+    // manufacture a mismatch that does not exist.
+    if running { version } else { None }
+}
+
 fn binary_version(bin: &Path) -> Option<String> {
     let output = run_with_timeout(Command::new(bin).arg("--version"), VERSION_TIMEOUT)?;
     if !output.status.success() {
@@ -265,16 +832,45 @@ fn binary_version(bin: &Path) -> Option<String> {
 /// Spawn a command with a wall-clock timeout, killing it if it overruns. Returns
 /// `None` on spawn failure or timeout.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
     use std::process::Stdio;
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+
+    // THE PIPES MUST BE DRAINED WHILE THE CHILD RUNS, NOT AFTER IT EXITS.
+    //
+    // This function used to poll `try_wait()` and only call `wait_with_output()`
+    // once the child had already exited. That works for a command that prints a
+    // few bytes and is why it survived so long — every caller was `--version` or
+    // `status server`. It DEADLOCKS for anything that produces more than one
+    // pipe buffer (64 KiB on macOS): the child fills the pipe, blocks in
+    // `write`, never exits, `try_wait` never reports exit, and the timeout fires
+    // and kills it. The caller then sees a timeout and concludes the data is
+    // absent — a false negative that looks exactly like a missing feature.
+    //
+    // Observed as `+N` reading `None` from a binary that demonstrably contained
+    // its provenance marker. The bug was not in the parser; the parser never got
+    // any input. Reader threads make output size irrelevant.
+    let mut stdout_pipe = child.stdout.take()?;
+    let mut stderr_pipe = child.stderr.take()?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
     let start = SystemTime::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed().map(|e| e > timeout).unwrap_or(true) {
                     let _ = child.kill();
@@ -285,7 +881,15 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
             }
             Err(_) => return None,
         }
-    }
+    };
+    // Both pipes are closed by the child's exit, so these joins cannot hang.
+    let stdout = stdout_reader.join().ok()?;
+    let stderr = stderr_reader.join().ok()?;
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// True when a Unix socket accepts a connection within the probe budget.
@@ -308,6 +912,61 @@ fn socket_connectable(_path: &Path) -> bool {
     // No Unix-socket liveness on non-unix; fall back to the binary version check
     // alone (broken == version unresolved).
     true
+}
+
+/// Read the `+N` local-changes marker OUT OF THE BINARY ITSELF.
+///
+/// `build.rs` bakes `HERDR_FORK_PROVENANCE=<git describe --tags --long>` as a
+/// single self-describing literal precisely so it survives into a file that can
+/// be inspected while stopped. That matters: `herdrtest` spends most of its life
+/// installed-but-not-running, and asking a dead server for its provenance is not
+/// an option. `strings` is the same technique `herdr-bridge-check.sh` already
+/// uses to gate these binaries, so the dependency is not a new one.
+///
+/// `None` means this binary carries no stamp — an upstream build, or a fork
+/// build older than the stamp. The caller must render that as unknown. Do not
+/// add a working-tree fallback; that is the bug this function exists to remove.
+fn binary_fork_commits(bin: &Path) -> Option<u32> {
+    // `grep -a -o -m1` rather than `strings`: it returns ONE short line instead
+    // of every literal in a 30 MB binary. `run_with_timeout` no longer deadlocks
+    // on volume, but there is no reason to move megabytes to read 26 bytes.
+    let out = run_with_timeout(
+        Command::new("grep")
+            .args(["-a", "-o", "-m1", "HERDR_FORK_PROVENANCE=[^;]*;"])
+            .arg(bin),
+        VERSION_TIMEOUT,
+    )?;
+    // Exit 1 simply means "no match": an upstream binary, or one predating the
+    // stamp. That is a legitimate answer, not an error, and it must yield None.
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // NOT line-anchored, and that is deliberate. The Rust string table packs
+    // unrelated literals end to end with no separators, so `strings` emits the
+    // marker in the MIDDLE of a multi-kilobyte line — the first version of this
+    // parser matched on `^HERDR_FORK_PROVENANCE=` and found nothing in a binary
+    // that demonstrably contained it. Scan for the needle anywhere, then stop at
+    // the first character that cannot belong to a `git describe` output, since
+    // whatever literal was linked next begins there.
+    const NEEDLE: &str = "HERDR_FORK_PROVENANCE=";
+    let start = text.find(NEEDLE)? + NEEDLE.len();
+    // The build bakes a `;` terminator for exactly this reason — see
+    // `build_info::FORK_PROVENANCE`. Stopping on "first character that looks
+    // wrong" is not sufficient, because every character `git describe` emits is
+    // also legal in the identifier that may be linked immediately after it.
+    let desc = text[start..].split(';').next()?.trim();
+    if desc.is_empty() || desc == "unknown" {
+        return None;
+    }
+    // `<tag>-<ahead>-g<sha>[-dirty]`
+    let desc = desc.strip_suffix("-dirty").unwrap_or(desc);
+    let mut parts = desc.rsplitn(3, '-');
+    let sha = parts.next()?;
+    if !sha.starts_with('g') {
+        return None; // `--always` degraded to a bare sha: no tag, no count.
+    }
+    parts.next()?.parse().ok()
 }
 
 /// Count own-fork commits ahead of `version`'s release tag: `git -C <repo>
@@ -477,6 +1136,56 @@ fn stale_budget() -> u64 {
 
 /// Atomic write: temp file in the same dir, then rename, so the host's
 /// mtime-cached reader never sees a torn file.
+/// Write the offline patch-notes cache: `latest_notes.md` (what the click
+/// opens) plus `releases_notes.md` (every published release, newest first, so
+/// the archive survives even when a version disappears from a later manifest).
+///
+/// Failures are deliberately silent: the notes are a convenience surface, and a
+/// collector that exited non-zero over them would take the whole version strip
+/// down with it.
+fn write_notes_cache(dir: &Path, m: &Manifest) {
+    if let Some(notes) = manifest_notes(m, &m.version) {
+        let url = notes_url_from_manifest(m).unwrap_or_default();
+        let body = format!(
+            "# herdr {}\n\n{}{}\n",
+            m.version,
+            if url.is_empty() {
+                String::new()
+            } else {
+                format!("{url}\n\n")
+            },
+            notes
+        );
+        let _ = write_atomic(&dir.join(NOTES_FILE), body.as_bytes());
+    }
+
+    let mut versions: Vec<&String> = m.releases.keys().collect();
+    versions.sort_by(|a, b| version_key(b).cmp(&version_key(a)));
+    let mut archive = String::new();
+    for v in versions {
+        if let Some(notes) = m.releases.get(v).and_then(|r| r.notes.clone()) {
+            archive.push_str(&format!("# herdr {v}\n\n{}\n\n", notes.trim()));
+        }
+    }
+    if !archive.is_empty() {
+        let _ = write_atomic(&dir.join(ARCHIVE_FILE), archive.as_bytes());
+    }
+}
+
+/// Numeric sort key for a `major.minor.patch` string, so `0.7.10` sorts after
+/// `0.7.9` instead of before it as a lexical compare would.
+fn version_key(v: &str) -> (u32, u32, u32) {
+    let mut it = v
+        .split('.')
+        .map(|p| p.trim_matches(|c: char| !c.is_ascii_digit()))
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;

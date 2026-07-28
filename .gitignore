@@ -37,3 +37,6 @@ node_modules/
 .DS_Store
 /.wrangler/
 **/.wrangler/
+
+# local build dir for this worktree
+target-vdsafety/
