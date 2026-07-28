@@ -84,6 +84,99 @@ pub struct SessionStats {
     pub idle_secs: u64,
 }
 
+
+/// How a running/installed CLI version compares to the latest published one.
+///
+/// `Unknown` is deliberately a first-class state rather than being folded into
+/// `Outdated`. A failed or never-completed fetch must NOT paint the version red:
+/// "we could not check" and "you are behind" are different facts and the strip
+/// has to show them differently, or a dead network reads as a pending update
+/// forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    Current,
+    Outdated,
+    Unknown,
+}
+
+/// A CLI's running/installed version alongside the latest published one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliVersion {
+    /// For Claude Code: the version the pane is actually RUNNING, read from the
+    /// transcript envelope — not whatever is installed on disk, which may be
+    /// newer and is exactly the gap this feature exists to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Latest published version. `None` until a fetch has ever succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// Age of the `latest` value in seconds. `None` when never fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_age_secs: Option<u64>,
+}
+
+impl CliVersion {
+    /// Compare `current` against `latest`, dotted-numeric segment by segment.
+    ///
+    /// Any missing side, or any non-numeric segment, yields [`Freshness::Unknown`]
+    /// rather than a guess — see the type docs on why that matters.
+    pub fn freshness(&self) -> Freshness {
+        let (Some(cur), Some(latest)) = (self.current.as_deref(), self.latest.as_deref()) else {
+            return Freshness::Unknown;
+        };
+        match (parse_semver(cur), parse_semver(latest)) {
+            (Some(c), Some(l)) if c >= l => Freshness::Current,
+            (Some(_), Some(_)) => Freshness::Outdated,
+            _ => Freshness::Unknown,
+        }
+    }
+}
+
+/// Parse a dotted numeric version into comparable segments. Returns `None` if
+/// any segment is not a plain number, so exotic version strings degrade to
+/// `Unknown` instead of comparing wrongly.
+fn parse_semver(v: &str) -> Option<Vec<u64>> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let parts: Vec<u64> = core
+        .split('.')
+        .map(|p| p.parse::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+/// Which clickable version token in the caption is being referred to.
+///
+/// Lives in the model crate (not the native core) because the WASM guest needs
+/// the same identity to route hover and clicks — a second, parallel definition
+/// is exactly the kind of duplication that lets the two renderers drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionToken {
+    /// The Claude Code version this pane is running.
+    Claude,
+    /// The installed codex CLI version (cx panes only).
+    Codex,
+}
+
+/// Versions shown in the usage caption.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliVersions {
+    /// Claude Code — always present, since every pane the usage dash tracks runs it.
+    #[serde(default)]
+    pub claude: CliVersion,
+    /// The machine's installed `codex` CLI. Populated only for cx panes: in a
+    /// native Claude pane the codex binary is not in the loop and showing its
+    /// version would just be noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CliVersion>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub cli: Cli,
@@ -109,6 +202,9 @@ pub struct UsageSnapshot {
     /// Per-session STATS for the focused session. `None` when the source can't
     /// derive them yet (Codex/pi) → STATS view renders dashes, never fabricates.
     pub stats: Option<SessionStats>,
+    /// Running/latest CLI versions rendered as clickable tokens in the caption.
+    #[serde(default)]
+    pub versions: CliVersions,
 }
 
 impl UsageSnapshot {
@@ -129,6 +225,7 @@ impl UsageSnapshot {
             state_note: None,
             state_full: None,
             stats: None,
+            versions: CliVersions::default(),
         }
     }
 
@@ -291,5 +388,84 @@ mod tests {
         assert_eq!(back.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(back.state, ThreadState::Working);
         assert_eq!(back.stats.unwrap().agents_done, 4);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn v(current: &str, latest: &str) -> CliVersion {
+        CliVersion {
+            current: Some(current.to_string()),
+            latest: Some(latest.to_string()),
+            checked_age_secs: Some(0),
+        }
+    }
+
+    #[test]
+    fn equal_versions_are_current() {
+        assert_eq!(v("2.1.220", "2.1.220").freshness(), Freshness::Current);
+    }
+
+    #[test]
+    fn behind_is_outdated_and_ahead_is_current() {
+        assert_eq!(v("2.1.219", "2.1.220").freshness(), Freshness::Outdated);
+        // Segment-wise, not lexicographic: "2.1.9" vs "2.1.10" is the classic
+        // string-compare trap and must resolve numerically.
+        assert_eq!(v("2.1.9", "2.1.10").freshness(), Freshness::Outdated);
+        assert_eq!(v("2.2.0", "2.1.220").freshness(), Freshness::Current);
+        // A local build ahead of the registry is not "outdated".
+        assert_eq!(v("2.1.221", "2.1.220").freshness(), Freshness::Current);
+    }
+
+    #[test]
+    fn differing_segment_counts_compare_by_segment() {
+        assert_eq!(v("2.1", "2.1.1").freshness(), Freshness::Outdated);
+        assert_eq!(v("2.2", "2.1.9").freshness(), Freshness::Current);
+    }
+
+    #[test]
+    fn prerelease_and_v_prefix_are_tolerated() {
+        assert_eq!(v("v2.1.220", "2.1.220").freshness(), Freshness::Current);
+        assert_eq!(v("2.1.220-beta.1", "2.1.220").freshness(), Freshness::Current);
+    }
+
+    /// The important negative case: a missing or unparseable version must never
+    /// paint the token red. "could not check" is not "you are behind".
+    #[test]
+    fn unknown_never_masquerades_as_outdated() {
+        assert_eq!(CliVersion::default().freshness(), Freshness::Unknown);
+        assert_eq!(
+            CliVersion {
+                current: Some("2.1.220".into()),
+                latest: None,
+                checked_age_secs: None,
+            }
+            .freshness(),
+            Freshness::Unknown
+        );
+        assert_eq!(v("nightly", "2.1.220").freshness(), Freshness::Unknown);
+        assert_eq!(v("2.1.220", "unknown").freshness(), Freshness::Unknown);
+    }
+
+    /// Old `usage_input.json` written before this feature must still load, or a
+    /// host/guest running the previous build would fail to parse every frame.
+    /// Derived by round-tripping a real snapshot and deleting the new key, so
+    /// the fixture cannot drift out of sync with the struct.
+    #[test]
+    fn snapshot_without_versions_deserializes() {
+        let snap = UsageSnapshot::empty(Cli::Claude);
+        let mut value = serde_json::to_value(&snap).expect("serialize");
+        let obj = value.as_object_mut().expect("snapshot is a json object");
+        assert!(
+            obj.remove("versions").is_some(),
+            "the field under test must actually be present before removal"
+        );
+
+        let legacy: UsageSnapshot =
+            serde_json::from_value(value).expect("legacy snapshot still deserializes");
+        assert_eq!(legacy.versions, CliVersions::default());
+        assert_eq!(legacy.versions.claude.freshness(), Freshness::Unknown);
     }
 }
