@@ -387,8 +387,7 @@ impl App {
             let Some(ac) = terminal.auto_continue_after_restart else {
                 continue;
             };
-            let is_claude =
-                terminal.effective_known_agent() == Some(crate::detect::Agent::Claude);
+            let is_claude = terminal.effective_known_agent() == Some(crate::detect::Agent::Claude);
             let idle = terminal.state == crate::detect::AgentState::Idle;
             let has_runtime = self.terminal_runtimes.get(&terminal_id).is_some();
 
@@ -412,17 +411,14 @@ impl App {
             // case fall back to a settle delay: once the agent has had time to come
             // up and is sitting at an idle claude screen, treat it as ready. Slow
             // or visible boots take the saw_activity path well before this fires.
-            let settled =
-                now.saturating_duration_since(ac.armed_at) >= AUTO_CONTINUE_READY_SETTLE;
+            let settled = now.saturating_duration_since(ac.armed_at) >= AUTO_CONTINUE_READY_SETTLE;
             let ready = is_claude && idle && has_runtime && (saw_activity || settled);
 
             match ac.nudged_at {
                 None => {
                     if ready {
                         if self.send_auto_continue_nudge(&terminal_id, false) {
-                            self.mutate_auto_continue(&terminal_id, |ac| {
-                                ac.nudged_at = Some(now)
-                            });
+                            self.mutate_auto_continue(&terminal_id, |ac| ac.nudged_at = Some(now));
                             changed = true;
                             tracing::info!(
                                 terminal = %terminal_id,
@@ -1002,7 +998,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn armed_auto_continue_app() -> (App, crate::terminal::TerminalId, tokio::sync::mpsc::Receiver<Bytes>) {
+    fn armed_auto_continue_app() -> (
+        App,
+        crate::terminal::TerminalId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("resumed");
         let pane_id = workspace.tabs[0].root_pane;
@@ -1013,8 +1013,9 @@ mod tests {
         let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.auto_continue_after_restart =
-            Some(crate::terminal::AutoContinueAfterRestart::armed(std::time::Instant::now()));
+        terminal.auto_continue_after_restart = Some(
+            crate::terminal::AutoContinueAfterRestart::armed(std::time::Instant::now()),
+        );
         (app, terminal_id, rx)
     }
 
@@ -1027,7 +1028,10 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_detected_state(Some(crate::detect::Agent::Claude), crate::detect::AgentState::Idle);
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
 
         app.tick_auto_continue_after_restart(std::time::Instant::now());
 
@@ -1048,10 +1052,14 @@ mod tests {
     async fn auto_continue_nudges_once_resumed_claude_is_ready() {
         let (mut app, terminal_id, mut rx) = armed_auto_continue_app();
         // Live detection first sees the resume shell/agent working (activity).
-        app.state.terminals.get_mut(&terminal_id).unwrap().set_detected_state(
-            Some(crate::detect::Agent::Claude),
-            crate::detect::AgentState::Working,
-        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Working,
+            );
         app.tick_auto_continue_after_restart(std::time::Instant::now());
         assert!(rx.try_recv().is_err(), "working state does not nudge");
         assert!(
@@ -1065,10 +1073,14 @@ mod tests {
         );
 
         // Then claude becomes ready (idle): nudge fires exactly once.
-        app.state.terminals.get_mut(&terminal_id).unwrap().set_detected_state(
-            Some(crate::detect::Agent::Claude),
-            crate::detect::AgentState::Idle,
-        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
         let nudged_at = std::time::Instant::now();
         app.tick_auto_continue_after_restart(nudged_at);
 
@@ -1088,8 +1100,13 @@ mod tests {
             .is_some());
 
         // Still idle after the stall window -> bare Enter retry.
-        app.tick_auto_continue_after_restart(nudged_at + AUTO_CONTINUE_STALL_RETRY + std::time::Duration::from_millis(1));
-        assert_eq!(rx.try_recv().expect("retry enter"), Bytes::from_static(b"\r"));
+        app.tick_auto_continue_after_restart(
+            nudged_at + AUTO_CONTINUE_STALL_RETRY + std::time::Duration::from_millis(1),
+        );
+        assert_eq!(
+            rx.try_recv().expect("retry enter"),
+            Bytes::from_static(b"\r")
+        );
     }
 
     #[cfg(unix)]
@@ -1102,7 +1119,10 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_detected_state(Some(crate::detect::Agent::Claude), crate::detect::AgentState::Idle);
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
 
         let armed_at = app
             .state
@@ -1118,14 +1138,15 @@ mod tests {
             armed_at + AUTO_CONTINUE_READY_SETTLE - std::time::Duration::from_millis(1),
         );
         assert!(rx.try_recv().is_err(), "no nudge before settle delay");
-        assert!(!app
-            .state
-            .terminals
-            .get(&terminal_id)
-            .unwrap()
-            .auto_continue_after_restart
-            .unwrap()
-            .saw_activity);
+        assert!(
+            !app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .auto_continue_after_restart
+                .unwrap()
+                .saw_activity
+        );
 
         // After the settle delay: nudge fires exactly once.
         app.tick_auto_continue_after_restart(
@@ -1142,23 +1163,35 @@ mod tests {
     #[tokio::test]
     async fn auto_continue_clears_once_agent_starts_working_on_nudge() {
         let (mut app, terminal_id, mut rx) = armed_auto_continue_app();
-        app.state.terminals.get_mut(&terminal_id).unwrap().set_detected_state(
-            Some(crate::detect::Agent::Claude),
-            crate::detect::AgentState::Working,
-        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Working,
+            );
         app.tick_auto_continue_after_restart(std::time::Instant::now());
-        app.state.terminals.get_mut(&terminal_id).unwrap().set_detected_state(
-            Some(crate::detect::Agent::Claude),
-            crate::detect::AgentState::Idle,
-        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Idle,
+            );
         app.tick_auto_continue_after_restart(std::time::Instant::now());
         assert!(rx.try_recv().is_ok(), "nudge sent");
 
         // Agent picks up the nudge and starts working -> entry retired.
-        app.state.terminals.get_mut(&terminal_id).unwrap().set_detected_state(
-            Some(crate::detect::Agent::Claude),
-            crate::detect::AgentState::Working,
-        );
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Claude),
+                crate::detect::AgentState::Working,
+            );
         app.tick_auto_continue_after_restart(std::time::Instant::now());
         assert!(app
             .state

@@ -37,8 +37,7 @@ pub fn parse_subagent_marker(screen: &str) -> Option<String> {
         .get_or_init(|| regex::Regex::new(r"(?m)^─{3,}\s*@([A-Za-z0-9_-]+)\s*─+\s*$").unwrap());
     let message = MESSAGE
         .get_or_init(|| regex::Regex::new(r"Message @([A-Za-z0-9_-]+)\s*(?:…|\.\.\.)").unwrap());
-    let viewing =
-        VIEWING.get_or_init(|| regex::Regex::new(r"Viewing @([A-Za-z0-9_-]+)").unwrap());
+    let viewing = VIEWING.get_or_init(|| regex::Regex::new(r"Viewing @([A-Za-z0-9_-]+)").unwrap());
     separator
         .captures(screen)
         .or_else(|| message.captures(screen))
@@ -176,9 +175,15 @@ mod tests {
     #[test]
     fn subagent_marker_separator_ignores_chat_mention_and_manage_row() {
         // A chat line mentioning @foo is NOT a `─`-bounded separator.
-        assert_eq!(parse_subagent_marker("please ask @foo to review this\n"), None);
+        assert_eq!(
+            parse_subagent_marker("please ask @foo to review this\n"),
+            None
+        );
         // The manage-subagents list row is not a separator either.
-        assert_eq!(parse_subagent_marker("❯ ⏺ probe-demo  running · 12s\n"), None);
+        assert_eq!(
+            parse_subagent_marker("❯ ⏺ probe-demo  running · 12s\n"),
+            None
+        );
     }
 
     #[test]

@@ -371,7 +371,8 @@ impl App {
         }
         // Record each pane in the tab before it is torn down. Guarded above so
         // this never runs for the last tab (that routes through workspace close).
-        self.state.stage_pane_close_history(ws_idx, pane_ids.iter().copied());
+        self.state
+            .stage_pane_close_history(ws_idx, pane_ids.iter().copied());
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return tab_not_found(id, &target.tab_id);
         };

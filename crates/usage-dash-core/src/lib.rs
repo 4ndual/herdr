@@ -119,7 +119,10 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
             // reported sid has no transcript on disk (herdr can report a sid that
             // never got a file), so a live cx pane isn't stuck on a stale snapshot.
             let sid = focus.session_id.as_deref().filter(|s| !s.is_empty());
-            let cwd = focus.cwd.as_deref().map(|c| c.to_string_lossy().into_owned());
+            let cwd = focus
+                .cwd
+                .as_deref()
+                .map(|c| c.to_string_lossy().into_owned());
             match sources::claude::snapshot_for_focus(
                 sid,
                 cwd.as_deref(),

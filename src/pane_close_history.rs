@@ -528,7 +528,10 @@ fn read_user_prompts(path: &std::path::Path) -> Option<(Option<String>, Option<S
     let last = if prompts.len() == 1 {
         None
     } else {
-        Some(truncate_chars(&prompts[prompts.len() - 1], PROMPT_MAX_CHARS))
+        Some(truncate_chars(
+            &prompts[prompts.len() - 1],
+            PROMPT_MAX_CHARS,
+        ))
     };
     Some((Some(first), last))
 }

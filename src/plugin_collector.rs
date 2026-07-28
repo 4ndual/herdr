@@ -162,9 +162,10 @@ fn run_collector(
         .map_err(|err| format!("failed to spawn collector: {err}"))?;
 
     // Drain stdout on a helper thread so a full pipe can never deadlock the wait.
-    let stdout_reader = child.stdout.take().map(|stdout| {
-        std::thread::spawn(move || read_capped(stdout, COLLECTOR_STDOUT_MAX_BYTES))
-    });
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|stdout| std::thread::spawn(move || read_capped(stdout, COLLECTOR_STDOUT_MAX_BYTES)));
 
     let deadline = Instant::now() + COLLECTOR_TIMEOUT;
     let mut timed_out = false;
@@ -274,8 +275,14 @@ mod tests {
             "/plugins/usage-dash-ui/../../target/release/usage-dash-collector"
         );
         // Bare names and absolute paths pass through untouched.
-        assert_eq!(resolve_program("usage-dash-collector", root), "usage-dash-collector");
-        assert_eq!(resolve_program("/usr/bin/collector", root), "/usr/bin/collector");
+        assert_eq!(
+            resolve_program("usage-dash-collector", root),
+            "usage-dash-collector"
+        );
+        assert_eq!(
+            resolve_program("/usr/bin/collector", root),
+            "/usr/bin/collector"
+        );
     }
 
     #[test]
@@ -302,7 +309,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let script = dir.join("collector.sh");
             let mut f = std::fs::File::create(&script).unwrap();
-            f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes()).unwrap();
+            f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+                .unwrap();
             let mut perms = std::fs::metadata(&script).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&script, perms).unwrap();
@@ -322,7 +330,10 @@ mod tests {
         #[test]
         fn replace_keep_clear_scripts_map_to_outcomes() {
             let (dir, script) = write_script(r#"echo '{"outcome":"replace","snapshot":{"k":7}}'"#);
-            assert!(matches!(run(&script, &dir), Ok(CollectorOutcome::Replace(_))));
+            assert!(matches!(
+                run(&script, &dir),
+                Ok(CollectorOutcome::Replace(_))
+            ));
             std::fs::remove_dir_all(&dir).ok();
 
             let (dir, script) = write_script(r#"echo '{"outcome":"keep"}'"#);
@@ -339,13 +350,7 @@ mod tests {
             let (dir, script) = write_script(
                 r#"printf '{"outcome":"replace","snapshot":{"focus":"%s"}}' "$HERDR_FOCUS_JSON""#,
             );
-            let out = run_collector(
-                &script.to_string_lossy(),
-                &[],
-                &dir,
-                &dir,
-                "sentinel-focus",
-            );
+            let out = run_collector(&script.to_string_lossy(), &[], &dir, &dir, "sentinel-focus");
             match out {
                 Ok(CollectorOutcome::Replace(value)) => {
                     assert_eq!(

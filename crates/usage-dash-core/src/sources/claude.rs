@@ -240,10 +240,7 @@ pub fn snapshot_for_sid(sid: &str) -> Option<UsageSnapshot> {
 /// `<sid>/subagents/` transcripts), while keeping the account's plan-quota rows
 /// (5h / weekly / today) and per-session state/stats from the MAIN session. A
 /// missing/unmatched subagent falls back silently to the main-session snapshot.
-pub fn snapshot_for_sid_with_subagent(
-    sid: &str,
-    subagent: Option<&str>,
-) -> Option<UsageSnapshot> {
+pub fn snapshot_for_sid_with_subagent(sid: &str, subagent: Option<&str>) -> Option<UsageSnapshot> {
     let path = transcript_for_sid(sid)?;
     snapshot_from_transcript(&path, subagent)
 }
@@ -635,7 +632,7 @@ mod tests {
         );
         let t = parse_transcript(&transcript);
         assert_eq!(t.ctx_tokens, Some(4982)); // postTokens, not the pre-compact 59698
-        // window inference still sees the pre-compact peak.
+                                              // window inference still sees the pre-compact peak.
         assert_eq!(t.max_ctx_tokens, 59698);
     }
 
@@ -819,14 +816,21 @@ mod tests {
     // filename slug ('aprobe1') deliberately differs from the meta `name` ('probe1').
     fn write_subagent_session(h: &TempHome, sid: &str, meta: &str, jsonl: &str) {
         let proj = "-Users-andual-Projects-herdr";
-        h.write(&format!(".claude/projects/{proj}/{sid}.jsonl"), MAIN_TRANSCRIPT);
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}.jsonl"),
+            MAIN_TRANSCRIPT,
+        );
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
         h.write(
-            &format!(".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.meta.json"),
+            &format!(
+                ".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.meta.json"
+            ),
             meta,
         );
         h.write(
-            &format!(".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.jsonl"),
+            &format!(
+                ".claude/projects/{proj}/{sid}/subagents/agent-aprobe1-a5e2b92b5f55e765.jsonl"
+            ),
             jsonl,
         );
     }
@@ -841,7 +845,7 @@ mod tests {
         // Match by meta `name` ("probe1"), though the filename slug is "aprobe1".
         let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
         assert_eq!(s.cli, Cli::Claude); // stays the account's plan
-        // ctx swapped to the subagent's tail: 5 + 12000 + 0 = 12005 (main was 90010).
+                                        // ctx swapped to the subagent's tail: 5 + 12000 + 0 = 12005 (main was 90010).
         assert_eq!(s.ctx_used_tokens, Some(12005));
         // model swapped to the subagent's real model id, with the @name marker.
         assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · @probe1"));
@@ -856,7 +860,12 @@ mod tests {
         let sid = "sid-alias";
         let meta = r#"{"agentType":"probe1","name":"probe1","model":"opus[1m]"}"#;
         // jsonl present but no assistant turn yet.
-        write_subagent_session(&h, sid, meta, r#"{"type":"user","message":{"role":"user"}}"#);
+        write_subagent_session(
+            &h,
+            sid,
+            meta,
+            r#"{"type":"user","message":{"role":"user"}}"#,
+        );
         // 1M enabled on the account so the opus alias infers the 1M window.
         h.write(".claude/settings.json", r#"{"model":"opus[1m]"}"#);
 
@@ -896,7 +905,10 @@ mod tests {
         let h = TempHome::new("sub-dup");
         let sid = "sid-dup";
         let proj = "-Users-andual-Projects-herdr";
-        h.write(&format!(".claude/projects/{proj}/{sid}.jsonl"), MAIN_TRANSCRIPT);
+        h.write(
+            &format!(".claude/projects/{proj}/{sid}.jsonl"),
+            MAIN_TRANSCRIPT,
+        );
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
         // Two agents both named "probe1"; the newer one's jsonl must win.
         let older = h.write(

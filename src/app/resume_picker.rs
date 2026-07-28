@@ -208,7 +208,6 @@ impl App {
             let _ = runtime.try_send_bytes(Bytes::from(bytes));
         }
     }
-
 }
 
 /// Allocate a unique, private result-file path for one picker run.
@@ -262,7 +261,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
-        path.push(format!("herdr-resume-wrapper-{}-{micros:x}.sh", std::process::id()));
+        path.push(format!(
+            "herdr-resume-wrapper-{}-{micros:x}.sh",
+            std::process::id()
+        ));
         std::fs::write(&path, body).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -309,7 +311,11 @@ mod tests {
         let err = app.open_resume_picker_overlay(missing).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(app.state.resume_picker.is_none());
-        assert_ne!(app.state.mode, Mode::ResumePicker, "mode not switched on failure");
+        assert_ne!(
+            app.state.mode,
+            Mode::ResumePicker,
+            "mode not switched on failure"
+        );
     }
 
     #[tokio::test]

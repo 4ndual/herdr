@@ -229,9 +229,7 @@ const HIDDEN_TICKS: u32 = 15;
 /// width <= 3 is the collapsed handle (see `render_handle`).
 fn harness_panel_visible(app: &App) -> bool {
     app.state.view.panel_rects.iter().any(|p| {
-        p.plugin_id == crate::app::HARNESS_PLUGIN_ID
-            && p.rect.width > 3
-            && p.rect.height > 1
+        p.plugin_id == crate::app::HARNESS_PLUGIN_ID && p.rect.width > 3 && p.rect.height > 1
     })
 }
 
@@ -385,9 +383,12 @@ fn resolve_tmux_attach(pid: u32) -> Option<TmuxAttach> {
         let (id, name) = l.split_once(' ')?;
         (id == want).then(|| name.to_string())
     })?;
-    let clients = run_capture("tmux", &["-S", socket, "list-clients", "-t", &session, "-F", "x"])
-        .map(|c| c.lines().count())
-        .unwrap_or(0);
+    let clients = run_capture(
+        "tmux",
+        &["-S", socket, "list-clients", "-t", &session, "-F", "x"],
+    )
+    .map(|c| c.lines().count())
+    .unwrap_or(0);
     Some(TmuxAttach {
         attach_cmd: format!("tmux -S {socket} attach -t {session}"),
         session,
@@ -395,11 +396,7 @@ fn resolve_tmux_attach(pid: u32) -> Option<TmuxAttach> {
     })
 }
 
-fn refresh(
-    cache: &mut HarnessCache,
-    focus: &herdr_ui_plugin_api::FocusInput,
-    env: &SessionEnv,
-) {
+fn refresh(cache: &mut HarnessCache, focus: &herdr_ui_plugin_api::FocusInput, env: &SessionEnv) {
     // Latest-focused Claude pane wins; other focuses keep the last target.
     if focus.agent == herdr_ui_plugin_api::AgentKind::Claude {
         if let (Some(sid), Some(cwd)) = (focus.session_id.as_deref(), focus.cwd.as_deref()) {
@@ -590,7 +587,11 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                             .unwrap_or(0);
                         stats.ctx_reads.insert(
                             name.to_string(),
-                            CtxRead { bytes: len, seq: stats.seq, at: ts.clone() },
+                            CtxRead {
+                                bytes: len,
+                                seq: stats.seq,
+                                at: ts.clone(),
+                            },
                         );
                     }
                 }
@@ -603,7 +604,11 @@ fn ingest_line(stats: &mut JsonlStats, v: &serde_json::Value) {
                             .unwrap_or(0);
                         stats.ctx_reads.insert(
                             name.to_string(),
-                            CtxRead { bytes: len, seq: stats.seq, at: ts.clone() },
+                            CtxRead {
+                                bytes: len,
+                                seq: stats.seq,
+                                at: ts.clone(),
+                            },
                         );
                     }
                 }
@@ -920,7 +925,12 @@ fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
 /// Cheap; safe to call every tick without a full config re-parse.
 fn refresh_agent_kind(cache: &mut HarnessCache) {
     cache.agent_kind = match &cache.transcript {
-        Some(p) if p.to_string_lossy().contains(".claude-code-router/profiles/") => "cx",
+        Some(p)
+            if p.to_string_lossy()
+                .contains(".claude-code-router/profiles/") =>
+        {
+            "cx"
+        }
         _ => "claude",
     }
     .to_string();
@@ -1132,15 +1142,12 @@ fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) 
         let procs = parse_ps(&ps);
         // Prefer the pid herdr resolved from the pane's foreground job; fall back
         // to the sid grep for older/resumed sessions that carry it in argv.
-        let root_pid = env
-            .agent_pid
-            .filter(|p| procs.contains_key(p))
-            .or_else(|| {
-                procs
-                    .iter()
-                    .find(|(_, p)| p.command.contains(sid))
-                    .map(|(pid, _)| *pid)
-            });
+        let root_pid = env.agent_pid.filter(|p| procs.contains_key(p)).or_else(|| {
+            procs
+                .iter()
+                .find(|(_, p)| p.command.contains(sid))
+                .map(|(pid, _)| *pid)
+        });
         if let Some(root_pid) = root_pid {
             // Whole-tree rollup (breadth-first over ppid links).
             let tree = descendant_tree(&procs, root_pid);
@@ -1172,7 +1179,11 @@ fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) 
             }
             // Per-descendant rows (skip the root itself), capped; the SUM above
             // still covers every process even past the cap.
-            for (pid, depth) in tree.iter().filter(|(p, _)| *p != root_pid).take(MAX_PROC_ROWS) {
+            for (pid, depth) in tree
+                .iter()
+                .filter(|(p, _)| *p != root_pid)
+                .take(MAX_PROC_ROWS)
+            {
                 if let Some(p) = procs.get(pid) {
                     let base = p
                         .command
@@ -1249,7 +1260,6 @@ fn fmt_tokens(tok: u32) -> String {
     }
 }
 
-
 fn basename(p: &Path) -> String {
     p.file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -1316,7 +1326,9 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
     let mut rows = Vec::new();
     let mut loaded_tok = 0u32; // tokens occupying context NOW.
     for (i, path) in cache.ctx_paths.iter().take(MAX_ROWS).enumerate() {
-        let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+        let bytes = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let tok = estimate_tokens(bytes);
         loaded_tok += tok;
         let scope = ctx_scope(path, &home);
@@ -1345,7 +1357,9 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
     // Memory index MEMORY.md loads at start; individual memory files load
     // on-recall (grouped under CONTEXT so the UI can nest them).
     if let Some(idx) = &cache.mem_index {
-        let bytes = std::fs::metadata(idx).map(|m| m.len() as usize).unwrap_or(0);
+        let bytes = std::fs::metadata(idx)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
         let tok = estimate_tokens(bytes);
         loaded_tok += tok;
         rows.push(HarnessRow {
@@ -1403,7 +1417,9 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
     seen.sort_by(|a, b| b.1.seq.cmp(&a.1.seq)); // most-recent first
     for (name, read) in seen.into_iter().take(MAX_ROWS.saturating_sub(rows.len())) {
         // Real byte count: recorded content length wins; else stat the path.
-        let disk = std::fs::metadata(Path::new(name)).ok().map(|m| m.len() as usize);
+        let disk = std::fs::metadata(Path::new(name))
+            .ok()
+            .map(|m| m.len() as usize);
         let bytes: Option<usize> = if read.bytes > 0 {
             Some(read.bytes)
         } else {
@@ -1420,7 +1436,11 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
                     fmt_bytes(b)
                 )),
             ),
-            None => ("n/det".to_string(), None, Some("not determinable".to_string())),
+            None => (
+                "n/det".to_string(),
+                None,
+                Some("not determinable".to_string()),
+            ),
         };
         let mut tooltip = format!("{name}\nread this session");
         if !read.at.is_empty() {
@@ -1436,7 +1456,11 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
             key: format!("ctxr:{name}"),
             label: basename(Path::new(name)),
             meta,
-            state: if evicted { RowState::Off } else { RowState::None },
+            state: if evicted {
+                RowState::Off
+            } else {
+                RowState::None
+            },
             tooltip,
             openable: false,
             can_disable: false,
@@ -1517,7 +1541,13 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
         .iter()
         .enumerate()
         .filter(|(_, e)| is_project(e))
-        .chain(cache.hooks.iter().enumerate().filter(|(_, e)| !is_project(e)))
+        .chain(
+            cache
+                .hooks
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !is_project(e)),
+        )
         .collect();
     for (i, entry) in ordered {
         // Transcript hook attachments are keyed at EVENT granularity (multiple
@@ -1560,7 +1590,11 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
             key: format!("hook:{i}"),
             label: entry.name.clone(),
             meta,
-            state: if active { RowState::Active } else { RowState::Idle },
+            state: if active {
+                RowState::Active
+            } else {
+                RowState::Idle
+            },
             tooltip,
             openable: entry.script.is_some(),
             can_disable: true,
@@ -1770,7 +1804,13 @@ fn skills_section(cache: &HarnessCache) -> HarnessSection {
         .skills
         .iter()
         .enumerate()
-        .map(|(i, e)| (i, e, cache.stats.skill_calls.get(&e.name).copied().unwrap_or(0)))
+        .map(|(i, e)| {
+            (
+                i,
+                e,
+                cache.stats.skill_calls.get(&e.name).copied().unwrap_or(0),
+            )
+        })
         .collect();
     entries.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.name.cmp(&b.1.name)));
     let compacted = cache.stats.last_compaction_seq > 0;
@@ -1786,8 +1826,10 @@ fn skills_section(cache: &HarnessCache) -> HarnessSection {
         // R11 loaded_at / R12 eviction from the last invoke.
         let last = cache.stats.skill_last.get(&skill.name);
         let loaded_at = last.map(|(_, at)| at.clone()).filter(|s| !s.is_empty());
-        let evicted =
-            compacted && last.map(|(seq, _)| *seq <= cache.stats.last_compaction_seq).unwrap_or(false);
+        let evicted = compacted
+            && last
+                .map(|(seq, _)| *seq <= cache.stats.last_compaction_seq)
+                .unwrap_or(false);
         let mut tooltip = format!(
             "{}\ninvoked x{calls} this session\nloaded now: {} (description in catalog, loads every session)\nif invoked: +{} (SKILL.md body, {} on disk)\nskills load on demand — no disable (archive the skill dir instead)\nclick opens SKILL.md",
             display_path(&skill.path), fmt_tokens(desc_tok), fmt_tokens(body_tok), fmt_bytes(body_bytes)
@@ -1809,14 +1851,22 @@ fn skills_section(cache: &HarnessCache) -> HarnessSection {
             } else {
                 fmt_tokens(desc_tok)
             },
-            state: if calls > 0 { RowState::Idle } else { RowState::Off },
+            state: if calls > 0 {
+                RowState::Idle
+            } else {
+                RowState::Off
+            },
             tooltip,
             openable: skill.path.is_file(),
             can_disable: false,
             indent: 0,
             tok_loaded: Some(desc_tok),
             tok_full: Some(body_tok),
-            tok_src: Some(format!("desc {}B · body {}", skill.desc_bytes, fmt_bytes(body_bytes))),
+            tok_src: Some(format!(
+                "desc {}B · body {}",
+                skill.desc_bytes,
+                fmt_bytes(body_bytes)
+            )),
             load_when: Some(if evicted { "evicted" } else { "on-invoke" }.to_string()),
             loaded_at,
             scope: Some("global".to_string()),
@@ -1839,7 +1889,10 @@ fn skills_section(cache: &HarnessCache) -> HarnessSection {
     HarnessSection {
         title: "SKILLS".to_string(),
         summary: format!("{}", cache.skills.len()),
-        agg: Some(format!("{invoked} used · {} loaded", fmt_tokens(listing_tok))),
+        agg: Some(format!(
+            "{invoked} used · {} loaded",
+            fmt_tokens(listing_tok)
+        )),
         collapsed_default: false,
         rows,
     }
@@ -1915,9 +1968,7 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
             let i: usize = idx.parse().ok()?;
             cache.ctx_paths.get(i).cloned().map(ResolvedAction::Open)
         }
-        (HarnessActionKind::Open, "memidx") => {
-            cache.mem_index.clone().map(ResolvedAction::Open)
-        }
+        (HarnessActionKind::Open, "memidx") => cache.mem_index.clone().map(ResolvedAction::Open),
         (HarnessActionKind::Open, "mem") => {
             let i: usize = idx.parse().ok()?;
             cache.mem_files.get(i).cloned().map(ResolvedAction::Open)
@@ -2210,9 +2261,8 @@ impl App {
     }
 
     fn disable_hook(&mut self, entry: &HookEntry, profile_wide: bool) -> bool {
-        let stash =
-            crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
-                .join("harness-disabled.json");
+        let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
+            .join("harness-disabled.json");
         let mut changed = remove_hook_from_file(entry, &stash);
         if profile_wide {
             // Also remove from the ccp profile source so a profile rebuild
@@ -2322,7 +2372,10 @@ mod tests {
             hook_display_name("/Users/x/.bun/bin/bun /Users/x/.claude/hooks/pkg-guard/hook.ts"),
             "pkg-guard"
         );
-        assert_eq!(hook_display_name("bash /Users/x/.claude/hooks/orchestrator/emit.sh"), "orchestrator");
+        assert_eq!(
+            hook_display_name("bash /Users/x/.claude/hooks/orchestrator/emit.sh"),
+            "orchestrator"
+        );
         assert_eq!(hook_display_name("mytool --flag"), "mytool");
     }
 
@@ -2358,7 +2411,11 @@ mod tests {
         let tree = descendant_tree(&procs, 1);
         let pids: Vec<u32> = tree.iter().map(|(p, _)| *p).collect();
         assert_eq!(pids, vec![1, 2, 3, 4]);
-        let total_rss: u64 = tree.iter().filter_map(|(p, _)| procs.get(p)).map(|p| p.rss_kb).sum();
+        let total_rss: u64 = tree
+            .iter()
+            .filter_map(|(p, _)| procs.get(p))
+            .map(|p| p.rss_kb)
+            .sum();
         assert_eq!(total_rss, 650);
         // Depth of the grandchild is 2.
         assert_eq!(tree.iter().find(|(p, _)| *p == 4).map(|(_, d)| *d), Some(2));
@@ -2447,7 +2504,10 @@ mod tests {
         let f = dir.join("SKILL.md");
         std::fs::write(&f, "---\nname: foo\ndescription: does a thing\n---\nbody\n")
             .expect("write");
-        assert_eq!(frontmatter_field(&f, "description").as_deref(), Some("does a thing"));
+        assert_eq!(
+            frontmatter_field(&f, "description").as_deref(),
+            Some("does a thing")
+        );
         assert_eq!(frontmatter_field(&f, "name").as_deref(), Some("foo"));
         assert_eq!(frontmatter_field(&f, "missing"), None);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2492,10 +2552,7 @@ mod tests {
         };
         assert!(remove_hook_from_file(&entry, &stash));
         let root = read_json(&file).expect("reread");
-        assert_eq!(
-            root["hooks"]["Stop"].as_array().map(|a| a.len()),
-            Some(0)
-        );
+        assert_eq!(root["hooks"]["Stop"].as_array().map(|a| a.len()), Some(0));
         assert!(stash.is_file());
         // A second removal drifts (entry gone) and must refuse.
         assert!(!remove_hook_from_file(&entry, &stash));

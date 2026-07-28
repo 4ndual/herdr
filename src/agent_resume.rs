@@ -123,10 +123,7 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
             // dispatcher so cx-origin sessions come back UP as cx (gateway + GPT
             // models, correct CLAUDE_CONFIG_DIR); daily sessions fall through to
             // plain claude untouched. See cmix/scripts/patch-herdr-cx-resume.mjs.
-            vec![
-                "cx-resume".into(),
-                session_ref.value.clone(),
-            ]
+            vec!["cx-resume".into(), session_ref.value.clone()]
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]

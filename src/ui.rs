@@ -703,7 +703,12 @@ fn layout_plugin_panels(
                 let max_slot = terminal.height.saturating_sub(min_peer);
                 let h = resolve_extent(size, content_h, terminal.height).min(max_slot);
                 if h == 0 {
-                    skips.push(skip(&entry, "no_room_for_top_bottom_band", content_w, content_h));
+                    skips.push(skip(
+                        &entry,
+                        "no_room_for_top_bottom_band",
+                        content_w,
+                        content_h,
+                    ));
                     continue;
                 }
                 let start = matches!(placement.region, PluginPanelRegion::Top);
@@ -718,7 +723,12 @@ fn layout_plugin_panels(
                 let w = resolve_extent(size, content_w, terminal.width);
                 let h = content_h.min(terminal.height);
                 if w == 0 || h == 0 {
-                    skips.push(skip(&entry, "no_room_for_free_overlay", content_w, content_h));
+                    skips.push(skip(
+                        &entry,
+                        "no_room_for_free_overlay",
+                        content_w,
+                        content_h,
+                    ));
                     continue;
                 }
                 let x = match placement.align {

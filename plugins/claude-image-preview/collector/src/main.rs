@@ -135,7 +135,11 @@ fn collect_images(root: &Path, session_id: &str) -> std::io::Result<Vec<ImageEnt
         let has_known_ext = path
             .extension()
             .and_then(|ext| ext.to_str())
-            .map(|ext| EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(ext)))
+            .map(|ext| {
+                EXTENSIONS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(ext))
+            })
             .unwrap_or(false);
         if !has_known_ext {
             continue;
@@ -270,10 +274,8 @@ fn jpeg_dimensions(path: &Path) -> std::io::Result<(u32, u32)> {
         }
         let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
         // SOF0..SOF15 except the DHT/JPG/DAC markers interleaved in that range.
-        let is_sof = (0xC0..=0xCF).contains(&marker)
-            && marker != 0xC4
-            && marker != 0xC8
-            && marker != 0xCC;
+        let is_sof =
+            (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
         if is_sof {
             if i + 9 > bytes.len() {
                 return Err(invalid());

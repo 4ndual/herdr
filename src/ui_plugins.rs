@@ -1036,9 +1036,9 @@ impl UiPluginManager {
     /// which combined with `last_error_for` splits the three states that used to
     /// be indistinguishable from outside the process.
     pub(crate) fn is_module_loaded(&self, plugin_id: &str, module_id: &str) -> bool {
-        self.runtime.as_ref().is_some_and(|runtime| {
-            runtime.has_instance(plugin_id, module_id)
-        })
+        self.runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.has_instance(plugin_id, module_id))
     }
 
     /// fork(+127): the module's last load / hot-reload / call error, if the most

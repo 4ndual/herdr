@@ -212,8 +212,7 @@ mod tests {
 
     #[test]
     fn full_render_declares_collapse_hit() {
-        let event: UiEvent =
-            serde_json::from_str(&frame_json(&env_json())).expect("frame parses");
+        let event: UiEvent = serde_json::from_str(&frame_json(&env_json())).expect("frame parses");
         let update = handle_event(&event);
         assert!(update.layers[0]
             .hits
@@ -259,7 +258,10 @@ mod tests {
             serde_json::from_str(&action_json(render::ACTION_TOGGLE_COLLAPSE, "left_up"))
                 .expect("action parses");
         let update = handle_event(&event);
-        assert!(update.effects.is_empty(), "left_up must not toggle collapse");
+        assert!(
+            update.effects.is_empty(),
+            "left_up must not toggle collapse"
+        );
     }
 
     #[test]

@@ -127,73 +127,72 @@ impl App {
         let plugin_filter = params.plugin_id.as_deref();
         let module_filter = params.module_id.as_deref();
 
-        let mut modules: Vec<crate::api::schema::PluginUiModuleStatus> = self
-            .ui_plugins
-            .all()
-            .iter()
-            .filter(|module| {
-                plugin_filter.is_none_or(|want| module.plugin_id == want)
-                    && module_filter.is_none_or(|want| module.module_id == want)
-            })
-            .map(|module| {
-                let skip = self
-                    .state
-                    .plugin_panel_skips
-                    .iter()
-                    .find(|s| s.plugin_id == module.plugin_id && s.module_id == module.module_id);
-                let (layer_count, layer_bytes) =
-                    self.state.pane_graphics_totals_for_plugin(&module.plugin_id);
-                crate::api::schema::PluginUiModuleStatus {
-                    plugin_id: module.plugin_id.clone(),
-                    module_id: module.module_id.clone(),
-                    enabled: self
+        let mut modules: Vec<crate::api::schema::PluginUiModuleStatus> =
+            self.ui_plugins
+                .all()
+                .iter()
+                .filter(|module| {
+                    plugin_filter.is_none_or(|want| module.plugin_id == want)
+                        && module_filter.is_none_or(|want| module.module_id == want)
+                })
+                .map(|module| {
+                    let skip = self.state.plugin_panel_skips.iter().find(|s| {
+                        s.plugin_id == module.plugin_id && s.module_id == module.module_id
+                    });
+                    let (layer_count, layer_bytes) = self
                         .state
-                        .installed_plugins
-                        .get(&module.plugin_id)
-                        .is_some_and(|plugin| plugin.enabled),
-                    loaded: self
-                        .ui_plugins
-                        .is_module_loaded(&module.plugin_id, &module.module_id),
-                    api_version_declared: module.api_version,
-                    negotiated_version: module.negotiated_version,
-                    hot_reload: format!("{:?}", module.hot_reload),
-                    surfaces: module
-                        .surfaces
-                        .iter()
-                        .map(|surface| format!("{surface:?}"))
-                        .collect(),
-                    capabilities: module
-                        .requested_capabilities
-                        .iter()
-                        .map(|capability| format!("{capability:?}"))
-                        .collect(),
-                    graphics_roots: module.graphics_roots.clone(),
-                    max_layers_per_pane: module.max_layers_per_pane,
-                    ui_input_file: module.ui_input_file.clone(),
-                    collector_declared: self
-                        .state
-                        .installed_plugins
-                        .get(&module.plugin_id)
-                        .and_then(|plugin| {
-                            plugin
-                                .ui_modules
-                                .iter()
-                                .find(|m| m.id == module.module_id)
-                                .map(|m| m.collector.is_some())
-                        })
-                        .unwrap_or(false),
-                    last_error: self
-                        .ui_plugins
-                        .last_error_for(&module.plugin_id, &module.module_id)
-                        .map(str::to_string),
-                    last_skip_reason: skip.map(|s| s.reason.clone()),
-                    panel_content_w: skip.map(|s| s.content_w).unwrap_or(0),
-                    panel_content_h: skip.map(|s| s.content_h).unwrap_or(0),
-                    layer_count,
-                    layer_bytes,
-                }
-            })
-            .collect();
+                        .pane_graphics_totals_for_plugin(&module.plugin_id);
+                    crate::api::schema::PluginUiModuleStatus {
+                        plugin_id: module.plugin_id.clone(),
+                        module_id: module.module_id.clone(),
+                        enabled: self
+                            .state
+                            .installed_plugins
+                            .get(&module.plugin_id)
+                            .is_some_and(|plugin| plugin.enabled),
+                        loaded: self
+                            .ui_plugins
+                            .is_module_loaded(&module.plugin_id, &module.module_id),
+                        api_version_declared: module.api_version,
+                        negotiated_version: module.negotiated_version,
+                        hot_reload: format!("{:?}", module.hot_reload),
+                        surfaces: module
+                            .surfaces
+                            .iter()
+                            .map(|surface| format!("{surface:?}"))
+                            .collect(),
+                        capabilities: module
+                            .requested_capabilities
+                            .iter()
+                            .map(|capability| format!("{capability:?}"))
+                            .collect(),
+                        graphics_roots: module.graphics_roots.clone(),
+                        max_layers_per_pane: module.max_layers_per_pane,
+                        ui_input_file: module.ui_input_file.clone(),
+                        collector_declared: self
+                            .state
+                            .installed_plugins
+                            .get(&module.plugin_id)
+                            .and_then(|plugin| {
+                                plugin
+                                    .ui_modules
+                                    .iter()
+                                    .find(|m| m.id == module.module_id)
+                                    .map(|m| m.collector.is_some())
+                            })
+                            .unwrap_or(false),
+                        last_error: self
+                            .ui_plugins
+                            .last_error_for(&module.plugin_id, &module.module_id)
+                            .map(str::to_string),
+                        last_skip_reason: skip.map(|s| s.reason.clone()),
+                        panel_content_w: skip.map(|s| s.content_w).unwrap_or(0),
+                        panel_content_h: skip.map(|s| s.content_h).unwrap_or(0),
+                        layer_count,
+                        layer_bytes,
+                    }
+                })
+                .collect();
         modules.sort_by(|a, b| {
             a.plugin_id
                 .cmp(&b.plugin_id)

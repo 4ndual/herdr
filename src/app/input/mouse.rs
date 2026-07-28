@@ -193,10 +193,7 @@ impl AppState {
                 // the pane-close log and the resume machinery, so intercept them
                 // here before they route to the (ignoring) guest.
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    if let Some(action) = hit
-                        .action_id
-                        .as_deref()
-                        .and_then(parse_historial_action)
+                    if let Some(action) = hit.action_id.as_deref().and_then(parse_historial_action)
                     {
                         self.pending_historial_action = Some(action);
                         return None;
@@ -207,11 +204,7 @@ impl AppState {
                 // pane spawning and the Claude settings files. Right-clicks are
                 // NOT intercepted — they route to the guest's disable menu.
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                    if let Some(action) = hit
-                        .action_id
-                        .as_deref()
-                        .and_then(parse_harness_action)
-                    {
+                    if let Some(action) = hit.action_id.as_deref().and_then(parse_harness_action) {
                         self.pending_harness_action = Some(action);
                         return None;
                     }
@@ -2043,11 +2036,15 @@ mod tests {
         assert_eq!(restore.kind, HistorialActionKind::Restore);
         assert_eq!(restore.key, "100:w_1_p_2");
         assert_eq!(
-            super::parse_historial_action("historial:fork:5:p").unwrap().kind,
+            super::parse_historial_action("historial:fork:5:p")
+                .unwrap()
+                .kind,
             HistorialActionKind::Fork
         );
         assert_eq!(
-            super::parse_historial_action("historial:del:5:p").unwrap().kind,
+            super::parse_historial_action("historial:del:5:p")
+                .unwrap()
+                .kind,
             HistorialActionKind::Delete
         );
         // The guest-owned toggle and unrelated ids are not host actions.

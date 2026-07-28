@@ -374,7 +374,11 @@ mod tests {
     #[test]
     fn ctx_uses_last_token_usage_not_cumulative_total() {
         let p = parse_rollout(LONG_SESSION_ROLLOUT);
-        assert_eq!(p.total_tokens, Some(186_669), "current context, not the 14.2M cumulative");
+        assert_eq!(
+            p.total_tokens,
+            Some(186_669),
+            "current context, not the 14.2M cumulative"
+        );
         assert_eq!(p.ctx_window, Some(258_400));
     }
 
@@ -440,7 +444,10 @@ mod tests {
             {"slug":"Codex Plan/gpt-5.5","context_window":1050000},
             {"slug":"Claude Plan/claude-opus-4-8","context_window":1000000}]}"#;
         // Bare session id matches the "Codex Plan/"-prefixed slug.
-        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-5.6-sol"), Some(128000));
+        assert_eq!(
+            ctx_window_from_catalog_str(raw, "gpt-5.6-sol"),
+            Some(128000)
+        );
         assert_eq!(ctx_window_from_catalog_str(raw, "gpt-5.5"), Some(1050000));
         // A prefixed id also matches.
         assert_eq!(
