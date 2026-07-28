@@ -190,22 +190,75 @@ fn build_historial_rows(
         .collect()
 }
 
+/// Hash of the last content written to each ui-input path, so an unchanged
+/// payload is not rewritten. See [`write_ui_input_atomic`] for why.
+///
+/// Keyed by full path, so two sessions writing the same filename under different
+/// state dirs never alias. Bounded by the number of (plugin, session) input
+/// files — a handful — so it needs no eviction.
+static UI_INPUT_LAST_WRITTEN: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, u64>>,
+> = std::sync::OnceLock::new();
+
+fn ui_input_content_hash(contents: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    contents.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Atomically write `contents` to `<state_dir>/<filename>` (spec §7.1 writer
 /// side): write a sibling temp file then rename it into place, so item B's
 /// mtime-cached reader never observes a torn file. Creates `state_dir` when
 /// missing. Pure over its inputs so it is testable against a temp dir.
+///
+/// Additionally **skips the write entirely when the content is byte-identical
+/// to what this process last wrote there**.
+///
+/// Why the skip exists: every dashboard writer (usage, goal, historial,
+/// harness) calls this on the ~1 Hz dash tick regardless of whether anything
+/// changed, and the payloads are large (historial ~22 KB, harness ~36 KB). That
+/// rewrote ~74 KB/s of mostly-identical bytes forever. macOS flagged herdr for
+/// disk writes on 2026-07-25 — 2147.51 MB dirtied over 6.4 h (92.64 KB/s
+/// measured, matching the sum of these files almost exactly) — and the dirty
+/// file-backed pages are charged to the process footprint, which is how herdr
+/// reached 1341 MB in that report and 2322 MB in the 07-26 jetsam event. So
+/// this is both a disk-wear fix and a memory-footprint fix.
+///
+/// Atomicity is preserved because the skip path performs no write at all; when
+/// a write IS needed it is still temp-file + rename as before. The cache tracks
+/// only what *this* process wrote: on a miss (first write after start, or an
+/// externally modified file) we simply write, which is the old behaviour.
 fn write_ui_input_atomic(
     state_dir: &std::path::Path,
     filename: &str,
     contents: &str,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(state_dir)?;
     let final_path = state_dir.join(filename);
+    let hash = ui_input_content_hash(contents);
+
+    // Skip only when we KNOW the file on disk holds these exact bytes: the hash
+    // matches AND the file is still there. A missing file (state dir cleared,
+    // plugin reinstalled) must fall through and rewrite, never silently leave
+    // the guest with nothing — "publishes nothing" and "nothing changed" must
+    // not look the same.
+    if let Ok(lock) = UI_INPUT_LAST_WRITTEN.get_or_init(Default::default).lock() {
+        if lock.get(&final_path) == Some(&hash) && final_path.exists() {
+            return Ok(());
+        }
+    }
+
+    std::fs::create_dir_all(state_dir)?;
     let tmp_path = state_dir.join(format!(".{filename}.{}.tmp", std::process::id()));
     std::fs::write(&tmp_path, contents.as_bytes())?;
     if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
+    }
+    // Recorded only AFTER a successful rename, so a failed publish is retried
+    // on the next tick instead of being remembered as written.
+    if let Ok(mut lock) = UI_INPUT_LAST_WRITTEN.get_or_init(Default::default).lock() {
+        lock.insert(final_path, hash);
     }
     Ok(())
 }
@@ -3274,6 +3327,40 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Mutex;
+
+    /// The dash writers call `write_ui_input_atomic` every tick with mostly
+    /// identical payloads; rewriting them was the disk-write/footprint problem.
+    /// Unchanged content must not touch the file, changed content must, and a
+    /// file that disappeared must be republished even if the content matches.
+    #[test]
+    fn ui_input_writes_skip_unchanged_content_but_not_missing_files() -> std::io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("herdr-ui-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = "dedupe_test_input.json";
+        let path = dir.join(name);
+
+        write_ui_input_atomic(&dir, name, "{\"a\":1}")?;
+        let first = std::fs::metadata(&path)?.modified()?;
+        assert_eq!(std::fs::read_to_string(&path)?, "{\"a\":1}");
+
+        // Same bytes: the file must not be rewritten at all.
+        write_ui_input_atomic(&dir, name, "{\"a\":1}")?;
+        assert_eq!(std::fs::metadata(&path)?.modified()?, first);
+
+        // Different bytes: must be published.
+        write_ui_input_atomic(&dir, name, "{\"a\":2}")?;
+        assert_eq!(std::fs::read_to_string(&path)?, "{\"a\":2}");
+
+        // File vanished under us (state dir cleared, plugin reinstalled): the
+        // cached hash still matches, but we must republish rather than leave
+        // the guest with nothing.
+        std::fs::remove_file(&path)?;
+        write_ui_input_atomic(&dir, name, "{\"a\":2}")?;
+        assert_eq!(std::fs::read_to_string(&path)?, "{\"a\":2}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     fn raw_key(
         code: KeyCode,
