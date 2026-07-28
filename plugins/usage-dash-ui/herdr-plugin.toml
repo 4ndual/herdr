@@ -23,7 +23,14 @@ hot_reload = "on"
 surfaces = ["usage_strip"]
 # Frame events (per-tick render input + rect) are delivered only to modules that
 # request LayoutRead or FocusedSession.
-capabilities = ["layout_read", "focused_session"]
+#
+# mouse_all: the caption's version tokens reveal the latest version on HOVER,
+#   and hover only reaches a module that requests MouseAll (src/ui_plugins.rs
+#   gates `UiEvent::Mouse` on it). Clicks alone would arrive without it, via the
+#   v3 hit-rect Action routing.
+# plugin_actions: a confirmed click on an outdated version runs the update
+#   actions declared below through HostEffect::InvokePluginAction.
+capabilities = ["layout_read", "focused_session", "mouse_all", "plugin_actions"]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
 # host writes it today (interim, relocating to a plugin collector in D/E); the
@@ -35,3 +42,31 @@ ui_input_file = "usage_input.json"
 # plugin_root; the bin lands in the ROOT workspace target dir (this plugin is a
 # nested wasm workspace, so ../../target escapes it to <repo>/target).
 collector = ["../../target/release/usage-dash-collector"]
+
+# ── CLI version actions ─────────────────────────────────────────────────────
+# Invoked from the caption's version tokens. The update actions RESTART the
+# pane, which is why the guest requires a confirming second click before it
+# emits them (see `handle_version_click` in src/lib.rs).
+#
+# Both CLIs on this machine are standalone native installs, not npm packages
+# (`~/.local/share/claude/versions`, `~/.codex/packages/standalone`), so the
+# updater is each tool's own `update` subcommand — which re-checks against its
+# real release channel rather than trusting the npm number the strip displays.
+
+[[actions]]
+id = "update-claude-code"
+title = "Update Claude Code and resume this pane"
+description = "Run `claude update`, then relaunch this pane's session with --resume"
+command = ["bash", "scripts/update-claude-code.sh"]
+
+[[actions]]
+id = "update-codex"
+title = "Update the codex CLI"
+description = "Run the codex updater; does not restart the pane (codex is not the pane's own binary)"
+command = ["bash", "scripts/update-codex.sh"]
+
+[[actions]]
+id = "verify-cli-versions"
+title = "Re-check CLI versions now"
+description = "Force a fresh latest-version fetch, bypassing the 30-minute cache"
+command = ["bash", "scripts/verify-cli-versions.sh"]

@@ -991,6 +991,18 @@ mod tests {
             .collect()
     }
 
+    /// Action-list counterpart to `user_linked`. The unfiltered action list also
+    /// carries the builtin plugins' actions, so tests about a linked user plugin
+    /// must exclude them or they break whenever a builtin gains an action.
+    fn user_actions(
+        actions: &[crate::api::schema::PluginActionInfo],
+    ) -> Vec<&crate::api::schema::PluginActionInfo> {
+        actions
+            .iter()
+            .filter(|action| !action.plugin_id.starts_with("builtin."))
+            .collect()
+    }
+
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2401,6 +2413,7 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         let ResponseResult::PluginActionList { actions } = response_result(&list) else {
             panic!("expected plugin action list: {list}");
         };
+        let actions = user_actions(&actions);
         assert_eq!(actions.len(), 1);
         assert_eq!(
             actions[0].qualified_id(),
@@ -2506,7 +2519,9 @@ command = ["sh", "-c", "printf %s ${{HERDR_PANE_ID-unset}} > '{}'; sleep 1"]
         let ResponseResult::PluginActionList { actions } = response_result(&actions) else {
             panic!("expected action list: {actions}");
         };
-        assert!(actions.is_empty());
+        // A stale manifest must contribute no actions; builtin actions are
+        // unaffected by it and are filtered out rather than asserted away.
+        assert!(user_actions(&actions).is_empty());
 
         let invoke = app.handle_api_request(Request {
             id: "invoke".into(),
