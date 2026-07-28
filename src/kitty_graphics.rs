@@ -1966,6 +1966,9 @@ mod tests {
         assert_eq!(images.len(), 1);
     }
 
+    // fork: only the `host-images`-gated plugin-panel tests below use this, so
+    // it goes unused (and warns) in a default-feature test build.
+    #[cfg(feature = "host-images")]
     fn write_temp_png(name: &str, width: u32, height: u32) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kitty_synth_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1999,6 +2002,10 @@ mod tests {
         assert_eq!(cols, 4);
     }
 
+    // fork: exercises `collect_plugin_panel_images`, which is compiled out with
+    // the `host-images` feature off, so the test must be gated the same way or
+    // the default-feature test build fails to resolve the function.
+    #[cfg(feature = "host-images")]
     #[test]
     fn plugin_panel_image_builds_placement_and_encodes_upload_and_display() {
         let path = write_temp_png("panel.png", 40, 40);
@@ -2039,6 +2046,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    // fork: gated for the same reason as the placement test above.
+    #[cfg(feature = "host-images")]
     #[test]
     fn plugin_panel_image_skips_zero_area_and_missing_file() {
         let cell = HostCellSize {
