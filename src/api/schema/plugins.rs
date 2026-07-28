@@ -23,6 +23,84 @@ pub struct PluginListParams {
     pub plugin_id: Option<String>,
 }
 
+/// fork(+127): params for `plugin.ui.status`. Both filters are optional; omitting
+/// both returns every registered UI module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginUiStatusParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+}
+
+/// fork(+127): read-only live status of one registered UI module.
+///
+/// This type is the answer to the question that cost hours: *what is actually
+/// loaded in this running instance, and if my thing is not showing, why not?*
+/// Before it, answering that required rebuilding a mirror sandbox of the whole
+/// config, because nothing on the wire distinguished "module failed to load"
+/// from "module loaded and produced nothing" from "module produced nodes that
+/// did not fit". Each of those is a different field here.
+///
+/// Strictly read-only and side-effect free, so it is safe to poll and safe to
+/// expose to plugins themselves under `api_read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PluginUiModuleStatus {
+    pub plugin_id: String,
+    pub module_id: String,
+    /// Whether the owning plugin is enabled in the registry. A module can be
+    /// registered-but-disabled; distinguishing that from "not registered" is the
+    /// first fork in the diagnostic tree.
+    pub enabled: bool,
+    /// Whether a guest instance is live right now. `false` with `last_error` set
+    /// is a load/hot-reload failure; `false` with no error means never loaded.
+    pub loaded: bool,
+    /// `api_version` as DECLARED in the manifest.
+    pub api_version_declared: u32,
+    /// The version actually negotiated with the guest's export. A mismatch with
+    /// `api_version_declared` is silent at runtime and changes which events the
+    /// module receives, which makes it worth showing side by side.
+    pub negotiated_version: u32,
+    pub hot_reload: String,
+    pub surfaces: Vec<String>,
+    /// Capabilities the manifest requested. Shown so "my API call is being
+    /// denied" can be checked against what was actually granted without reading
+    /// the manifest off disk.
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphics_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_layers_per_pane: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_input_file: Option<String>,
+    /// Whether this module declares an out-of-process collector.
+    pub collector_declared: bool,
+    /// Last load / hot-reload / guest-call error, or `None` if the last attempt
+    /// succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// fork(+127): why this module's PANEL was dropped in the last laid-out
+    /// frame, if it was. `None` means it was not dropped — either it rendered or
+    /// it declares no panel surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skip_reason: Option<String>,
+    /// Content dims measured for the panel in the last laid-out frame. `(0, 0)`
+    /// with `last_skip_reason == "no_content"` is the "module produced nothing"
+    /// case; non-zero dims with a skip reason is the "did not fit" case.
+    pub panel_content_w: u16,
+    pub panel_content_h: u16,
+    /// How many `pane.graphics` layers this module's PLUGIN currently holds,
+    /// across every pane, and how many bytes they retain.
+    ///
+    /// Plugin-scoped, not module-scoped, because layer ownership is stamped with
+    /// the plugin id — that is also the granularity `plugin disable` operates at.
+    /// `layer_bytes` is the honest per-plugin RAM number for graphics: guest
+    /// memory lives inside a wasm instance and is invisible to `footprint`, so
+    /// the host accounting here is the only way to attribute it.
+    pub layer_count: usize,
+    pub layer_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PluginUnlinkParams {
     pub plugin_id: String,
@@ -344,6 +422,18 @@ pub struct PluginManifestUiModule {
     /// undeclared root makes that a refusal rather than a filesystem oracle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graphics_roots: Vec<String>,
+    /// fork(+127): ceiling on how many `pane.graphics` layers this plugin may
+    /// hold on ONE pane. Omitted means the host default (8); the host clamps any
+    /// value to a hard maximum (32).
+    ///
+    /// Declared rather than implicit because +127 changed layer identity from
+    /// `owner` to `(owner, layer_id)`, which is what lets one plugin paint many
+    /// images at once — and each retained layer holds its bytes in host memory
+    /// for as long as it exists. A declared ceiling is visible in `plugin list`
+    /// before anyone enables the plugin and makes the worst-case footprint of
+    /// enabling it something you can read off the manifest instead of measure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_layers_per_pane: Option<usize>,
     /// fork(wave-2): optional argv naming a command the host executes on each
     /// dashboard tick to PRODUCE this module's snapshot out-of-process, so
     /// collection logic hot-reloads (rebuild the bin) without a host rebuild.

@@ -292,6 +292,7 @@ mod tests {
 
         let mut plugin = sample_plugin(id);
         plugin.ui_modules = vec![PluginManifestUiModule {
+            max_layers_per_pane: None,
             id: format!("{id}.dash"),
             title: "Dash".to_string(),
             description: Some("v3 ui module".to_string()),

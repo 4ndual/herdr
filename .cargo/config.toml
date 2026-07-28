@@ -7,3 +7,22 @@ ZIG = "/opt/homebrew/opt/zig@0.15/bin/zig"
 # NOT feed the version string, so it perturbs nothing else. See
 # src/build_info.rs::is_fork_build and src/update.rs fork-build refusal.
 HERDR_FORK_BUILD = { value = "1", force = true }
+
+# fork(+127): identify THIS lane's artifacts by name, not by commit count.
+#
+# `git describe` counts commits per-HEAD, but worktrees share one object store,
+# so two unrelated trees can both describe as `+127` and share no code. That
+# already happened: the promoted `hr` binary describes as v0.7.5-127-g41730785
+# while this lane is also called 127. The version strip is what Andres actually
+# glances at, so an artifact from here must say what it IS.
+#
+# `force = true` so an inherited environment value cannot silently blank it —
+# an empty variant is indistinguishable from a plain build, which is exactly the
+# ambiguity this exists to remove.
+#
+# It rides its OWN `cargo:rustc-env` line and its own `;`-terminated literal
+# (build.rs::emit_fork_variant). It must never be appended to
+# HERDR_FORK_PROVENANCE: `fork_commit_count()` parses that value right-to-left
+# and requires `g<sha>` last, so a combined string yields None and the strip
+# silently renders a bare version with no `+N` at all.
+HERDR_FORK_VARIANT = { value = "imgapi", force = true }

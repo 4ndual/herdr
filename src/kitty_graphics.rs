@@ -91,6 +91,12 @@ enum HostSourceKey {
     /// layers of the same pane hash to the same `host_placement_id`, so the
     /// encoder's diff treats them as one placement and the second silently
     /// replaces the first instead of compositing over it.
+    ///
+    /// fork(+127): the discriminator is now the hash of the `(owner, layer_id)`
+    /// PAIR, matching the layer identity in `AppState`. Hashing the owner alone
+    /// reintroduced exactly the collision this field exists to prevent, one level
+    /// down: a single plugin's several `[Image #N]` layers all shared a key, so
+    /// state held N layers and the screen showed one.
     PaneLayer {
         pane_id: PaneId,
         owner: u64,
@@ -912,7 +918,7 @@ fn pane_graphics_host_placement(
         cell_size,
         source_key: HostSourceKey::PaneLayer {
             pane_id: info.id,
-            owner: pane_graphics_owner_key(layer.owner.as_deref()),
+            owner: pane_graphics_layer_key(layer.owner.as_deref(), &layer.layer_id),
         },
         scrollback_offset: 0,
         placement: KittyImagePlacement {
@@ -982,12 +988,18 @@ fn pane_graphics_host_image_id(pane_id: PaneId, signature: ImageSignature) -> u3
 /// fork: stable hash of a layer owner, used to keep coexisting layers on one
 /// pane distinct in `HostSourceKey`. The socket caller (`None`) gets its own
 /// value rather than colliding with any plugin id.
-fn pane_graphics_owner_key(owner: Option<&str>) -> u64 {
+/// fork(+127): renamed from `pane_graphics_owner_key` and now hashes the layer
+/// identity pair, not just the owner. See `HostSourceKey::PaneLayer`.
+fn pane_graphics_layer_key(owner: Option<&str>, layer_id: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     match owner {
         None => "\0socket".hash(&mut hasher),
         Some(owner) => owner.hash(&mut hasher),
     }
+    // Hashed as a separate field after a separator so ("a","bc") and ("ab","c")
+    // cannot collide.
+    "\0layer".hash(&mut hasher);
+    layer_id.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1334,7 +1346,7 @@ mod tests {
         let mut placement = test_placement(viewport_col, viewport_row);
         placement.source_key = HostSourceKey::PaneLayer {
             pane_id: placement.pane_id,
-            owner: pane_graphics_owner_key(None),
+            owner: pane_graphics_layer_key(None, ""),
         };
         placement
     }
@@ -1356,7 +1368,7 @@ mod tests {
             host_placement_id(
                 HostSourceKey::PaneLayer {
                     pane_id: placement.pane_id,
-                    owner: pane_graphics_owner_key(None),
+                    owner: pane_graphics_layer_key(None, ""),
                 },
                 &placement.placement,
             ),

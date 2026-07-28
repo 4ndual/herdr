@@ -13,7 +13,7 @@ use super::panes::{
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
-    PluginPaneInfo,
+    PluginPaneInfo, PluginUiModuleStatus,
 };
 use super::server::ServerCapabilities;
 use super::session::SessionSnapshot;
@@ -214,6 +214,10 @@ pub enum ResponseResult {
     },
     PluginList {
         plugins: Vec<InstalledPluginInfo>,
+    },
+    /// fork(+127): see `PluginUiModuleStatus`.
+    PluginUiStatus {
+        modules: Vec<PluginUiModuleStatus>,
     },
     PluginUnlinked {
         plugin_id: String,

@@ -2473,6 +2473,13 @@
         },
         "PaneGraphicsClearParams": {
           "properties": {
+            "layer_id": {
+              "description": "fork(+127): which of the owner's layers to clear. Omitted (the default)\nclears ALL layers this caller owns on the pane, which is exactly the\npre-+127 behaviour — so an existing caller that never learned about\n`layer_id` still wipes what it painted. Naming one clears only that layer.\n\nIgnored for the privileged socket caller (`owner == None`), which clears\nthe whole pane regardless; see `handle_pane_graphics_clear`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "pane_id": {
               "type": "string"
             }
@@ -2535,6 +2542,11 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "layer_id": {
+              "default": "",
+              "description": "fork(+127): identifies this layer WITHIN its owner, so one caller can hold\nseveral coexisting layers on one pane.\n\nBefore +127 a layer's identity was its owner alone: one layer per plugin\nper pane, and a second `set` replaced the first. That is fine for a single\npanel image and impossible for the Claude `[Image #N]` case, where one\nplugin must paint every placeholder visible in a pane at once.\n\nIdentity is the pair `(owner, layer_id)`. Empty (the default) is a real\nid, not \"unset\" — it is the one every pre-+127 caller uses, which is why\ntheir single-layer behaviour is unchanged.",
+              "type": "string"
             },
             "pane_id": {
               "type": "string"
@@ -3591,6 +3603,24 @@
             "github"
           ],
           "type": "string"
+        },
+        "PluginUiStatusParams": {
+          "description": "fork(+127): params for `plugin.ui.status`. Both filters are optional; omitting\nboth returns every registered UI module.",
+          "properties": {
+            "module_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plugin_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
         },
         "PluginUnlinkParams": {
           "properties": {
@@ -5730,6 +5760,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginSetEnabledParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "plugin.ui.status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PluginUiStatusParams"
             }
           },
           "required": [
@@ -8497,6 +8543,15 @@
               "$ref": "#/schemas/success_response/$defs/PluginUiModuleKind",
               "default": "wasm"
             },
+            "max_layers_per_pane": {
+              "description": "fork(+127): ceiling on how many `pane.graphics` layers this plugin may\nhold on ONE pane. Omitted means the host default (8); the host clamps any\nvalue to a hard maximum (32).\n\nDeclared rather than implicit because +127 changed layer identity from\n`owner` to `(owner, layer_id)`, which is what lets one plugin paint many\nimages at once — and each retained layer holds its bytes in host memory\nfor as long as it exists. A declared ceiling is visible in `plugin list`\nbefore anyone enables the plugin and makes the worst-case footprint of\nenabling it something you can read off the manifest instead of measure.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "module": {
               "type": "string"
             },
@@ -8765,6 +8820,132 @@
             "wasm"
           ],
           "type": "string"
+        },
+        "PluginUiModuleStatus": {
+          "description": "fork(+127): read-only live status of one registered UI module.\n\nThis type is the answer to the question that cost hours: *what is actually\nloaded in this running instance, and if my thing is not showing, why not?*\nBefore it, answering that required rebuilding a mirror sandbox of the whole\nconfig, because nothing on the wire distinguished \"module failed to load\"\nfrom \"module loaded and produced nothing\" from \"module produced nodes that\ndid not fit\". Each of those is a different field here.\n\nStrictly read-only and side-effect free, so it is safe to poll and safe to\nexpose to plugins themselves under `api_read`.",
+          "properties": {
+            "api_version_declared": {
+              "description": "`api_version` as DECLARED in the manifest.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "capabilities": {
+              "description": "Capabilities the manifest requested. Shown so \"my API call is being\ndenied\" can be checked against what was actually granted without reading\nthe manifest off disk.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "collector_declared": {
+              "description": "Whether this module declares an out-of-process collector.",
+              "type": "boolean"
+            },
+            "enabled": {
+              "description": "Whether the owning plugin is enabled in the registry. A module can be\nregistered-but-disabled; distinguishing that from \"not registered\" is the\nfirst fork in the diagnostic tree.",
+              "type": "boolean"
+            },
+            "graphics_roots": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "hot_reload": {
+              "type": "string"
+            },
+            "last_error": {
+              "description": "Last load / hot-reload / guest-call error, or `None` if the last attempt\nsucceeded.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_skip_reason": {
+              "description": "fork(+127): why this module's PANEL was dropped in the last laid-out\nframe, if it was. `None` means it was not dropped — either it rendered or\nit declares no panel surface.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "layer_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "layer_count": {
+              "description": "How many `pane.graphics` layers this module's PLUGIN currently holds,\nacross every pane, and how many bytes they retain.\n\nPlugin-scoped, not module-scoped, because layer ownership is stamped with\nthe plugin id — that is also the granularity `plugin disable` operates at.\n`layer_bytes` is the honest per-plugin RAM number for graphics: guest\nmemory lives inside a wasm instance and is invisible to `footprint`, so\nthe host accounting here is the only way to attribute it.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "loaded": {
+              "description": "Whether a guest instance is live right now. `false` with `last_error` set\nis a load/hot-reload failure; `false` with no error means never loaded.",
+              "type": "boolean"
+            },
+            "max_layers_per_pane": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "module_id": {
+              "type": "string"
+            },
+            "negotiated_version": {
+              "description": "The version actually negotiated with the guest's export. A mismatch with\n`api_version_declared` is silent at runtime and changes which events the\nmodule receives, which makes it worth showing side by side.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "panel_content_h": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "panel_content_w": {
+              "description": "Content dims measured for the panel in the last laid-out frame. `(0, 0)`\nwith `last_skip_reason == \"no_content\"` is the \"module produced nothing\"\ncase; non-zero dims with a skip reason is the \"did not fit\" case.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "plugin_id": {
+              "type": "string"
+            },
+            "surfaces": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "ui_input_file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "plugin_id",
+            "module_id",
+            "enabled",
+            "loaded",
+            "api_version_declared",
+            "negotiated_version",
+            "hot_reload",
+            "surfaces",
+            "capabilities",
+            "collector_declared",
+            "panel_content_w",
+            "panel_content_h",
+            "layer_count",
+            "layer_bytes"
+          ],
+          "type": "object"
         },
         "PluginUiSurface": {
           "oneOf": [
@@ -9718,6 +9899,26 @@
               "required": [
                 "type",
                 "plugins"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "fork(+127): see `PluginUiModuleStatus`.",
+              "properties": {
+                "modules": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/PluginUiModuleStatus"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "plugin_ui_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "modules"
               ],
               "type": "object"
             },

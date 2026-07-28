@@ -130,6 +130,10 @@ struct RawPluginManifestUiModule {
     // (see PluginManifestUiModule::graphics_roots).
     #[serde(default)]
     graphics_roots: Vec<String>,
+    // fork(+127): optional per-pane graphics layer ceiling
+    // (see PluginManifestUiModule::max_layers_per_pane).
+    #[serde(default)]
+    max_layers_per_pane: Option<usize>,
     // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
     #[serde(default)]
     collector: Option<Vec<String>>,
@@ -610,6 +614,7 @@ fn normalize_manifest_ui_module(
         ui_input_file,
         image_file,
         graphics_roots,
+        max_layers_per_pane: module.max_layers_per_pane,
         collector,
     })
 }
@@ -875,6 +880,7 @@ mod tests {
     #[test]
     fn ui_module_requires_surface_and_api_version() {
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
             description: None,
@@ -895,6 +901,7 @@ mod tests {
         assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
 
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
             description: None,
@@ -918,6 +925,7 @@ mod tests {
     #[test]
     fn ui_module_normalizes_wasm_panel_manifest() {
         let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: " Goal UI ".into(),
             description: Some(" Native overlays ".into()),
@@ -956,6 +964,7 @@ mod tests {
 
     fn ui_module_with_input_file(name: &str) -> RawPluginManifestUiModule {
         RawPluginManifestUiModule {
+            max_layers_per_pane: None,
             id: "usage".into(),
             title: "Usage".into(),
             description: None,

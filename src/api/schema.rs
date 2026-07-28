@@ -231,6 +231,10 @@ pub enum Method {
     PluginEnable(PluginSetEnabledParams),
     #[serde(rename = "plugin.disable")]
     PluginDisable(PluginSetEnabledParams),
+    // fork(+127): read-only live status of the registered UI modules. See
+    // `PluginUiModuleStatus` for why this exists.
+    #[serde(rename = "plugin.ui.status")]
+    PluginUiStatus(PluginUiStatusParams),
     #[serde(rename = "plugin.action.list")]
     PluginActionList(PluginActionListParams),
     #[serde(rename = "plugin.action.invoke")]

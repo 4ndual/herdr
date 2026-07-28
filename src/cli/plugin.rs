@@ -32,6 +32,8 @@ pub(super) fn run_plugin_command(args: &[String]) -> std::io::Result<i32> {
         "enable" => plugin_set_enabled(&args[1..], true),
         "disable" => plugin_set_enabled(&args[1..], false),
         "action" => run_plugin_action_command(&args[1..]),
+        // fork(+127): `herdr plugin ui status` — read-only live UI-module state.
+        "ui" => run_plugin_ui_command(&args[1..]),
         "log" | "logs" => plugin_log_list(&args[1..]),
         "pane" => run_plugin_pane_command(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -383,6 +385,63 @@ fn plugin_log_list(args: &[String]) -> std::io::Result<i32> {
         plugin_id,
         limit,
     }))
+}
+
+/// fork(+127): `herdr plugin ui <subcommand>`.
+fn run_plugin_ui_command(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(|arg| arg.as_str()) {
+        Some("status") => plugin_ui_status(&args[1..]),
+        Some("help") | Some("--help") | Some("-h") | None => {
+            print_plugin_ui_help();
+            Ok(if args.is_empty() { 2 } else { 0 })
+        }
+        Some(_) => {
+            print_plugin_ui_help();
+            Ok(2)
+        }
+    }
+}
+
+fn print_plugin_ui_help() {
+    eprintln!("usage: herdr plugin ui status [--plugin ID] [--module ID]");
+    eprintln!();
+    eprintln!("Read-only live state of the registered UI modules: whether each is");
+    eprintln!("loaded, the API version it negotiated, its last error, why its panel");
+    eprintln!("was skipped in the last frame, and how many pane-graphics layers and");
+    eprintln!("bytes its plugin currently holds. Side-effect free and safe to poll.");
+}
+
+fn plugin_ui_status(args: &[String]) -> std::io::Result<i32> {
+    let mut plugin_id = None;
+    let mut module_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--plugin" => {
+                let Some(value) = required_value(args, &mut index, "--plugin") else {
+                    return Ok(2);
+                };
+                plugin_id = Some(value);
+            }
+            "--module" => {
+                let Some(value) = required_value(args, &mut index, "--module") else {
+                    return Ok(2);
+                };
+                module_id = Some(value);
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    print_plugin_response(Method::PluginUiStatus(
+        crate::api::schema::PluginUiStatusParams {
+            plugin_id,
+            module_id,
+        },
+    ))
 }
 
 fn run_plugin_action_command(args: &[String]) -> std::io::Result<i32> {
@@ -1655,6 +1714,7 @@ fn print_plugin_help() {
 fn print_plugin_action_help() {
     eprintln!("herdr plugin action commands:");
     eprintln!("  herdr plugin action list [--plugin ID]");
+    eprintln!("  herdr plugin ui status [--plugin ID] [--module ID]");
     eprintln!("  herdr plugin action invoke <action_id> [--plugin ID]");
 }
 

@@ -68,6 +68,7 @@ fn stream_set_message(
                 id: id.into(),
                 method: api::schema::Method::PaneGraphicsStreamSet(
                     api::schema::PaneGraphicsSetParams {
+                        layer_id: String::new(),
                         pane_id: pane_id.into(),
                         owner: owner.into(),
                         format: api::schema::PaneGraphicsFormat::Png,
@@ -269,6 +270,7 @@ fn stream_set_has_graphics_only_render_impact() {
         request: api::schema::Request {
             id: "direct-frame".into(),
             method: api::schema::Method::PaneGraphicsSet(api::schema::PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id,
                 owner: String::new(),
                 format: api::schema::PaneGraphicsFormat::Png,
@@ -296,12 +298,18 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
     server.app.state.active = Some(0);
     server.app.state.selected = 0;
 
+    // fork(+127): the rejected case used to be "kitty renderer disabled". That
+    // gate is gone — a `set` with the renderer off now SUCCEEDS and correctly
+    // does schedule a render, because `pane_graphics_paint` will paint it. So
+    // the property under test (a REFUSED request must not schedule rendering)
+    // needs a request that is still genuinely refused: an unknown pane.
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
         request: api::schema::Request {
-            id: "disabled-set".into(),
+            id: "unknown-pane-set".into(),
             method: api::schema::Method::PaneGraphicsSet(api::schema::PaneGraphicsSetParams {
-                pane_id: public_pane_id.clone(),
+                layer_id: String::new(),
+                pane_id: "no-such-workspace:p9".into(),
                 owner: String::new(),
                 format: api::schema::PaneGraphicsFormat::Png,
                 image_width: 1,
@@ -324,8 +332,9 @@ fn rejected_or_stale_requests_do_not_schedule_rendering() {
             .unwrap()
             .error
             .code,
-        "feature_disabled"
+        "pane_not_found"
     );
+    assert!(server.app.state.pane_graphics_layers.is_empty());
 
     server.app.state.kitty_graphics_enabled = true;
     server

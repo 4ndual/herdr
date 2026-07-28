@@ -3752,6 +3752,20 @@ impl HeadlessServer {
                     // shows them, kitty-capable or not.
                     if !self.app.state.kitty_graphics_enabled {
                         self.app.paint_halfblock_images(area, &mut buffer);
+                        // fork(+127): plugin-owned `pane.graphics` layers, same as
+                        // the direct-TUI arm in `app/mod.rs`.
+                        //
+                        // BOTH call sites are required and this one is the one that
+                        // matters in practice: a server+client herdr (which is what
+                        // `hr` is) renders here, not in the TUI loop. Wiring only
+                        // `app/mod.rs` produced a layer that was present in state
+                        // with a correct `layer_count` and completely absent from
+                        // the screen — found by `tmux capture-pane -e`, and
+                        // invisible to any check that reads state or `pane read`.
+                        crate::pane_graphics_paint::paint_pane_graphics_halfblock(
+                            &self.app.state,
+                            &mut buffer,
+                        );
                     }
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",

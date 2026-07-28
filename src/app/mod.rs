@@ -817,6 +817,7 @@ impl App {
             workspaces,
             active,
             previous_pane_focus: None,
+            plugin_panel_skips: Vec::new(),
             selected,
             mode,
             should_quit: false,
@@ -1531,6 +1532,16 @@ impl App {
                     );
                     if !kitty_graphics_enabled {
                         self.paint_halfblock_images(area, frame.buffer_mut());
+                        // fork(+127): plugin-owned `pane.graphics` layers used to
+                        // reach the screen ONLY through the kitty arm below, so a
+                        // plugin's images silently did not exist with the kitty
+                        // renderer off. This is their half-block path; it is not
+                        // behind `host-images`, because it paints bytes a plugin
+                        // handed us, not anything read from `~/.claude`.
+                        crate::pane_graphics_paint::paint_pane_graphics_halfblock(
+                            &self.state,
+                            frame.buffer_mut(),
+                        );
                     }
                 })?;
                 if kitty_graphics_enabled {
@@ -1909,7 +1920,19 @@ impl App {
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
-                self.state.pane_graphics_layers.clear();
+                // fork(+127): do NOT clear `pane_graphics_layers` here. This clear
+                // predates the half-block compositor, when a layer could only ever be
+                // drawn by the kitty backend and so was dead state the moment kitty was
+                // switched off. It is now the second half of the "two switches in
+                // series" coupling: `experimental.kitty_graphics` is a *renderer
+                // selector*, not a feature gate, and layers are plugin-owned state that
+                // outlives the choice of renderer. Clearing them here dropped every
+                // plugin's images on `server reload-config` while leaving the guest
+                // instances alive — so their no-repaint guards still believed they had
+                // painted and never re-issued `pane.graphics.set`, and the mosaic never
+                // came back until the plugin was disabled and re-enabled.
+                // Streams stay cleared: they are kitty-transport state with no
+                // compositor equivalent.
                 self.state.pane_graphics_streams.clear();
                 self.state.host_cell_size = crate::kitty_graphics::HostCellSize::default();
             }
@@ -2182,7 +2205,9 @@ impl App {
     /// clean), and refreshes derived render state so stale overlays clear on the
     /// next frame.
     pub(crate) fn resync_ui_plugins_after_lifecycle_change(&mut self) {
-        let removed = self.ui_plugins.sync_to_registry(&self.state.installed_plugins);
+        let removed = self
+            .ui_plugins
+            .sync_to_registry(&self.state.installed_plugins);
         for (plugin_id, module_id) in &removed {
             let key = crate::plugin_collector::module_key(plugin_id, module_id);
             self.collectors_in_flight.remove(&key);
@@ -2210,7 +2235,13 @@ impl App {
                 .installed_plugins
                 .values()
                 .filter(|plugin| std::path::PathBuf::from(&plugin.manifest_path) == manifest_path)
-                .map(|plugin| (plugin.plugin_id.clone(), plugin.enabled, plugin.source.clone()))
+                .map(|plugin| {
+                    (
+                        plugin.plugin_id.clone(),
+                        plugin.enabled,
+                        plugin.source.clone(),
+                    )
+                })
                 .collect();
             for (plugin_id, enabled, source) in affected {
                 match crate::app::api::plugins::load_plugin_manifest(&manifest_str, enabled) {
@@ -3262,8 +3293,20 @@ mod tests {
     fn build_historial_rows_dedups_and_caps_at_limit() {
         let mut records = Vec::new();
         // Two records for the same session value must collapse to one.
-        records.push(historial_record(1000, "dup", Some("claude"), Some("same-sid"), true));
-        records.push(historial_record(999, "dup", Some("claude"), Some("same-sid"), true));
+        records.push(historial_record(
+            1000,
+            "dup",
+            Some("claude"),
+            Some("same-sid"),
+            true,
+        ));
+        records.push(historial_record(
+            999,
+            "dup",
+            Some("claude"),
+            Some("same-sid"),
+            true,
+        ));
         // Then more than HISTORIAL_ROW_LIMIT distinct restorable sessions.
         for i in 0..(HISTORIAL_ROW_LIMIT + 10) {
             let sid = format!("sid-{i}");
@@ -3381,8 +3424,12 @@ mod tests {
             .installed_plugins
             .insert(info.plugin_id.clone(), info);
         app.resync_ui_plugins_after_lifecycle_change();
-        let has_dash =
-            |app: &App| app.ui_plugins.all().iter().any(|m| m.plugin_id == "example.dash");
+        let has_dash = |app: &App| {
+            app.ui_plugins
+                .all()
+                .iter()
+                .any(|m| m.plugin_id == "example.dash")
+        };
         assert!(has_dash(&app));
 
         // A collector is mid-flight for this module.
@@ -4599,6 +4646,54 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// fork(+127): switching `experimental.kitty_graphics` off is a *renderer*
+    /// change, not a feature toggle: the half-block compositor draws the same
+    /// plugin-owned layers. Dropping them here left live guests believing they had
+    /// already painted, so their images never came back after `reload-config`.
+    #[test]
+    fn reload_config_disabling_kitty_graphics_keeps_plugin_layers() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-kitty-off-keeps-layers");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[experimental]\nkitty_graphics = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.kitty_graphics_enabled = true;
+        let pane_id = crate::layout::PaneId::alloc();
+        app.state.pane_graphics_layers.insert(
+            pane_id,
+            vec![state::PaneGraphicsLayer::new_with_layer_id(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                1,
+                1,
+                vec![1, 2, 3, 4],
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    grid_cols: 1,
+                    grid_rows: 1,
+                    ..Default::default()
+                },
+                Some("plugin:images".to_string()),
+                "img-1".to_string(),
+            )],
+        );
+
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.kitty_graphics_enabled);
+        assert_eq!(
+            app.state
+                .pane_graphics_layers
+                .get(&pane_id)
+                .map(|layers| layers.len()),
+            Some(1),
+            "renderer switch must not drop plugin-owned graphics layers"
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

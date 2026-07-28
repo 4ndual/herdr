@@ -298,6 +298,19 @@ pub struct PaneGraphicsSetParams {
     /// has no such constraint and is capped at the streaming limit instead.
     #[serde(default)]
     pub source_path: String,
+    /// fork(+127): identifies this layer WITHIN its owner, so one caller can hold
+    /// several coexisting layers on one pane.
+    ///
+    /// Before +127 a layer's identity was its owner alone: one layer per plugin
+    /// per pane, and a second `set` replaced the first. That is fine for a single
+    /// panel image and impossible for the Claude `[Image #N]` case, where one
+    /// plugin must paint every placeholder visible in a pane at once.
+    ///
+    /// Identity is the pair `(owner, layer_id)`. Empty (the default) is a real
+    /// id, not "unset" — it is the one every pre-+127 caller uses, which is why
+    /// their single-layer behaviour is unchanged.
+    #[serde(default)]
+    pub layer_id: String,
     #[serde(default)]
     pub placement: PaneGraphicsPlacementParams,
 }
@@ -319,6 +332,15 @@ pub struct PaneGraphicsPlacementParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsClearParams {
     pub pane_id: String,
+    /// fork(+127): which of the owner's layers to clear. Omitted (the default)
+    /// clears ALL layers this caller owns on the pane, which is exactly the
+    /// pre-+127 behaviour — so an existing caller that never learned about
+    /// `layer_id` still wipes what it painted. Naming one clears only that layer.
+    ///
+    /// Ignored for the privileged socket caller (`owner == None`), which clears
+    /// the whole pane regardless; see `handle_pane_graphics_clear`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_id: Option<String>,
     /// Which plugin is asking, as `plugin:<plugin_id>`, or empty for a call that
     /// came in over the socket API. `skip`ped like the stream `owner` above so
     /// no caller can supply it: the UI-plugin bridge is the only writer, after

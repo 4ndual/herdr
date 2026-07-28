@@ -250,6 +250,7 @@ fn serve_frames(
             Request {
                 id: frame_id,
                 method: Method::PaneGraphicsStreamSet(PaneGraphicsSetParams {
+                    layer_id: String::new(),
                     pane_id: pane_id.to_string(),
                     owner: owner.to_string(),
                     format: header.format,

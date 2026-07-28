@@ -35,6 +35,10 @@ const READ_METHODS: &[&str] = &[
     "layout.export",
     "plugin.list",
     "plugin.action.list",
+    // fork(+127): read-only and side-effect free. A plugin being able to read its
+    // OWN diagnostic state (did my panel get dropped? why?) is the difference
+    // between a plugin that can report a problem and one that can only vanish.
+    "plugin.ui.status",
 ];
 
 const WRITE_METHODS: &[&str] = &[

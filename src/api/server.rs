@@ -428,6 +428,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::IntegrationUninstall(_) => "integration.uninstall",
         Method::PluginLink(_) => "plugin.link",
         Method::PluginList(_) => "plugin.list",
+        Method::PluginUiStatus(_) => "plugin.ui.status",
         Method::PluginUnlink(_) => "plugin.unlink",
         Method::PluginEnable(_) => "plugin.enable",
         Method::PluginDisable(_) => "plugin.disable",
@@ -1334,6 +1335,7 @@ mod pane_graphics_request_tests {
         let request = Request {
             id: "graphics-max".into(),
             method: Method::PaneGraphicsSet(crate::api::schema::PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: "pane_1".into(),
                 owner: String::new(),
                 format: crate::api::schema::PaneGraphicsFormat::Png,

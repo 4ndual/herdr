@@ -16,9 +16,6 @@ impl App {
         id: String,
         target: crate::api::schema::PaneTarget,
     ) -> String {
-        if let Err(response) = require_pane_graphics_enabled(self, &id) {
-            return response;
-        }
         if self.parse_pane_id(&target.pane_id).is_none() {
             return pane_not_found(id, &target.pane_id);
         }
@@ -39,9 +36,6 @@ impl App {
         id: String,
         params: PaneGraphicsSetParams,
     ) -> String {
-        if let Err(response) = require_pane_graphics_enabled(self, &id) {
-            return response;
-        }
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -126,13 +120,51 @@ impl App {
             }
         }
 
-        let layer = PaneGraphicsLayer::new(
+        let layer_id = params.layer_id.trim().to_string();
+        if layer_id.len() > PANE_GRAPHICS_LAYER_ID_MAX_LEN {
+            return encode_error(id, "invalid_layer_id", "layer_id is too long");
+        }
+
+        // fork(+127): with `(owner, layer_id)` identity a caller can hold many
+        // layers per pane, so the count needs a ceiling. Each layer retains its
+        // decoded bytes for the lifetime of the layer, so an unbounded count is
+        // an unbounded host allocation driven by a sandboxed guest. Refused
+        // explicitly rather than dropped, because a silently-ignored `set` is
+        // precisely the failure a plugin author cannot diagnose from outside.
+        //
+        // Only counted when this is a NEW layer: replacing one of your own is
+        // always allowed, or a plugin at the cap could never update its images.
+        if !self
+            .state
+            .pane_graphics_layer_exists(pane_id, owner.as_deref(), &layer_id)
+        {
+            let total = self
+                .state
+                .pane_graphics_owner_layer_total(pane_id, owner.as_deref());
+            let limit = self.pane_graphics_layer_limit(owner.as_deref());
+            if total >= limit {
+                tracing::warn!(
+                    owner = owner.as_deref().unwrap_or("<socket>"),
+                    total,
+                    limit,
+                    "pane.graphics.set refused: owner is at its per-pane layer limit"
+                );
+                return encode_error(
+                    id,
+                    "layer_limit_reached",
+                    format!("owner already holds {total} layers on this pane (limit {limit})"),
+                );
+            }
+        }
+
+        let layer = PaneGraphicsLayer::new_with_layer_id(
             params.format,
             params.image_width,
             params.image_height,
             data,
             params.placement,
             owner,
+            layer_id,
         );
         self.state.upsert_pane_graphics_layer(pane_id, layer);
 
@@ -157,6 +189,22 @@ impl App {
     /// neither `..` nor a symlink planted inside an allowed root can escape it.
     /// The comparison is component-wise rather than string-prefix so that a root
     /// of `/a/img` does not accidentally admit `/a/imgsecrets/x.png`.
+    /// fork(+127): how many layers this owner may hold on one pane.
+    ///
+    /// A plugin may raise or lower it with `max_layers_per_pane` in its manifest,
+    /// clamped to `PANE_GRAPHICS_MAX_LAYER_LIMIT` — declared up front and visible
+    /// in `plugin list` before anyone enables it, like every other reach a plugin
+    /// asks for. The socket caller is the user and is not limited.
+    fn pane_graphics_layer_limit(&self, owner: Option<&str>) -> usize {
+        let Some(plugin_id) = owner.and_then(|owner| owner.strip_prefix("plugin:")) else {
+            return usize::MAX;
+        };
+        self.ui_plugins
+            .max_layers_per_pane_for_plugin(plugin_id)
+            .unwrap_or(PANE_GRAPHICS_DEFAULT_LAYER_LIMIT)
+            .min(PANE_GRAPHICS_MAX_LAYER_LIMIT)
+    }
+
     fn read_pane_graphics_source(
         &self,
         source_path: &str,
@@ -220,9 +268,6 @@ impl App {
         id: String,
         params: PaneGraphicsClearParams,
     ) -> String {
-        if let Err(response) = require_pane_graphics_enabled(self, &id) {
-            return response;
-        }
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -238,8 +283,11 @@ impl App {
         // owner doc on `PaneGraphicsLayer`: the user at the CLI outranks any
         // plugin and needs one call that reliably wipes a pane, while a plugin
         // must never be able to erase another plugin's image.
-        self.state
-            .clear_pane_graphics_layers(pane_id, layer_owner(&params.owner).as_deref());
+        self.state.clear_pane_graphics_layers(
+            pane_id,
+            layer_owner(&params.owner).as_deref(),
+            params.layer_id.as_deref(),
+        );
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -249,9 +297,6 @@ impl App {
         id: String,
         params: PaneGraphicsSetParams,
     ) -> String {
-        if let Err(response) = require_pane_graphics_enabled(self, &id) {
-            return response;
-        }
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -279,9 +324,6 @@ impl App {
         id: String,
         params: PaneGraphicsStreamParams,
     ) -> String {
-        if let Err(response) = require_pane_graphics_enabled(self, &id) {
-            return response;
-        }
         if params.owner.is_empty() {
             return encode_error(
                 id,
@@ -339,16 +381,30 @@ impl App {
     }
 }
 
-fn require_pane_graphics_enabled(app: &App, id: &str) -> Result<(), String> {
-    if app.state.kitty_graphics_enabled {
-        return Ok(());
-    }
-    Err(encode_error(
-        id.to_owned(),
-        "feature_disabled",
-        "pane graphics require experimental.kitty_graphics",
-    ))
-}
+// fork(+127): `require_pane_graphics_enabled` was deleted here, and deleting it
+// is NOT a loosening of the security boundary — read this before restoring it.
+//
+// It refused all five `pane.graphics.*` handlers unless `experimental.kitty_graphics`
+// was on. But `kitty_graphics` is a RENDERER SELECTOR: it chooses between the
+// kitty escape protocol and the half-block painter (`app/mod.rs`). Gating an API
+// surface on it put two unrelated switches in series, so a plugin's own
+// off-switch meant nothing while the flag was off, and turning the flag on was a
+// precondition for using plugins rather than an alternative. That coupling was
+// an accident of history and it is what +127 exists to remove.
+//
+// The real gate is untouched and is the only one that ever protected anything:
+// a UI plugin reaching these methods through the bridge must hold the
+// `pane_graphics` capability (`ui_plugin_api_bridge::PANE_GRAPHICS_METHODS`),
+// declared in its manifest and visible in `plugin list` before anyone enables
+// it, and a `source_path` must still canonicalise under a declared
+// `graphics_roots` entry. Socket callers were never gated by capability at all
+// and could already paint whenever kitty happened to be on — for them this was
+// a coin-flip, not a permission.
+//
+// What made the deletion safe rather than merely tidy is `pane_graphics_paint`:
+// layers now render on BOTH backends, so an accepted call is an honest promise
+// of paint. Before +127, dropping this check would have accepted writes that
+// silently never reached the screen.
 
 fn pane_graphics_expected_data_len(
     format: crate::api::schema::PaneGraphicsFormat,
@@ -387,6 +443,22 @@ fn layer_owner(owner: &str) -> Option<String> {
     }
 }
 
+/// fork(+127): a `layer_id` is a short opaque handle chosen by the caller, not a
+/// payload. Capped so it cannot be used as a side channel for storing data in
+/// host state.
+const PANE_GRAPHICS_LAYER_ID_MAX_LEN: usize = 128;
+
+/// fork(+127): default ceiling on layers one owner may hold on one pane.
+///
+/// 8 covers the real case comfortably — a Claude pane showing more than a
+/// handful of `[Image #N]` placeholders at once is already unreadable — while
+/// keeping the worst-case retained bytes per plugin bounded and predictable,
+/// which is what makes per-plugin RAM measurable rather than a guess.
+const PANE_GRAPHICS_DEFAULT_LAYER_LIMIT: usize = 8;
+
+/// fork(+127): hard ceiling no manifest may exceed.
+const PANE_GRAPHICS_MAX_LAYER_LIMIT: usize = 32;
+
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
 }
@@ -424,11 +496,15 @@ mod tests {
             }),
         };
 
+        // fork(+127): with the kitty renderer off, `.info` no longer refuses with
+        // `feature_disabled` — it refuses with `cell_size_unavailable`, which is
+        // the honest reason. Cell metrics are a property of the HOST TERMINAL,
+        // not of which painter herdr chose, and conflating the two was the same
+        // renderer/API coupling removed everywhere else in +127.
         let response = app.handle_api_request(request(public_pane_id.clone()));
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "feature_disabled");
+        assert_eq!(error.error.code, "cell_size_unavailable");
 
-        app.state.kitty_graphics_enabled = true;
         app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
             width_px: 11,
             height_px: 22,
@@ -456,6 +532,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-set".into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id.clone(),
                 owner: String::new(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -489,6 +566,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id,
                 owner: String::new(),
             }),
@@ -502,6 +580,7 @@ mod tests {
         crate::api::schema::Request {
             id: id.into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: pane_id.to_string(),
                 owner: owner.to_string(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -537,6 +616,7 @@ mod tests {
             events: vec![],
             panes: vec![],
             ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                max_layers_per_pane: None,
                 id: "images".into(),
                 title: "Images".into(),
                 description: None,
@@ -571,6 +651,7 @@ mod tests {
         crate::api::schema::Request {
             id: id.into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: pane_id.to_string(),
                 owner: owner.to_string(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -832,6 +913,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "clear-a".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id.clone(),
                 owner: "plugin:a".into(),
             }),
@@ -846,6 +928,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "clear-cli".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id,
                 owner: String::new(),
             }),
@@ -873,6 +956,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "cli-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id,
                 owner: String::new(),
             }),
@@ -912,15 +996,34 @@ mod tests {
         assert_ne!(app.state.pane_graphics_revision, revision_before);
     }
 
+    /// fork(+127): the inverse of the test this replaces.
+    ///
+    /// It used to assert `feature_disabled` when `experimental.kitty_graphics`
+    /// was off. That gate is gone: it coupled an API surface to a RENDERER
+    /// SELECTOR, so a plugin's own off-switch was meaningless whenever the flag
+    /// happened to be off. What replaces it is this — with kitty off, a `set`
+    /// SUCCEEDS and the layer is retained, because `pane_graphics_paint` renders
+    /// it as half-blocks. The old behaviour and the new one are both about
+    /// honesty: an accepted call must be a promise the host can keep, and now it
+    /// is on both backends.
+    ///
+    /// The real gate is unchanged and lives elsewhere: a UI plugin needs the
+    /// `pane_graphics` capability (`ui_plugin_api_bridge`), and `source_path`
+    /// still has to canonicalise under a declared `graphics_roots` entry.
     #[test]
-    fn api_pane_graphics_rejects_when_kitty_graphics_disabled() {
+    fn api_pane_graphics_works_with_the_kitty_renderer_disabled() {
         let (mut app, public_pane_id) = app_with_test_workspace();
         let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        assert!(
+            !app.state.kitty_graphics_enabled,
+            "precondition: the kitty renderer is off"
+        );
         let data = base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3, 4]);
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-set".into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id.clone(),
                 owner: String::new(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -932,19 +1035,28 @@ mod tests {
                 placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
             }),
         });
-        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "feature_disabled");
-        assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "graphics-set");
+        assert_eq!(
+            app.state
+                .pane_graphics_layers
+                .get(&pane_id)
+                .map(Vec::len)
+                .unwrap_or(0),
+            1,
+            "the layer is retained so the half-block compositor can paint it"
+        );
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-clear".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id,
                 owner: String::new(),
             }),
         });
-        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "feature_disabled");
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "graphics-clear");
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
     }
 
@@ -1042,6 +1154,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-set-public".into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id.clone(),
                 owner: String::new(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -1060,6 +1173,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-set-stream".into(),
             method: crate::api::schema::Method::PaneGraphicsStreamSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id.clone(),
                 owner: "stream-1".into(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -1079,6 +1193,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-set-stream-wrong-owner".into(),
             method: crate::api::schema::Method::PaneGraphicsStreamSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id.clone(),
                 owner: "stream-2".into(),
                 format: crate::api::schema::PaneGraphicsFormat::Rgba,
@@ -1100,6 +1215,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-clear-public".into(),
             method: crate::api::schema::Method::PaneGraphicsClear(PaneGraphicsClearParams {
+                layer_id: None,
                 pane_id: public_pane_id.clone(),
                 owner: String::new(),
             }),
@@ -1135,6 +1251,7 @@ mod tests {
             let response = app.handle_api_request(crate::api::schema::Request {
                 id: "graphics-overflow".into(),
                 method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                    layer_id: String::new(),
                     pane_id: public_pane_id,
                     owner: String::new(),
                     format,
@@ -1166,6 +1283,7 @@ mod tests {
                 let response = app.handle_api_request(crate::api::schema::Request {
                     id: "graphics-raw-length".into(),
                     method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                        layer_id: String::new(),
                         pane_id: public_pane_id,
                         owner: String::new(),
                         format,
@@ -1200,6 +1318,7 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-public-too-large".into(),
             method: crate::api::schema::Method::PaneGraphicsSet(PaneGraphicsSetParams {
+                layer_id: String::new(),
                 pane_id: public_pane_id,
                 owner: String::new(),
                 format: crate::api::schema::PaneGraphicsFormat::Png,
@@ -1221,10 +1340,20 @@ mod tests {
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
     }
 
+    /// fork(+127): streaming, like the one-shot methods, no longer depends on
+    /// the kitty renderer selector. The stream is still an EXCLUSIVE claim on
+    /// the pane and is still never reachable from a wasm guest (it sits in
+    /// `ui_plugin_api_bridge::BLOCKING_METHODS`); only the renderer coupling was
+    /// removed.
     #[test]
-    fn api_pane_graphics_stream_methods_require_kitty_graphics() {
+    fn api_pane_graphics_stream_works_with_the_kitty_renderer_disabled() {
         let (mut app, public_pane_id) = app_with_test_workspace();
         let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        assert!(
+            !app.state.kitty_graphics_enabled,
+            "precondition: the kitty renderer is off"
+        );
+
         let open = app.handle_api_request(crate::api::schema::Request {
             id: "graphics-stream-open".into(),
             method: crate::api::schema::Method::PaneGraphicsStreamOpen(
@@ -1234,26 +1363,21 @@ mod tests {
                 },
             ),
         });
-        let error: ErrorResponse = serde_json::from_str(&open).unwrap();
-        assert_eq!(error.error.code, "feature_disabled");
+        let success: SuccessResponse = serde_json::from_str(&open).unwrap();
+        assert_eq!(success.id, "graphics-stream-open");
+        assert!(app.state.pane_graphics_streams.contains_key(&pane_id));
 
-        let set = app.handle_api_request(crate::api::schema::Request {
-            id: "graphics-stream-set".into(),
-            method: crate::api::schema::Method::PaneGraphicsStreamSet(PaneGraphicsSetParams {
-                pane_id: public_pane_id,
-                owner: "stream-1".into(),
-                format: crate::api::schema::PaneGraphicsFormat::Png,
-                image_width: 1,
-                image_height: 1,
-                data: Some(vec![1_u8]),
-                data_base64: String::new(),
-                source_path: String::new(),
-                placement: crate::api::schema::PaneGraphicsPlacementParams::default(),
-            }),
+        let close = app.handle_api_request(crate::api::schema::Request {
+            id: "graphics-stream-close".into(),
+            method: crate::api::schema::Method::PaneGraphicsStreamClose(
+                crate::api::schema::PaneGraphicsStreamParams {
+                    pane_id: public_pane_id,
+                    owner: "stream-1".into(),
+                },
+            ),
         });
-        let error: ErrorResponse = serde_json::from_str(&set).unwrap();
-        assert_eq!(error.error.code, "feature_disabled");
+        let success: SuccessResponse = serde_json::from_str(&close).unwrap();
+        assert_eq!(success.id, "graphics-stream-close");
         assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
-        assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
     }
 }

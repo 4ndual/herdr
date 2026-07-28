@@ -51,6 +51,8 @@ pub(crate) struct RegisteredUiModule {
     /// module may not use `source_path` at all. Stored unresolved; the host
     /// canonicalises at use time so a root that appears later still works.
     pub graphics_roots: Vec<String>,
+    /// fork(+127): manifest `max_layers_per_pane`, or `None` for the host default.
+    pub max_layers_per_pane: Option<usize>,
 }
 
 /// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
@@ -189,6 +191,12 @@ struct PluginRuntime {
 }
 
 impl PluginRuntime {
+    /// fork(+127): whether a compiled+instantiated guest exists for this module.
+    fn has_instance(&self, plugin_id: &str, module_id: &str) -> bool {
+        self.instances
+            .contains_key(&(plugin_id.to_string(), module_id.to_string()))
+    }
+
     fn new() -> Result<Self, String> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
@@ -508,6 +516,7 @@ impl UiPluginManager {
                     ui_input_file: module.ui_input_file.clone(),
                     image_file: module.image_file.clone(),
                     graphics_roots: module.graphics_roots.clone(),
+                    max_layers_per_pane: module.max_layers_per_pane,
                 };
                 let key = module_key(&registered);
                 if let Some(mtime) = old_mtimes.get(&registered.module_path).copied() {
@@ -1021,6 +1030,25 @@ impl UiPluginManager {
     ///
     /// An unlinked plugin has no modules and so gets an empty list, which the
     /// caller treats as a refusal.
+    /// fork(+127): is a guest instance live for this module right now?
+    ///
+    /// Distinguishes "registered but never successfully loaded" from "loaded",
+    /// which combined with `last_error_for` splits the three states that used to
+    /// be indistinguishable from outside the process.
+    pub(crate) fn is_module_loaded(&self, plugin_id: &str, module_id: &str) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            runtime.has_instance(plugin_id, module_id)
+        })
+    }
+
+    /// fork(+127): the module's last load / hot-reload / call error, if the most
+    /// recent attempt failed.
+    pub(crate) fn last_error_for(&self, plugin_id: &str, module_id: &str) -> Option<&str> {
+        self.last_errors
+            .get(&(plugin_id.to_string(), module_id.to_string()))
+            .map(String::as_str)
+    }
+
     pub(crate) fn graphics_roots_for_plugin(&self, plugin_id: &str) -> Vec<String> {
         let mut roots: Vec<String> = self
             .modules
@@ -1031,6 +1059,22 @@ impl UiPluginManager {
         roots.sort();
         roots.dedup();
         roots
+    }
+
+    /// fork(+127): the plugin's declared per-pane graphics layer ceiling.
+    ///
+    /// Plugin-scoped for the same reason `graphics_roots_for_plugin` is: the
+    /// off-switch (`plugin disable`) operates on whole plugins, and layer
+    /// ownership is stamped with the plugin id, not the module id. When two
+    /// modules of one plugin declare different values the LOWEST wins — a
+    /// declaration is a promise about resource use, and the strictest promise a
+    /// plugin made is the one it should be held to.
+    pub(crate) fn max_layers_per_pane_for_plugin(&self, plugin_id: &str) -> Option<usize> {
+        self.modules
+            .iter()
+            .filter(|module| module.plugin_id == plugin_id)
+            .filter_map(|module| module.max_layers_per_pane)
+            .min()
     }
 
     /// API v3 (§4): dispatch a resolved click's `Action` event to the one
@@ -1496,6 +1540,7 @@ mod tests {
             ui_input_file: None,
             image_file: None,
             graphics_roots: Vec::new(),
+            max_layers_per_pane: None,
         };
         let effect = HostEffect::SetSurfaceCollapsed {
             surface: UiSurface::UsageStrip,
@@ -1566,6 +1611,7 @@ mod tests {
                 ui_input_file: None,
                 image_file: None,
                 graphics_roots: Vec::new(),
+                max_layers_per_pane: None,
                 collector: None,
             }],
             link_handlers: vec![],

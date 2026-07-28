@@ -74,6 +74,10 @@ mod historial_host;
 // fork: off by default — see the `host-images` feature in Cargo.toml.
 #[cfg(feature = "host-images")]
 mod host_image;
+// fork(+127): ALWAYS compiled, unlike `host_image` above. Codecs and the
+// half-block rasteriser are needed by plugin-owned graphics layers, which must
+// work in a `host-images`-off build — that is the whole point of +127.
+mod image_decode;
 mod input;
 mod integration;
 mod ipc;
@@ -84,6 +88,8 @@ mod metadata_tokens;
 mod noninteractive_process;
 mod pane;
 mod pane_close_history;
+// fork(+127): renderer-independent painting of plugin-owned graphics layers.
+mod pane_graphics_paint;
 mod persist;
 mod platform;
 mod plugin_collector;

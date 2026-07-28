@@ -37,9 +37,25 @@ pub(crate) struct PaneGraphicsLayer {
     /// order within the pane. A `None` owner is deliberately privileged — the
     /// user driving the CLI outranks any plugin and may clear anything.
     pub owner: Option<String>,
+    /// fork(+127): distinguishes coexisting layers of the SAME owner. Identity
+    /// within a pane is the pair `(owner, layer_id)`, not `owner` alone.
+    ///
+    /// The reason is the Claude `[Image #N]` case: one plugin has to paint every
+    /// placeholder visible in a pane simultaneously. With owner-only identity the
+    /// second `set` replaced the first, so a pane with two images showed one.
+    ///
+    /// `""` is a real id and the default, which is what keeps every pre-+127
+    /// caller (and the socket CLI) behaving exactly as before.
+    pub layer_id: String,
 }
 
 impl PaneGraphicsLayer {
+    /// fork(+127): the empty-`layer_id` shorthand. Every production caller goes
+    /// through `new_with_layer_id` (the API handler is the only one), so this is
+    /// `cfg(test)` to keep it from reading as a supported second way to build a
+    /// layer — a non-test caller reaching for it would be silently opting out of
+    /// layer identity and get back the pre-+127 "one layer per plugin" bug.
+    #[cfg(test)]
     pub(crate) fn new(
         format: crate::api::schema::PaneGraphicsFormat,
         image_width: u32,
@@ -47,6 +63,29 @@ impl PaneGraphicsLayer {
         data: Vec<u8>,
         render: crate::api::schema::PaneGraphicsPlacementParams,
         owner: Option<String>,
+    ) -> Self {
+        Self::new_with_layer_id(
+            format,
+            image_width,
+            image_height,
+            data,
+            render,
+            owner,
+            String::new(),
+        )
+    }
+
+    /// fork(+127): the full constructor. `new` above is kept as the empty-`layer_id`
+    /// shorthand so existing call sites and tests read unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_layer_id(
+        format: crate::api::schema::PaneGraphicsFormat,
+        image_width: u32,
+        image_height: u32,
+        data: Vec<u8>,
+        render: crate::api::schema::PaneGraphicsPlacementParams,
+        owner: Option<String>,
+        layer_id: String,
     ) -> Self {
         let data_fingerprint = pane_graphics_data_fingerprint(&data);
         Self {
@@ -57,6 +96,7 @@ impl PaneGraphicsLayer {
             data_fingerprint,
             render,
             owner,
+            layer_id,
         }
     }
 }
@@ -831,6 +871,45 @@ pub struct RightPanelRailIcon {
     pub plugin_id: String,
     pub rect: Rect,
     pub active: bool,
+}
+
+/// fork(+127): one plugin panel that was NOT laid out this frame, and why.
+///
+/// Exists because a dropped panel was previously indistinguishable from a plugin
+/// that was never registered — the failure mode that made a vanished panel cost
+/// hours to diagnose. `plugin.ui.status` serves these, so the question is
+/// answerable against a live instance with no rebuild and no mirror sandbox.
+///
+/// Rebuilt every frame; a snapshot of "why not now", not a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelSkip {
+    pub plugin_id: String,
+    pub module_id: String,
+    /// Stable machine-readable token (`no_content`, `no_room_for_side_band`, ...).
+    /// Stable so a plugin author can match on it; the dims below make it
+    /// actionable — they separate "the module produced nothing" from "the module
+    /// produced nodes the region could not fit".
+    pub reason: String,
+    pub content_w: u16,
+    pub content_h: u16,
+}
+
+impl PanelSkip {
+    pub(crate) fn new(
+        plugin_id: &str,
+        module_id: &str,
+        reason: &str,
+        content_w: u16,
+        content_h: u16,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.to_string(),
+            module_id: module_id.to_string(),
+            reason: reason.to_string(),
+            content_w,
+            content_h,
+        }
+    }
 }
 
 /// One resolved plugin `Panel` rect, tagged with the owning module identity so
@@ -1770,6 +1849,9 @@ pub struct AppState {
     /// owning `(plugin_id, module_id)` and negotiated API version (§4 identity
     /// threading). Ordered `(z_index desc, plugin_id asc, module_id asc)`.
     pub(crate) ui_surface_layers: Vec<UiSurfaceLayer>,
+    /// fork(+127): why each plugin panel was dropped in the last laid-out frame.
+    /// Written by `compute_view`, read by `plugin.ui.status`. See `PanelSkip`.
+    pub(crate) plugin_panel_skips: Vec<PanelSkip>,
     /// Deferred plugin action invocations requested by UI/plugin surfaces.
     pub(crate) pending_plugin_action_invocation: Option<PendingPluginActionInvocation>,
     /// API v3 (§4): a resolved click awaiting `UiEvent::Action` dispatch by
@@ -2095,6 +2177,60 @@ impl AppState {
         removed
     }
 
+    /// fork(+127): total layer count and retained bytes for one plugin across
+    /// every pane — the per-plugin graphics footprint served by `plugin.ui.status`.
+    ///
+    /// Host-side accounting is the only honest way to get this number: the bytes
+    /// are held here, not in the guest, and guest memory inside a wasm instance
+    /// is invisible to `footprint`. Measure the out-of-process collector with
+    /// `footprint -p <pid>` (never `ps` RSS) and add this for the graphics half.
+    pub(crate) fn pane_graphics_totals_for_plugin(&self, plugin_id: &str) -> (usize, usize) {
+        let owner = format!("plugin:{plugin_id}");
+        self.pane_graphics_layers
+            .values()
+            .flat_map(|layers| layers.iter())
+            .filter(|layer| layer.owner.as_deref() == Some(owner.as_str()))
+            .fold((0, 0), |(count, bytes), layer| {
+                (count + 1, bytes + layer.data.len())
+            })
+    }
+
+    /// fork(+127): does this owner already hold `layer_id` on `pane_id`?
+    ///
+    /// Used by the `set` handler to tell "replace one of mine" (always allowed)
+    /// from "add another" (subject to the per-pane limit).
+    pub(crate) fn pane_graphics_layer_exists(
+        &self,
+        pane_id: PaneId,
+        owner: Option<&str>,
+        layer_id: &str,
+    ) -> bool {
+        self.pane_graphics_layers
+            .get(&pane_id)
+            .is_some_and(|layers| {
+                layers
+                    .iter()
+                    .any(|l| l.owner.as_deref() == owner && l.layer_id == layer_id)
+            })
+    }
+
+    /// fork(+127): how many layers `owner` currently holds on `pane_id`.
+    pub(crate) fn pane_graphics_owner_layer_total(
+        &self,
+        pane_id: PaneId,
+        owner: Option<&str>,
+    ) -> usize {
+        self.pane_graphics_layers
+            .get(&pane_id)
+            .map(|layers| {
+                layers
+                    .iter()
+                    .filter(|l| l.owner.as_deref() == owner)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// fork: insert or replace `layer` on `pane_id`, keyed by its owner, keeping
     /// the vec in composite order (socket layer bottom, then plugins by owner).
     ///
@@ -2107,7 +2243,13 @@ impl AppState {
         layer: PaneGraphicsLayer,
     ) -> bool {
         let layers = self.pane_graphics_layers.entry(pane_id).or_default();
-        let replaced = match layers.iter_mut().find(|held| held.owner == layer.owner) {
+        // fork(+127): match on the (owner, layer_id) PAIR. Matching on owner
+        // alone is what made a second image from the same plugin replace the
+        // first instead of coexisting with it.
+        let replaced = match layers
+            .iter_mut()
+            .find(|held| held.owner == layer.owner && held.layer_id == layer.layer_id)
+        {
             Some(held) => {
                 *held = layer;
                 true
@@ -2117,7 +2259,14 @@ impl AppState {
                 false
             }
         };
-        layers.sort_by(|a, b| a.owner.cmp(&b.owner));
+        // Sort by the same pair so composite order is deterministic across
+        // frames — an unstable order would make two overlapping layers of one
+        // plugin flicker between which is on top.
+        layers.sort_by(|a, b| {
+            a.owner
+                .cmp(&b.owner)
+                .then_with(|| a.layer_id.cmp(&b.layer_id))
+        });
         self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
         replaced
     }
@@ -2125,10 +2274,16 @@ impl AppState {
     /// fork: remove layers from `pane_id`. `owner` of `None` is the privileged
     /// socket caller and clears the whole pane; a plugin owner clears only its
     /// own layer. Returns how many layers went away.
+    /// fork(+127): `layer_id` of `None` means "every layer this owner holds on
+    /// the pane", which is the pre-+127 meaning of the whole call, so a caller
+    /// that never learned about layer ids still wipes exactly what it painted.
+    /// `Some(id)` narrows it to one layer. Ignored when `owner` is `None`: the
+    /// socket caller clears the pane outright.
     pub(crate) fn clear_pane_graphics_layers(
         &mut self,
         pane_id: PaneId,
         owner: Option<&str>,
+        layer_id: Option<&str>,
     ) -> usize {
         let Some(layers) = self.pane_graphics_layers.get_mut(&pane_id) else {
             return 0;
@@ -2136,7 +2291,14 @@ impl AppState {
         let before = layers.len();
         match owner {
             None => layers.clear(),
-            Some(owner) => layers.retain(|layer| layer.owner.as_deref() != Some(owner)),
+            Some(owner) => layers.retain(|layer| {
+                let mine = layer.owner.as_deref() == Some(owner);
+                let targeted = match layer_id {
+                    None => true,
+                    Some(id) => layer.layer_id == id,
+                };
+                !(mine && targeted)
+            }),
         }
         let removed = before - layers.len();
         if layers.is_empty() {
@@ -2434,6 +2596,7 @@ impl AppState {
             plugin_command_logs: Vec::new(),
             ui_context_menu_items: Vec::new(),
             ui_surface_layers: Vec::new(),
+            plugin_panel_skips: Vec::new(),
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
             pending_historial_action: None,

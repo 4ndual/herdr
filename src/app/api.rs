@@ -1157,6 +1157,9 @@ impl App {
             Method::PluginList(params) => {
                 return self.handle_plugin_list(request.id, params);
             }
+            Method::PluginUiStatus(params) => {
+                return self.handle_plugin_ui_status(request.id, params);
+            }
             Method::PluginUnlink(params) => {
                 return self.handle_plugin_unlink(request.id, params);
             }
@@ -1207,9 +1210,7 @@ impl App {
         use crate::api::schema::ResponseResult;
         match self.open_resume_picker_overlay(std::path::PathBuf::from(params.wrapper)) {
             Ok(()) => responses::encode_success(id, ResponseResult::Ok {}),
-            Err(err) => {
-                responses::encode_error(id, "resume_picker_open_failed", err.to_string())
-            }
+            Err(err) => responses::encode_error(id, "resume_picker_open_failed", err.to_string()),
         }
     }
 

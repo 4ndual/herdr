@@ -343,50 +343,51 @@ fn compute_view_internal(
         .as_deref()
         .filter(|active| !right_panel_collapsed && right_panel_plugins.iter().any(|p| p == active))
         .map(str::to_string);
-    let (terminal_area, right_panel_rect, right_panel_rail_icons) = if right_panel_has_content
-        && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24
-    {
-        // The rail is always shown when a right-panel plugin has content; the
-        // content column is carved only when a plugin is expanded.
-        let rail_w = RIGHT_PANEL_RAIL_WIDTH;
-        let content_w = if active_right_panel.is_some() {
-            (terminal_area.width / 4)
-                .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
-                .min(terminal_area.width.saturating_sub(24 + rail_w))
+    let (terminal_area, right_panel_rect, right_panel_rail_icons) =
+        if right_panel_has_content && terminal_area.width > GOAL_PANEL_MIN_WIDTH + 24 {
+            // The rail is always shown when a right-panel plugin has content; the
+            // content column is carved only when a plugin is expanded.
+            let rail_w = RIGHT_PANEL_RAIL_WIDTH;
+            let content_w = if active_right_panel.is_some() {
+                (terminal_area.width / 4)
+                    .clamp(GOAL_PANEL_MIN_WIDTH, GOAL_PANEL_MAX_WIDTH)
+                    .min(terminal_area.width.saturating_sub(24 + rail_w))
+            } else {
+                0
+            };
+            let [panes, content, rail] = Layout::horizontal([
+                Constraint::Min(24),
+                Constraint::Length(content_w),
+                Constraint::Length(rail_w),
+            ])
+            .areas(terminal_area);
+            // Content-size the panel height: a short panel (e.g. a 7-row historial)
+            // carves a box only as tall as its current content instead of the whole
+            // column, so it no longer visually dominates. Derived from the active
+            // plugin's most-recent layer (previous frame), converging in one tick;
+            // clamped to the full column height as the sane max, so a long list still
+            // gets the whole column.
+            let content = match active_right_panel
+                .as_deref()
+                .and_then(|plugin_id| right_panel_content_height(app, plugin_id))
+            {
+                // Small padding below the content so a row hover-tooltip (drawn
+                // beneath the hovered row) has a few lines to render into without the
+                // panel having to reserve the whole column.
+                Some(h) if content_w > 0 => Rect {
+                    height: h
+                        .saturating_add(RIGHT_PANEL_CONTENT_PAD)
+                        .clamp(1, content.height),
+                    ..content
+                },
+                _ => content,
+            };
+            let icons =
+                build_right_panel_rail(&right_panel_plugins, active_right_panel.as_deref(), rail);
+            (panes, content, icons)
         } else {
-            0
+            (terminal_area, Rect::default(), Vec::new())
         };
-        let [panes, content, rail] = Layout::horizontal([
-            Constraint::Min(24),
-            Constraint::Length(content_w),
-            Constraint::Length(rail_w),
-        ])
-        .areas(terminal_area);
-        // Content-size the panel height: a short panel (e.g. a 7-row historial)
-        // carves a box only as tall as its current content instead of the whole
-        // column, so it no longer visually dominates. Derived from the active
-        // plugin's most-recent layer (previous frame), converging in one tick;
-        // clamped to the full column height as the sane max, so a long list still
-        // gets the whole column.
-        let content = match active_right_panel
-            .as_deref()
-            .and_then(|plugin_id| right_panel_content_height(app, plugin_id))
-        {
-            // Small padding below the content so a row hover-tooltip (drawn
-            // beneath the hovered row) has a few lines to render into without the
-            // panel having to reserve the whole column.
-            Some(h) if content_w > 0 => Rect {
-                height: h.saturating_add(RIGHT_PANEL_CONTENT_PAD).clamp(1, content.height),
-                ..content
-            },
-            _ => content,
-        };
-        let icons =
-            build_right_panel_rail(&right_panel_plugins, active_right_panel.as_deref(), rail);
-        (panes, content, icons)
-    } else {
-        (terminal_area, Rect::default(), Vec::new())
-    };
 
     // Generic plugin-panel placement: lay out every module that declares the
     // `Panel` surface AND currently renders content, from the DATA in its
@@ -396,8 +397,12 @@ fn compute_view_internal(
     // shrinks the pane area cleanly, and each resolved rect is disjoint from the
     // panes and from other panels, giving each panel its own hit-rects (never
     // stealing usage-dash or pane input). Idle/empty panels carve nothing.
-    let (terminal_area, usage_strip_rect, panel_rects) =
+    let (terminal_area, usage_strip_rect, panel_rects, panel_skips) =
         layout_plugin_panels(app, terminal_area, usage_strip_rect);
+    // fork(+127): record why each dropped panel dropped, for `plugin.ui.status`.
+    // Overwritten wholesale every frame: the answer callers need is "why is it
+    // not showing NOW", and a growing history would just be a leak.
+    app.plugin_panel_skips = panel_skips;
 
     if !app.sidebar_collapsed {
         app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
@@ -543,11 +548,11 @@ fn build_right_panel_rail(
 /// generic marker for unknown plugins.
 fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
     match plugin_id {
-        "builtin.historial-dash" => "\u{1F553}", // 🕓
+        "builtin.historial-dash" => "\u{1F553}",  // 🕓
         "builtin.harness-manager" => "\u{1F39B}", // 🎛
-        "builtin.goal-dash" => "\u{1F3AF}",      // 🎯
-        "builtin.usage-dash" => "\u{1F4CA}",     // 📊
-        _ => "\u{25A6}",                         // ▦
+        "builtin.goal-dash" => "\u{1F3AF}",       // 🎯
+        "builtin.usage-dash" => "\u{1F4CA}",      // 📊
+        _ => "\u{25A6}",                          // ▦
     }
 }
 
@@ -582,14 +587,32 @@ fn render_right_panel_rail(app: &AppState, frame: &mut Frame) {
 /// order (already `(z desc, plugin asc, module asc)`), so multiple panels in the
 /// same region carve deterministically from the remaining space and never
 /// overlap. See `.local/prd/generic-plugin-panel-placement.md`.
+/// fork(+127): also returns one `PanelSkip` for every module whose panel was
+/// dropped this frame, and why.
+///
+/// Every `continue` below used to be silent. A panel that vanished here was
+/// indistinguishable from one that was never registered: no warning, no toast,
+/// `plugin list` still saying enabled, and no read-only way to ask a live
+/// instance what happened. That cost hours. The skips are stored on `AppState`
+/// by `compute_view_internal` and served by `plugin.ui.status`, so the question
+/// "why is my panel not showing?" is answerable from outside the process.
+///
+/// Purity is preserved: this function still takes `&AppState` and returns the
+/// records; the caller (which already holds `&mut`) is what writes them.
 fn layout_plugin_panels(
     app: &AppState,
     mut terminal: Rect,
     mut usage: Rect,
-) -> (Rect, Rect, Vec<crate::app::state::PanelRect>) {
+) -> (
+    Rect,
+    Rect,
+    Vec<crate::app::state::PanelRect>,
+    Vec<crate::app::state::PanelSkip>,
+) {
     use crate::api::schema::{PluginPanelAlign, PluginPanelRegion};
 
     let mut out: Vec<crate::app::state::PanelRect> = Vec::new();
+    let mut skips: Vec<crate::app::state::PanelSkip> = Vec::new();
     let mut seen: Vec<(String, String)> = Vec::new();
     for entry in &app.ui_surface_layers {
         if entry.layer.surface != UiSurface::Panel {
@@ -620,6 +643,13 @@ fn layout_plugin_panels(
                 region = ?placement.region,
                 "plugin panel skipped: no content to carve for"
             );
+            skips.push(crate::app::state::PanelSkip::new(
+                &entry.plugin_id,
+                &entry.module_id,
+                "no_content",
+                content_w,
+                content_h,
+            ));
             continue;
         }
         let size = placement.size.as_deref();
@@ -628,11 +658,13 @@ fn layout_plugin_panels(
         let rect = match placement.region {
             PluginPanelRegion::BottomBand => {
                 if usage.width == 0 {
+                    skips.push(skip(&entry, "usage_band_zero_width", content_w, content_h));
                     continue;
                 }
                 let max_slot = usage.width.saturating_sub(min_peer);
                 let slot_w = resolve_extent(size, content_w, usage.width).min(max_slot);
                 if slot_w == 0 {
+                    skips.push(skip(&entry, "no_room_in_usage_band", content_w, content_h));
                     continue;
                 }
                 let (peer, panel) = carve_band_horizontal(usage, slot_w, placement.align);
@@ -641,11 +673,13 @@ fn layout_plugin_panels(
             }
             PluginPanelRegion::Left | PluginPanelRegion::Right => {
                 if terminal.height == 0 {
+                    skips.push(skip(&entry, "pane_area_zero_height", content_w, content_h));
                     continue;
                 }
                 let max_slot = terminal.width.saturating_sub(min_peer);
                 let w = resolve_extent(size, content_w, terminal.width).min(max_slot);
                 if w == 0 {
+                    skips.push(skip(&entry, "no_room_for_side_band", content_w, content_h));
                     continue;
                 }
                 let start = matches!(placement.region, PluginPanelRegion::Left);
@@ -663,11 +697,13 @@ fn layout_plugin_panels(
             }
             PluginPanelRegion::Top | PluginPanelRegion::Bottom => {
                 if terminal.width == 0 {
+                    skips.push(skip(&entry, "pane_area_zero_width", content_w, content_h));
                     continue;
                 }
                 let max_slot = terminal.height.saturating_sub(min_peer);
                 let h = resolve_extent(size, content_h, terminal.height).min(max_slot);
                 if h == 0 {
+                    skips.push(skip(&entry, "no_room_for_top_bottom_band", content_w, content_h));
                     continue;
                 }
                 let start = matches!(placement.region, PluginPanelRegion::Top);
@@ -682,6 +718,7 @@ fn layout_plugin_panels(
                 let w = resolve_extent(size, content_w, terminal.width);
                 let h = content_h.min(terminal.height);
                 if w == 0 || h == 0 {
+                    skips.push(skip(&entry, "no_room_for_free_overlay", content_w, content_h));
                     continue;
                 }
                 let x = match placement.align {
@@ -698,7 +735,23 @@ fn layout_plugin_panels(
             rect,
         });
     }
-    (terminal, usage, out)
+    (terminal, usage, out, skips)
+}
+
+/// fork(+127): build a `PanelSkip` from a surface-layer entry.
+fn skip(
+    entry: &crate::ui_plugins::UiSurfaceLayer,
+    reason: &str,
+    content_w: u16,
+    content_h: u16,
+) -> crate::app::state::PanelSkip {
+    crate::app::state::PanelSkip::new(
+        &entry.plugin_id,
+        &entry.module_id,
+        reason,
+        content_w,
+        content_h,
+    )
 }
 
 /// Resolve a placement `size` extent against content and available cells:
