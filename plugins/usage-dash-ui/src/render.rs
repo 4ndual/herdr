@@ -15,7 +15,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 use usage_dash_model::{
-    countdown, fmt_k, Cli, ThreadState, UsageRenderInput, UsageSnapshot, DAILY_BUDGET_PCT,
+    countdown, fmt_k, Cli, CliVersion, Freshness, ThreadState, UsageRenderInput, UsageSnapshot,
+    VersionToken, DAILY_BUDGET_PCT,
 };
 
 const DIM: Color = Color::DarkGray;
@@ -25,6 +26,10 @@ const DIM: Color = Color::DarkGray;
 /// reclaimed rows back to panes (a collapsed strip keeps a single row).
 pub const ACTION_TOGGLE_COLLAPSE: &str = "usage:toggle_collapse";
 /// The clickable collapse button drawn on the box's top border.
+/// Action ids for the clickable version tokens on the caption border.
+pub const ACTION_VERSION_CLAUDE: &str = "usage:version_claude";
+pub const ACTION_VERSION_CODEX: &str = "usage:version_codex";
+
 const COLLAPSE_BTN: &str = "[▾]";
 /// Fixed bar width for the left box (keeps the shrink-to-fit measurement stable).
 const BAR_W: usize = 10;
@@ -192,25 +197,113 @@ fn rounded_block() -> Block<'static> {
 /// The box caption rendered ON the top border (like a ratatui block title):
 /// the CLI name (bold, CLI color), `· model` (white), `· plan` (dim).
 /// Replaces the old in-box `USAGE · Cli` + `model` rows.
-fn caption_line(snap: &UsageSnapshot) -> Line<'static> {
+/// Colour for a version token. Green = current, red = outdated, dim = unknown.
+///
+/// `Unknown` must be visually distinct from both: a version we could not check
+/// is not up to date, and is not known to need updating.
+fn freshness_color(f: Freshness) -> Color {
+    match f {
+        Freshness::Current => Color::Green,
+        Freshness::Outdated => Color::Red,
+        Freshness::Unknown => DIM,
+    }
+}
+
+/// A version token's rendered text. Mirrors `usage-dash-core::render`.
+fn version_token_text(v: &CliVersion, hovered: bool, confirming: bool) -> Option<String> {
+    let current = v.current.as_deref()?;
+    let freshness = v.freshness();
+    let latest = v.latest.as_deref();
+
+    Some(match (confirming, hovered, freshness, latest) {
+        (true, _, _, Some(l)) => format!("{current}→{l} click to update?"),
+        (_, true, Freshness::Outdated, Some(l)) => format!("{current}→{l}"),
+        (_, true, Freshness::Current, Some(l)) => format!("{current} (latest {l})"),
+        (_, true, Freshness::Unknown, _) => format!("{current} (latest unknown)"),
+        _ => current.to_string(),
+    })
+}
+
+/// Interaction state the guest owns for the caption's version tokens.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VersionUi {
+    /// Token the cursor is over, if any.
+    pub hovered: Option<VersionToken>,
+    /// Token awaiting a confirming second click.
+    pub confirming: Option<VersionToken>,
+}
+
+/// Caption spans plus each version token's offset/width within the caption.
+struct Caption {
+    line: Line<'static>,
+    claude_span: Option<(u16, u16)>,
+    codex_span: Option<(u16, u16)>,
+}
+
+/// The box caption rendered ON the top border, with the version tokens as
+/// separate, individually coloured spans so they can be hit-tested.
+fn caption_line(snap: &UsageSnapshot, ui: VersionUi) -> Caption {
     let mut spans = vec![Span::styled(
         snap.cli.label().to_string(),
         Style::default()
             .fg(cli_color(snap.cli))
             .add_modifier(Modifier::BOLD),
     )];
-    if let Some(m) = &snap.model {
+    let mut offset: u16 = spans[0].content.chars().count() as u16;
+    let mut claude_span = None;
+    let mut codex_span = None;
+
+    if let Some(text) = version_token_text(
+        &snap.versions.claude,
+        ui.hovered == Some(VersionToken::Claude),
+        ui.confirming == Some(VersionToken::Claude),
+    ) {
+        spans.push(Span::styled(" · ".to_string(), Style::default().fg(DIM)));
+        offset += 3;
+        let width = text.chars().count() as u16;
+        claude_span = Some((offset, width));
         spans.push(Span::styled(
-            format!(" · {m}"),
-            Style::default().fg(Color::White),
+            text,
+            Style::default().fg(freshness_color(snap.versions.claude.freshness())),
         ));
+        offset += width;
     }
+
+    if let Some(m) = &snap.model {
+        let text = format!(" · {m}");
+        offset += text.chars().count() as u16;
+        spans.push(Span::styled(text, Style::default().fg(Color::White)));
+    }
+
+    if let Some(codex) = snap.versions.codex.as_ref() {
+        if let Some(text) = version_token_text(
+            codex,
+            ui.hovered == Some(VersionToken::Codex),
+            ui.confirming == Some(VersionToken::Codex),
+        ) {
+            let prefix = " · codex ";
+            spans.push(Span::styled(prefix.to_string(), Style::default().fg(DIM)));
+            offset += prefix.chars().count() as u16;
+            let width = text.chars().count() as u16;
+            codex_span = Some((offset, width));
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(freshness_color(codex.freshness())),
+            ));
+        }
+    }
+
     if let Some(plan) = &snap.plan {
         if !plan.is_empty() {
             spans.push(Span::styled(format!(" · {plan}"), Style::default().fg(DIM)));
         }
     }
-    Line::from(spans)
+
+    Caption {
+        line: Line::from(spans),
+        claude_span,
+        codex_span,
+    }
 }
 
 /// The USAGE left-column cells: ctx, 5h, week, today.
@@ -450,7 +543,12 @@ fn collapse_button(rect: Rect, buf: &mut Buffer) -> Option<UiHitRect> {
     })
 }
 
-pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiHitRect> {
+pub fn render(
+    input: &UsageRenderInput,
+    area: Rect,
+    buf: &mut Buffer,
+    version_ui: VersionUi,
+) -> Vec<UiHitRect> {
     let now = input.now;
     let expanded = input.expanded;
     let collapsed = input.collapsed;
@@ -519,7 +617,7 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
 
-    let caption = caption_line(snap);
+    let caption = caption_line(snap, version_ui);
     let usage = usage_cells(snap, now, &input.five_hour_abs, &input.weekly_abs);
     let stats = stats_compact(snap);
     let has_stats = !stats.is_empty();
@@ -560,7 +658,7 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
     let content_w = body
         .iter()
         .chain(std::iter::once(&state_line))
-        .chain(std::iter::once(&caption))
+        .chain(std::iter::once(&caption.line))
         .map(|l| l.width())
         .max()
         .unwrap_or(0) as u16;
@@ -577,7 +675,29 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
         ..area
     };
 
-    let block = rounded_block().title(caption);
+    // Version tokens ride the top border; ratatui's left-aligned title starts one
+    // column in from the box edge. Convert caption-local offsets to absolute
+    // rects, dropping any token the box is too narrow to actually show — a hit
+    // rect over clipped text would be an invisible click target.
+    let title_x = rect.x + 1;
+    let box_right = rect.x + rect.width;
+    let token_rect = |span: Option<(u16, u16)>| -> Option<Rect> {
+        let (offset, width) = span?;
+        let x = title_x + offset;
+        if width == 0 || x >= box_right {
+            return None;
+        }
+        Some(Rect {
+            x,
+            y: rect.y,
+            width: width.min(box_right.saturating_sub(x)),
+            height: 1,
+        })
+    };
+    let claude_rect = token_rect(caption.claude_span);
+    let codex_rect = token_rect(caption.codex_span);
+
+    let block = rounded_block().title(caption.line);
     let inner = block.inner(rect);
     block.render(rect, buf);
 
@@ -638,6 +758,24 @@ pub fn render(input: &UsageRenderInput, area: Rect, buf: &mut Buffer) -> Vec<UiH
             width: stats_hw.min(inner.width),
             height: 1,
             action_id: "usage:toggle_stats".into(),
+        });
+    }
+    if let Some(r) = claude_rect {
+        hits.push(UiHitRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            action_id: ACTION_VERSION_CLAUDE.into(),
+        });
+    }
+    if let Some(r) = codex_rect {
+        hits.push(UiHitRect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            action_id: ACTION_VERSION_CODEX.into(),
         });
     }
     hits

@@ -212,8 +212,18 @@ impl App {
                 )
             });
         match result {
-            Ok((tab_idx, terminal, runtime)) => {
+            Ok((tab_idx, mut terminal, runtime)) => {
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+                // Carry the closed pane's human name onto the restored pane.
+                // Without this the pane has no manual label and its border falls
+                // back to the display agent (e.g. "cx"), losing the name it had.
+                if let Some(pane_label) = record
+                    .label
+                    .clone()
+                    .filter(|label| !label.trim().is_empty())
+                {
+                    terminal.set_manual_label(pane_label);
+                }
                 self.state.terminals.insert(terminal.id.clone(), terminal);
                 self.state.remove_alias_shadowed_by_new_pane(
                     self.state.workspaces[ws_idx].tabs[tab_idx].root_pane,
@@ -509,6 +519,43 @@ mod tests {
             crate::worktree::canonical_or_original(created_cwd),
             crate::worktree::canonical_or_original(&cached_cwd)
         );
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
+    async fn historial_restore_keeps_the_closed_pane_name() {
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config::default(), true, None, api_rx, event_hub);
+        app.state.workspaces = vec![Workspace::test_new("tabs")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let record = crate::pane_close_history::PaneCloseRecord {
+            ts_unix_ms: 1,
+            pane_id: "w1p1".into(),
+            label: Some("codeword".into()),
+            agent: Some("cx".into()),
+            session_source: None,
+            session_kind: None,
+            session_value: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            workspace_id: "w1".into(),
+            workspace_name: None,
+            tab_name: None,
+            first_prompt: None,
+            last_prompt: None,
+        };
+        let argv = vec![exiting_test_command().to_string()];
+
+        assert!(app.spawn_historial_restore_tab(&record, argv));
+
+        let restored = &app.state.workspaces[0].tabs[1];
+        let terminal_id = restored.terminal_id(restored.root_pane).unwrap();
+        let terminal = app.state.terminals.get(terminal_id).unwrap();
+        // Without the manual label the border would fall back to the display
+        // agent ("cx"), which is what the restore used to show.
+        assert_eq!(terminal.border_label(true).as_deref(), Some("codeword"));
         shutdown_test_runtimes(&mut app);
     }
 }

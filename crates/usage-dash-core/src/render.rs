@@ -15,8 +15,10 @@
 //! params, and it writes the clickable hit-rects back into the view so the host
 //! can map clicks via [`crate::handle`].
 
-use crate::model::{countdown, fmt_k, Cli, ThreadState, UsageSnapshot, DAILY_BUDGET_PCT};
-use crate::UsageView;
+use crate::model::{
+    countdown, fmt_k, Cli, CliVersion, Freshness, ThreadState, UsageSnapshot, DAILY_BUDGET_PCT,
+};
+use crate::{UsageView, VersionToken};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -196,25 +198,146 @@ fn rounded_block() -> Block<'static> {
 /// The box caption rendered ON the top border (like a ratatui block title):
 /// the CLI name (bold, CLI color), `· model` (white), `· plan` (dim).
 /// Replaces the old in-box `USAGE · Cli` + `model` rows.
-fn caption_line(snap: &UsageSnapshot) -> Line<'static> {
+/// Colour for a version token. Green = current, red = outdated, dim = unknown.
+///
+/// `Unknown` must be visually distinct from both: a version we could not check
+/// is not a version that is up to date, and it is not one that needs updating.
+fn freshness_color(f: Freshness) -> Color {
+    match f {
+        Freshness::Current => Color::Green,
+        Freshness::Outdated => Color::Red,
+        Freshness::Unknown => DIM,
+    }
+}
+
+/// One version token's rendered text plus the span that draws it.
+///
+/// Text varies with interaction state:
+///   * armed for confirmation → `2.1.219→2.1.220 click to update?`
+///   * hovered                → `2.1.219→2.1.220`
+///   * otherwise              → `2.1.219`
+///
+/// The latest version is revealed on hover rather than shown always, so the
+/// common (up-to-date) case stays as narrow as it is today.
+fn version_token_text(v: &CliVersion, hovered: bool, confirming: bool) -> Option<String> {
+    let current = v.current.as_deref()?;
+    let freshness = v.freshness();
+    let latest = v.latest.as_deref();
+
+    Some(match (confirming, hovered, freshness, latest) {
+        (true, _, _, Some(l)) => format!("{current}→{l} click to update?"),
+        (_, true, Freshness::Outdated, Some(l)) => format!("{current}→{l}"),
+        // Hovering a current token confirms what it was compared against.
+        (_, true, Freshness::Current, Some(l)) => format!("{current} (latest {l})"),
+        (_, true, Freshness::Unknown, _) => format!("{current} (latest unknown)"),
+        _ => current.to_string(),
+    })
+}
+
+/// Caption spans plus, for each version token, its column offset and width
+/// within the caption — the caller turns those into absolute [`Rect`]s once the
+/// box position is known.
+struct Caption {
+    line: Line<'static>,
+    /// `(offset_in_caption, width)` for the Claude token, when drawn.
+    claude_span: Option<(u16, u16)>,
+    /// `(offset_in_caption, width)` for the codex token, when drawn.
+    codex_span: Option<(u16, u16)>,
+}
+
+/// The box caption rendered ON the top border:
+/// `Claude · 2.1.220 · cx · Opus 5 1M · low · codex 0.145.0`
+///
+/// Version tokens are separate, individually coloured spans so they can be
+/// hit-tested; everything else is plain text.
+fn caption_line(snap: &UsageSnapshot, view: &UsageView) -> Caption {
     let mut spans = vec![Span::styled(
         snap.cli.label().to_string(),
         Style::default()
             .fg(cli_color(snap.cli))
             .add_modifier(Modifier::BOLD),
     )];
-    if let Some(m) = &snap.model {
+    // Running width of the caption so far, used to locate the version tokens.
+    let mut offset: u16 = spans[0].content.chars().count() as u16;
+    let mut claude_span = None;
+    let mut codex_span = None;
+
+    let hovered = hovered_token(view);
+
+    // Claude Code version, immediately after the CLI name.
+    if let Some(text) = version_token_text(
+        &snap.versions.claude,
+        hovered == Some(VersionToken::Claude),
+        view.version_confirm == Some(VersionToken::Claude),
+    ) {
+        spans.push(Span::styled(" · ".to_string(), Style::default().fg(DIM)));
+        offset += 3;
+        let width = text.chars().count() as u16;
+        claude_span = Some((offset, width));
         spans.push(Span::styled(
-            format!(" · {m}"),
-            Style::default().fg(Color::White),
+            text,
+            Style::default().fg(freshness_color(snap.versions.claude.freshness())),
         ));
+        offset += width;
     }
+
+    if let Some(m) = &snap.model {
+        let text = format!(" · {m}");
+        offset += text.chars().count() as u16;
+        spans.push(Span::styled(text, Style::default().fg(Color::White)));
+    }
+
+    // codex CLI version — only present for cx panes (the collector omits it
+    // otherwise, since the codex binary is not in a native pane's loop).
+    if let Some(codex) = snap.versions.codex.as_ref() {
+        if let Some(text) = version_token_text(
+            codex,
+            hovered == Some(VersionToken::Codex),
+            view.version_confirm == Some(VersionToken::Codex),
+        ) {
+            let prefix = " · codex ";
+            spans.push(Span::styled(prefix.to_string(), Style::default().fg(DIM)));
+            offset += prefix.chars().count() as u16;
+            let width = text.chars().count() as u16;
+            codex_span = Some((offset, width));
+            spans.push(Span::styled(
+                text,
+                Style::default().fg(freshness_color(codex.freshness())),
+            ));
+            // No further offset bookkeeping: codex is the last positioned token,
+            // and the trailing plan span is not hit-tested.
+        }
+    }
+
     if let Some(plan) = &snap.plan {
         if !plan.is_empty() {
             spans.push(Span::styled(format!(" · {plan}"), Style::default().fg(DIM)));
         }
     }
-    Line::from(spans)
+
+    Caption {
+        line: Line::from(spans),
+        claude_span,
+        codex_span,
+    }
+}
+
+/// Which version token the cursor is currently over, from the previous frame's
+/// hit rects. Hover is resolved against the LAST frame because that is the
+/// geometry the cursor was actually over.
+fn hovered_token(view: &UsageView) -> Option<VersionToken> {
+    let (col, row) = view.hover?;
+    let inside = |r: Option<Rect>| {
+        r.map(|r| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+            .unwrap_or(false)
+    };
+    if inside(view.hits.claude_version) {
+        Some(VersionToken::Claude)
+    } else if inside(view.hits.codex_version) {
+        Some(VersionToken::Codex)
+    } else {
+        None
+    }
 }
 
 /// The USAGE left-column cells: ctx, 5h, week, today. (model moved to the
@@ -396,6 +519,10 @@ fn render_tooltip(f: &mut Frame, area: Rect, anchor: Rect, text: &str) {
 pub struct Hits {
     pub state: Option<Rect>,
     pub stats: Option<Rect>,
+    /// The Claude Code version token on the caption border, when drawn.
+    pub claude_version: Option<Rect>,
+    /// The codex CLI version token on the caption border (cx panes only).
+    pub codex_version: Option<Rect>,
 }
 
 /// Renders the panel into `area` for the given snapshot and interactive `view`.
@@ -457,7 +584,7 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
     //   under the context) → a dim rule → the slim state footer. When the state
     //   is expanded the full status scrolls below the footer. The box shrinks to
     //   its content; the rest of the strip stays free for the AGENTS·TASKS pane.
-    let caption = caption_line(snap);
+    let caption = caption_line(snap, view);
     let usage = usage_cells(snap, now);
     let stats = stats_compact(snap);
     let has_stats = !stats.is_empty();
@@ -501,7 +628,7 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
     let content_w = body
         .iter()
         .chain(std::iter::once(&state_line))
-        .chain(std::iter::once(&caption))
+        .chain(std::iter::once(&caption.line))
         .map(|l| l.width())
         .max()
         .unwrap_or(0) as u16;
@@ -520,7 +647,30 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
         ..area
     };
 
-    let block = rounded_block().title(caption);
+    // Caption tokens ride the top border, which ratatui's left-aligned title
+    // starts one column in from the box edge. Convert each token's caption-local
+    // offset into an absolute rect now that the box position is settled, and
+    // drop any token the box is too narrow to actually show — a hit rect for
+    // text that was clipped away would be an invisible click target.
+    let title_x = rect.x + 1;
+    let box_right = rect.x + rect.width;
+    let token_rect = |span: Option<(u16, u16)>| -> Option<Rect> {
+        let (offset, width) = span?;
+        let x = title_x + offset;
+        if width == 0 || x >= box_right {
+            return None;
+        }
+        Some(Rect {
+            x,
+            y: rect.y,
+            width: width.min(box_right.saturating_sub(x)),
+            height: 1,
+        })
+    };
+    let claude_version = token_rect(caption.claude_span);
+    let codex_version = token_rect(caption.codex_span);
+
+    let block = rounded_block().title(caption.line);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
@@ -742,6 +892,8 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
             width: stats_hw.min(inner.width),
             height: 1,
         }),
+        claude_version,
+        codex_version,
     }
 }
 

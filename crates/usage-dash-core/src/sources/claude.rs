@@ -41,6 +41,28 @@ fn projects_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Is this transcript from a **cx** session — Claude Code driving models through
+/// the CCR gateway?
+///
+/// Answered by WHERE the transcript lives, not by which model it names. cx
+/// writes under `~/.claude-code-router/profiles/<profile>/claude/projects/…`
+/// while native Claude Code writes under `~/.claude/projects/…`, so the path is
+/// a direct, model-independent witness of how the pane was launched.
+///
+/// This distinction used to be keyed on the model family (gpt-* ⇒ cx), which was
+/// wrong in both directions: cx routes the Claude plan through the gateway too,
+/// so a cx pane on `claude-opus-5` reported itself as a plain Claude session and
+/// showed no `cx` tag at all. Runtime (which gateway) and plan (whose quota) are
+/// two independent axes; only the plan axis belongs to the model family.
+fn is_cx_transcript(path: &Path) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        return false;
+    }
+    let ccr = PathBuf::from(home).join(".claude-code-router/profiles");
+    path.starts_with(&ccr)
+}
+
 /// Locate the transcript `<sid>.jsonl` under any project dir across every root
 /// (native + CCR profiles); newest mtime wins.
 pub fn transcript_for_sid(sid: &str) -> Option<PathBuf> {
@@ -82,18 +104,68 @@ pub struct Transcript {
     pub ctx_tokens: Option<u64>, // current context = last assistant prompt size
     pub max_ctx_tokens: u64,     // largest seen this session (for window inference)
     // fork(wave-2): true when the LAST assistant message carried a `thinking`
-    // content block (extended thinking on). No level is recorded in transcripts,
-    // so this is a plain on/off signal rendered as the " · thinking" suffix.
+    // content block (extended thinking on). This is only an OBSERVATION that the
+    // model thought on that turn, not the selected level — see `effort`.
     pub thinking: bool,
+    /// fork: the SELECTED thinking/reasoning level ("none"/"low"/"medium"/
+    /// "high"/…), read from the top-level `effort` field Claude Code stamps on
+    /// every assistant record. Unlike `thinking` this is the *setting*, so it
+    /// stays correct on a turn that happened not to emit a thinking block.
+    /// Last real assistant record wins, so changing the level mid-session is
+    /// reflected on the next turn. `None` on transcripts that predate the field.
+    pub effort: Option<String>,
+    /// fork: the Claude Code version, from the top-level `version` field on the
+    /// same record (e.g. "2.1.220").
+    pub version: Option<String>,
 }
 
-/// fork(wave-2): the model-display suffix for a thread's reasoning/thinking mode.
-/// Empty when thinking is off, so callers can append it unconditionally.
-fn thinking_suffix(thinking: bool) -> &'static str {
-    if thinking {
-        " · thinking"
-    } else {
-        ""
+/// fork: the model-display suffix for a thread's reasoning/thinking mode.
+///
+/// Prefers the SELECTED level (`effort`) over the observed `thinking` flag,
+/// because the level is what the user actually chose and what they asked to
+/// see. The flag remains the fallback for transcripts written before Claude
+/// Code stamped `effort`, so old sessions keep the previous behaviour instead
+/// of silently losing their mode. Empty when there is nothing to say, so
+/// callers can append it unconditionally.
+fn thinking_suffix(thinking: bool, effort: Option<&str>) -> String {
+    match effort.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(level) => format!(" · {}", abbrev_effort(level)),
+        // `think` rather than `thinking` — same meaning, 3 columns cheaper, and
+        // this is the fallback for pre-`effort` transcripts only.
+        None if thinking => " · think".to_string(),
+        None => String::new(),
+    }
+}
+
+/// fork: shorten the reasoning level for the strip. The caption sets the box
+/// width, so every column here widens the dash for all panes. Only `medium` is
+/// actually long; the rest already fit and stay verbatim so the value remains
+/// readable rather than encoded.
+fn abbrev_effort(level: &str) -> String {
+    let lower = level.to_ascii_lowercase();
+    match lower.as_str() {
+        "medium" => "med".to_string(),
+        _ => lower,
+    }
+}
+
+/// fork: the `<version>` / `<version> cx` prefix carried INSIDE the model
+/// string.
+///
+/// It belongs on its own snapshot field, and was written that way first — but
+/// the running host deserializes the collector's JSON into its own compiled-in
+/// `UsageSnapshot` and silently drops fields it predates, so a new field cannot
+/// reach the screen without a host rebuild and a restart. The model string is
+/// passed through untouched, so the data rides there instead. Unwind this in
+/// favour of real fields at the next host promote.
+fn version_prefix(version: Option<&str>, cx: bool) -> String {
+    match (version.map(str::trim).filter(|v| !v.is_empty()), cx) {
+        (Some(v), true) => format!("{v} cx · "),
+        (Some(v), false) => format!("{v} · "),
+        // No version (old transcript): the `cx` tag still matters on its own —
+        // it is the one bit that says this pane is not talking to Anthropic.
+        (None, true) => "cx · ".to_string(),
+        (None, false) => String::new(),
     }
 }
 
@@ -157,6 +229,20 @@ pub fn parse_transcript(content: &str) -> Transcript {
             .filter(|m| is_real_model(m))
         {
             out.model = Some(m.to_string());
+            // fork: `effort` and `version` live on the ENVELOPE (`v`), not on
+            // `message`. They are read here, under the same last-real-assistant
+            // gate as the model, so a synthetic or subagent-tail record can
+            // never move them out of step with the model they belong to.
+            out.effort = v
+                .get("effort")
+                .and_then(|x| x.as_str())
+                .filter(|e| !e.trim().is_empty())
+                .map(|e| e.to_string());
+            out.version = v
+                .get("version")
+                .and_then(|x| x.as_str())
+                .filter(|e| !e.trim().is_empty())
+                .map(|e| e.to_string());
             // last real assistant message wins — a plain tool-use continuation
             // with no thinking block clears the flag, matching the visible state.
             out.thinking = msg
@@ -191,7 +277,17 @@ pub fn model_display(id: &str) -> String {
         "opus" => "Opus 4.8".into(),
         "sonnet" => "Sonnet 4.6".into(),
         "haiku" => "Haiku 4.5".into(),
-        other => other.to_string(),
+        // fork: the 5-family. Without these the ids fall through raw as
+        // `claude-opus-5`, which is 7 characters of vendor prefix on the widest
+        // line in the box — and the caption is what sets the box width.
+        "claude-opus-5" => "Opus 5".into(),
+        "claude-sonnet-5" => "Sonnet 5".into(),
+        "claude-fable-5" => "Fable 5".into(),
+        // fork: generic fallback for ids we don't know yet — drop the `claude-`
+        // vendor prefix rather than render it. Every model in this box is
+        // already labelled by CLI, so the prefix carries no information and
+        // costs 7 columns. Unknown non-claude ids stay verbatim.
+        other => other.strip_prefix("claude-").unwrap_or(other).to_string(),
     }
 }
 
@@ -304,12 +400,15 @@ fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<Usage
     let content = std::fs::read_to_string(path).ok()?;
     let t = parse_transcript(&content);
     let model_id = t.model.clone().unwrap_or_default();
+    // Runtime axis: where the transcript lives. Independent of the plan axis
+    // (model family) resolved just below.
+    let cx = is_cx_transcript(path);
 
     // A cx session (Claude Code driving a GPT model via CCR) is attributed to
     // the Codex plan — never Anthropic. The LAST assistant model decides: if the
     // user flipped back to a claude-* model, the session stays Claude.
     if t.model.as_deref().map(is_gpt_model).unwrap_or(false) {
-        let mut s = gpt_snapshot_for_sid(&content, path, &t)?;
+        let mut s = gpt_snapshot_for_sid(&content, path, &t, cx)?;
         if let Some(name) = subagent {
             apply_subagent_override(&mut s, path, name);
         }
@@ -320,14 +419,28 @@ fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<Usage
     let window = window_for(&model_id, t.max_ctx_tokens);
     s.model = t.model.as_deref().map(|id| {
         let name = model_display(id);
+        // fork: `1M` not `(1M context)` — 9 columns saved on the line that sets
+        // the box width, with the meaning intact next to a model name.
         let base = if window == WINDOW_1M {
-            format!("{name} (1M context)")
+            format!("{name} 1M")
         } else {
             name
         };
-        // fork(wave-2): model · mode (e.g. `Opus 4.8 (1M context) · thinking`).
-        format!("{base}{}", thinking_suffix(t.thinking))
+        // fork: version · model · mode (e.g. `2.1.220 · Opus 5 1M · high`).
+        // Plain Claude Code carries no runtime tag: `cx` is the notable case,
+        // and tagging the common one would just widen every pane's strip. A cx
+        // pane on a CLAUDE model still gets the tag — it is gateway-routed, and
+        // that is exactly the case the old model-family test missed.
+        format!(
+            "{}{base}{}",
+            version_prefix(t.version.as_deref(), cx),
+            thinking_suffix(t.thinking, t.effort.as_deref())
+        )
     });
+    // Version freshness for the caption's clickable tokens. `t.version` is what
+    // this pane is RUNNING, which is the number the user can act on — not
+    // whatever happens to be installed on disk.
+    s.versions = crate::sources::cliver::versions_for(t.version.as_deref(), cx, false);
     s.ctx_used_tokens = t.ctx_tokens;
     s.ctx_window = Some(window);
     s.fill_ctx_pct();
@@ -378,6 +491,8 @@ struct SubagentResolved {
     meta_alias: String,
     // fork(wave-2): the subagent's own thinking state (its transcript tail).
     thinking: bool,
+    /// fork: the subagent's own SELECTED reasoning level (its transcript tail).
+    effort: Option<String>,
 }
 
 /// fork(wave-1): find the subagent named `name` next to the main transcript
@@ -430,24 +545,31 @@ fn resolve_subagent(main_transcript: &Path, name: &str) -> Option<SubagentResolv
         "{}.jsonl",
         meta_str.strip_suffix(".meta.json").unwrap_or(&meta_str)
     ));
-    let (model_id, ctx_tokens, max_ctx_tokens, thinking) = match std::fs::read_to_string(&jsonl) {
-        Ok(content) => {
-            let t = parse_transcript(&content);
-            (
-                t.model.unwrap_or_default(),
-                t.ctx_tokens,
-                t.max_ctx_tokens,
-                t.thinking,
-            )
-        }
-        Err(_) => (String::new(), None, 0, false),
-    };
+    // fork: `effort` comes from the SUBAGENT's own transcript, not the main
+    // thread's — a subagent is routinely spawned at a different level than the
+    // orchestrator, and showing the parent's level while an @agent is focused
+    // would misreport the very thing being displayed.
+    let (model_id, ctx_tokens, max_ctx_tokens, thinking, effort) =
+        match std::fs::read_to_string(&jsonl) {
+            Ok(content) => {
+                let t = parse_transcript(&content);
+                (
+                    t.model.unwrap_or_default(),
+                    t.ctx_tokens,
+                    t.max_ctx_tokens,
+                    t.thinking,
+                    t.effort,
+                )
+            }
+            Err(_) => (String::new(), None, 0, false, None),
+        };
     Some(SubagentResolved {
         model_id,
         ctx_tokens,
         max_ctx_tokens,
         meta_alias,
         thinking,
+        effort,
     })
 }
 
@@ -483,7 +605,7 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
         }
         s.model = Some(format!(
             "{stripped}{} · @{name}",
-            thinking_suffix(r.thinking)
+            thinking_suffix(r.thinking, r.effort.as_deref())
         ));
     } else {
         let window = window_for(&display_id, r.max_ctx_tokens);
@@ -491,14 +613,14 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
         s.ctx_approx = false;
         let name_disp = model_display(&display_id);
         let with_win = if window == WINDOW_1M {
-            format!("{name_disp} (1M context)")
+            format!("{name_disp} 1M")
         } else {
             name_disp
         };
         // fork(wave-2): model · mode · @subagent.
         s.model = Some(format!(
             "{with_win}{} · @{name}",
-            thinking_suffix(r.thinking)
+            thinking_suffix(r.thinking, r.effort.as_deref())
         ));
     }
     if r.ctx_tokens.is_some() {
@@ -511,7 +633,12 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
 /// come from the same Claude Code transcript (cx *is* Claude Code), but quota is
 /// the Codex plan's and the context window comes from the CCR model catalog.
 /// Crucially, this path NEVER calls the Anthropic usage API.
-fn gpt_snapshot_for_sid(content: &str, path: &Path, t: &Transcript) -> Option<UsageSnapshot> {
+fn gpt_snapshot_for_sid(
+    content: &str,
+    path: &Path,
+    t: &Transcript,
+    cx: bool,
+) -> Option<UsageSnapshot> {
     let mut s = UsageSnapshot::empty(Cli::Codex);
     let raw_model = t.model.clone().unwrap_or_default();
     let model_id = crate::sources::codex::strip_codex_plan_prefix(&raw_model).to_string();
@@ -523,9 +650,20 @@ fn gpt_snapshot_for_sid(content: &str, path: &Path, t: &Transcript) -> Option<Us
     // GPT turns report input/output tokens with cache_* always 0, so the existing
     // context sum (input + cache_read + cache_creation) is exactly the input size.
     s.ctx_used_tokens = t.ctx_tokens;
-    // fork(wave-2): mode suffix for consistency; cx-routed GPT transcripts don't
-    // carry thinking blocks, so this is a no-op in practice.
-    s.model = Some(format!("{model_id}{}", thinking_suffix(t.thinking)));
+    // fork: mode suffix. The older comment here claimed this was a no-op for cx
+    // because cx-routed GPT transcripts carry no thinking blocks — true of the
+    // BLOCK, but cx is Claude Code and stamps the same top-level `effort` field
+    // as any other session, so the SELECTED level is available and shown.
+    //
+    // Caveat worth knowing when reading this number: it is the level selected
+    // CLIENT-side. Whether the CCR gateway forwards it to the Codex model is a
+    // separate question and not something this transcript can answer.
+    s.model = Some(format!(
+        "{}{model_id}{}",
+        version_prefix(t.version.as_deref(), cx),
+        thinking_suffix(t.thinking, t.effort.as_deref())
+    ));
+    s.versions = crate::sources::cliver::versions_for(t.version.as_deref(), cx, false);
     s.fill_ctx_pct();
     s.source_age_secs = util::file_age_secs(path);
 
@@ -564,6 +702,76 @@ mod tests {
     const TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
 {"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":60,"cache_read_input_tokens":38634,"cache_creation_input_tokens":85989,"output_tokens":349}}}
 {"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":2,"cache_read_input_tokens":149701,"cache_creation_input_tokens":4352,"output_tokens":136}}}"#;
+
+    // fork: real-shaped records carrying the top-level `effort` + `version`
+    // fields Claude Code stamps on the ENVELOPE (not inside `message`). The
+    // level changes mid-transcript — the last real assistant record must win,
+    // so switching thinking mode is reflected rather than latched.
+    const TRANSCRIPT_EFFORT: &str = r#"{"type":"user","message":{"role":"user"}}
+{"type":"assistant","version":"2.1.220","effort":"high","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"output_tokens":5}}}
+{"type":"assistant","version":"2.1.220","effort":"low","message":{"model":"claude-opus-5","usage":{"input_tokens":12,"cache_read_input_tokens":120,"cache_creation_input_tokens":0,"output_tokens":6}}}"#;
+
+    #[test]
+    fn parses_last_effort_and_version_from_envelope() {
+        let t = parse_transcript(TRANSCRIPT_EFFORT);
+        assert_eq!(t.effort.as_deref(), Some("low")); // last record wins
+        assert_eq!(t.version.as_deref(), Some("2.1.220"));
+    }
+
+    #[test]
+    fn transcript_without_effort_leaves_none() {
+        // Pre-`effort` transcripts must not fabricate a level.
+        let t = parse_transcript(TRANSCRIPT);
+        assert!(t.effort.is_none());
+        assert!(t.version.is_none());
+    }
+
+    #[test]
+    fn selected_effort_wins_over_observed_thinking_flag() {
+        // The whole point of preferring `effort`: a turn that emitted no
+        // thinking block still reports the SELECTED level, instead of
+        // silently reading as "thinking off".
+        assert_eq!(thinking_suffix(false, Some("high")), " · high");
+        // Long levels are abbreviated so the caption stays narrow; see abbrev_effort.
+        assert_eq!(thinking_suffix(true, Some("Medium")), " · med");
+        // "none" is a real selected level and must be shown as such, never
+        // collapsed into "no suffix" — off and unknown must stay distinct.
+        assert_eq!(thinking_suffix(false, Some("none")), " · none");
+    }
+
+    #[test]
+    fn thinking_flag_is_the_fallback_for_old_transcripts() {
+        assert_eq!(thinking_suffix(true, None), " · think");
+        assert_eq!(thinking_suffix(false, None), "");
+        // Whitespace-only is treated as absent, not as a level.
+        assert_eq!(thinking_suffix(true, Some("  ")), " · think");
+    }
+
+    #[test]
+    fn caption_abbreviations_keep_the_box_narrow() {
+        // The caption sets the usage box width, so these are width fixes, not
+        // cosmetics. Each assertion is a column count the dash no longer pays.
+        assert_eq!(model_display("claude-opus-5"), "Opus 5");
+        // Unknown 5-family / future ids lose the vendor prefix, not their identity.
+        assert_eq!(model_display("claude-neptune-9"), "neptune-9");
+        // Non-claude ids are untouched.
+        assert_eq!(model_display("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(abbrev_effort("medium"), "med");
+        assert_eq!(abbrev_effort("HIGH"), "high");
+    }
+
+    #[test]
+    fn version_prefix_tags_cx_only() {
+        // Plain Claude Code gets no runtime tag — tagging the common case would
+        // widen every pane's strip to say nothing.
+        assert_eq!(version_prefix(Some("2.1.220"), false), "2.1.220 · ");
+        assert_eq!(version_prefix(Some("2.1.220"), true), "2.1.220 cx · ");
+        // A missing version must not swallow the cx tag: which gateway a pane
+        // talks to is the part that changes what the user does next.
+        assert_eq!(version_prefix(None, true), "cx · ");
+        assert_eq!(version_prefix(None, false), "");
+        assert_eq!(version_prefix(Some("  "), false), "");
+    }
 
     #[test]
     fn parses_last_assistant_context() {
@@ -606,7 +814,7 @@ mod tests {
         );
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
         let s = snapshot_for_sid(sid).expect("snapshot");
-        assert_eq!(s.model.as_deref(), Some("Opus 4.8 · thinking"));
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8 · think"));
     }
 
     #[test]
@@ -619,7 +827,7 @@ mod tests {
         write_subagent_session(&h, sid, meta, sub);
         let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
         // ordering: model · mode · @subagent
-        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · thinking · @probe1"));
+        assert_eq!(s.model.as_deref(), Some("Sonnet 4.6 · think · @probe1"));
     }
 
     // fork(wave-2): real-shaped compact_boundary system entry (manual /compact).
@@ -728,6 +936,15 @@ mod tests {
     const GPT_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
 {"type":"assistant","message":{"model":"gpt-5.6-sol","usage":{"input_tokens":12000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":300}}}"#;
 
+    /// A Claude-model transcript carrying the envelope fields the caption reads
+    /// (`version`, `effort`) plus a 1M context window. Distinct from the older
+    /// `CLAUDE_TRANSCRIPT` fixture below, which predates those fields. The
+    /// observed context deliberately exceeds 200k so `window_for` resolves the
+    /// 1M window from evidence rather than from the `one_m_enabled()` env
+    /// toggle, which would make the expected caption environment-dependent.
+    const CLAUDE_V_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
+{"type":"assistant","version":"2.1.220","effort":"high","message":{"model":"claude-opus-5","usage":{"input_tokens":250000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":300}}}"#;
+
     const CATALOG: &str = r#"{"models":[
         {"slug":"Codex Plan/gpt-5.6-sol","context_window":128000},
         {"slug":"Codex Plan/gpt-5.5","context_window":1050000}]}"#;
@@ -749,6 +966,43 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// A cx pane running a CLAUDE model. This is the case the old model-family
+    /// test got wrong: cx routes the Anthropic plan through the gateway too, so
+    /// the session is legitimately `Cli::Claude` on Anthropic quota — but it is
+    /// still gateway-routed and must say so. Runtime and plan are independent.
+    #[test]
+    fn cx_pane_on_a_claude_model_still_reports_the_cx_runtime() {
+        let h = TempHome::new("cxclaude");
+        let sid = "sid-cx-claude";
+        h.write(
+            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
+            CLAUDE_V_TRANSCRIPT,
+        );
+
+        let s = snapshot_for_sid(sid).expect("snapshot");
+        // Plan axis: a Claude model on the Claude plan, not Codex.
+        assert_eq!(s.cli, Cli::Claude);
+        // Runtime axis: tagged cx purely because of where the transcript lives.
+        assert_eq!(s.model.as_deref(), Some("2.1.220 cx · Opus 5 1M · high"));
+    }
+
+    /// The mirror of the case above: the very same transcript under the NATIVE
+    /// Claude Code root must carry no cx tag. Without this, "always tags cx"
+    /// would pass the test above just as well.
+    #[test]
+    fn native_claude_pane_carries_no_cx_tag() {
+        let h = TempHome::new("nativeclaude");
+        let sid = "sid-native";
+        h.write(
+            &format!(".claude/projects/-tmp-proj/{sid}.jsonl"),
+            CLAUDE_V_TRANSCRIPT,
+        );
+
+        let s = snapshot_for_sid(sid).expect("snapshot");
+        assert_eq!(s.cli, Cli::Claude);
+        assert_eq!(s.model.as_deref(), Some("2.1.220 · Opus 5 1M · high"));
+    }
+
     #[test]
     fn cx_gpt_session_is_codex_with_codex_quota() {
         let h = TempHome::new("gpt");
@@ -763,7 +1017,8 @@ mod tests {
 
         let s = snapshot_for_sid(sid).expect("snapshot");
         assert_eq!(s.cli, Cli::Codex); // Codex identity, never Anthropic
-        assert_eq!(s.model.as_deref(), Some("gpt-5.6-sol")); // raw, stripped id
+        // "cx · " marks the gateway-routed runtime; no version in this fixture.
+        assert_eq!(s.model.as_deref(), Some("cx · gpt-5.6-sol"));
         assert_eq!(s.ctx_window, Some(128000)); // from CCR catalog
         assert_eq!(s.ctx_used_tokens, Some(12000));
         assert_eq!(s.plan.as_deref(), Some("prolite"));
@@ -862,7 +1117,7 @@ mod tests {
 
         let s = snapshot_for_sid_with_subagent(sid, Some("probe1")).expect("snapshot");
         // alias "opus[1m]" -> model_display passthrough + @name; window inferred 1M (contains "opus").
-        assert_eq!(s.model.as_deref(), Some("opus[1m] (1M context) · @probe1"));
+        assert_eq!(s.model.as_deref(), Some("opus[1m] 1M · @probe1"));
         assert_eq!(s.ctx_window, Some(WINDOW_1M));
     }
 
@@ -1031,7 +1286,7 @@ mod tests {
         let s = snapshot_for_focus(Some("00000000-missing"), Some("/Users/andual"), None)
             .expect("fallback snapshot");
         assert_eq!(s.cli, Cli::Codex); // router transcript -> Codex attribution
-        assert_eq!(s.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(s.model.as_deref(), Some("cx · gpt-5.6-sol"));
     }
 
     #[test]
