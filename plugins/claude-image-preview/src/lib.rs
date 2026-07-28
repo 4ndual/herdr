@@ -199,19 +199,9 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         } if request_id == REQ_PANES => {
             state.panes_in_flight = false;
             if *ok {
-                let previous = state.pane_id.clone();
-                let focused = response.as_ref().and_then(focused_pane);
-                let (pane_id, session) = match focused {
-                    Some((pane_id, session)) => (Some(pane_id), session),
-                    None => (None, None),
-                };
-                // Focus moved: our placeholders describe a pane we are no longer
-                // looking at. Drop them rather than paint stale geometry.
-                if pane_id != previous {
-                    state.placeholders.clear();
+                if let Some(response) = response.as_ref() {
+                    handle_pane_list(state, response);
                 }
-                state.pane_id = pane_id;
-                state.pane_session = session;
             }
             status_only(state)
         }
@@ -240,8 +230,7 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
                 // `pane.read` failure is exactly what made this plugin look
                 // like a working feature painting nothing.
                 state.placeholders.clear();
-                state.last_error =
-                    Some(error.clone().unwrap_or_else(|| "pane.read failed".into()));
+                state.last_error = Some(error.clone().unwrap_or_else(|| "pane.read failed".into()));
             }
             status_only(state)
         }
@@ -269,22 +258,52 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     }
 }
 
+/// Apply a `pane.list` answer: adopt the focused pane and its session, and drop
+/// placeholders that describe a pane we have just left. Split out of the event
+/// arm so the focus-change behaviour is testable without the ABI.
+fn handle_pane_list(state: &mut State, response: &serde_json::Value) {
+    let previous = state.pane_id.clone();
+    let (pane_id, session) = match focused_pane(response) {
+        Some((pane_id, session)) => (Some(pane_id), session),
+        None => (None, None),
+    };
+    // Focus moved: our placeholders describe a pane we are no longer looking
+    // at. Drop them rather than paint stale geometry. The reconcile in
+    // `on_frame` then clears the old pane's layers by `(pane_id, layer_id)`.
+    if pane_id != previous {
+        state.placeholders.clear();
+    }
+    state.pane_id = pane_id;
+    state.pane_session = session;
+}
+
 fn on_frame(state: &mut State, input: &ImageInput) -> UiUpdate {
-    let Some(pane_id) = state.pane_id.clone() else {
-        if state.panes_in_flight {
-            return status_only(state);
-        }
+    let mut update = status_only(state);
+
+    // Re-resolve the focused pane EVERY frame we are not already waiting on a
+    // listing — not only the first time. Asking once and caching the answer
+    // latches the plugin to whichever pane happened to be focused when the
+    // module loaded: every later focus change is invisible, the guest keeps
+    // reading a pane the user has left, finds no placeholders, and reports
+    // `none on screen` with no error. That is indistinguishable from "this
+    // feature is broken" and it is invisible in a single-pane sandbox, which is
+    // exactly why it shipped. Focus is not initial state; it is state that
+    // changes constantly, so it belongs on the same per-frame cadence as the
+    // pane read. The `REQ_PANES` arm already drops stale placeholders when the
+    // id changes, and the reconcile below clears the old pane's layers by
+    // `(pane_id, layer_id)`, so a change costs one clear and one set.
+    if !state.panes_in_flight {
         state.panes_in_flight = true;
-        let mut update = status_only(state);
         update.effects.push(HostEffect::Api {
             request_id: REQ_PANES.to_string(),
             method: "pane.list".to_string(),
             params: serde_json::json!({}),
         });
+    }
+
+    let Some(pane_id) = state.pane_id.clone() else {
         return update;
     };
-
-    let mut update = status_only(state);
 
     // Re-read the pane text every frame we are not already waiting on one: the
     // placeholder can scroll, and its ROW is what tells the host where to paint.
@@ -536,10 +555,20 @@ fn focused_pane(response: &serde_json::Value) -> Option<(String, Option<String>)
         .get("pane_id")
         .and_then(serde_json::Value::as_str)?
         .to_string();
-    let session = focused
-        .get("agent_session")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    // `pane.list` returns `agent_session` as an OBJECT
+    // (`{agent, kind, source, value}`), not a bare string. Reading it as a
+    // string left `pane_session` permanently `None`, which made the
+    // cross-session guard below inert: it falls back to "no opinion" and paints
+    // whatever the collector last produced. Harmless while focus never moved —
+    // and now that focus IS re-resolved every frame, a focus change to another
+    // agent's pane is precisely the race the guard exists to stop. Both shapes
+    // are accepted so a host that ever flattens the field keeps working.
+    let session = focused.get("agent_session").and_then(|value| {
+        value
+            .as_str()
+            .or_else(|| value.get("value").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+    });
     Some((pane_id, session))
 }
 
@@ -564,7 +593,11 @@ mod tests {
         State {
             pane_id: Some("w_1_p_1".into()),
             pane_session: Some("sess".into()),
-            read_in_flight: true, // suppress the read effect so tests see paints only
+            // Suppress the two per-frame query effects so the paint tests below
+            // count paints only. `a_resolved_pane_still_re_resolves_focus_every_frame`
+            // is the test that asserts those queries are actually issued.
+            read_in_flight: true,
+            panes_in_flight: true,
             ..State::default()
         }
     }
@@ -790,6 +823,88 @@ mod tests {
         assert_eq!(
             focused_pane(&response),
             Some(("w_1_p_2".to_string(), Some("b".to_string())))
+        );
+    }
+
+    /// `pane.list` really answers with `agent_session` as an object; the bare
+    /// string is accepted too so a flattened host field keeps working.
+    #[test]
+    fn agent_session_object_shape_is_read_not_ignored() {
+        let response = serde_json::json!({
+            "panes": [{
+                "pane_id": "w2_p5",
+                "focused": true,
+                "agent_session": {
+                    "agent": "claude",
+                    "kind": "id",
+                    "source": "herdr:claude",
+                    "value": "f17a7ab8"
+                }
+            }]
+        });
+        assert_eq!(
+            focused_pane(&response),
+            Some(("w2_p5".to_string(), Some("f17a7ab8".to_string())))
+        );
+    }
+
+    fn api_methods(update: &UiUpdate) -> Vec<String> {
+        update
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                HostEffect::Api { method, .. } => Some(method.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE regression test for the focus latch. Asking `pane.list` only while
+    /// `pane_id` is `None` pinned the plugin to the pane that was focused when
+    /// the module loaded: every later focus change was invisible and the guest
+    /// read a pane the user had left. A single-pane sandbox cannot see this, so
+    /// it has to be a test — a resolved pane must NOT stop the re-resolution.
+    #[test]
+    fn a_resolved_pane_still_re_resolves_focus_every_frame() {
+        let mut state = State {
+            pane_id: Some("w2_p5".to_string()),
+            pane_session: Some("sess".to_string()),
+            ..State::default()
+        };
+        let input = ImageInput::default();
+
+        let update = on_frame(&mut state, &input);
+        assert!(
+            api_methods(&update).contains(&"pane.list".to_string()),
+            "a frame with a known pane must still ask which pane is focused"
+        );
+        // …and it still reads the pane it knows about in the same frame, so
+        // re-resolving costs no latency on the common no-focus-change path.
+        assert!(api_methods(&update).contains(&"pane.read".to_string()));
+
+        // One listing at a time: the second frame must not stack a duplicate.
+        let update = on_frame(&mut state, &input);
+        assert!(!api_methods(&update).contains(&"pane.list".to_string()));
+
+        // The answer arrives naming a DIFFERENT pane: stale placeholders go.
+        state.placeholders = vec![Placeholder {
+            number: 1,
+            col: 0,
+            row: 0,
+            col_exact: true,
+        }];
+        handle_pane_list(
+            &mut state,
+            &serde_json::json!({
+                "panes": [{"pane_id": "w1_pK", "focused": true,
+                           "agent_session": {"value": "other"}}]
+            }),
+        );
+        assert_eq!(state.pane_id.as_deref(), Some("w1_pK"));
+        assert_eq!(state.pane_session.as_deref(), Some("other"));
+        assert!(
+            state.placeholders.is_empty(),
+            "placeholders describe the pane we left"
         );
     }
 
