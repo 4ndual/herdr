@@ -769,13 +769,23 @@ fn hook_display_name(command: &str) -> String {
     command.chars().take(24).collect()
 }
 
-/// First token of the command that is an existing file (the hook script), for
-/// the open-in-editor affordance.
+/// The token of the command that is the hook SCRIPT, for the open-in-editor and
+/// copy-path affordances.
+///
+/// Scanned in reverse, for the same reason `hook_display_name` does it: a hook
+/// command is usually `<interpreter> <script>`, and the interpreter is just as
+/// absolute and just as much a real file as the script is. Taking the first
+/// match resolved every one of this machine's 13 configured hooks to
+/// `~/.bun/bin/bun` — one identical, useless path on every row, with open and
+/// copy both pointing at the runtime binary instead of the hook. A
+/// single-token command (`/usr/local/bin/mytool --flag`) has first == last, so
+/// it still resolves to itself.
 fn hook_script_path(command: &str) -> Option<PathBuf> {
     command
         .split_whitespace()
         .map(PathBuf::from)
-        .find(|p| p.is_absolute() && p.is_file())
+        .filter(|p| p.is_absolute() && p.is_file())
+        .next_back()
 }
 
 /// Read a single scalar field from a markdown file's leading YAML frontmatter
@@ -2444,6 +2454,42 @@ mod tests {
         }
     }
     use super::*;
+
+    /// A hook command is `<interpreter> <script>` and BOTH tokens are absolute
+    /// existing files, so "first match" silently resolves to the interpreter.
+    /// On this machine that made all 13 hooks report `~/.bun/bin/bun`: one
+    /// identical path on every row, with open/copy pointing at the runtime
+    /// binary. The script is the last such token, never the first.
+    #[test]
+    fn hook_script_path_picks_the_script_not_the_interpreter() {
+        let dir = std::env::temp_dir()
+            .join(format!("harness-script-path-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let interp = dir.join("bun");
+        let script = dir.join("pre_tool_use.ts");
+        std::fs::write(&interp, "").expect("write interp");
+        std::fs::write(&script, "").expect("write script");
+
+        // Both tokens exist and are absolute; the script must win.
+        assert_eq!(
+            hook_script_path(&format!("{} {}", interp.display(), script.display())).as_deref(),
+            Some(script.as_path()),
+        );
+
+        // Single-token command: first == last, still resolves to itself.
+        assert_eq!(
+            hook_script_path(&format!("{} --flag", interp.display())).as_deref(),
+            Some(interp.as_path()),
+        );
+
+        // Nothing on disk and nothing absolute ⇒ no path, so the guest offers
+        // neither open nor copy rather than a dead affordance.
+        assert_eq!(hook_script_path("mytool --flag"), None);
+        assert_eq!(
+            hook_script_path(&dir.join("gone.ts").display().to_string()),
+            None,
+        );
+    }
 
     #[test]
     fn hook_display_name_skips_generic_entrypoints() {
