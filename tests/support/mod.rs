@@ -86,6 +86,66 @@ pub fn cleanup_test_base(base: &Path) {
     let _ = fs::remove_dir_all(base);
 }
 
+/// Free space on the filesystem holding `path`, walking up to the nearest
+/// existing ancestor (the path we are waiting for usually does not exist yet —
+/// that is why we are here).
+fn free_bytes_near(path: &Path) -> Option<u64> {
+    let mut probe = path;
+    loop {
+        if probe.exists() {
+            break;
+        }
+        probe = probe.parent()?;
+    }
+    let c_path = std::ffi::CString::new(probe.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call,
+    // and `stat` is only read after a success return.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// Appended to every "it never showed up" panic in this harness.
+///
+/// A herdr server that cannot write its runtime directory dies before it can
+/// bind, so the socket simply never appears and the test reports a timeout. The
+/// disk being full and the server being slow are indistinguishable from the
+/// waiting side, and that ambiguity cost a full evening: 16 integration tests
+/// "timed out" while the boot volume sat under 1 GiB free, and the failure named
+/// neither the disk nor the server. The tests were re-run, re-measured and
+/// hunted as a code bug; they pass unchanged once there is room.
+///
+/// So: never let this class of failure report only the symptom. Test bases live
+/// under `/tmp`, which on macOS is the boot volume — the same volume every
+/// agent's `target/` dir competes for.
+fn environment_note(path: &Path) -> String {
+    match free_bytes_near(path) {
+        Some(free) => {
+            let mib = free / (1024 * 1024);
+            format!(
+                "\n  free space on that filesystem: {mib} MiB{}",
+                low_space_verdict(mib)
+            )
+        }
+        None => "\n  free space on that filesystem: could not be determined".to_string(),
+    }
+}
+
+/// The verdict that turns a number into an instruction. Split out so a test can
+/// hold the threshold rather than restate it — a test that re-derives the
+/// constant it is checking cannot fail when the constant moves.
+fn low_space_verdict(free_mib: u64) -> &'static str {
+    if free_mib < 1024 {
+        "  <-- SUSPECT: this is almost certainly why. A server that cannot write its \
+         runtime dir never binds its socket. Free space and re-run before treating \
+         this as a code failure."
+    } else {
+        ""
+    }
+}
+
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -94,7 +154,11 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("socket did not appear at {}", path.display());
+    panic!(
+        "socket did not appear at {} within {timeout:?}{}",
+        path.display(),
+        environment_note(path)
+    );
 }
 
 pub fn wait_for_file(path: &Path, timeout: Duration) {
@@ -105,7 +169,11 @@ pub fn wait_for_file(path: &Path, timeout: Duration) {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("file did not appear at {}", path.display());
+    panic!(
+        "file did not appear at {} within {timeout:?}{}",
+        path.display(),
+        environment_note(path)
+    );
 }
 
 pub fn encode_varint_u32(v: u32) -> Vec<u8> {
@@ -742,6 +810,43 @@ mod tests {
         assert!(
             !is_test_herdr_binary(Path::new("/home/can/.local/bin/herdr")),
             "installed binaries must not be considered test-owned"
+        );
+    }
+
+    /// A wait that gives up must say something about the environment it gave up
+    /// in. The path it is waiting for does not exist yet — that is the whole
+    /// situation — so the probe has to walk up to a real ancestor, and a
+    /// diagnostic that silently returns "unknown" for every ordinary temp path
+    /// would be worse than none: it would look like the check ran.
+    #[test]
+    fn the_environment_note_reports_real_free_space_for_a_path_that_does_not_exist() {
+        let missing = std::env::temp_dir().join("herdr-no-such-dir-xyz/socket");
+        assert!(!missing.exists(), "the fixture path must not exist");
+
+        let note = environment_note(&missing);
+        assert!(
+            note.contains("free space"),
+            "the note said nothing about free space: {note}"
+        );
+        assert!(
+            !note.contains("could not be determined"),
+            "the probe failed to walk up to an existing ancestor: {note}"
+        );
+    }
+
+    /// The whole point is the verdict, not the number. An operator reading
+    /// "socket did not appear" plus a bare byte count still has to know that
+    /// a full disk stops a server from binding.
+    #[test]
+    fn a_low_free_space_note_names_the_disk_as_the_suspect() {
+        // We cannot fill the disk, so drive the real verdict function directly.
+        assert!(
+            low_space_verdict(842).contains("SUSPECT"),
+            "842 MiB — the figure the night actually cost us — went unflagged"
+        );
+        assert!(
+            low_space_verdict(13 * 1024).is_empty(),
+            "13 GiB was flagged as suspect; the warning must stay rare to stay read"
         );
     }
 }
