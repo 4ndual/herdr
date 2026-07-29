@@ -94,6 +94,21 @@ const PANE_GRAPHICS_METHODS: &[&str] = &[
     "pane.graphics.set",
     "pane.graphics.clear",
     "pane.graphics.info",
+    // fork(+128): text overlays sit under `PaneGraphics` rather than getting a
+    // capability of their own, for the same reason `pane.swap` sits under
+    // `ApiWrite` — a split is justified by distinct POWER, not by a distinct
+    // noun. A plugin holding `pane_graphics` can already paint arbitrary pixels
+    // over every cell of a pane, which includes rendering any text it likes as
+    // an image. Withholding `pane.text.*` from it would withhold nothing except
+    // the legible, theme-aware, cheap way to do what it can already do badly.
+    //
+    // The converse also holds and is what makes this safe: `pane.text.*` is
+    // strictly weaker. It composites at render time and cannot reach
+    // `PaneState`, scrollback, or `pane.read`, so it cannot change what any
+    // reader — including a resumed agent — believes was printed. If that ever
+    // stops being true, this row is the wrong home for it.
+    "pane.text.set",
+    "pane.text.clear",
 ];
 
 /// fork: flip an already-installed plugin's enabled bit, gated on `PluginAdmin`.
@@ -272,6 +287,36 @@ mod tests {
                 decide(method),
                 ApiMethodDecision::Allow(PluginUiCapability::ApiWrite),
                 "{method} must not ride along with ApiWrite"
+            );
+        }
+    }
+
+    /// fork(+128): text overlays must be reachable, and must resolve to
+    /// `PaneGraphics` — the same capability that already permits painting
+    /// arbitrary pixels over the pane. A plugin holding that can render any text
+    /// it likes as an image, so a separate capability here would gate nothing
+    /// while making the manifest longer.
+    #[test]
+    fn pane_text_overlays_are_reachable_under_the_pane_graphics_capability() {
+        for method in ["pane.text.set", "pane.text.clear"] {
+            assert_eq!(
+                decide(method),
+                ApiMethodDecision::Allow(PluginUiCapability::PaneGraphics),
+                "{method} must be reachable through PaneGraphics"
+            );
+        }
+    }
+
+    /// The companion to that argument: a module WITHOUT `pane_graphics` must not
+    /// reach text overlays either. If this ever passes as `Allow`, the overlay
+    /// API has quietly become ungated.
+    #[test]
+    fn text_overlays_are_not_reachable_as_an_ordinary_write() {
+        for method in ["pane.text.set", "pane.text.clear"] {
+            assert_ne!(
+                decide(method),
+                ApiMethodDecision::Allow(PluginUiCapability::ApiWrite),
+                "{method} must not fall through to ApiWrite"
             );
         }
     }

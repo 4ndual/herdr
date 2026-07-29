@@ -185,6 +185,14 @@ pub enum Method {
     PaneGraphicsClear(PaneGraphicsClearParams),
     #[serde(rename = "pane.graphics.info")]
     PaneGraphicsInfo(PaneTarget),
+    /// fork(+128): the text-overlay half of the pane-compositing API. Kept
+    /// beside the graphics methods rather than under `pane.write` or an edit
+    /// namespace because it composites at render time and never mutates the
+    /// terminal — same lifetime, same identity, same capability.
+    #[serde(rename = "pane.text.set")]
+    PaneTextSet(PaneTextSetParams),
+    #[serde(rename = "pane.text.clear")]
+    PaneTextClear(PaneTextClearParams),
     #[serde(rename = "pane.graphics.stream")]
     #[schemars(skip)]
     PaneGraphicsStream(PaneGraphicsStreamParams),

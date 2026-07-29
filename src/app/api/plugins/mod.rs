@@ -139,9 +139,21 @@ impl App {
                     let skip = self.state.plugin_panel_skips.iter().find(|s| {
                         s.plugin_id == module.plugin_id && s.module_id == module.module_id
                     });
-                    let (layer_count, layer_bytes) = self
+                    let (graphics_layers, graphics_bytes) = self
                         .state
                         .pane_graphics_totals_for_plugin(&module.plugin_id);
+                    // fork(+128): text overlays are folded into the SAME totals
+                    // rather than reported as a separate pair. `layer_count` is
+                    // read as "what this plugin is holding on panes", and a
+                    // number that silently covered only the image half would
+                    // under-report a plugin whose whole footprint is overlays —
+                    // making a leak look like zero. No schema change: existing
+                    // readers get a more complete answer to the question they
+                    // were already asking.
+                    let (text_layers, text_bytes) =
+                        self.state.pane_text_totals_for_plugin(&module.plugin_id);
+                    let (layer_count, layer_bytes) =
+                        (graphics_layers + text_layers, graphics_bytes + text_bytes);
                     crate::api::schema::PluginUiModuleStatus {
                         plugin_id: module.plugin_id.clone(),
                         module_id: module.module_id.clone(),
@@ -235,6 +247,18 @@ impl App {
                     plugin_id = %plugin_id,
                     cleared,
                     "cleared pane graphics layers owned by unlinked plugin"
+                );
+            }
+            // fork(+128): text overlays leave the same way, and for a sharper
+            // reason — text painted over a pane reads as if the program printed
+            // it, so an overlay outliving its plugin is worse than a stale
+            // image.
+            let cleared_text = self.state.clear_pane_text_layers_for_owner(&source);
+            if cleared_text > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared = cleared_text,
+                    "cleared pane text layers owned by unlinked plugin"
                 );
             }
         }
@@ -884,6 +908,18 @@ impl App {
                     plugin_id = %plugin_id,
                     cleared,
                     "cleared pane graphics layers owned by disabled plugin"
+                );
+            }
+            // fork(+128): text overlays leave the same way, and for a sharper
+            // reason — text painted over a pane reads as if the program printed
+            // it, so an overlay outliving its plugin is worse than a stale
+            // image.
+            let cleared_text = self.state.clear_pane_text_layers_for_owner(&source);
+            if cleared_text > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared = cleared_text,
+                    "cleared pane text layers owned by disabled plugin"
                 );
             }
         }

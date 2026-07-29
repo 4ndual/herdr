@@ -350,6 +350,88 @@ pub struct PaneGraphicsClearParams {
     pub owner: String,
 }
 
+/// fork(+128): the largest text overlay a single `pane.text.set` may carry.
+///
+/// Far below the graphics cap because this payload is characters, not pixels: a
+/// 500x500 overlay of wide glyphs is under 1 MiB of UTF-8 and already covers a
+/// screen many times over. The cap exists so a runaway guest cannot pin host
+/// memory one `set` at a time, not because any legitimate overlay approaches it.
+pub(crate) const PANE_TEXT_SET_MAX_BYTES: usize = 64 * 1024;
+
+/// fork(+128): one styled run within an overlay line.
+///
+/// Colours are NAMED, never RGB. Herdr remaps buffer colours to the active
+/// palette (`recolor_to_palette`), and a truecolor `Rgb` passes through that
+/// remap untouched — so an overlay that picked its own hex would be the one
+/// element on screen that ignores the user's theme, and would do it silently.
+/// An unrecognised name is treated as "unset" rather than refused: a plugin
+/// naming a colour the host does not know should lose the styling, not the text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneTextSpanParams {
+    pub text: String,
+    /// Named foreground: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+    /// `cyan`, `gray`/`grey`, `white`, each also available as `bright_*`. Empty
+    /// (the default) inherits whatever the cell already had.
+    #[serde(default)]
+    pub fg: String,
+    /// Named background, same vocabulary as `fg`. Empty keeps the cell's own
+    /// background, which is what makes a span composite over pane text rather
+    /// than punching a hole in it.
+    #[serde(default)]
+    pub bg: String,
+    #[serde(default)]
+    pub bold: bool,
+}
+
+/// fork(+128): one row of an overlay, as a sequence of styled spans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct PaneTextLineParams {
+    #[serde(default)]
+    pub spans: Vec<PaneTextSpanParams>,
+}
+
+/// fork(+128): retain a TEXT overlay on a pane.
+///
+/// The deliberate non-goal, and the reason this is not `pane.write` or an edit
+/// API: it does not mutate the terminal. The lines are composited into the
+/// ratatui buffer for the frame, exactly like a `pane.graphics` layer, and
+/// `PaneState`/scrollback never see them. Search, copy, resume and agent
+/// detection keep reading the real program output, so a plugin cannot corrupt
+/// what an agent believes it printed — the property `.local/prd/127-plugin-owned-images.md`
+/// reserved for this stage.
+///
+/// Identity, placement and cleanup are intentionally the same model as
+/// `PaneGraphicsSetParams`: `(owner, layer_id)`, cell-grid placement relative to
+/// the pane's inner rect, and removal when the owning plugin goes away. A plugin
+/// author who has learned one has learned the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextSetParams {
+    pub pane_id: String,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
+    #[serde(default)]
+    pub layer_id: String,
+    #[serde(default)]
+    pub lines: Vec<PaneTextLineParams>,
+    #[serde(default)]
+    pub placement: PaneGraphicsPlacementParams,
+}
+
+/// fork(+128): drop text overlays. Mirrors `PaneGraphicsClearParams` exactly,
+/// including the asymmetry: a plugin clears only what it owns, while a socket
+/// caller (`owner` empty) clears the pane outright, because the user at the CLI
+/// outranks any plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextClearParams {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_id: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsStreamParams {
     pub pane_id: String,

@@ -1025,6 +1025,7 @@ impl App {
             installed_plugins: load_plugin_registry(no_session),
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
+            pane_text_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,
@@ -1618,6 +1619,19 @@ impl App {
                             frame.buffer_mut(),
                         );
                     }
+                    // fork(+128): text overlays paint UNCONDITIONALLY, outside
+                    // the `!kitty_graphics_enabled` arm above. Images have two
+                    // emission backends and so have to pick one; text has
+                    // exactly one path — cells in the ratatui buffer — and is
+                    // unrelated to the kitty renderer. Putting it inside that
+                    // arm would resurrect the +127 bug it was written to fix: a
+                    // plugin's overlay silently not existing because an
+                    // unrelated experimental flag happened to be on.
+                    //
+                    // It runs AFTER the graphics paint so a caption composites
+                    // over its image rather than under it, regardless of which
+                    // API call arrived first.
+                    crate::pane_text_paint::paint_pane_text(&self.state, frame.buffer_mut());
                 })?;
                 if kitty_graphics_enabled {
                     let plugin_images = self.resolve_plugin_surface_images(frame_area);
@@ -3102,6 +3116,24 @@ impl App {
                 params.owner = format!("plugin:{plugin_id}");
             }
             crate::api::schema::Method::PaneGraphicsClear(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            // fork(+128): text overlays MUST be stamped here too. Omitting them
+            // was caught by the sandbox E2E and is worth spelling out, because
+            // the failure is silent and looks like success: an unstamped call
+            // still paints, so the overlay appears and the plugin looks correct.
+            // What actually happened is that the layer was recorded with the
+            // PRIVILEGED (`None`) owner — the socket caller's identity. Two
+            // consequences, neither visible on screen: the disable/unlink
+            // cleanup could not find the layer, so the overlay would outlive the
+            // plugin that drew it; and `pane.text.clear` from any other plugin
+            // would have wiped it, since a `None`-owned layer belongs to
+            // everyone. Any future `pane.*` method that carries a `#[serde(skip)]
+            // owner` needs an arm here on the day it is added.
+            crate::api::schema::Method::PaneTextSet(params) => {
+                params.owner = format!("plugin:{plugin_id}");
+            }
+            crate::api::schema::Method::PaneTextClear(params) => {
                 params.owner = format!("plugin:{plugin_id}");
             }
             _ => {}

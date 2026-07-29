@@ -7,6 +7,7 @@ mod env;
 mod integrations;
 mod layouts;
 mod pane_graphics;
+mod pane_text;
 mod panes;
 pub(crate) mod plugins;
 mod responses;
@@ -1100,6 +1101,12 @@ impl App {
             }
             Method::PaneGraphicsInfo(params) => {
                 return self.handle_pane_graphics_info(request.id, params);
+            }
+            Method::PaneTextSet(params) => {
+                return self.handle_pane_text_set(request.id, params);
+            }
+            Method::PaneTextClear(params) => {
+                return self.handle_pane_text_clear(request.id, params);
             }
             Method::PaneGraphicsStream(_) => {
                 return responses::encode_error(

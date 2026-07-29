@@ -69,7 +69,7 @@ pub(crate) fn paint_pane_graphics_halfblock(app: &AppState, buf: &mut Buffer) {
 /// plugin would paint in different places on different terminals, which is
 /// exactly the class of bug a plugin author cannot debug from outside.
 fn paint_layer(layer: &PaneGraphicsLayer, inner: Rect, buf: &mut Buffer) {
-    let Some(area) = layer_area(layer, inner) else {
+    let Some(area) = layer_area(&layer.render, inner) else {
         return;
     };
     let Some(img) = layer_rgba(layer) else {
@@ -115,11 +115,18 @@ fn paint_layer(layer: &PaneGraphicsLayer, inner: Rect, buf: &mut Buffer) {
 ///
 /// Negative `viewport_col`/`viewport_row` are legal (kitty allows a placement to
 /// start off the left/top edge); the visible remainder is what gets painted.
-pub(crate) fn layer_area(layer: &PaneGraphicsLayer, inner: Rect) -> Option<Rect> {
+///
+/// fork(+128): takes the PLACEMENT rather than the layer, so the text painter
+/// resolves its box through this exact function instead of a second copy of the
+/// rules. Two implementations of one placement contract is how a plugin ends up
+/// painting an image and its caption in different places.
+pub(crate) fn layer_area(
+    render: &crate::api::schema::PaneGraphicsPlacementParams,
+    inner: Rect,
+) -> Option<Rect> {
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
-    let render = layer.render;
     let cols = if render.grid_cols == 0 {
         u32::from(inner.width)
     } else {
@@ -253,7 +260,7 @@ mod tests {
             vec![0; 3],
             placement(0, 0, 0, 0),
         );
-        assert_eq!(layer_area(&l, INNER), Some(INNER));
+        assert_eq!(layer_area(&l.render, INNER), Some(INNER));
     }
 
     #[test]
@@ -266,7 +273,7 @@ mod tests {
             placement(3, 2, 8, 4),
         );
         assert_eq!(
-            layer_area(&l, INNER),
+            layer_area(&l.render, INNER),
             Some(Rect {
                 x: 13,
                 y: 7,
@@ -286,7 +293,7 @@ mod tests {
             placement(35, 18, 20, 20),
         );
         assert_eq!(
-            layer_area(&l, INNER),
+            layer_area(&l.render, INNER),
             Some(Rect {
                 x: 45,
                 y: 23,
@@ -308,7 +315,7 @@ mod tests {
             placement(-2, -1, 8, 4),
         );
         assert_eq!(
-            layer_area(&l, INNER),
+            layer_area(&l.render, INNER),
             Some(Rect {
                 x: 10,
                 y: 5,
@@ -327,7 +334,7 @@ mod tests {
             vec![0; 3],
             placement(-8, 0, 8, 4),
         );
-        assert_eq!(layer_area(&l, INNER), None);
+        assert_eq!(layer_area(&l.render, INNER), None);
         let l = layer(
             PaneGraphicsFormat::Rgb,
             1,
@@ -335,7 +342,7 @@ mod tests {
             vec![0; 3],
             placement(40, 0, 8, 4),
         );
-        assert_eq!(layer_area(&l, INNER), None);
+        assert_eq!(layer_area(&l.render, INNER), None);
     }
 
     #[test]
@@ -347,7 +354,7 @@ mod tests {
             vec![0; 3],
             placement(0, 0, 0, 0),
         );
-        assert_eq!(layer_area(&l, Rect::new(0, 0, 0, 0)), None);
+        assert_eq!(layer_area(&l.render, Rect::new(0, 0, 0, 0)), None);
     }
 
     #[test]

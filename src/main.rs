@@ -90,6 +90,7 @@ mod pane;
 mod pane_close_history;
 // fork(+127): renderer-independent painting of plugin-owned graphics layers.
 mod pane_graphics_paint;
+mod pane_text_paint;
 mod persist;
 mod platform;
 mod plugin_collector;

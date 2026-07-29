@@ -19,6 +19,44 @@ pub(crate) struct PluginPaneRecord {
     pub entrypoint: String,
 }
 
+/// fork(+128): a retained TEXT overlay on a pane.
+///
+/// Deliberately the same shape as [`PaneGraphicsLayer`] minus the pixels:
+/// identity is the pair `(owner, layer_id)`, placement is the same cell-grid
+/// box relative to the pane's inner rect, and the same disable/unlink cleanup
+/// removes it. That symmetry is the point — a plugin author who understands
+/// `pane.graphics` already understands this, and the two composite into the
+/// same frame through the same call site.
+///
+/// What it is NOT is an edit API. The lines never reach `PaneState`, the
+/// parser, or scrollback; they are painted into the ratatui buffer for one
+/// frame and discarded. A plugin therefore cannot change what `pane.read`,
+/// copy, search, agent detection or a resumed agent sees — only what the user
+/// looks at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneTextLayer {
+    pub lines: Vec<crate::api::schema::PaneTextLineParams>,
+    pub render: crate::api::schema::PaneGraphicsPlacementParams,
+    /// `plugin:<plugin_id>` for a layer set through the UI-plugin bridge, or
+    /// `None` for one set over the socket API. Same privilege rule as graphics:
+    /// a `None` owner is the user at the CLI and outranks any plugin.
+    pub owner: Option<String>,
+    pub layer_id: String,
+}
+
+impl PaneTextLayer {
+    /// Retained UTF-8 bytes, for per-plugin footprint accounting. Counts only
+    /// the text: the styling fields are fixed-size and a plugin cannot inflate
+    /// memory with them.
+    pub(crate) fn byte_len(&self) -> usize {
+        self.lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.text.len())
+            .sum()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PaneGraphicsLayer {
     pub format: crate::api::schema::PaneGraphicsFormat,
@@ -1839,6 +1877,17 @@ pub struct AppState {
     /// follow sorted by owner, so the paint order is deterministic across
     /// frames rather than dependent on hash iteration order.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, Vec<PaneGraphicsLayer>>,
+    /// fork(+128): retained TEXT overlays per pane, same ordering contract as
+    /// `pane_graphics_layers` — bottom-first, socket caller below plugins,
+    /// sorted by `(owner, layer_id)` so composite order is stable across frames.
+    ///
+    /// Kept as a SEPARATE map rather than folded into the graphics vec so that
+    /// text always composites above images. Interleaving the two would make the
+    /// stacking depend on which call arrived first, and the case that matters —
+    /// a caption or annotation over an image — would work or not depending on
+    /// call order, which is precisely the kind of bug a plugin author cannot
+    /// diagnose from outside the host.
+    pub(crate) pane_text_layers: std::collections::HashMap<PaneId, Vec<PaneTextLayer>>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2179,6 +2228,101 @@ impl AppState {
             self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
         }
         removed
+    }
+
+    /// fork(+128): the text-overlay twin of `clear_pane_graphics_layers_for_owner`,
+    /// and it exists for the same reason — a UI plugin gets no unload or disable
+    /// event, so it cannot clear its own overlays. Without this, disabling a
+    /// plugin would leave its text painted over the user's pane forever, which
+    /// is worse than the image case: text over terminal output reads as if the
+    /// program printed it.
+    pub(crate) fn clear_pane_text_layers_for_owner(&mut self, owner: &str) -> usize {
+        let mut removed = 0_usize;
+        for layers in self.pane_text_layers.values_mut() {
+            let before = layers.len();
+            layers.retain(|layer| layer.owner.as_deref() != Some(owner));
+            removed += before - layers.len();
+        }
+        self.pane_text_layers.retain(|_, layers| !layers.is_empty());
+        if removed > 0 {
+            self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// fork(+128): upsert a text overlay, keyed on the `(owner, layer_id)` pair
+    /// and re-sorted on the same pair, exactly like `upsert_pane_graphics_layer`.
+    /// Returns whether an existing layer was replaced; both outcomes succeed.
+    pub(crate) fn upsert_pane_text_layer(&mut self, pane_id: PaneId, layer: PaneTextLayer) -> bool {
+        let layers = self.pane_text_layers.entry(pane_id).or_default();
+        let replaced = match layers
+            .iter_mut()
+            .find(|held| held.owner == layer.owner && held.layer_id == layer.layer_id)
+        {
+            Some(held) => {
+                *held = layer;
+                true
+            }
+            None => {
+                layers.push(layer);
+                false
+            }
+        };
+        layers.sort_by(|a, b| {
+            a.owner
+                .cmp(&b.owner)
+                .then_with(|| a.layer_id.cmp(&b.layer_id))
+        });
+        self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        replaced
+    }
+
+    /// fork(+128): remove text overlays, with the same privilege asymmetry as
+    /// the graphics clear — `owner: None` is the socket caller and wipes the
+    /// pane, a plugin owner removes only its own, and `layer_id: None` means
+    /// every layer that owner holds here.
+    pub(crate) fn clear_pane_text_layers(
+        &mut self,
+        pane_id: PaneId,
+        owner: Option<&str>,
+        layer_id: Option<&str>,
+    ) -> usize {
+        let Some(layers) = self.pane_text_layers.get_mut(&pane_id) else {
+            return 0;
+        };
+        let before = layers.len();
+        match owner {
+            None => layers.clear(),
+            Some(owner) => layers.retain(|layer| {
+                let mine = layer.owner.as_deref() == Some(owner);
+                let targeted = match layer_id {
+                    None => true,
+                    Some(id) => layer.layer_id == id,
+                };
+                !(mine && targeted)
+            }),
+        }
+        let removed = before - layers.len();
+        if layers.is_empty() {
+            self.pane_text_layers.remove(&pane_id);
+        }
+        if removed > 0 {
+            self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// fork(+128): layer count and retained text bytes for one plugin, the
+    /// text-overlay half of the `plugin.ui.status` footprint.
+    pub(crate) fn pane_text_totals_for_plugin(&self, plugin_id: &str) -> (usize, usize) {
+        let owner = format!("plugin:{plugin_id}");
+        self.pane_text_layers
+            .values()
+            .flat_map(|layers| layers.iter())
+            .filter(|layer| layer.owner.as_deref() == Some(owner.as_str()))
+            .fold((0, 0), |(count, bytes), layer| {
+                (count + 1, bytes + layer.byte_len())
+            })
     }
 
     /// fork(+127): total layer count and retained bytes for one plugin across
@@ -2594,6 +2738,7 @@ impl AppState {
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
+            pane_text_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,

@@ -3768,6 +3768,14 @@ impl HeadlessServer {
                             &mut buffer,
                         );
                     }
+                    // fork(+128): text overlays, unconditional for the same
+                    // reason as the TUI arm — one emission path, nothing to do
+                    // with the kitty renderer. This is the call site that
+                    // matters for `hr`, which renders here rather than in the
+                    // TUI loop; +127 learned that the hard way by wiring only
+                    // `app/mod.rs` and getting a layer that existed in state and
+                    // never appeared on screen.
+                    crate::pane_text_paint::paint_pane_text(&self.app.state, &mut buffer);
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,

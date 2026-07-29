@@ -3151,6 +3151,95 @@
           ],
           "type": "object"
         },
+        "PaneTextClearParams": {
+          "description": "fork(+128): drop text overlays. Mirrors `PaneGraphicsClearParams` exactly,\nincluding the asymmetry: a plugin clears only what it owns, while a socket\ncaller (`owner` empty) clears the pane outright, because the user at the CLI\noutranks any plugin.",
+          "properties": {
+            "layer_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "PaneTextLineParams": {
+          "description": "fork(+128): one row of an overlay, as a sequence of styled spans.",
+          "properties": {
+            "spans": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/request/$defs/PaneTextSpanParams"
+              },
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
+        "PaneTextSetParams": {
+          "description": "fork(+128): retain a TEXT overlay on a pane.\n\nThe deliberate non-goal, and the reason this is not `pane.write` or an edit\nAPI: it does not mutate the terminal. The lines are composited into the\nratatui buffer for the frame, exactly like a `pane.graphics` layer, and\n`PaneState`/scrollback never see them. Search, copy, resume and agent\ndetection keep reading the real program output, so a plugin cannot corrupt\nwhat an agent believes it printed — the property `.local/prd/127-plugin-owned-images.md`\nreserved for this stage.\n\nIdentity, placement and cleanup are intentionally the same model as\n`PaneGraphicsSetParams`: `(owner, layer_id)`, cell-grid placement relative to\nthe pane's inner rect, and removal when the owning plugin goes away. A plugin\nauthor who has learned one has learned the other.",
+          "properties": {
+            "layer_id": {
+              "default": "",
+              "type": "string"
+            },
+            "lines": {
+              "default": [],
+              "items": {
+                "$ref": "#/schemas/request/$defs/PaneTextLineParams"
+              },
+              "type": "array"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "placement": {
+              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacementParams",
+              "default": {
+                "grid_cols": 0,
+                "grid_rows": 0,
+                "viewport_col": 0,
+                "viewport_row": 0
+              }
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "PaneTextSpanParams": {
+          "description": "fork(+128): one styled run within an overlay line.\n\nColours are NAMED, never RGB. Herdr remaps buffer colours to the active\npalette (`recolor_to_palette`), and a truecolor `Rgb` passes through that\nremap untouched — so an overlay that picked its own hex would be the one\nelement on screen that ignores the user's theme, and would do it silently.\nAn unrecognised name is treated as \"unset\" rather than refused: a plugin\nnaming a colour the host does not know should lose the styling, not the text.",
+          "properties": {
+            "bg": {
+              "default": "",
+              "description": "Named background, same vocabulary as `fg`. Empty keeps the cell's own\nbackground, which is what makes a span composite over pane text rather\nthan punching a hole in it.",
+              "type": "string"
+            },
+            "bold": {
+              "default": false,
+              "type": "boolean"
+            },
+            "fg": {
+              "default": "",
+              "description": "Named foreground: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,\n`cyan`, `gray`/`grey`, `white`, each also available as `bright_*`. Empty\n(the default) inherits whatever the cell already had.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
         "PaneWaitForOutputParams": {
           "properties": {
             "lines": {
@@ -5488,6 +5577,39 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "fork(+128): the text-overlay half of the pane-compositing API. Kept\nbeside the graphics methods rather than under `pane.write` or an edit\nnamespace because it composites at render time and never mutates the\nterminal — same lifetime, same identity, same capability.",
+          "properties": {
+            "method": {
+              "const": "pane.text.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTextSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.text.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTextClearParams"
             }
           },
           "required": [
@@ -8811,6 +8933,11 @@
             {
               "const": "pane_graphics",
               "description": "fork: `pane.graphics.*` via `HostEffect::Api` — painting an image into a\npane's cell grid. Deliberately NOT folded into `ApiWrite`: drawing over a\npane is a different power from splitting or closing one, it is the only\ncapability that puts pixels on screen outside the plugin's own surface,\nand separating it means `plugin list` shows exactly which plugin holds\nthe right to draw into the user's panes.",
+              "type": "string"
+            },
+            {
+              "const": "plugin_admin",
+              "description": "fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Kept out of\n`ApiWrite` for the same reason as the two above: a module holding this\ncan switch OTHER modules off, so it has to be declared and visible in\n`plugin list` rather than arriving as a side effect of ordinary writes.\n`plugin.link`/`plugin.unlink` remain host-reserved — installing code from\na path is a strictly larger power than flipping an installed plugin's\nenabled bit, and nothing in-guest needs it.",
               "type": "string"
             }
           ]
