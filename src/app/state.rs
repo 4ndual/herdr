@@ -1427,6 +1427,10 @@ pub struct PendingHarnessAction {
 pub enum HarnessActionKind {
     /// Open the row's file in a new editor tab.
     Open,
+    /// Put the row's absolute path on the clipboard. Resolves the key exactly
+    /// like [`Self::Open`] — the row model carries no path, so the host is the
+    /// only side that can turn a key into one.
+    CopyPath,
     /// Disable the entry in the settings file that defines it (session-facing).
     DisableSession,
     /// Disable the entry AND its ccp profile source (profile-wide).

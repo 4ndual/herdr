@@ -1953,9 +1953,35 @@ fn agents_section(cache: &HarnessCache) -> HarnessSection {
 /// lock, applied after releasing it).
 enum ResolvedAction {
     Open(PathBuf),
+    CopyPath(PathBuf),
     DisableHook(HookEntry, bool),
     DisableMcp(McpEntry),
     DisablePlugin(String),
+}
+
+/// Maps a row key's `<kind>:<idx>` halves to the file that row stands for, or
+/// `None` when the row has no file (a hook with no script, an unknown kind, a
+/// stale index). The row model deliberately carries no path — this cache is the
+/// only place one exists — so both `Open` and `CopyPath` come through here.
+fn resolve_row_path(cache: &HarnessCache, kind: &str, idx: &str) -> Option<PathBuf> {
+    match kind {
+        "memidx" => cache.mem_index.clone(),
+        "ctx" => cache.ctx_paths.get(idx.parse::<usize>().ok()?).cloned(),
+        "mem" => cache.mem_files.get(idx.parse::<usize>().ok()?).cloned(),
+        "hook" => cache
+            .hooks
+            .get(idx.parse::<usize>().ok()?)
+            .and_then(|h| h.script.clone()),
+        "skill" => cache
+            .skills
+            .get(idx.parse::<usize>().ok()?)
+            .map(|s| s.path.clone()),
+        "agent" => cache
+            .agents
+            .get(idx.parse::<usize>().ok()?)
+            .map(|(_, p)| p.clone()),
+        _ => None,
+    }
 }
 
 fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
@@ -1964,36 +1990,15 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
     let (kind, idx) = action.key.split_once(':')?;
     let profile_wide = action.kind == HarnessActionKind::DisableProfile;
     match (action.kind, kind) {
-        (HarnessActionKind::Open, "ctx") => {
-            let i: usize = idx.parse().ok()?;
-            cache.ctx_paths.get(i).cloned().map(ResolvedAction::Open)
+        // Open and CopyPath answer the same question — "which file is this row?"
+        // — and differ only in what the host then does with the answer, so they
+        // share one resolver. Keeping them in sync matters: a row advertises
+        // `openable`, and the guest offers "copy path" off that same flag.
+        (HarnessActionKind::Open, _) => {
+            resolve_row_path(cache, kind, idx).map(ResolvedAction::Open)
         }
-        (HarnessActionKind::Open, "memidx") => cache.mem_index.clone().map(ResolvedAction::Open),
-        (HarnessActionKind::Open, "mem") => {
-            let i: usize = idx.parse().ok()?;
-            cache.mem_files.get(i).cloned().map(ResolvedAction::Open)
-        }
-        (HarnessActionKind::Open, "hook") => {
-            let i: usize = idx.parse().ok()?;
-            cache
-                .hooks
-                .get(i)
-                .and_then(|h| h.script.clone())
-                .map(ResolvedAction::Open)
-        }
-        (HarnessActionKind::Open, "skill") => {
-            let i: usize = idx.parse().ok()?;
-            cache
-                .skills
-                .get(i)
-                .map(|s| ResolvedAction::Open(s.path.clone()))
-        }
-        (HarnessActionKind::Open, "agent") => {
-            let i: usize = idx.parse().ok()?;
-            cache
-                .agents
-                .get(i)
-                .map(|(_, p)| ResolvedAction::Open(p.clone()))
+        (HarnessActionKind::CopyPath, _) => {
+            resolve_row_path(cache, kind, idx).map(ResolvedAction::CopyPath)
         }
         (_, "hook") => {
             let i: usize = idx.parse().ok()?;
@@ -2091,6 +2096,15 @@ impl App {
         };
         let acted = match resolved {
             ResolvedAction::Open(path) => self.spawn_harness_editor_tab(&path),
+            // Copying changes nothing on disk, so return before the
+            // rescan+republish below, which exists to make a just-disabled
+            // entry show its new state.
+            ResolvedAction::CopyPath(path) => {
+                let text = path.to_string_lossy().into_owned();
+                self.state.request_clipboard_write = Some(text.clone().into_bytes());
+                self.harness_toast(format!("copied {text}"));
+                return true;
+            }
             ResolvedAction::DisableHook(entry, profile_wide) => {
                 self.disable_hook(&entry, profile_wide)
             }

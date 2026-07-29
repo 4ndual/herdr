@@ -390,6 +390,17 @@ fn row_key(action_id: &str) -> Option<&str> {
 
 /// Whether the model row with `key` offers the disable menu.
 fn key_can_disable(key: &str) -> bool {
+    row_flag(key, |r| r.can_disable)
+}
+
+/// Whether the model row with `key` resolves to a file. Reuses `openable`,
+/// which is exactly "the host can turn this key into a path" — the same
+/// precondition "copy path" needs, since the guest never sees a path itself.
+fn key_can_copy(key: &str) -> bool {
+    row_flag(key, |r| r.openable)
+}
+
+fn row_flag(key: &str, pick: impl Fn(&harness_manager_model::HarnessRow) -> bool) -> bool {
     MODEL
         .lock()
         .expect("model mutex poisoned")
@@ -398,7 +409,7 @@ fn key_can_disable(key: &str) -> bool {
             m.sections
                 .iter()
                 .flat_map(|s| s.rows.iter())
-                .any(|r| r.key == key && r.can_disable)
+                .any(|r| r.key == key && pick(r))
         })
         .unwrap_or(false)
 }
@@ -408,10 +419,17 @@ fn handle_action(action_id: &str, kind: UiActionKind, row: u16) -> UiUpdate {
     // does not intercept RightDown, so it routes here as a v3 Action.
     if kind == UiActionKind::RightDown {
         if let Some(key) = row_key(action_id) {
-            if key_can_disable(key) {
+            let can_disable = key_can_disable(key);
+            let can_copy = key_can_copy(key);
+            // A row earns a menu if it offers anything beyond cancel. Openable
+            // rows now qualify on their own, so a file row that cannot be
+            // disabled still gets "copy path".
+            if can_disable || can_copy {
                 *MENU.lock().expect("menu mutex poisoned") = Some(render::MenuState {
                     key: key.to_string(),
                     anchor_y: row,
+                    can_copy,
+                    can_disable,
                 });
                 return render_from_cache().unwrap_or_default();
             }

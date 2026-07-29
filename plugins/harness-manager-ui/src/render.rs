@@ -35,6 +35,10 @@ pub const ACTION_ROW_PREFIX: &str = "harness:row:";
 /// Disable-menu options (host-resolved config edits).
 pub const ACTION_DISABLE_SESSION_PREFIX: &str = "harness:disable_session:";
 pub const ACTION_DISABLE_PROFILE_PREFIX: &str = "harness:disable_profile:";
+/// Copies the row's absolute path (host-resolved: the host owns the path, the
+/// row model never carries one, so this mirrors `harness:open:` and resolves
+/// through the same collector cache).
+pub const ACTION_COPY_PREFIX: &str = "harness:copy:";
 /// Closes the disable menu (guest-owned).
 pub const ACTION_MENU_CANCEL: &str = "harness:menu_cancel";
 
@@ -44,6 +48,7 @@ const EXPAND_HANDLE: &str = ">";
 const EMPTY_HINT: &str = "focus a claude pane to inspect it";
 const MENU_SESSION: &str = "| disable: this session   |";
 const MENU_PROFILE: &str = "| disable: profile-global |";
+const MENU_COPY: &str = "| copy path               |";
 const MENU_CANCEL: &str = "| cancel                  |";
 
 /// An open right-click disable menu: the row key it targets and the absolute
@@ -52,6 +57,14 @@ const MENU_CANCEL: &str = "| cancel                  |";
 pub struct MenuState {
     pub key: String,
     pub anchor_y: u16,
+    /// Whether the targeted row resolves to a file the host can open. Only such
+    /// rows get the "copy path" entry — the guest never sees a path itself, so
+    /// offering it on a pathless row would produce a silent no-op.
+    pub can_copy: bool,
+    /// Whether the targeted row offers the disable options. A row can be
+    /// copyable without being disableable (and vice versa), so the menu is
+    /// built from these two flags rather than assumed to be all three options.
+    pub can_disable: bool,
 }
 
 /// One visible line of the body. Shared by the renderer and the guest's hover
@@ -512,22 +525,28 @@ fn render_row(
 
 fn render_menu(menu: &MenuState, area: Rect, buf: &mut Buffer, hits: &mut Vec<UiHitRect>) {
     let bottom = area.y + area.height; // exclusive
-    // Anchor directly under the clicked row, clamped so all 3 lines fit.
+    let mut entries: Vec<(&str, String)> = Vec::with_capacity(4);
+    if menu.can_disable {
+        entries.push((
+            MENU_SESSION,
+            format!("{ACTION_DISABLE_SESSION_PREFIX}{}", menu.key),
+        ));
+        entries.push((
+            MENU_PROFILE,
+            format!("{ACTION_DISABLE_PROFILE_PREFIX}{}", menu.key),
+        ));
+    }
+    if menu.can_copy {
+        entries.push((MENU_COPY, format!("{ACTION_COPY_PREFIX}{}", menu.key)));
+    }
+    entries.push((MENU_CANCEL, ACTION_MENU_CANCEL.to_string()));
+    // Anchor directly under the clicked row, clamped so every line fits. The
+    // entry count is variable (a row may be copyable, disableable, or both), so
+    // clamp against the built list rather than a hardcoded height.
     let start_y = menu
         .anchor_y
         .saturating_add(1)
-        .min(bottom.saturating_sub(3).max(area.y));
-    let entries: [(&str, String); 3] = [
-        (
-            MENU_SESSION,
-            format!("{ACTION_DISABLE_SESSION_PREFIX}{}", menu.key),
-        ),
-        (
-            MENU_PROFILE,
-            format!("{ACTION_DISABLE_PROFILE_PREFIX}{}", menu.key),
-        ),
-        (MENU_CANCEL, ACTION_MENU_CANCEL.to_string()),
-    ];
+        .min(bottom.saturating_sub(entries.len() as u16).max(area.y));
     for (i, (text, action_id)) in entries.iter().enumerate() {
         let y = start_y + i as u16;
         if y >= bottom {
@@ -628,6 +647,58 @@ fn truncate_to(s: &str, budget: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The menu is built from what the row actually supports, so a copyable
+    /// row and a disableable row get different option sets. Regression cover
+    /// for "copy path" being offered on rows the host cannot resolve a path
+    /// for, which would look like a dead click.
+    #[test]
+    fn menu_offers_only_the_options_the_row_supports() {
+        fn ids(can_copy: bool, can_disable: bool) -> Vec<String> {
+            let menu = MenuState {
+                key: "ctx:0".to_string(),
+                anchor_y: 3,
+                can_copy,
+                can_disable,
+            };
+            let area = Rect::new(0, 0, 40, 20);
+            let mut buf = Buffer::empty(area);
+            let mut hits = Vec::new();
+            render_menu(&menu, area, &mut buf, &mut hits);
+            hits.into_iter().map(|h| h.action_id).collect()
+        }
+
+        assert_eq!(
+            ids(true, true),
+            vec![
+                "harness:disable_session:ctx:0",
+                "harness:disable_profile:ctx:0",
+                "harness:copy:ctx:0",
+                ACTION_MENU_CANCEL,
+            ]
+        );
+        assert_eq!(
+            ids(true, false),
+            vec!["harness:copy:ctx:0", ACTION_MENU_CANCEL]
+        );
+        assert_eq!(
+            ids(false, true),
+            vec![
+                "harness:disable_session:ctx:0",
+                "harness:disable_profile:ctx:0",
+                ACTION_MENU_CANCEL,
+            ]
+        );
+    }
+
+    /// Every menu line must be the same width or the bordered box looks broken.
+    #[test]
+    fn menu_labels_share_one_width() {
+        let w = MENU_SESSION.chars().count();
+        for label in [MENU_PROFILE, MENU_COPY, MENU_CANCEL] {
+            assert_eq!(label.chars().count(), w, "{label:?} is a different width");
+        }
+    }
 
     fn row(key: &str, label: &str, group: Option<&str>) -> HarnessRow {
         HarnessRow {
@@ -810,6 +881,8 @@ mod tests {
         let menu = MenuState {
             key: "hook:0".to_string(),
             anchor_y: 4,
+            can_copy: false,
+            can_disable: true,
         };
         let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[]);
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
@@ -841,6 +914,8 @@ mod tests {
         let menu = MenuState {
             key: "hook:0".to_string(),
             anchor_y,
+            can_copy: false,
+            can_disable: true,
         };
         let hits = render(&model(), area, &mut buf, None, Some(&menu), 0, &[]);
         let start_y = anchor_y + 1;

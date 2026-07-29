@@ -44,6 +44,8 @@ fn parse_harness_action(action_id: &str) -> Option<crate::app::state::PendingHar
     use crate::app::state::{HarnessActionKind, PendingHarnessAction};
     let (kind, key) = if let Some(key) = action_id.strip_prefix("harness:open:") {
         (HarnessActionKind::Open, key)
+    } else if let Some(key) = action_id.strip_prefix("harness:copy:") {
+        (HarnessActionKind::CopyPath, key)
     } else if let Some(key) = action_id.strip_prefix("harness:disable_session:") {
         (HarnessActionKind::DisableSession, key)
     } else if let Some(key) = action_id.strip_prefix("harness:disable_profile:") {
@@ -2015,6 +2017,24 @@ fn ui_action_kind_for_crossterm(kind: MouseEventKind) -> Option<herdr_ui_plugin_
 
 #[cfg(test)]
 mod tests {
+
+    /// `harness:copy:` must route to the host like open/disable do. It cannot be
+    /// guest-owned: the row model carries no path, so only the host can turn a
+    /// row key into one.
+    #[test]
+    fn harness_copy_action_routes_to_the_host_with_its_key() {
+        use crate::app::state::HarnessActionKind;
+
+        let parsed = super::parse_harness_action("harness:copy:ctx:2")
+            .expect("harness:copy: must parse as a host action");
+        assert_eq!(parsed.kind, HarnessActionKind::CopyPath);
+        assert_eq!(parsed.key, "ctx:2");
+
+        // Guest-owned ids and empty keys stay unrouted.
+        assert!(super::parse_harness_action("harness:copy:").is_none());
+        assert!(super::parse_harness_action("harness:menu_cancel").is_none());
+        assert!(super::parse_harness_action("harness:toggle_panel").is_none());
+    }
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::{Direction, Rect};
 
