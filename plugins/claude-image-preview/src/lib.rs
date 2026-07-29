@@ -51,17 +51,30 @@ const REQ_READ_PREFIX: &str = "claude-image:read:";
 const REQ_SET_PREFIX: &str = "claude-image:set:";
 /// Prefix for clear calls.
 const REQ_CLEAR_PREFIX: &str = "claude-image:clear:";
+/// Request id for the one-shot cell-geometry probe. Asked once per module load:
+/// cell pixel size is a font property, not something that changes per frame.
+const REQ_INFO: &str = "claude-image:info";
 
 /// Ceiling on layers this guest will ask for, matching the manifest's
 /// `max_layers_per_pane`. Enforced here as well as in the host so the guest is
 /// never the thing that trips the host's limit and generates error traffic.
 const MAX_LAYERS: usize = 8;
 
-/// How many cells wide/tall a placeholder preview is drawn. Deliberately a
-/// GUEST policy, not a host one: "how big should a Claude image preview be" is
-/// exactly the sort of decision that used to require editing herdr.
-const PREVIEW_COLS: u32 = 40;
-const PREVIEW_ROWS: u32 = 12;
+/// The BOX a placeholder preview is fitted into, in cells. Deliberately a GUEST
+/// policy, not a host one: "how big should a Claude image preview be" is exactly
+/// the sort of decision that used to require editing herdr.
+///
+/// These are a CEILING, not a size. Emitting them as the size — which is what
+/// this plugin used to do — draws every image at the same 40x12 no matter its
+/// shape, so a tall screenshot and a wide banner come out equally squashed. The
+/// actual box comes from `fit_preview`.
+const MAX_PREVIEW_COLS: u32 = 40;
+const MAX_PREVIEW_ROWS: u32 = 12;
+
+/// Cell size assumed until `pane.graphics.info` answers. Roughly a 12pt
+/// monospace cell; only the RATIO matters here, and 1:2 is close enough that a
+/// preview drawn before the probe returns is not visibly wrong.
+const ASSUMED_CELL_PX: (u32, u32) = (8, 16);
 
 // ── input from the collector ───────────────────────────────────────────────
 
@@ -96,6 +109,12 @@ struct Placeholder {
 }
 
 /// What we asked the host to paint, so an unchanged screen costs nothing.
+///
+/// The BOX is part of this key, not just the position. Keying only on
+/// `(path, col, row)` means a preview whose fitted size changed — because the
+/// cell probe answered, or the collector reported different image dimensions —
+/// is judged "already painted" and never re-sent, so the image keeps whatever
+/// box it was first given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Painted {
     pane_id: String,
@@ -103,6 +122,8 @@ struct Painted {
     path: String,
     col: u16,
     row: u16,
+    grid_cols: u32,
+    grid_rows: u32,
 }
 
 #[derive(Default)]
@@ -115,6 +136,15 @@ struct State {
     pane_session: Option<String>,
     panes_in_flight: bool,
     read_in_flight: bool,
+    /// Cell size in pixels, from `pane.graphics.info`. `None` until the probe
+    /// answers; `fit_preview` falls back rather than blocking on it, because a
+    /// preview that never paints is worse than one fitted with an assumed cell
+    /// aspect for a frame.
+    cell_px: Option<(u32, u32)>,
+    info_in_flight: bool,
+    /// Set once the probe has answered either way. A refusal must not leave the
+    /// guest asking forever, so this is set on failure too.
+    info_settled: bool,
     /// Placeholders from the most recent successful `pane.read`.
     placeholders: Vec<Placeholder>,
     /// Layers we believe are currently set, in `layer_id` order.
@@ -201,6 +231,23 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
             if *ok {
                 if let Some(response) = response.as_ref() {
                     handle_pane_list(state, response);
+                }
+            }
+            status_only(state)
+        }
+        UiEvent::ApiResult {
+            request_id,
+            ok,
+            response,
+            ..
+        } if request_id == REQ_INFO => {
+            state.info_in_flight = false;
+            // Settled either way. A host that refuses the probe (older binary,
+            // capability not granted) must cost one call, not one per frame.
+            state.info_settled = true;
+            if *ok {
+                if let Some(response) = response.as_ref() {
+                    state.cell_px = parse_cell_px(response);
                 }
             }
             status_only(state)
@@ -305,6 +352,18 @@ fn on_frame(state: &mut State, input: &ImageInput) -> UiUpdate {
         return update;
     };
 
+    // Cell geometry is a font fact, so this is asked ONCE, not per frame. It is
+    // what turns the box ceiling into a shape: without it there is no way to
+    // know how many rows are as tall as N columns are wide.
+    if !state.info_settled && !state.info_in_flight {
+        state.info_in_flight = true;
+        update.effects.push(HostEffect::Api {
+            request_id: REQ_INFO.to_string(),
+            method: "pane.graphics.info".to_string(),
+            params: serde_json::json!({ "pane_id": pane_id }),
+        });
+    }
+
     // Re-read the pane text every frame we are not already waiting on one: the
     // placeholder can scroll, and its ROW is what tells the host where to paint.
     // The read is what makes the preview follow the text instead of pinning to
@@ -342,12 +401,15 @@ fn on_frame(state: &mut State, input: &ImageInput) -> UiUpdate {
                     .images
                     .iter()
                     .find(|entry| entry.number == placeholder.number)?;
+                let (grid_cols, grid_rows) = fit_preview(entry.width, entry.height, state.cell_px)?;
                 Some(Painted {
                     pane_id: pane_id.clone(),
                     number: placeholder.number,
                     path: entry.path.clone(),
                     col: placeholder.col,
                     row: placeholder.row,
+                    grid_cols,
+                    grid_rows,
                 })
             })
             .take(MAX_LAYERS)
@@ -409,13 +471,21 @@ fn on_frame(state: &mut State, input: &ImageInput) -> UiUpdate {
                     .unwrap_or(0),
                 // The host reads the bytes, checked against `graphics_roots`.
                 "source_path": entry.path,
+                // FIELD NAMES ARE LOAD-BEARING. `PaneGraphicsPlacementParams`
+                // is `viewport_col`/`viewport_row`, every field is
+                // `#[serde(default)]`, and the struct does not deny unknown
+                // fields — so `col`/`row` (what this sent until 2026-07-28) are
+                // accepted, discarded, and defaulted to 0. Every preview then
+                // painted at the pane's top-left, stacked on top of each other,
+                // which is the bug the user reported as "images block text".
+                // There is no error to see: the call succeeds.
                 "placement": {
-                    "col": entry.col,
+                    "viewport_col": entry.col,
                     // One row below the placeholder text, so the preview sits
                     // under its own `[Image #N]` label rather than covering it.
-                    "row": entry.row.saturating_add(1),
-                    "grid_cols": PREVIEW_COLS,
-                    "grid_rows": PREVIEW_ROWS,
+                    "viewport_row": entry.row.saturating_add(1),
+                    "grid_cols": entry.grid_cols,
+                    "grid_rows": entry.grid_rows,
                 },
             }),
         });
@@ -429,6 +499,54 @@ fn on_frame(state: &mut State, input: &ImageInput) -> UiUpdate {
 
 fn layer_id(number: u32) -> String {
     format!("img-{number}")
+}
+
+/// Read `cell_width_px`/`cell_height_px` out of a `pane.graphics.info` answer.
+/// Both must be present and non-zero: a half-known cell is not better than the
+/// assumption, it is just a differently-wrong aspect.
+fn parse_cell_px(response: &serde_json::Value) -> Option<(u32, u32)> {
+    let width = response.get("cell_width_px")?.as_u64()? as u32;
+    let height = response.get("cell_height_px")?.as_u64()? as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
+}
+
+/// Fit an image into the preview box while keeping its shape.
+///
+/// The box is measured in CELLS but the image is measured in PIXELS, and a cell
+/// is about twice as tall as it is wide. Ignoring that is what made the old
+/// fixed 40x12 wrong for everything: 40x12 cells is roughly 320x192 pixels, a
+/// 5:3 landscape frame, so a portrait screenshot was squashed into it.
+///
+/// Returns `None` for a zero-sized image — a degenerate box is a host error
+/// waiting to happen, and there is nothing sensible to draw.
+fn fit_preview(
+    image_width: u32,
+    image_height: u32,
+    cell_px: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if image_width == 0 || image_height == 0 {
+        return None;
+    }
+    let (cell_w, cell_h) = cell_px.unwrap_or(ASSUMED_CELL_PX);
+    let (cell_w, cell_h) = (cell_w.max(1), cell_h.max(1));
+
+    // Widest box whose HEIGHT is within the ceiling, then clamp to the width
+    // ceiling. Doing it in this order means the binding constraint wins
+    // whichever it is, so the result is inside the box on both axes.
+    // u64 throughout: the products are pixel counts times cell counts.
+    let cols_at_max_rows =
+        (u64::from(MAX_PREVIEW_ROWS) * u64::from(image_width) * u64::from(cell_h))
+            / (u64::from(image_height) * u64::from(cell_w));
+    let grid_cols = MAX_PREVIEW_COLS.min(cols_at_max_rows.max(1) as u32);
+
+    let rows_at_that_width = (u64::from(grid_cols) * u64::from(image_height) * u64::from(cell_w))
+        / (u64::from(image_width) * u64::from(cell_h));
+    let grid_rows = MAX_PREVIEW_ROWS.min(rows_at_that_width.max(1) as u32);
+
+    Some((grid_cols, grid_rows))
 }
 
 /// Our own surface is one status line. It reports the count, whether any visible
@@ -598,6 +716,9 @@ mod tests {
             // is the test that asserts those queries are actually issued.
             read_in_flight: true,
             panes_in_flight: true,
+            // Same reason: the cell probe is a query, not a paint. Tests that
+            // care about it set this back to false.
+            info_settled: true,
             ..State::default()
         }
     }
@@ -766,9 +887,238 @@ mod tests {
         assert_eq!(params["source_path"], "/c/1.png");
         assert!(params.get("data").is_none());
         assert!(params.get("data_base64").is_none());
-        assert_eq!(params["placement"]["col"], 2);
+        assert_eq!(params["placement"]["viewport_col"], 2);
         // One row below its own label.
-        assert_eq!(params["placement"]["row"], 1);
+        assert_eq!(params["placement"]["viewport_row"], 1);
+    }
+
+    /// The regression this pins is the reason every preview used to land at the
+    /// pane's top-left. `PaneGraphicsPlacementParams` names its fields
+    /// `viewport_col`/`viewport_row`, defaults every one of them, and does not
+    /// deny unknown fields — so `col`/`row` were accepted, dropped, and read as
+    /// 0, with a successful response and nothing in any log.
+    ///
+    /// Asserting the ABSENCE of the old names is the point: the previous version
+    /// of this suite asserted `placement["col"] == 2` and passed, which is how a
+    /// green test suite shipped a feature that never worked. A test that only
+    /// checks the value it wrote cannot see a name the host ignores.
+    #[test]
+    fn the_placement_uses_the_hosts_field_names_and_not_the_ignored_ones() {
+        let mut state = ready_state();
+        state.placeholders = parse_placeholders(&rows(&["  [Image #1]"]));
+        let input = ImageInput {
+            session_id: "sess".into(),
+            images: vec![entry(1, "/c/1.png")],
+        };
+        let update = on_frame(&mut state, &input);
+        let placement = params_of(&update, "claude-image:set:1")["placement"].clone();
+
+        assert!(
+            placement.get("col").is_none() && placement.get("row").is_none(),
+            "the host silently ignores `col`/`row`; sending them is the bug: {placement}"
+        );
+        assert!(placement.get("viewport_col").is_some());
+        assert!(placement.get("viewport_row").is_some());
+    }
+
+    /// A structural guard, not another value assertion.
+    ///
+    /// The host's `PaneGraphicsPlacementParams` lives in the herdr BINARY crate
+    /// (`src/api/schema/panes.rs`). The contract this guest vendors,
+    /// `herdr-ui-plugin-api`, contains no placement type at all — so there is no
+    /// shared type to round-trip through, and a misspelled field cannot fail at
+    /// compile time. THAT is the structural reason this bug was possible, and
+    /// the reason it survived: both sides agree only on a JSON object shape that
+    /// neither side checks.
+    ///
+    /// The nearest available guard is a local mirror with the one attribute the
+    /// host struct is missing. Deserializing the ACTUAL emitted payload into it
+    /// fails on any field the host would silently drop, so a future rename
+    /// breaks this test instead of the feature. The real fix is to move the
+    /// placement type into the shared crate, or add `deny_unknown_fields` to the
+    /// host struct; until then this mirror must be updated in lockstep, which is
+    /// exactly why it names its source file above.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HostPlacementMirror {
+        #[serde(default)]
+        viewport_col: i32,
+        #[serde(default)]
+        viewport_row: i32,
+        #[serde(default)]
+        grid_cols: u32,
+        #[serde(default)]
+        grid_rows: u32,
+    }
+
+    #[test]
+    fn the_emitted_placement_deserializes_into_the_hosts_shape() {
+        let mut state = ready_state();
+        state.placeholders = parse_placeholders(&rows(&["  [Image #1]"]));
+        let input = ImageInput {
+            session_id: "sess".into(),
+            images: vec![entry(1, "/c/1.png")],
+        };
+        let update = on_frame(&mut state, &input);
+        let placement = params_of(&update, "claude-image:set:1")["placement"].clone();
+
+        let parsed: HostPlacementMirror =
+            serde_json::from_value(placement.clone()).unwrap_or_else(|error| {
+                panic!("host would reject/ignore part of {placement}: {error}")
+            });
+        assert_eq!(parsed.viewport_col, 2);
+        assert_eq!(parsed.viewport_row, 1);
+        assert!(parsed.grid_cols > 0 && parsed.grid_rows > 0);
+
+        // And prove the guard actually guards: the payload this plugin used to
+        // send is rejected by the mirror even though the real host accepts it.
+        assert!(
+            serde_json::from_value::<HostPlacementMirror>(
+                serde_json::json!({"col": 2, "row": 1, "grid_cols": 40, "grid_rows": 12})
+            )
+            .is_err(),
+            "the mirror must reject the field names the host silently ignores"
+        );
+    }
+
+    /// A non-zero column is what proves the placement is per-placeholder rather
+    /// than defaulted. With the old names every image resolved to 0,0 and they
+    /// stacked on each other at the corner.
+    #[test]
+    fn two_placeholders_get_two_distinct_positions() {
+        let mut state = ready_state();
+        state.placeholders = parse_placeholders(&rows(&["  [Image #1]", "        [Image #2]"]));
+        let input = ImageInput {
+            session_id: "sess".into(),
+            images: vec![entry(1, "/c/1.png"), entry(2, "/c/2.png")],
+        };
+        let update = on_frame(&mut state, &input);
+        let first = params_of(&update, "claude-image:set:1")["placement"].clone();
+        let second = params_of(&update, "claude-image:set:2")["placement"].clone();
+        assert_eq!((&first["viewport_col"], &first["viewport_row"]).0, 2);
+        assert_ne!(first["viewport_col"], second["viewport_col"]);
+        assert_ne!(first["viewport_row"], second["viewport_row"]);
+    }
+
+    /// The other half of the user's complaint: every preview was the same
+    /// 40x12 regardless of the image, so nothing kept its shape.
+    #[test]
+    fn the_box_keeps_the_images_shape_through_the_cell_aspect() {
+        // 2:1 landscape. A cell is 8x16, so 40 cols is 320px wide and the box
+        // that matches is 10 rows (160px) — not the old flat 12.
+        assert_eq!(fit_preview(400, 200, Some((8, 16))), Some((40, 10)));
+
+        // Portrait: height binds first, so the box narrows instead of
+        // stretching the image across the full 40 columns.
+        let (cols, rows) = fit_preview(200, 400, Some((8, 16))).expect("fits");
+        assert_eq!(rows, MAX_PREVIEW_ROWS);
+        assert!(
+            cols < MAX_PREVIEW_COLS,
+            "a tall image must not fill the width"
+        );
+        assert_eq!((cols, rows), (12, 12));
+    }
+
+    #[test]
+    fn every_fitted_box_stays_inside_the_ceiling() {
+        for (width, height) in [(1, 4000), (4000, 1), (7, 11), (1920, 1080), (1, 1)] {
+            let (cols, rows) = fit_preview(width, height, Some((8, 16)))
+                .unwrap_or_else(|| panic!("{width}x{height} must fit"));
+            assert!(cols >= 1 && rows >= 1, "{width}x{height} -> {cols}x{rows}");
+            assert!(
+                cols <= MAX_PREVIEW_COLS && rows <= MAX_PREVIEW_ROWS,
+                "{width}x{height} -> {cols}x{rows} escapes the box"
+            );
+        }
+    }
+
+    /// A zero-sized image has no shape to preserve and a zero-sized box means
+    /// "the whole pane" to the host — precisely the overpaint being fixed.
+    #[test]
+    fn a_zero_sized_image_is_not_painted() {
+        assert_eq!(fit_preview(0, 100, Some((8, 16))), None);
+        assert_eq!(fit_preview(100, 0, Some((8, 16))), None);
+    }
+
+    /// The probe is a one-shot, and a host that refuses it must not be asked
+    /// again every frame.
+    #[test]
+    fn the_cell_probe_is_asked_once_and_settles_even_when_refused() {
+        let mut state = ready_state();
+        state.info_settled = false;
+        let input = ImageInput::default();
+
+        let update = on_frame(&mut state, &input);
+        assert!(api_methods(&update).contains(&"pane.graphics.info".to_string()));
+        // In flight: no duplicate on the next frame.
+        let update = on_frame(&mut state, &input);
+        assert!(!api_methods(&update).contains(&"pane.graphics.info".to_string()));
+
+        handle_event(&UiEvent::ApiResult {
+            request_id: REQ_INFO.to_string(),
+            ok: false,
+            response: None,
+            error: Some("unsupported".into()),
+        });
+
+        // A refusal settles it too, so the guest falls back to the assumed cell
+        // aspect rather than re-asking forever.
+        let mut state = ready_state();
+        state.info_settled = true;
+        state.placeholders = parse_placeholders(&rows(&["[Image #1]"]));
+        let update = on_frame(
+            &mut state,
+            &ImageInput {
+                session_id: "sess".into(),
+                images: vec![entry(1, "/c/1.png")],
+            },
+        );
+        assert!(!api_methods(&update).contains(&"pane.graphics.info".to_string()));
+        let placement = params_of(&update, "claude-image:set:1")["placement"].clone();
+        assert_eq!(placement["grid_cols"], 40);
+        assert_eq!(placement["grid_rows"], 10);
+    }
+
+    #[test]
+    fn a_cell_size_answer_is_adopted_and_changes_the_fit() {
+        assert_eq!(
+            parse_cell_px(&serde_json::json!({"cell_width_px": 10, "cell_height_px": 21})),
+            Some((10, 21))
+        );
+        // A degenerate answer is worse than the assumption, not better.
+        assert_eq!(
+            parse_cell_px(&serde_json::json!({"cell_width_px": 0, "cell_height_px": 21})),
+            None
+        );
+        // The cell aspect changes the box, which is the whole reason to ask.
+        // Square cells are SHORTER than 8x16 ones, so the same 2:1 image needs
+        // more rows — and hits the row ceiling first, narrowing the width.
+        let square = fit_preview(400, 200, Some((10, 10))).expect("fits");
+        let tall = fit_preview(400, 200, Some((8, 16))).expect("fits");
+        assert_eq!((square, tall), ((24, 12), (40, 10)));
+    }
+
+    /// The no-repaint guard keys on the BOX as well as the position. Learning
+    /// the real cell size after the first paint must re-send, or the preview
+    /// keeps the box it was fitted with under the assumption.
+    #[test]
+    fn a_changed_fit_repaints_even_though_the_image_did_not_change() {
+        let mut state = ready_state();
+        state.placeholders = parse_placeholders(&rows(&["[Image #1]"]));
+        let input = ImageInput {
+            session_id: "sess".into(),
+            images: vec![entry(1, "/c/1.png")],
+        };
+        assert!(!calls(&on_frame(&mut state, &input)).is_empty());
+        // Unchanged screen: nothing re-sent.
+        assert!(calls(&on_frame(&mut state, &input)).is_empty());
+
+        state.cell_px = Some((10, 10));
+        let update = on_frame(&mut state, &input);
+        let placement = params_of(&update, "claude-image:set:1")["placement"].clone();
+        // Square cells refit the same 2:1 image from 40x10 to 24x12.
+        assert_eq!(placement["grid_cols"], 24, "square cells, 2:1 image");
+        assert_eq!(placement["grid_rows"], 12);
     }
 
     /// Never more than the manifest's declared ceiling: the guest must not be
