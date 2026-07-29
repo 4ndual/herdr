@@ -1583,7 +1583,15 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
             entry.name, scope, human, entry.event, entry.matcher,
             ev.count, if ev.count>0 {ev.total_ms/ev.count} else {0}, ev.last_ms, ev.err_count, ev.err_ms
         );
-        if entry.script.is_some() {
+        // #31: surface the script PATH. Every other row type puts its path on
+        // tooltip line 1, but a hook's line 1 is `name (scope)` — the guest
+        // treats line 1 as the row's identity and titles the tooltip/detail box
+        // with it, so overwriting it would trade the name and scope for the
+        // path. Adding a labelled line keeps both, and the row model still
+        // carries no path field, so `resolve_row_path` stays the single place
+        // one exists and copy/open keep resolving identically.
+        if let Some(script) = entry.script.as_ref() {
+            tooltip.push_str(&format!("\nscript: {}", script.display()));
             tooltip.push_str("\nclick opens the hook script");
         }
         rows.push(HarnessRow {
