@@ -316,7 +316,10 @@ fn guest_vocabulary() -> Option<Vec<String>> {
     // The host runs plugin commands with the plugin root as CWD.
     candidates.push(PathBuf::from(REL_WASM));
     let wasm = candidates.into_iter().find(|p| p.exists())?;
-    let out = run_with_timeout(Command::new("strings").arg("-a").arg(&wasm), VERSION_TIMEOUT)?;
+    let out = run_with_timeout(
+        Command::new("strings").arg("-a").arg(&wasm),
+        VERSION_TIMEOUT,
+    )?;
     if !out.status.success() {
         return None;
     }
@@ -474,10 +477,7 @@ fn read_verification(state_dir: &Path, label: &str, bin: &Path) -> (Verification
     // "restarting completes a verified update"; `Broken` means "do not". They
     // must not share a glyph.
     let failed: Vec<&ReceiptCheck> = receipt.checks.iter().filter(|c| !c.ok).collect();
-    if !receipt.ok
-        && failed.len() == 1
-        && failed[0].name == AWAITING_RESTART_CHECK
-    {
+    if !receipt.ok && failed.len() == 1 && failed[0].name == AWAITING_RESTART_CHECK {
         return (
             Verification::Passed,
             Some(if failed[0].detail.is_empty() {
@@ -790,8 +790,13 @@ fn running_version(bin: &Path, root: Option<&Path>, session: Option<&str>) -> Op
     // nesting vars (the collector runs as a child of a herdr instance) and pin
     // the XDG roots, or the CLI resolves the WRONG instance's socket.
     for k in [
-        "HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_CLIENT_SOCKET_PATH", "HERDR_SESSION",
-        "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID",
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_CLIENT_SOCKET_PATH",
+        "HERDR_SESSION",
+        "HERDR_WORKSPACE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_PANE_ID",
     ] {
         cmd.env_remove(k);
     }
@@ -817,7 +822,11 @@ fn running_version(bin: &Path, root: Option<&Path>, session: Option<&str>) -> Op
     }
     // A stopped server is running nothing; returning its last version would
     // manufacture a mismatch that does not exist.
-    if running { version } else { None }
+    if running {
+        version
+    } else {
+        None
+    }
 }
 
 fn binary_version(bin: &Path) -> Option<String> {

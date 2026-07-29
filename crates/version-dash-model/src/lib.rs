@@ -531,7 +531,9 @@ impl VersionRenderInput {
             Some(test) if test.state.is_promotable() => None,
             Some(test) => Some(match test.state {
                 InstanceState::Working => "herdrtest is still being verified".to_string(),
-                InstanceState::Broken => "herdrtest is BROKEN — fix it before promoting".to_string(),
+                InstanceState::Broken => {
+                    "herdrtest is BROKEN — fix it before promoting".to_string()
+                }
                 InstanceState::Escalated => "an agent is still working on herdrtest".to_string(),
                 InstanceState::Behind => "herdrtest is behind and unverified".to_string(),
                 InstanceState::AwaitingRestart => {
@@ -766,7 +768,10 @@ mod tests {
             }
         }
         let block = input.hr_promotion_block();
-        assert!(block.is_some(), "hr must be inert while awaiting its restart");
+        assert!(
+            block.is_some(),
+            "hr must be inert while awaiting its restart"
+        );
         assert!(block.unwrap_or_default().contains("restart"));
     }
 
@@ -776,17 +781,31 @@ mod tests {
         // and nothing verified the staged build. This must NOT read as
         // up_to_date, and must NOT read as a calm "press ctrl+opt+X".
         let s = InstanceStatus::classify_running(
-            Some("0.7.5"), Some("0.7.5"), false, None, Verification::None, Some("0.7.3"),
+            Some("0.7.5"),
+            Some("0.7.5"),
+            false,
+            None,
+            Verification::None,
+            Some("0.7.3"),
         );
         assert_eq!(s, InstanceState::UnsafeRestart);
         assert_ne!(s, InstanceState::UpToDate, "this was the lie");
-        assert_ne!(s, InstanceState::AwaitingRestart, "calm is the wrong register here");
+        assert_ne!(
+            s,
+            InstanceState::AwaitingRestart,
+            "calm is the wrong register here"
+        );
     }
 
     #[test]
     fn a_staged_binary_with_a_passing_receipt_is_merely_pending() {
         let s = InstanceStatus::classify_running(
-            Some("0.7.5"), Some("0.7.5"), false, None, Verification::Passed, Some("0.7.3"),
+            Some("0.7.5"),
+            Some("0.7.5"),
+            false,
+            None,
+            Verification::Passed,
+            Some("0.7.3"),
         );
         assert_eq!(s, InstanceState::AwaitingRestart);
     }
@@ -795,12 +814,26 @@ mod tests {
     fn running_equals_disk_classifies_normally() {
         assert_eq!(
             InstanceStatus::classify_running(
-                Some("0.7.5"), Some("0.7.5"), false, None, Verification::None, Some("0.7.5")),
-            InstanceState::UpToDate);
+                Some("0.7.5"),
+                Some("0.7.5"),
+                false,
+                None,
+                Verification::None,
+                Some("0.7.5")
+            ),
+            InstanceState::UpToDate
+        );
         assert_eq!(
             InstanceStatus::classify_running(
-                Some("0.7.3"), Some("0.7.5"), false, None, Verification::None, Some("0.7.3")),
-            InstanceState::Behind);
+                Some("0.7.3"),
+                Some("0.7.5"),
+                false,
+                None,
+                Verification::None,
+                Some("0.7.3")
+            ),
+            InstanceState::Behind
+        );
     }
 
     #[test]
@@ -808,8 +841,15 @@ mod tests {
         // If the server cannot be asked, do not guess that a restart is safe.
         assert_eq!(
             InstanceStatus::classify_running(
-                Some("0.7.5"), Some("0.7.5"), false, None, Verification::None, None),
-            InstanceState::UpToDate);
+                Some("0.7.5"),
+                Some("0.7.5"),
+                false,
+                None,
+                Verification::None,
+                None
+            ),
+            InstanceState::UpToDate
+        );
     }
 
     #[test]
@@ -821,7 +861,10 @@ mod tests {
             }
         }
         let block = input.hr_promotion_block();
-        assert!(block.is_some(), "must not promote over an ungated staged binary");
+        assert!(
+            block.is_some(),
+            "must not promote over an ungated staged binary"
+        );
         assert!(block.unwrap_or_default().contains("UNVERIFIED"));
     }
 

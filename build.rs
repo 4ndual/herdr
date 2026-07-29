@@ -63,13 +63,7 @@ fn emit_fork_provenance(manifest_dir: &std::path::Path) {
             // used to identify a build. Archival tags must not be able to do
             // that; only `v*` release tags may set the base.
             .args([
-                "describe",
-                "--tags",
-                "--match",
-                "v*",
-                "--long",
-                "--always",
-                "--dirty",
+                "describe", "--tags", "--match", "v*", "--long", "--always", "--dirty",
             ])
             .output()
             .ok()
