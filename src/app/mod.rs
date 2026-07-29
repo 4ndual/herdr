@@ -2844,6 +2844,16 @@ impl App {
             "HERDR_FOCUS_AGENT".to_string(),
             format!("{:?}", focus.agent).to_lowercase(),
         );
+        // Wall clock, every frame. Guests run in wasm with no host clock at all,
+        // so without this a plugin cannot answer "how long ago" about anything —
+        // not even its own data. A timestamp carried INSIDE a plugin's input is
+        // not a substitute: the case that needs an age is precisely the case
+        // where that input stopped arriving, so the only usable clock is one
+        // delivered on the frame itself.
+        env.insert(
+            "HERDR_NOW_UNIX".to_string(),
+            usage_dash_core::util::now_unix().to_string(),
+        );
         if let Some(layout_json) = layout_json {
             env.insert("HERDR_LAYOUT_JSON".to_string(), layout_json.to_string());
         }

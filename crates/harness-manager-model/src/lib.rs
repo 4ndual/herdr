@@ -139,6 +139,20 @@ pub struct HarnessRenderModel {
     #[serde(default)]
     pub target: String,
     pub sections: Vec<HarnessSection>,
+    /// Unix seconds when the collector built this model.
+    ///
+    /// Lets the guest say how long ago its data was true. `None` in models
+    /// written by a host that predates the field, and the guest must degrade to
+    /// an age-less staleness marker rather than assume the epoch — a panel
+    /// claiming "stale since 1970" would be worse than one that just says
+    /// "stale".
+    ///
+    /// This alone is NOT enough to compute an age: the guest also needs the
+    /// current time, which it cannot get from a model that has stopped
+    /// arriving. The host supplies that separately, per frame, as
+    /// `HERDR_NOW_UNIX`.
+    #[serde(default)]
+    pub generated_at: Option<i64>,
 }
 
 impl HarnessRenderModel {

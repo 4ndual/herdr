@@ -1320,7 +1320,11 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
         sections.push(skills_section(cache));
         sections.push(agents_section(cache));
     }
-    let model = HarnessRenderModel { target, sections };
+    let model = HarnessRenderModel {
+        target,
+        sections,
+        generated_at: Some(usage_dash_core::util::now_unix()),
+    };
     match serde_json::to_string(&model) {
         Ok(json) => Some(json),
         Err(err) => {
