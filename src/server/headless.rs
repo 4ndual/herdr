@@ -7193,8 +7193,20 @@ next_tab = ""
         );
     }
 
+    /// fork(foreground-hysteresis): a bare KEYPRESS from a background client does
+    /// NOT promote it. Upstream promoted on any input, which this test was written
+    /// against; the fork routes plain typing through the hysteresis policy instead
+    /// (see `route_client_events`) for a named reason — two clients typing at once
+    /// otherwise thrash the shared runtime's resize, because every keystroke flips
+    /// which client's terminal size wins.
+    ///
+    /// Only an explicit window `FocusGained` is treated as an unambiguous "activate
+    /// this client" signal, which the sibling assertion below pins. Keeping both in
+    /// one test makes the boundary the fork actually chose visible in one place,
+    /// rather than leaving it as a comment in `headless.rs` that a future upstream
+    /// merge can quietly undo.
     #[tokio::test]
-    async fn background_key_makes_later_focus_lost_eligible() {
+    async fn fork_input_bare_keypress_does_not_promote_but_focus_gained_does() {
         let mut server = test_headless_server();
         let mut input_rx = install_focused_test_runtime(&mut server, b"\x1b[?1004h");
         server.clients.insert(1, test_app_client(Some(true), 1));
@@ -7202,7 +7214,7 @@ next_tab = ""
         server.foreground_client_id = Some(1);
         server.sync_foreground_client_state();
 
-        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+        server.handle_server_event(ServerEvent::ClientInputEvents {
             client_id: 2,
             events: vec![
                 crate::protocol::ClientInputEvent::Key {
@@ -7212,12 +7224,20 @@ next_tab = ""
                 },
                 crate::protocol::ClientInputEvent::FocusLost,
             ],
+        });
+        assert_eq!(
+            server.foreground_client_id,
+            Some(1),
+            "typing in a background client must not steal the foreground"
+        );
+
+        // ...but an explicit focus-gained still promotes immediately.
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::FocusGained],
         }));
         assert_eq!(server.foreground_client_id, Some(2));
-        assert_eq!(
-            input_rx.try_recv().expect("focus lost after promotion"),
-            Bytes::from_static(b"\x1b[O")
-        );
+        let _ = input_rx.try_recv();
     }
 
     #[tokio::test]
@@ -7253,15 +7273,23 @@ next_tab = ""
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+        // fork(foreground-hysteresis): the key is still ROUTED — that is what this
+        // test is named for and it is unchanged — but under the fork it no longer
+        // promotes client 3. See fork_input_bare_keypress_does_not_promote_but_
+        // focus_gained_does for the rationale; upstream asserted Some(3) here.
+        server.handle_server_event(ServerEvent::ClientInputEvents {
             client_id: 3,
             events: vec![crate::protocol::ClientInputEvent::Key {
                 code: crate::protocol::ClientKeyCode::Char('x'),
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Release,
             }],
-        }));
-        assert_eq!(server.foreground_client_id, Some(3));
+        });
+        assert_eq!(
+            server.foreground_client_id,
+            Some(1),
+            "a non-app client's keypress must not steal the foreground either"
+        );
     }
 
     fn install_focused_test_runtime(
