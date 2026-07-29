@@ -3146,7 +3146,7 @@ impl App {
     fn apply_ui_plugin_host_effects(&mut self) {
         for effect in self.ui_plugins.take_pending_effects() {
             match effect {
-                herdr_ui_plugin_api::HostEffect::CopyText(text) => {
+                herdr_ui_plugin_api::HostEffect::CopyText { text } => {
                     self.state.request_clipboard_write = Some(text.into_bytes());
                 }
                 herdr_ui_plugin_api::HostEffect::SendPaneKeys { lines } => {

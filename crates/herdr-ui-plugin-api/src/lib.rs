@@ -295,7 +295,14 @@ pub struct UiLayer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEffect {
-    CopyText(String),
+    /// Copy text through the host clipboard path. This is a struct variant, not
+    /// a newtype: `HostEffect` is internally tagged, and serde cannot serialize
+    /// a tagged newtype variant wrapping a string — it fails at run time with
+    /// "cannot serialize tagged newtype variant", which silently truncates the
+    /// emitting module's whole update to zero bytes and blanks its layer.
+    CopyText {
+        text: String,
+    },
     SendPaneKeys {
         lines: Vec<String>,
     },
@@ -465,5 +472,74 @@ pub mod guest {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod host_effect_tests {
+    use super::*;
+
+    /// Every `HostEffect` must survive a JSON round trip.
+    ///
+    /// `HostEffect` is internally tagged (`#[serde(tag = "kind")]`), and serde
+    /// cannot serialize an internally-tagged NEWTYPE variant that wraps a
+    /// primitive: it fails at run time, not compile time. That failure is
+    /// silent and catastrophic in practice — the guest's whole update is
+    /// truncated to zero bytes, so the emitting module's entire layer blanks
+    /// rather than just dropping the one effect. `CopyText` shipped that way.
+    ///
+    /// This test exists so a future primitive-wrapping variant fails here
+    /// instead of in a user's blanked panel.
+    #[test]
+    fn every_host_effect_round_trips_through_json() {
+        let effects = vec![
+            HostEffect::CopyText {
+                text: "hello".into(),
+            },
+            HostEffect::SendPaneKeys {
+                lines: vec!["echo hi".into()],
+            },
+            HostEffect::ShowToast {
+                message: "done".into(),
+            },
+            HostEffect::OpenPluginPane {
+                plugin_id: "p".into(),
+                entrypoint: "e".into(),
+                payload_json: Some("{}".into()),
+            },
+            HostEffect::InvokePluginAction {
+                plugin_id: "p".into(),
+                action_id: "a".into(),
+                payload_json: None,
+            },
+            HostEffect::Api {
+                request_id: "r1".into(),
+                method: "pane.info".into(),
+                params: serde_json::json!({"pane": "w1:p1"}),
+            },
+            HostEffect::SetSurfaceCollapsed {
+                surface: UiSurface::UsageStrip,
+                collapsed: true,
+            },
+        ];
+
+        for effect in effects {
+            let encoded = serde_json::to_string(&effect)
+                .unwrap_or_else(|err| panic!("failed to serialize {effect:?}: {err}"));
+            let decoded: HostEffect = serde_json::from_str(&encoded)
+                .unwrap_or_else(|err| panic!("failed to deserialize {encoded}: {err}"));
+            assert_eq!(decoded, effect, "round trip changed the effect");
+        }
+    }
+
+    /// Pin the wire shape the guests actually emit, so the field name cannot
+    /// drift without a deliberate edit here.
+    #[test]
+    fn copy_text_encodes_as_a_tagged_object_with_a_text_field() {
+        let encoded = serde_json::to_string(&HostEffect::CopyText {
+            text: "/tmp/x".into(),
+        })
+        .expect("copy_text must serialize");
+        assert_eq!(encoded, r#"{"kind":"copy_text","text":"/tmp/x"}"#);
     }
 }

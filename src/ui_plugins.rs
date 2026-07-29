@@ -1578,7 +1578,7 @@ fn filter_effects_for_module(
     effects
         .iter()
         .filter(|effect| match effect {
-            HostEffect::CopyText(_) => {
+            HostEffect::CopyText { .. } => {
                 module.requests(crate::api::schema::PluginUiCapability::ClipboardWrite)
             }
             HostEffect::SendPaneKeys { .. } => {
