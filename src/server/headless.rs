@@ -7534,6 +7534,12 @@ next_tab = ""
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
+        // fork(wave-1): upstream test predates the usage strip carve; disable it.
+        // Same 7-row (`USAGE_STRIP_HEIGHT`) drift that hit the tab_surface
+        // characterization pair — this test asserts each client gets ITS OWN
+        // terminal size, which the carve does not change, so the flag is set
+        // explicitly rather than re-baselining 39 to 32 and burying the reason.
+        server.app.state.usage_strip_enabled = false;
 
         let (desktop_tx, _desktop_control_rx, desktop_rx) = test_client_writer();
         let (mobile_tx, _mobile_control_rx, mobile_rx) = test_client_writer();

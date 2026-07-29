@@ -1177,6 +1177,13 @@ mod tests {
     #[tokio::test]
     async fn scheduled_tasks_do_not_start_pending_agent_resume_when_geometry_dirty() {
         let (mut app, pane_id) = test_app_with_pane();
+        // fork(native-dashes): `next_dash_tick` is initialised to `Instant::now()`
+        // in `App::new`, so it is already due by the time any test calls into the
+        // scheduler and the ~1 Hz dashboard refresh reports work done. This test
+        // is about the pending-agent-resume gate, not the dash tick, so push the
+        // tick out of the way explicitly. Its headless twin passes untouched
+        // because the headless path never includes the tick at all.
+        app.next_dash_tick = Instant::now() + Duration::from_secs(3600);
         app.state.ensure_test_terminals();
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
             foreground: Some(crate::terminal_theme::RgbColor {
