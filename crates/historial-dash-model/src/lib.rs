@@ -7,7 +7,12 @@
 use serde::{Deserialize, Serialize};
 
 /// One row in the historial panel: a previously-closed pane, newest first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Default` is derived so tests and fixtures can build a row from the two or
+/// three fields they care about with `..Default::default()`. Every field is a
+/// `String` or `bool` whose zero value already means "unknown/absent" on the
+/// wire — the same meaning `#[serde(default)]` gives the optional ones — so the
+/// derive introduces no state the deserializer could not already produce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HistorialRow {
     /// Stable routing key `"<ts_unix_ms>:<pane_id>"`. The host parses this back
     /// out of a clicked hit-rect's `action_id` to find the source record.

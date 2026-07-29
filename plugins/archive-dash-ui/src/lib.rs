@@ -699,15 +699,42 @@ mod tests {
         let _g = guard();
         reset();
         set_items(vec![item(1, "alpha", "claude", ""), item(2, "beta", "codex", "")]);
+        // Both chips must land on ONE row for the "wrong row" assertion below to
+        // mean what it says. `reset()` leaves PANEL_WIDTH at 0, which clamps to
+        // the 20-cell floor and wraps `beta` onto row 1 directly beneath
+        // `alpha` — so (col, oy + 1) resolved to chip 1, not to None, and the
+        // test read as a hit-testing bug when it was really an unset width.
+        *PANEL_WIDTH.lock().unwrap() = 80;
         *STRIP_ORIGIN.lock().unwrap() = Some((10, 5));
         let items = ITEMS.lock().unwrap().clone();
         let (_, segs) = strip_rows(&items);
         let s0 = &segs[0];
+        let s1 = &segs[1];
+        assert_eq!((s0.row, s1.row), (0, 0), "both chips fit on one row at w=80");
         let col = 10 + s0.x + s0.width / 2;
         assert_eq!(chip_at(col, 5), Some(0));
         assert_eq!(chip_at(col, 6), None); // wrong row
-        let s1 = &segs[1];
         assert_eq!(chip_at(10 + s1.x + s1.width / 2, 5), Some(1));
+        reset();
+    }
+
+    /// The companion case the single-row test above cannot cover: once the strip
+    /// wraps, a chip on row 1 is reachable ONLY at `oy + 1`, and the cell
+    /// directly above it belongs to whichever chip owns row 0.
+    #[test]
+    fn chip_at_follows_a_wrapped_chip_onto_its_own_row() {
+        let _g = guard();
+        reset();
+        set_items(vec![item(1, "alpha", "claude", ""), item(2, "beta", "codex", "")]);
+        *PANEL_WIDTH.lock().unwrap() = 20; // narrow enough to force a wrap
+        *STRIP_ORIGIN.lock().unwrap() = Some((10, 5));
+        let items = ITEMS.lock().unwrap().clone();
+        let (_, segs) = strip_rows(&items);
+        assert_eq!((segs[0].row, segs[1].row), (0, 1), "narrow strip wraps");
+        let col = 10 + segs[1].x + segs[1].width / 2;
+        assert_eq!(chip_at(col, 6), Some(1));
+        assert_eq!(chip_at(col, 5), Some(0)); // the row above is still chip 0
+        assert_eq!(chip_at(col, 7), None); // nothing below the last row
         reset();
     }
 
