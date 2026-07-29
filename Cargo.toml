@@ -28,7 +28,7 @@ crossterm = "0.29"
 ctrlc = "3"
 goal-dash-core = { path = "crates/goal-dash-core" }
 goal-dash-model = { path = "crates/goal-dash-model" }
-herdr-ui-plugin-api = { path = "crates/herdr-ui-plugin-api" }
+herdr-ui-plugin-api = { path = "crates/herdr-ui-plugin-api", features = ["schema"] }
 harness-manager-model = { path = "crates/harness-manager-model" }
 historial-dash-model = { path = "crates/historial-dash-model" }
 interprocess = "2.4.2"

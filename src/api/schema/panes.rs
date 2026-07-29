@@ -315,19 +315,11 @@ pub struct PaneGraphicsSetParams {
     pub placement: PaneGraphicsPlacementParams,
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
-)]
-pub struct PaneGraphicsPlacementParams {
-    #[serde(default)]
-    pub viewport_col: i32,
-    #[serde(default)]
-    pub viewport_row: i32,
-    #[serde(default)]
-    pub grid_cols: u32,
-    #[serde(default)]
-    pub grid_rows: u32,
-}
+/// The placement type now lives in `herdr-ui-plugin-api` so that GUESTS can
+/// depend on it and be compile-checked on the field names, which is the only
+/// thing that would have prevented the `col`/`row` misrender (see the type's own
+/// docs). This alias keeps the host's schema name stable.
+pub type PaneGraphicsPlacementParams = herdr_ui_plugin_api::PaneGraphicsPlacement;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsClearParams {

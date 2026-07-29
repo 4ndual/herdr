@@ -543,3 +543,251 @@ mod host_effect_tests {
         assert_eq!(encoded, r#"{"kind":"copy_text","text":"/tmp/x"}"#);
     }
 }
+
+// ── Pane graphics placement ────────────────────────────────────────────────
+
+/// Where a pane-graphics (or pane-text) layer sits, in terminal CELLS.
+///
+/// # Why this lives HERE and not in the host
+///
+/// It used to live only in the herdr binary crate, as
+/// `api::schema::PaneGraphicsPlacementParams`. Guests cannot reach that, so
+/// every guest hand-rolled the JSON object — and got no compile-time check on
+/// the field names. `claude-image-preview` shipped `col`/`row` instead of
+/// `viewport_col`/`viewport_row` for its entire life: the host accepted the
+/// call, discarded the unknown keys, defaulted the real fields, and painted
+/// every image at the pane's top-left, stacked over the text it was annotating.
+/// The call returned success and logged nothing, and the plugin's own test
+/// suite was green because it asserted on the same wrong names.
+///
+/// Sharing the type is the only fix that makes that class of mistake a COMPILE
+/// error rather than a silent misrender. `deny_unknown_fields` on the host
+/// makes it a loud runtime error for callers that still build JSON by hand;
+/// this makes it impossible for callers that do not.
+///
+/// # Extents are `Option`, and `Some(0)` is invalid
+///
+/// A missing extent means "the whole pane in that axis" — the long-standing
+/// default, and the reason `Default` is still meaningful. An extent that is
+/// present but zero is REJECTED rather than silently meaning whole-pane,
+/// because those two are worlds apart on screen and the difference used to be
+/// one typo wide: any misspelled key defaulted its real field to 0, and 0 read
+/// as "fill the pane", so a typo became a full-pane opaque overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PaneGraphicsPlacement {
+    /// Column of the layer's left edge, relative to the pane's text viewport.
+    /// May be negative: a placement starting off the left edge paints its
+    /// visible remainder, matching kitty.
+    #[serde(default)]
+    pub viewport_col: i32,
+    /// Row of the layer's top edge. Negative is legal, as above.
+    #[serde(default)]
+    pub viewport_row: i32,
+    /// Width in cells. `None` = the full pane width. `Some(0)` is an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_cols: Option<u32>,
+    /// Height in cells. `None` = the full pane height. `Some(0)` is an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_rows: Option<u32>,
+}
+
+impl PaneGraphicsPlacement {
+    /// The whole pane, in both axes.
+    ///
+    /// Spelled out rather than left to `Default::default()` so that "I meant the
+    /// entire pane" is visible at the call site. It is also the answer to the
+    /// question `box_at` panics on: a zero-sized box is never the way to ask for
+    /// everything.
+    pub const fn whole_pane() -> Self {
+        Self {
+            viewport_col: 0,
+            viewport_row: 0,
+            grid_cols: None,
+            grid_rows: None,
+        }
+    }
+
+    /// A box of `cols` x `rows` cells with its top-left at `col`/`row`.
+    ///
+    /// Takes bare `u32` on purpose: a caller writing `Some(cols)` is reasoning
+    /// about the representation again, which is what these constructors exist to
+    /// stop.
+    ///
+    /// # Panics
+    ///
+    /// If either extent is zero. Zero is not "the whole pane" — that is
+    /// [`whole_pane`](Self::whole_pane) — and it is not a size either, so there
+    /// is no honest placement to build.
+    ///
+    /// **This is a compile error only when the call is actually const-evaluated**
+    /// (a `const`/`static` initialiser, or a const-generic position). In ordinary
+    /// code — which is nearly every real call site — `box_at(x, y, 0, 0)` is a
+    /// normal runtime call and panics at runtime like any other assert. Do not
+    /// rely on the build catching a literal zero for you. For extents computed at
+    /// run time that may legitimately clamp to zero, use
+    /// [`try_box_at`](Self::try_box_at) and handle the `None`.
+    pub const fn box_at(col: i32, row: i32, cols: u32, rows: u32) -> Self {
+        assert!(
+            cols > 0,
+            "placement width must be greater than 0; use PaneGraphicsPlacement::whole_pane() for the full pane"
+        );
+        assert!(
+            rows > 0,
+            "placement height must be greater than 0; use PaneGraphicsPlacement::whole_pane() for the full pane"
+        );
+        Self {
+            viewport_col: col,
+            viewport_row: row,
+            grid_cols: Some(cols),
+            grid_rows: Some(rows),
+        }
+    }
+
+    /// [`box_at`](Self::box_at) for extents that may legitimately be zero,
+    /// returning `None` instead of panicking.
+    ///
+    /// This exists so that a caller whose `cols`/`rows` come out of a layout
+    /// calculation has somewhere to go other than the panicking constructor.
+    /// Without it the ergonomic path is also the fragile one, and a guest that
+    /// clamps to zero takes the whole plugin down instead of skipping a frame.
+    pub fn try_box_at(col: i32, row: i32, cols: u32, rows: u32) -> Option<Self> {
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        Some(Self::box_at(col, row, cols, rows))
+    }
+
+    /// `Err` with a caller-facing reason when an extent is present but zero.
+    ///
+    /// Deliberately NOT a clamp-to-1 or a fallback to whole-pane: both would put
+    /// something plausible on screen and leave the caller believing its numbers
+    /// were used, which is the failure mode this whole type exists to end.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.grid_cols == Some(0) {
+            return Err(
+                "placement.grid_cols must be greater than 0; omit it for the full pane width",
+            );
+        }
+        if self.grid_rows == Some(0) {
+            return Err(
+                "placement.grid_rows must be greater than 0; omit it for the full pane height",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::PaneGraphicsPlacement;
+
+    #[test]
+    fn whole_pane_omits_both_extents_rather_than_zeroing_them() {
+        let placement = PaneGraphicsPlacement::whole_pane();
+        assert_eq!(placement.grid_cols, None);
+        assert_eq!(placement.grid_rows, None);
+        assert!(placement.validate().is_ok());
+        // The distinction the whole type turns on: "whole pane" must not be
+        // expressible as a present zero, or we are back to the sentinel.
+        assert_ne!(
+            placement,
+            PaneGraphicsPlacement {
+                grid_cols: Some(0),
+                grid_rows: Some(0),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn box_at_wraps_the_extents_so_callers_never_write_some() {
+        let placement = PaneGraphicsPlacement::box_at(2, 1, 40, 12);
+        assert_eq!(placement.viewport_col, 2);
+        assert_eq!(placement.viewport_row, 1);
+        assert_eq!(placement.grid_cols, Some(40));
+        assert_eq!(placement.grid_rows, Some(12));
+        assert!(placement.validate().is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "placement width must be greater than 0")]
+    fn box_at_panics_rather_than_building_a_zero_extent() {
+        // `validate` only runs on the wire path, so without this assert the
+        // ergonomic constructor could build in-process exactly the state every
+        // other layer rejects.
+        let _ = PaneGraphicsPlacement::box_at(0, 0, 0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "placement height must be greater than 0")]
+    fn box_at_panics_on_a_zero_height_too() {
+        let _ = PaneGraphicsPlacement::box_at(0, 0, 4, 0);
+    }
+
+    #[test]
+    fn try_box_at_is_none_for_a_degenerate_box_and_never_upgrades_it() {
+        assert_eq!(PaneGraphicsPlacement::try_box_at(0, 0, 0, 4), None);
+        assert_eq!(PaneGraphicsPlacement::try_box_at(0, 0, 4, 0), None);
+        // Specifically NOT whole_pane(): mapping a zero extent to "everything"
+        // is how a nothing-sized box becomes a full-pane overlay, which is the
+        // original bug wearing a different hat.
+        assert_ne!(
+            PaneGraphicsPlacement::try_box_at(0, 0, 0, 0),
+            Some(PaneGraphicsPlacement::whole_pane())
+        );
+        assert_eq!(
+            PaneGraphicsPlacement::try_box_at(3, 4, 10, 5),
+            Some(PaneGraphicsPlacement::box_at(3, 4, 10, 5))
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_is_rejected_rather_than_defaulted() {
+        // This is the exact payload claude-image-preview shipped. Before
+        // deny_unknown_fields it deserialized happily into an all-zero
+        // placement, which the painter read as "the whole pane".
+        let err = serde_json::from_str::<PaneGraphicsPlacement>(
+            r#"{"col":2,"row":1,"grid_cols":40,"grid_rows":12}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("col"), "{err}");
+    }
+
+    #[test]
+    fn omitted_extents_mean_whole_pane_and_stay_omitted_on_the_wire() {
+        let placement = serde_json::from_str::<PaneGraphicsPlacement>(r#"{}"#).unwrap();
+        assert_eq!(placement, PaneGraphicsPlacement::default());
+        assert_eq!(placement.grid_cols, None);
+        assert!(placement.validate().is_ok());
+        assert_eq!(
+            serde_json::to_string(&placement).unwrap(),
+            r#"{"viewport_col":0,"viewport_row":0}"#
+        );
+    }
+
+    #[test]
+    fn a_present_but_zero_extent_is_an_error_not_a_full_pane_overlay() {
+        let placement = PaneGraphicsPlacement {
+            grid_cols: Some(0),
+            ..Default::default()
+        };
+        assert!(placement.validate().unwrap_err().contains("grid_cols"));
+        let placement = PaneGraphicsPlacement {
+            grid_rows: Some(0),
+            ..Default::default()
+        };
+        assert!(placement.validate().unwrap_err().contains("grid_rows"));
+    }
+
+    #[test]
+    fn a_negative_origin_is_legal() {
+        let placement =
+            serde_json::from_str::<PaneGraphicsPlacement>(r#"{"viewport_col":-3,"grid_cols":10}"#)
+                .unwrap();
+        assert_eq!(placement.viewport_col, -3);
+        assert_eq!(placement.grid_cols, Some(10));
+        assert!(placement.validate().is_ok());
+    }
+}

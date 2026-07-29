@@ -9,9 +9,14 @@ license = "AGPL-3.0-or-later"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ratatui = { version = "0.30", default-features = false, optional = true }
+schemars = { version = "1.2.1", features = ["derive"], optional = true }
 
 [features]
 # Enabled by WASM guest crates that render with ratatui into an off-screen
 # Buffer and flatten it back to UiNode::Line rows. The host never enables it.
 guest = ["dep:ratatui"]
+# Enabled by the HOST so the shared wire types can be emitted into the JSON API
+# schema artifact. Guests never enable it — it would pull schemars into every
+# wasm module for a derive only the schema generator reads.
+schema = ["dep:schemars"]
 

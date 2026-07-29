@@ -901,16 +901,18 @@ fn pane_graphics_host_placement(
         layer.data.clone()
     };
     let render = layer.render;
-    let grid_cols = if render.grid_cols == 0 {
-        u32::from(info.inner_rect.width)
-    } else {
-        render.grid_cols
-    };
-    let grid_rows = if render.grid_rows == 0 {
-        u32::from(info.inner_rect.height)
-    } else {
-        render.grid_rows
-    };
+    // An omitted extent means the whole pane in that axis; a present zero never
+    // reaches here because `PaneGraphicsPlacement::validate` rejects it at the
+    // API boundary. This is the SECOND copy of that rule in the tree — see the
+    // note on `pane_graphics_paint::layer_area`, which says two implementations
+    // of one placement contract is how a plugin ends up painting an image and
+    // its caption in different places. It was already true when that was written.
+    let grid_cols = render
+        .grid_cols
+        .unwrap_or_else(|| u32::from(info.inner_rect.width));
+    let grid_rows = render
+        .grid_rows
+        .unwrap_or_else(|| u32::from(info.inner_rect.height));
 
     HostPlacement {
         pane_id: info.id,
@@ -2035,8 +2037,8 @@ mod tests {
         assert_eq!(placement.placement.format, KittyImageFormat::Png);
         assert!(placement.placement.data_len > 0);
         // 40x40 px at 10x10 cells => 4x4 natural cells, fits the 6x6 rect.
-        assert_eq!(placement.placement.render.grid_cols, 4);
-        assert_eq!(placement.placement.render.grid_rows, 4);
+        assert_eq!(placement.placement.render.grid_cols, Some(4));
+        assert_eq!(placement.placement.render.grid_rows, Some(4));
 
         let mut images = HashMap::new();
         let mut host_placements = HashMap::new();

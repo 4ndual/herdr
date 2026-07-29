@@ -613,8 +613,8 @@ mod tests {
                 data_base64: data,
                 source_path: String::new(),
                 placement: crate::api::schema::PaneGraphicsPlacementParams {
-                    grid_cols: 10,
-                    grid_rows: 4,
+                    grid_cols: Some(10),
+                    grid_rows: Some(4),
                     ..Default::default()
                 },
             }),
@@ -630,8 +630,8 @@ mod tests {
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].image_width, 1);
         assert_eq!(layers[0].image_height, 1);
-        assert_eq!(layers[0].render.grid_cols, 10);
-        assert_eq!(layers[0].render.grid_rows, 4);
+        assert_eq!(layers[0].render.grid_cols, Some(10));
+        assert_eq!(layers[0].render.grid_rows, Some(4));
         assert!(!app.state.session_dirty);
 
         let response = app.handle_api_request(crate::api::schema::Request {

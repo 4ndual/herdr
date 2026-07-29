@@ -5347,11 +5347,7 @@ mod tests {
                 1,
                 1,
                 vec![1, 2, 3, 4],
-                crate::api::schema::PaneGraphicsPlacementParams {
-                    grid_cols: 1,
-                    grid_rows: 1,
-                    ..Default::default()
-                },
+                crate::api::schema::PaneGraphicsPlacementParams::box_at(0, 0, 1, 1),
                 Some("plugin:images".to_string()),
                 "img-1".to_string(),
             )],

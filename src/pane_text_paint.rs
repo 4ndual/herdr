@@ -198,8 +198,8 @@ mod tests {
         PaneGraphicsPlacementParams {
             viewport_col: col,
             viewport_row: row,
-            grid_cols: cols,
-            grid_rows: rows,
+            grid_cols: Some(cols),
+            grid_rows: Some(rows),
         }
     }
 

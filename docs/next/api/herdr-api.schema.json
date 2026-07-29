@@ -2497,27 +2497,37 @@
           ],
           "type": "string"
         },
-        "PaneGraphicsPlacementParams": {
+        "PaneGraphicsPlacement": {
+          "additionalProperties": false,
+          "description": "Where a pane-graphics (or pane-text) layer sits, in terminal CELLS.\n\n# Why this lives HERE and not in the host\n\nIt used to live only in the herdr binary crate, as\n`api::schema::PaneGraphicsPlacementParams`. Guests cannot reach that, so\nevery guest hand-rolled the JSON object — and got no compile-time check on\nthe field names. `claude-image-preview` shipped `col`/`row` instead of\n`viewport_col`/`viewport_row` for its entire life: the host accepted the\ncall, discarded the unknown keys, defaulted the real fields, and painted\nevery image at the pane's top-left, stacked over the text it was annotating.\nThe call returned success and logged nothing, and the plugin's own test\nsuite was green because it asserted on the same wrong names.\n\nSharing the type is the only fix that makes that class of mistake a COMPILE\nerror rather than a silent misrender. `deny_unknown_fields` on the host\nmakes it a loud runtime error for callers that still build JSON by hand;\nthis makes it impossible for callers that do not.\n\n# Extents are `Option`, and `Some(0)` is invalid\n\nA missing extent means \"the whole pane in that axis\" — the long-standing\ndefault, and the reason `Default` is still meaningful. An extent that is\npresent but zero is REJECTED rather than silently meaning whole-pane,\nbecause those two are worlds apart on screen and the difference used to be\none typo wide: any misspelled key defaulted its real field to 0, and 0 read\nas \"fill the pane\", so a typo became a full-pane opaque overlay.",
           "properties": {
             "grid_cols": {
-              "default": 0,
+              "description": "Width in cells. `None` = the full pane width. `Some(0)` is an error.",
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "grid_rows": {
-              "default": 0,
+              "description": "Height in cells. `None` = the full pane height. `Some(0)` is an error.",
               "format": "uint32",
               "minimum": 0,
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "viewport_col": {
               "default": 0,
+              "description": "Column of the layer's left edge, relative to the pane's text viewport.\nMay be negative: a placement starting off the left edge paints its\nvisible remainder, matching kitty.",
               "format": "int32",
               "type": "integer"
             },
             "viewport_row": {
               "default": 0,
+              "description": "Row of the layer's top edge. Negative is legal, as above.",
               "format": "int32",
               "type": "integer"
             }
@@ -2552,10 +2562,8 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacementParams",
+              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacement",
               "default": {
-                "grid_cols": 0,
-                "grid_rows": 0,
                 "viewport_col": 0,
                 "viewport_row": 0
               }
@@ -3200,10 +3208,8 @@
               "type": "string"
             },
             "placement": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacementParams",
+              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacement",
               "default": {
-                "grid_cols": 0,
-                "grid_rows": 0,
                 "viewport_col": 0,
                 "viewport_row": 0
               }

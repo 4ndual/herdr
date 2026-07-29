@@ -127,16 +127,13 @@ pub(crate) fn layer_area(
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
-    let cols = if render.grid_cols == 0 {
-        u32::from(inner.width)
-    } else {
-        render.grid_cols
-    };
-    let rows = if render.grid_rows == 0 {
-        u32::from(inner.height)
-    } else {
-        render.grid_rows
-    };
+    // An OMITTED extent means "the whole pane in that axis". A PRESENT zero is
+    // rejected at the API boundary (`PaneGraphicsPlacement::validate`) rather
+    // than reaching here, because the two used to be indistinguishable: every
+    // field defaulted to 0 and 0 meant whole-pane, so one misspelled key turned
+    // into a full-pane opaque overlay that reported success.
+    let cols = render.grid_cols.unwrap_or_else(|| u32::from(inner.width));
+    let rows = render.grid_rows.unwrap_or_else(|| u32::from(inner.height));
     if cols == 0 || rows == 0 {
         return None;
     }
@@ -239,8 +236,8 @@ mod tests {
         PaneGraphicsPlacementParams {
             viewport_col: col,
             viewport_row: row,
-            grid_cols: cols,
-            grid_rows: rows,
+            grid_cols: Some(cols),
+            grid_rows: Some(rows),
         }
     }
 
@@ -251,16 +248,41 @@ mod tests {
         height: 20,
     };
 
+    /// Replaces `zero_grid_dims_mean_the_whole_pane`, which pinned the sentinel
+    /// this change exists to remove. OMITTED extents are now the way to ask for
+    /// the whole pane; a PRESENT zero is a caller error, not a synonym for
+    /// "everything" (see the pair below).
     #[test]
-    fn zero_grid_dims_mean_the_whole_pane() {
+    fn omitted_grid_dims_mean_the_whole_pane() {
         let l = layer(
             PaneGraphicsFormat::Rgb,
             1,
             1,
             vec![0; 3],
-            placement(0, 0, 0, 0),
+            PaneGraphicsPlacementParams::whole_pane(),
         );
         assert_eq!(layer_area(&l.render, INNER), Some(INNER));
+    }
+
+    /// The other half of that boundary, stated explicitly rather than left to
+    /// the `cols == 0` guard's shape. A present zero must NOT resolve to the
+    /// whole pane: that equivalence is what turned one misspelled key into a
+    /// full-pane opaque overlay that reported success.
+    #[test]
+    fn a_present_zero_extent_paints_nothing_rather_than_everything() {
+        let l = layer(
+            PaneGraphicsFormat::Rgb,
+            1,
+            1,
+            vec![0; 3],
+            PaneGraphicsPlacementParams {
+                grid_cols: Some(0),
+                grid_rows: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(layer_area(&l.render, INNER), None);
+        assert_ne!(layer_area(&l.render, INNER), Some(INNER));
     }
 
     #[test]
