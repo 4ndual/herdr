@@ -1642,11 +1642,8 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
     rows.truncate(MAX_ROWS * 2);
     // Disabled hooks live only in the stash — config no longer mentions them —
     // so append them here or they are invisible and un-enableable.
-    let live: std::collections::HashSet<(String, Option<String>)> = cache
-        .hooks
-        .iter()
-        .map(|h| (h.name.clone(), None))
-        .collect();
+    let live: std::collections::HashSet<(String, Option<String>)> =
+        cache.hooks.iter().map(|h| (h.name.clone(), None)).collect();
     rows.extend(stashed_rows(
         &cache.stashed,
         "hook",
@@ -2079,10 +2076,7 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
         // into -- being absent from config is what makes them stash rows.
         // Key shape: `stash:<kind>:<name>`, with the project scope (if any)
         // recovered from the record itself at restore time.
-        (
-            HarnessActionKind::EnableSession | HarnessActionKind::EnableProfile,
-            "stash",
-        ) => {
+        (HarnessActionKind::EnableSession | HarnessActionKind::EnableProfile, "stash") => {
             let (stash_kind, name) = idx.split_once(':')?;
             Some(ResolvedAction::Enable(
                 stash_kind.to_string(),
@@ -2109,7 +2103,11 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
         // does the opposite of what it offered.
         (HarnessActionKind::EnableSession | HarnessActionKind::EnableProfile, "plugin") => {
             let i: usize = idx.parse().ok()?;
-            cache.plugins.get(i).cloned().map(ResolvedAction::EnablePlugin)
+            cache
+                .plugins
+                .get(i)
+                .cloned()
+                .map(ResolvedAction::EnablePlugin)
         }
         (_, "plugin") => {
             let i: usize = idx.parse().ok()?;
@@ -2154,7 +2152,9 @@ fn write_atomic(path: &Path, json: &str) -> bool {
     // Same directory ⇒ same filesystem ⇒ the rename below is atomic.
     let tmp = dir.join(format!(
         ".{}.herdr-tmp-{}",
-        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        path.file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default(),
         std::process::id()
     ));
     let write_and_sync = || -> std::io::Result<()> {
@@ -2566,7 +2566,11 @@ fn restore_from_stash(stash: &Path, kind: &str, name: &str, project: Option<&str
     match serde_json::to_string_pretty(&serde_json::Value::Array(remaining)) {
         Ok(pruned) => {
             if !write_atomic(stash, &pruned) {
-                tracing::warn!(kind, name, "harness enable: restored, but stash prune failed");
+                tracing::warn!(
+                    kind,
+                    name,
+                    "harness enable: restored, but stash prune failed"
+                );
             }
         }
         Err(err) => {
@@ -2819,7 +2823,11 @@ impl App {
                         r.get("kind").and_then(|k| k.as_str()).unwrap_or("hook") == kind
                             && r.get("name").and_then(|n| n.as_str()) == Some(name)
                     })
-                    .map(|r| r.get("project").and_then(|p| p.as_str()).map(str::to_string))
+                    .map(|r| {
+                        r.get("project")
+                            .and_then(|p| p.as_str())
+                            .map(str::to_string)
+                    })
             })
             .flatten();
         if !restore_from_stash(&stash, kind, name, project.as_deref()) {
@@ -3010,8 +3018,7 @@ mod tests {
     /// binary. The script is the last such token, never the first.
     #[test]
     fn hook_script_path_picks_the_script_not_the_interpreter() {
-        let dir = std::env::temp_dir()
-            .join(format!("harness-script-path-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("harness-script-path-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let interp = dir.join("bun");
         let script = dir.join("pre_tool_use.ts");
@@ -3463,10 +3470,7 @@ mod tests {
         std::fs::write(&f, "{\"old\":true}").expect("seed");
 
         assert!(write_atomic(&f, "{\"new\":true}"));
-        assert_eq!(
-            std::fs::read_to_string(&f).expect("read"),
-            "{\"new\":true}"
-        );
+        assert_eq!(std::fs::read_to_string(&f).expect("read"), "{\"new\":true}");
 
         // Exactly the destination remains -- no leftover temp file beside it.
         let left: Vec<String> = std::fs::read_dir(&dir)

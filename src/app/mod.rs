@@ -2161,6 +2161,7 @@ impl App {
                     let key_id = repeat_key_identity(&key);
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
+                            self.offer_key_to_ui_plugins(key.as_key_event());
                             if self.state.popup_pane.is_some() || self.state.mode == Mode::Terminal
                             {
                                 self.suppressed_repeat_keys.remove(&key_id);
@@ -2232,6 +2233,41 @@ impl App {
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);
+        }
+    }
+
+    /// Offers a key press to the wasm UI plugins that declared `keyboard_input`.
+    ///
+    /// This closes the same class of gap `drain_pending_plugin_ui_actions`
+    /// documents below: the offer existed only on the interactive
+    /// `App::handle_key` path (`app/input/mod.rs`), and herdr runs HEADLESS in
+    /// production, so `keyboard_input` was a capability the host negotiated,
+    /// granted, and then never delivered on. plugin-manager's manifest records
+    /// the measurement ("`UiEvent::Key` never actually reaches a right_panel
+    /// module even when this is declared and negotiated"); this is the delivery
+    /// gap it was waiting on.
+    ///
+    /// The offer is deliberately NOT a consume. `dispatch_crossterm_key_event`
+    /// returns "did any module change", not "did a module claim this key", and
+    /// the guest ABI has no way to say the latter — so the key still goes on to
+    /// the pane or the mode handler exactly as before. That is the interactive
+    /// path's semantics too, and it is the semantics doctor-dash was written
+    /// against ("keys are broadcast to plugins but NOT consumable, so no
+    /// destructive key is bound"). Making keys consumable is an ABI change, not
+    /// a delivery fix, and must not be smuggled in here: it would silently
+    /// invalidate that plugin's safety argument.
+    ///
+    /// Mirrors the interactive path's ordering: popup panes own the keyboard
+    /// outright and return before the offer, so a plugin never sees keystrokes
+    /// typed into a popup.
+    fn offer_key_to_ui_plugins(&mut self, key: crossterm::event::KeyEvent) {
+        if self.state.popup_pane.is_some() {
+            return;
+        }
+        if self.ui_plugins.dispatch_crossterm_key_event(key) {
+            self.refresh_ui_plugin_state_from_manager();
+            self.apply_ui_plugin_effects();
+            self.request_render();
         }
     }
 
@@ -7907,6 +7943,180 @@ last_pane = "prefix+tab"
         );
         assert!(popup_rx.try_recv().is_ok());
         assert!(tiled_rx.try_recv().is_err());
+    }
+
+    /// Builds a one-module wasm plugin that rewrites its own header layer on
+    /// any event it is allowed to see. Whether the header text changed is
+    /// therefore a direct read of "did this event reach the guest", which is
+    /// the only thing these two tests need to distinguish.
+    fn key_probe_plugin(
+        slug: &str,
+        capabilities: Vec<crate::api::schema::PluginUiCapability>,
+    ) -> crate::api::schema::InstalledPluginInfo {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-headless-key-{slug}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("dist")).expect("probe dist dir");
+        let initial = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"no-key","role":"accent"}]}]}]}"#;
+        let updated = r#"{"layers":[{"surface":"header","nodes":[{"kind":"line","spans":[{"text":"got-key","role":"accent"}]}]}]}"#;
+        let bytes = |s: &str| {
+            s.as_bytes()
+                .iter()
+                .map(|b| format!("\\{:02x}", b))
+                .collect::<String>()
+        };
+        let wat = format!(
+            "(module
+                (memory (export \"memory\") 1)
+                (data (i32.const 0) \"{initial_data}\")
+                (data (i32.const 2048) \"{updated_data}\")
+                (func (export \"herdr_ui_api_version\") (result i32) i32.const 2)
+                (func (export \"herdr_ui_static_update_ptr\") (result i32) i32.const 0)
+                (func (export \"herdr_ui_static_update_len\") (result i32) i32.const {initial_len})
+                (func (export \"herdr_ui_alloc\") (param i32) (result i32) i32.const 1024)
+                (func (export \"herdr_ui_on_event\") (param i32 i32) (result i32) i32.const 2048)
+                (func (export \"herdr_ui_on_event_len\") (result i32) i32.const {updated_len})
+            )",
+            initial_data = bytes(initial),
+            updated_data = bytes(updated),
+            initial_len = initial.len(),
+            updated_len = updated.len(),
+        );
+        let wasm = wat::parse_str(&wat).expect("probe wat");
+        std::fs::write(root.join("dist/probe.wasm"), wasm).expect("probe wasm");
+
+        crate::api::schema::InstalledPluginInfo {
+            plugin_id: format!("test.key-{slug}"),
+            name: "Key Probe".into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: root.join("herdr-plugin.toml").display().to_string(),
+            plugin_root: root.display().to_string(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: Vec::new(),
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                id: "probe".into(),
+                title: "Key Probe".into(),
+                description: None,
+                platforms: None,
+                kind: crate::api::schema::PluginUiModuleKind::Wasm,
+                api_version: 2,
+                module: "dist/probe.wasm".into(),
+                hot_reload: crate::api::schema::PluginHotReloadMode::On,
+                surfaces: vec![crate::api::schema::PluginUiSurface::Header],
+                placement: None,
+                capabilities,
+                ui_input_file: None,
+                image_file: None,
+                graphics_roots: Vec::new(),
+                max_layers_per_pane: None,
+                collector: None,
+            }],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        }
+    }
+
+    /// Returns (did the guest see the key, did the pane receive bytes) after
+    /// one key press routed through the HEADLESS client path.
+    async fn headless_key_probe(
+        capabilities: Vec<crate::api::schema::PluginUiCapability>,
+        slug: &str,
+    ) -> (bool, bool) {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("tiled");
+        let focused = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut rx) = TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(focused, runtime);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+
+        let plugin = key_probe_plugin(slug, capabilities);
+        let root = std::path::PathBuf::from(plugin.plugin_root.clone());
+        app.ui_plugins = crate::ui_plugins::UiPluginManager::from_installed_plugins(
+            &std::collections::HashMap::from([(plugin.plugin_id.clone(), plugin)]),
+        );
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Key(
+                crate::input::TerminalKey::new(
+                    crossterm::event::KeyCode::Char('k'),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            )],
+            true,
+        );
+
+        let layers = app.ui_plugins.surface_layers();
+        let saw_key = match &layers[0].layer.nodes[0] {
+            herdr_ui_plugin_api::UiNode::Line { spans } => spans[0].text == "got-key",
+            _ => panic!("probe plugin did not render a line node"),
+        };
+        let pane_got_bytes = rx.try_recv().is_ok();
+        let _ = std::fs::remove_dir_all(root);
+        (saw_key, pane_got_bytes)
+    }
+
+    /// herdr runs HEADLESS in production, and `route_client_events` never
+    /// offered keys to wasm plugins — so `keyboard_input` was negotiated,
+    /// granted, and then never delivered on. plugin-manager's manifest records
+    /// the measurement of exactly this.
+    ///
+    /// The second assertion is as load-bearing as the first: delivery is an
+    /// OFFER, not a consume. The guest ABI has no way to claim a key, so the
+    /// pane must still receive it — doctor-dash's safety argument ("keys are
+    /// broadcast to plugins but NOT consumable, so no destructive key is
+    /// bound") depends on that staying true.
+    #[tokio::test]
+    async fn a_declared_keyboard_plugin_sees_the_key_and_the_pane_still_gets_it() {
+        let (saw_key, pane_got_bytes) = headless_key_probe(
+            vec![crate::api::schema::PluginUiCapability::KeyboardInput],
+            "declared",
+        )
+        .await;
+        assert!(
+            saw_key,
+            "a plugin declaring keyboard_input never received the key on the headless path"
+        );
+        assert!(
+            pane_got_bytes,
+            "the key was swallowed before the pane — delivery must be an offer, not a consume"
+        );
+    }
+
+    /// The other half of the contract: opening the delivery path must not make
+    /// every plugin a keylogger, and must not disturb ordinary typing. A module
+    /// that did not declare `keyboard_input` sees nothing, and the pane is
+    /// unaffected either way.
+    #[tokio::test]
+    async fn an_undeclared_plugin_never_sees_the_key_and_typing_is_untouched() {
+        let (saw_key, pane_got_bytes) = headless_key_probe(
+            vec![crate::api::schema::PluginUiCapability::FocusedSession],
+            "undeclared",
+        )
+        .await;
+        assert!(
+            !saw_key,
+            "a plugin WITHOUT keyboard_input received the key — the capability gate is not holding"
+        );
+        assert!(
+            pane_got_bytes,
+            "ordinary typing stopped reaching the pane when a plugin was loaded"
+        );
     }
 
     #[test]
