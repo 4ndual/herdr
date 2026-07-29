@@ -1146,6 +1146,7 @@ impl HeadlessServer {
             panes,
             params.expected_protocol,
             params.expected_version,
+            self.app.ui_plugins.save_guest_state(),
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -4584,6 +4585,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             event_hub.clone(),
             &received.manifest.snapshot,
             &mut imports,
+            &received.manifest.ui_plugin_state,
         )?;
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;

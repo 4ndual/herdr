@@ -1169,6 +1169,7 @@ impl App {
             u32,
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
+        ui_plugin_state: &[crate::ui_plugins::UiPluginGuestState],
     ) -> io::Result<Self> {
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
@@ -1197,6 +1198,15 @@ impl App {
         // imported server arms its layer set exactly the way a fresh boot does.
         crate::bundled_plugins::merge_bundled_ui_plugins(&mut app.state.installed_plugins);
         app.resync_ui_plugins_after_lifecycle_change();
+        // The resync above instantiates every module fresh, so guests come up at
+        // their defaults. Push the carried state in now — after instantiation,
+        // before the first frame — so opted-in toggles survive the swap instead of
+        // resetting. Guests that do not implement the exposure carry nothing and
+        // are unaffected.
+        if !ui_plugin_state.is_empty() {
+            app.ui_plugins.restore_guest_state(ui_plugin_state);
+            app.refresh_ui_plugin_state_from_manager();
+        }
         let now = Instant::now();
         if background_update_check_enabled(app.no_session, app.update_version_check_enabled) {
             app.next_auto_update_check = app
@@ -4326,6 +4336,7 @@ mod tests {
             crate::api::EventHub::default(),
             &snapshot,
             &mut std::collections::HashMap::new(),
+            &[],
         )
         .expect("handoff import app");
 
@@ -4341,6 +4352,144 @@ mod tests {
                 .map(|module| module.plugin_id.clone())
                 .collect::<Vec<_>>()
         );
+
+        if let Some(value) = original_config_home {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&config_home);
+    }
+
+    /// fork(wave-2): the import path must push carried guest state into the
+    /// freshly instantiated modules. Guards the call site, not just the manager
+    /// helper — removing the `restore_guest_state` call in `new_from_handoff`
+    /// makes this fail while the ui_plugins round-trip test still passes.
+    #[cfg(unix)]
+    #[test]
+    fn handoff_import_restores_carried_guest_state() {
+        use crate::api::schema::{
+            PluginHotReloadMode, PluginManifestUiModule, PluginUiModuleKind, PluginUiSurface,
+        };
+
+        let _guard = config_env_lock().lock().unwrap();
+        let config_home = temp_config_path("handoff-import-guest-state")
+            .parent()
+            .expect("temp config path has a parent")
+            .to_path_buf();
+        let original_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        // Same stateful fixture shape as the ui_plugins test: parks whatever it
+        // is given at offset 2048 and hands that span back on save.
+        let plugin_root = config_home.join("example.state-ui");
+        std::fs::create_dir_all(plugin_root.join("dist")).expect("create fixture dir");
+        let static_json = r#"{"scope":"partial","layers":[]}"#;
+        let data = static_json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{data}")
+                (global $saved_len (mut i32) (i32.const 0))
+                (func (export "herdr_ui_api_version") (result i32) i32.const 2)
+                (func (export "herdr_ui_static_update_ptr") (result i32) i32.const 0)
+                (func (export "herdr_ui_static_update_len") (result i32) i32.const {len})
+                (func (export "herdr_ui_alloc") (param i32) (result i32) i32.const 1024)
+                (func (export "herdr_ui_save_state_ptr") (result i32) i32.const 2048)
+                (func (export "herdr_ui_save_state_len") (result i32) global.get $saved_len)
+                (func (export "herdr_ui_restore_state") (param i32 i32) (result i32)
+                    (memory.copy (i32.const 2048) (local.get 0) (local.get 1))
+                    (global.set $saved_len (local.get 1))
+                    (i32.const 1))
+            )"#,
+            len = static_json.len()
+        );
+        std::fs::write(
+            plugin_root.join("dist/state-ui.wasm"),
+            wat::parse_str(&wat).expect("fixture wat parses"),
+        )
+        .expect("write fixture wasm");
+
+        let mut plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: "example.state-ui".to_string(),
+            name: "State UI".to_string(),
+            version: "0.1.0".to_string(),
+            min_herdr_version: crate::build_info::BASE_VERSION.to_string(),
+            description: None,
+            manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+            plugin_root: plugin_root.display().to_string(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: vec![],
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            ui_modules: vec![],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        };
+        plugin.ui_modules.push(PluginManifestUiModule {
+            max_layers_per_pane: None,
+            id: "state-ui".into(),
+            title: "State UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 2,
+            module: "dist/state-ui.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::Header],
+            placement: None,
+            capabilities: vec![],
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            collector: None,
+        });
+        crate::persist::plugin_registry::save_to_path(
+            &crate::config::config_dir().join("plugins.json"),
+            std::slice::from_ref(&plugin),
+        )
+        .expect("write plugin registry");
+
+        let snapshot = crate::persist::SessionSnapshot {
+            version: 0,
+            workspaces: Vec::new(),
+            active: None,
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let carried = vec![crate::ui_plugins::UiPluginGuestState {
+            plugin_id: "example.state-ui".to_string(),
+            module_id: "state-ui".to_string(),
+            state: b"{\"v\":1,\"expanded\":true}".to_vec(),
+        }];
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new_from_handoff(
+            &Config::default(),
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+            &snapshot,
+            &mut std::collections::HashMap::new(),
+            &carried,
+        )
+        .expect("handoff import app");
+
+        let saved = app.ui_plugins.save_guest_state();
+        let mine = saved
+            .iter()
+            .find(|entry| entry.plugin_id == "example.state-ui")
+            .expect("imported server holds the carried guest state");
+        assert_eq!(mine.state, carried[0].state);
 
         if let Some(value) = original_config_home {
             std::env::set_var("XDG_CONFIG_HOME", value);

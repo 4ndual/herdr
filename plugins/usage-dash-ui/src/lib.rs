@@ -68,6 +68,55 @@ pub extern "C" fn herdr_ui_static_update_len() -> i32 {
 
 // ── Event handler ──────────────────────────────────────────────────────────
 
+// ── Optional handoff state-carry exposure ──────────────────────────────────
+// A live handoff instantiates the guest fresh, so the collapse state above
+// resets and the strip springs back open under the user. These optional
+// exports carry it across the swap; omitting them means "reset me", which is
+// what every plugin that has not opted in still does.
+
+static SAVED_STATE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Park the serialized state so `_len` measures the same buffer, mirroring the
+/// `static_update_ptr`/`_len` contract. Only the guest-owned collapse flag
+/// travels: the render input and version-token hover are re-derived on the next
+/// frame, so carrying them would risk staleness for nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn herdr_ui_save_state_ptr() -> i32 {
+    let state = format!(
+        r#"{{"v":1,"collapsed":{}}}"#,
+        COLLAPSED.load(Ordering::SeqCst)
+    );
+    let mut guard = SAVED_STATE.lock().expect("saved state mutex poisoned");
+    *guard = state.into_bytes();
+    guard.as_ptr() as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn herdr_ui_save_state_len() -> i32 {
+    SAVED_STATE
+        .lock()
+        .expect("saved state mutex poisoned")
+        .len() as i32
+}
+
+/// Adopt a blob from the previous server. Returns 0 for anything unrecognised,
+/// which the host treats as "start fresh" — a version bump here degrades to the
+/// old reset behaviour instead of failing the handoff.
+#[unsafe(no_mangle)]
+pub extern "C" fn herdr_ui_restore_state(ptr: i32, len: i32) -> i32 {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len.max(0) as usize) };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return 0;
+    };
+    if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
+        return 0;
+    }
+    if let Some(collapsed) = value.get("collapsed").and_then(serde_json::Value::as_bool) {
+        COLLAPSED.store(collapsed, Ordering::SeqCst);
+    }
+    1
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_on_event(ptr: i32, len: i32) -> i32 {
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len.max(0) as usize) };

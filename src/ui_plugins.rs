@@ -115,6 +115,20 @@ impl RegisteredUiModule {
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(100);
 const EPOCH_DEADLINE_TICKS: u64 = 5;
 
+/// fork(wave-2): per-module ceiling on the handoff state blob. The exposure is
+/// for user intent (toggles, selections), not for shipping a guest's heap
+/// through the handoff manifest, which is a single JSON line. A guest over the
+/// limit is refused and starts fresh rather than bloating the swap.
+const MAX_GUEST_STATE_BYTES: usize = 64 * 1024;
+
+/// fork(wave-2): one guest's opt-in state, carried across a live handoff.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UiPluginGuestState {
+    pub plugin_id: String,
+    pub module_id: String,
+    pub state: Vec<u8>,
+}
+
 pub(crate) struct UiPluginManager {
     modules: Vec<RegisteredUiModule>,
     by_surface: HashMap<PluginUiSurface, Vec<usize>>,
@@ -280,6 +294,61 @@ impl PluginRuntime {
         self.invalidate(module);
         self.static_update(module)
     }
+
+    /// fork(wave-2): read the opt-in state blob from every LIVE instance. Only
+    /// instantiated modules are asked — a module that was never built has no
+    /// state to carry by definition.
+    fn save_guest_state(&mut self) -> Vec<UiPluginGuestState> {
+        let keys = self.instances.keys().cloned().collect::<Vec<_>>();
+        let mut saved = Vec::new();
+        for key in keys {
+            let Some(instance) = self.instances.get_mut(&key) else {
+                continue;
+            };
+            match instance.save_state() {
+                Ok(Some(state)) => saved.push(UiPluginGuestState {
+                    plugin_id: key.0.clone(),
+                    module_id: key.1.clone(),
+                    state,
+                }),
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    plugin_id = %key.0,
+                    module_id = %key.1,
+                    error = %err,
+                    "ui plugin declined to save handoff state; it will start fresh"
+                ),
+            }
+        }
+        saved
+    }
+
+    fn restore_guest_state(&mut self, module: &RegisteredUiModule, bytes: &[u8]) -> bool {
+        let key = module_key(module);
+        match self.instance_for(module) {
+            Ok((instance, _rebuilt)) => match instance.restore_state(bytes) {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    tracing::warn!(
+                        plugin_id = %key.0,
+                        module_id = %key.1,
+                        error = %err,
+                        "ui plugin failed to restore handoff state; starting fresh"
+                    );
+                    false
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    plugin_id = %key.0,
+                    module_id = %key.1,
+                    error = %err,
+                    "ui plugin instance unavailable for handoff state restore"
+                );
+                false
+            }
+        }
+    }
 }
 
 /// A live wasm instance for one UI plugin module. Holds its `Store` so guest
@@ -293,6 +362,12 @@ struct ModuleInstance {
     on_event_len: Option<TypedFunc<(), i32>>,
     static_ptr: TypedFunc<(), i32>,
     static_len: TypedFunc<(), i32>,
+    /// fork(wave-2): optional guest state-carry exports (§ live handoff). A guest
+    /// that omits them keeps today's behaviour exactly — its state resets on
+    /// handoff — so this is an opt-in exposure, not a flag day.
+    save_state_ptr: Option<TypedFunc<(), i32>>,
+    save_state_len: Option<TypedFunc<(), i32>>,
+    restore_state: Option<TypedFunc<(i32, i32), i32>>,
     /// The version negotiated with the guest's `herdr_ui_api_version` export at
     /// build time (2 or 3, §2). Surfaced to the manager so it can be stored on
     /// the module and gate v3-only event delivery in `module_accepts_event`.
@@ -354,6 +429,17 @@ impl ModuleInstance {
         let on_event_len = instance
             .get_typed_func::<(), i32>(&mut store, "herdr_ui_on_event_len")
             .ok();
+        // Optional, like the event entry points above: absent means this guest
+        // does not carry state across a handoff.
+        let save_state_ptr = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_save_state_ptr")
+            .ok();
+        let save_state_len = instance
+            .get_typed_func::<(), i32>(&mut store, "herdr_ui_save_state_len")
+            .ok();
+        let restore_state = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "herdr_ui_restore_state")
+            .ok();
         Ok(Self {
             store,
             memory,
@@ -362,6 +448,9 @@ impl ModuleInstance {
             on_event_len,
             static_ptr,
             static_len,
+            save_state_ptr,
+            save_state_len,
+            restore_state,
             negotiated_version,
         })
     }
@@ -387,6 +476,67 @@ impl ModuleInstance {
         }
         serde_json::from_slice::<UiUpdate>(&data[ptr..end])
             .map_err(|err| format!("failed to parse wasm ui module update {path}: {err}"))
+    }
+
+    /// fork(wave-2): read the guest's opt-in handoff state blob, mirroring the
+    /// `static_update_ptr`/`_len` pair. `Ok(None)` means the guest does not
+    /// implement the exposure — the common case, and not an error.
+    fn save_state(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let (Some(ptr_fn), Some(len_fn)) = (&self.save_state_ptr, &self.save_state_len) else {
+            return Ok(None);
+        };
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let ptr = ptr_fn
+            .call(&mut self.store, ())
+            .map_err(|err| format!("ui wasm save_state_ptr failed: {err}"))?
+            as usize;
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let len = len_fn
+            .call(&mut self.store, ())
+            .map_err(|err| format!("ui wasm save_state_len failed: {err}"))?
+            as usize;
+        if len == 0 {
+            return Ok(None);
+        }
+        if len > MAX_GUEST_STATE_BYTES {
+            return Err(format!(
+                "ui wasm state blob is {len} bytes, over the {MAX_GUEST_STATE_BYTES} byte limit"
+            ));
+        }
+        let data = self.memory.data(&self.store);
+        let end = ptr
+            .checked_add(len)
+            .ok_or_else(|| "ui wasm state overflow".to_string())?;
+        if end > data.len() {
+            return Err("ui wasm save_state returned out-of-bounds slice".to_string());
+        }
+        Ok(Some(data[ptr..end].to_vec()))
+    }
+
+    /// Hand a saved blob back to a freshly built instance. Returns false when the
+    /// guest does not implement the exposure, so the caller can tell "declined"
+    /// from "restored". A guest that rejects the blob returns 0 and starts fresh.
+    fn restore_state(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        let (Some(alloc), Some(restore)) = (&self.alloc, &self.restore_state) else {
+            return Ok(false);
+        };
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let ptr = alloc
+            .call(&mut self.store, bytes.len() as i32)
+            .map_err(|err| format!("ui wasm alloc failed: {err}"))? as usize;
+        let data = self.memory.data_mut(&mut self.store);
+        let end = ptr
+            .checked_add(bytes.len())
+            .ok_or_else(|| "ui wasm state buffer overflow".to_string())?;
+        if end > data.len() {
+            return Err("ui wasm alloc returned out-of-bounds pointer".to_string());
+        }
+        data[ptr..end].copy_from_slice(bytes);
+        self.store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
+        let accepted = restore
+            .call(&mut self.store, (ptr as i32, bytes.len() as i32))
+            .map_err(|err| format!("ui wasm restore_state failed: {err}"))?;
+        Ok(accepted != 0)
     }
 
     fn dispatch(&mut self, event: &UiEvent) -> Result<Option<UiUpdate>, String> {
@@ -660,6 +810,59 @@ impl UiPluginManager {
             Some(runtime) => runtime.reload_static(module),
             None => Err("wasm ui plugin runtime unavailable".to_string()),
         }
+    }
+
+    /// fork(wave-2): collect the opt-in guest state to carry across a live
+    /// handoff. Guests that do not implement the exposure contribute nothing, so
+    /// this is empty on an unmodified plugin set.
+    pub(crate) fn save_guest_state(&mut self) -> Vec<UiPluginGuestState> {
+        match self.runtime.as_mut() {
+            Some(runtime) => runtime.save_guest_state(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Push carried state back into freshly instantiated guests, then re-read the
+    /// static update so a guest whose static view depends on its state is not
+    /// cached at its default for a frame. A guest that declines or errors keeps
+    /// its fresh state — cosmetic state is never worth dropping a plugin over.
+    pub(crate) fn restore_guest_state(&mut self, states: &[UiPluginGuestState]) -> usize {
+        let mut restored = 0;
+        for state in states {
+            let Some(module) = self
+                .modules
+                .iter()
+                .find(|module| {
+                    module.plugin_id == state.plugin_id && module.module_id == state.module_id
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(runtime) = self.runtime.as_mut() else {
+                return restored;
+            };
+            if !runtime.restore_guest_state(&module, &state.state) {
+                continue;
+            }
+            restored += 1;
+            let key = module_key(&module);
+            match self.load_module_static(&module) {
+                Ok((update, _negotiated)) => {
+                    self.loaded_updates.insert(key, update);
+                }
+                Err(err) => tracing::warn!(
+                    plugin_id = %module.plugin_id,
+                    module_id = %module.module_id,
+                    error = %err,
+                    "ui plugin static update failed after handoff state restore"
+                ),
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "restored ui plugin guest state after handoff");
+        }
+        restored
     }
 
     pub(crate) fn all(&self) -> &[RegisteredUiModule] {
@@ -1576,6 +1779,104 @@ mod tests {
         );
         let wasm = wat::parse_str(&wat).unwrap();
         std::fs::write(path, wasm).unwrap();
+    }
+
+    /// A module that implements the optional handoff state-carry exposure: it
+    /// parks whatever `restore_state` hands it at offset 2048 and reads that
+    /// same span back out of `save_state`. Enough to prove the host's round trip
+    /// without depending on a real plugin's serialization.
+    fn write_stateful_wasm(path: &std::path::Path, json: &str) {
+        let data = json
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{:02x}", byte))
+            .collect::<String>();
+        let wat = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{data}")
+                (global $saved_len (mut i32) (i32.const 0))
+                (func (export "herdr_ui_api_version") (result i32) i32.const 2)
+                (func (export "herdr_ui_static_update_ptr") (result i32) i32.const 0)
+                (func (export "herdr_ui_static_update_len") (result i32) i32.const {len})
+                (func (export "herdr_ui_alloc") (param i32) (result i32) i32.const 1024)
+                (func (export "herdr_ui_save_state_ptr") (result i32) i32.const 2048)
+                (func (export "herdr_ui_save_state_len") (result i32) global.get $saved_len)
+                (func (export "herdr_ui_restore_state") (param i32 i32) (result i32)
+                    (memory.copy (i32.const 2048) (local.get 0) (local.get 1))
+                    (global.set $saved_len (local.get 1))
+                    (i32.const 1))
+            )"#,
+            len = json.len()
+        );
+        let wasm = wat::parse_str(&wat).expect("stateful fixture wat parses");
+        std::fs::write(path, wasm).expect("write stateful fixture");
+    }
+
+    #[test]
+    fn guest_state_round_trips_only_for_modules_that_opt_in() {
+        // Opted-out module (the plain fixture): contributes nothing, which is what
+        // keeps this exposure from being a flag day.
+        let (plain_root, plain) = plugin_on_disk("Plain");
+        let mut manager = UiPluginManager::from_installed_plugins(&HashMap::from([(
+            plain.plugin_id.clone(),
+            plain.clone(),
+        )]));
+        assert!(
+            manager.save_guest_state().is_empty(),
+            "a guest without the state exports must carry nothing"
+        );
+        let _ = std::fs::remove_dir_all(plain_root);
+
+        // Opted-in module: nothing to save before anything is stored, then the
+        // exact bytes the host pushed in come back out.
+        let root = std::env::temp_dir().join(format!(
+            "herdr-ui-plugin-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(root.join("dist")).expect("create fixture dir");
+        write_stateful_wasm(
+            &root.join("dist/goal-ui.wasm"),
+            r#"{"scope":"partial","layers":[]}"#,
+        );
+        let mut plugin = sample_plugin();
+        plugin.plugin_root = root.display().to_string();
+        plugin.manifest_path = root.join("herdr-plugin.toml").display().to_string();
+        plugin.ui_modules[0].surfaces = vec![PluginUiSurface::Header];
+        let registry = HashMap::from([(plugin.plugin_id.clone(), plugin.clone())]);
+        let mut manager = UiPluginManager::from_installed_plugins(&registry);
+
+        assert!(
+            manager.save_guest_state().is_empty(),
+            "a guest with nothing stored yet reports no state"
+        );
+
+        let carried = vec![UiPluginGuestState {
+            plugin_id: plugin.plugin_id.clone(),
+            module_id: plugin.ui_modules[0].id.clone(),
+            state: b"{\"v\":1,\"counter\":7}".to_vec(),
+        }];
+        assert_eq!(manager.restore_guest_state(&carried), 1);
+
+        let saved = manager.save_guest_state();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].plugin_id, plugin.plugin_id);
+        assert_eq!(saved[0].state, carried[0].state);
+
+        // An entry for a module that is not registered is ignored, not fatal —
+        // the exporting server's plugin set need not match the importer's.
+        let stranger = vec![UiPluginGuestState {
+            plugin_id: "example.not-installed".into(),
+            module_id: "nope".into(),
+            state: b"{}".to_vec(),
+        }];
+        assert_eq!(manager.restore_guest_state(&stranger), 0);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn sample_plugin() -> InstalledPluginInfo {

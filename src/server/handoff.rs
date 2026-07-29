@@ -39,6 +39,11 @@ pub(crate) struct HandoffManifest {
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// fork(wave-2): opt-in guest UI state carried across the swap. `default` so
+    /// the two builds a handoff always spans stay compatible in both directions:
+    /// an older exporter simply sends none, and an older importer ignores it.
+    #[serde(default)]
+    pub ui_plugin_state: Vec<crate::ui_plugins::UiPluginGuestState>,
 }
 
 #[cfg(unix)]
@@ -304,6 +309,7 @@ pub(crate) fn manifest_for(
     panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
+    ui_plugin_state: Vec<crate::ui_plugins::UiPluginGuestState>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -313,6 +319,7 @@ pub(crate) fn manifest_for(
         expected_protocol,
         snapshot,
         panes,
+        ui_plugin_state,
     }
 }
 
