@@ -2953,6 +2953,101 @@ mod tests {
         assert!(checked > 0, "no toggleable rows were examined at all");
     }
 
+    /// The same question one level up: not "does `resolve_row_path` know the
+    /// file" but "does a CopyPath CLICK reach it". The two differ because
+    /// `resolve_action` matches on `(kind, row_kind)` and the `hook`/`mcp`/
+    /// `plugin` arms are wildcards on the action kind. They sit BELOW the
+    /// CopyPath arm, and match arms are ordered — so a single line moved the
+    /// wrong way turns "copy this hook's path" into "disable this hook", with
+    /// no compile error and no runtime complaint. That is the failure this
+    /// test exists to catch, and it cannot be caught one level down.
+    ///
+    /// It installs the process-wide `CACHE`, which no other test in this file
+    /// touches; if that ever changes these tests must be serialised.
+    #[test]
+    fn a_copy_path_click_never_falls_through_into_a_disable() {
+        let cache = HarnessCache {
+            ctx_paths: vec![PathBuf::from("/w/CLAUDE.md")],
+            mem_index: Some(PathBuf::from("/w/memory/MEMORY.md")),
+            mem_files: vec![PathBuf::from("/w/memory/one.md")],
+            skills: vec![SkillEntry {
+                name: "s".to_string(),
+                path: PathBuf::from("/w/skills/s/SKILL.md"),
+                desc_bytes: 0,
+            }],
+            agents: vec![("rev".to_string(), PathBuf::from("/w/agents/rev.md"))],
+            hooks: vec![HookEntry {
+                file: PathBuf::from("/w/.claude/settings.json"),
+                event: "PreToolUse".to_string(),
+                matcher: "*".to_string(),
+                matcher_idx: 0,
+                hook_idx: 0,
+                name: "h".to_string(),
+                command: "h.sh".to_string(),
+                script: Some(PathBuf::from("/w/hooks/h.sh")),
+            }],
+            ..Default::default()
+        };
+        *CACHE.lock().expect("cache mutex poisoned") = Some(cache);
+
+        let copy = |key: &str| {
+            resolve_action(&PendingHarnessAction {
+                kind: HarnessActionKind::CopyPath,
+                key: key.to_string(),
+            })
+        };
+
+        for (key, want) in [
+            ("ctx:0", Some("/w/CLAUDE.md")),
+            ("memidx:0", Some("/w/memory/MEMORY.md")),
+            ("mem:0", Some("/w/memory/one.md")),
+            ("skill:0", Some("/w/skills/s/SKILL.md")),
+            ("agent:0", Some("/w/agents/rev.md")),
+            // The three wildcard-armed kinds. `hook` has a path and must copy
+            // it; `mcp` and `plugin` have none and must resolve to nothing --
+            // NOT to the disable their wildcard arm would otherwise produce.
+            ("hook:0", Some("/w/hooks/h.sh")),
+            ("mcp:0", None),
+            ("plugin:0", None),
+        ] {
+            match copy(key) {
+                Some(ResolvedAction::CopyPath(p)) => assert_eq!(
+                    Some(p.to_string_lossy().into_owned()),
+                    want.map(str::to_string),
+                    "copy {key} resolved to the wrong file"
+                ),
+                None => assert_eq!(want, None, "copy {key} resolved to nothing"),
+                Some(other) => panic!(
+                    "copy {key} resolved to {} -- a copy click must never become \
+                     a state-changing action",
+                    match other {
+                        ResolvedAction::Open(_) => "Open",
+                        ResolvedAction::DisableHook(..) => "DisableHook",
+                        ResolvedAction::DisableMcp(_) => "DisableMcp",
+                        ResolvedAction::DisablePlugin(_) => "DisablePlugin",
+                        ResolvedAction::EnablePlugin(_) => "EnablePlugin",
+                        ResolvedAction::Enable(..) => "Enable",
+                        ResolvedAction::CopyPath(_) => unreachable!(),
+                    }
+                ),
+            }
+        }
+
+        // Negative control: the SAME keys under a disable click must reach the
+        // disable arms. Without this the assertions above would still pass if
+        // `resolve_action` had simply stopped resolving anything at all.
+        let disable = resolve_action(&PendingHarnessAction {
+            kind: HarnessActionKind::DisableSession,
+            key: "hook:0".to_string(),
+        });
+        assert!(
+            matches!(disable, Some(ResolvedAction::DisableHook(..))),
+            "a disable click on the same row must still disable"
+        );
+
+        *CACHE.lock().expect("cache mutex poisoned") = None;
+    }
+
     /// Copy-path must resolve the SAME file open does, for every row kind that
     /// has one — and must decline the ones that do not, so the guest never
     /// offers a copy that would silently do nothing.
