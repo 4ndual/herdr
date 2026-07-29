@@ -8,8 +8,18 @@ publish = false
 name = "image-view-collector"
 path = "src/main.rs"
 
-# Nested workspace: builds native and independently of the host binary.
-[workspace]
+# A member of the ROOT herdr workspace, NOT its own nested one, matching
+# usage-dash / version-dash / claude-image-preview. That is what makes the
+# binary land at `<workspace>/target/release/image-view-collector`, which is
+# where the plugin manifest's `collector` argv points via a plugin-root-relative
+# path. As a standalone nested workspace it built to
+# `plugins/image-view-ui/collector/target/`, nothing in the tree built it, and
+# the manifest never named it — so the collector this plugin's own comments
+# describe had never run.
+#
+# Override directory-based workspace discovery: the parent `image-view-ui` dir
+# is itself a (wasm) workspace root, so membership must be pinned explicitly.
+workspace = "../../.."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -31,6 +31,20 @@ capabilities = ["layout_read", "focused_session", "api_read", "pane_graphics"]
 # the guest only ever handles a PATH plus its pixel dimensions. Image BYTES
 # never enter the guest — the host reads them, gated by graphics_roots below.
 ui_input_file = "image_input.json"
+# The collector that WRITES that file. Its absence was the bug: every comment in
+# this manifest described an out-of-process collector, the code for it existed
+# under `collector/`, and nothing declared or built it — so `image_input.json`
+# was never written and the guest had nothing to paint. A plugin that documents
+# a component it does not wire up looks identical, from the outside, to one
+# whose component is broken.
+#
+# argv[0] is resolved against plugin_root, and the collector is a root-workspace
+# member, so `../../target/release/...` reaches `<workspace>/target/release`.
+# argv[1] is the image root: passed explicitly rather than left to the
+# collector's IMAGE_VIEW_ROOT fallback, so the directory this plugin reads is
+# visible in the manifest next to the `graphics_roots` that constrain it. The
+# collector expands `~/` itself.
+collector = ["../../target/release/image-view-collector", "~/.claude/image-cache"]
 # The only directories a `pane.graphics.set { source_path }` from this module may
 # name. Declared here, visible in `plugin list` before anyone enables it, and
 # enforced after canonicalising both sides so no symlink or `..` escapes.

@@ -100,11 +100,29 @@ fn newest_png(root: &Path) -> std::io::Result<Option<PathBuf>> {
         Ok(())
     };
 
-    for entry in std::fs::read_dir(root)? {
+    // An absent image root is the NORMAL case, not an error: the agent creates
+    // the cache dir lazily, the first time an image is actually pasted. Left
+    // propagating, this printed a bare `Error: Os { code: 2 }` — naming neither
+    // the path nor the reason — on every single collector run for any user who
+    // had not pasted an image yet, which is most of them. Same rule the
+    // claude-image-preview collector states for an image-less session.
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            for nested in std::fs::read_dir(&path)? {
+            // A subdirectory that vanishes between listing and descending is a
+            // race with the agent writing the cache, not a failure of this run.
+            let nested_entries = match std::fs::read_dir(&path) {
+                Ok(nested_entries) => nested_entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            for nested in nested_entries {
                 consider(nested?.path())?;
             }
         } else {
@@ -197,6 +215,22 @@ mod tests {
         set_mtime(&old, long_ago);
 
         assert_eq!(newest_png(&dir).unwrap(), Some(new));
+    }
+
+    /// The state this plugin is in for most users most of the time: the agent
+    /// has not pasted an image yet, so it has never created the cache dir. It
+    /// must be indistinguishable from "the dir is there and empty" — both are
+    /// "nothing to show", not a failure. This previously escaped as a bare
+    /// `Error: Os { code: 2 }` naming neither the path nor the reason.
+    #[test]
+    fn an_absent_image_root_is_nothing_to_show_not_an_error() {
+        let missing = temp_dir("absent").join("never-created");
+        assert!(!missing.exists());
+        assert_eq!(newest_png(&missing).unwrap(), None);
+
+        // Same answer as the present-but-empty directory, deliberately.
+        let empty = temp_dir("absent-empty");
+        assert_eq!(newest_png(&empty).unwrap(), newest_png(&missing).unwrap());
     }
 
     #[test]
