@@ -45,6 +45,29 @@ pub struct HarnessRow {
     /// host-resolved via `harness:disable_session:` / `harness:disable_profile:`.
     #[serde(default)]
     pub can_disable: bool,
+    /// Whether a right-click offers to turn this entry back ON, host-resolved via
+    /// `harness:enable_session:` / `harness:enable_profile:`.
+    ///
+    /// This is a separate flag rather than `!can_disable` because the two are not
+    /// complements: a row can be off and NOT re-enableable (nothing recorded the
+    /// original definition), and a row can be on and not disableable. Only the
+    /// host knows whether a restorable record exists, so only the host may set it.
+    #[serde(default)]
+    pub can_enable: bool,
+    /// When a toggle on this row takes effect: `"now"` for entries herdr itself
+    /// owns (its own plugins), `"next session"` for anything Claude Code reads at
+    /// session start — hooks, MCPs, Claude plugins, skills, agents.
+    ///
+    /// DESIGN §1.1: a toggle that looks instant but is not is a silent failure, so
+    /// the renderer states this on the row rather than letting the user infer it.
+    /// `None` means the row has no toggle and nothing to say.
+    #[serde(default)]
+    pub applies_when: Option<String>,
+    /// Set by the host when this row's toggle has been written to config but has
+    /// NOT yet taken effect (i.e. `applies_when` is not `"now"` and the session
+    /// has not restarted). Rendered as pending, never as done.
+    #[serde(default)]
+    pub toggle_pending: bool,
     /// Extra indentation level (context tree children render indented).
     #[serde(default)]
     pub indent: u8,

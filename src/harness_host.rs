@@ -2094,6 +2094,36 @@ fn write_atomic(path: &Path, json: &str) -> bool {
     true
 }
 
+/// Seconds since the unix epoch, for stamping stash records. Zero if the clock
+/// is before the epoch, which only happens on a badly set machine and is not
+/// worth failing a disable over.
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Human "how long ago" for a stash timestamp, e.g. "3h ago".
+///
+/// Relative rather than absolute because there is no date-formatting crate in
+/// this tree, and for "when did I turn this off" the age is the useful part
+/// anyway. Records written before timestamps existed return `None`, and the
+/// tooltip omits the line rather than inventing one.
+fn age_phrase(disabled_at: Option<u64>) -> Option<String> {
+    let then = disabled_at?;
+    if then == 0 {
+        return None;
+    }
+    let secs = epoch_secs().saturating_sub(then);
+    Some(match secs {
+        0..=89 => "just now".to_string(),
+        90..=5399 => format!("{}m ago", secs / 60),
+        5400..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    })
+}
+
 /// Append `record` to the disable stash at `stash`, atomically. Returns whether
 /// the record is durably on disk.
 ///
@@ -2158,6 +2188,7 @@ fn remove_hook_from_file(entry: &HookEntry, stash: &Path) -> bool {
         "file": entry.file.to_string_lossy(),
         "kind": "hook",
         "name": entry.name,
+        "disabled_at": epoch_secs(),
         "event": entry.event,
         "matcher": entry.matcher,
         "removed": removed,
@@ -2210,6 +2241,7 @@ fn remove_mcp_from_file(entry: &McpEntry, file: &Path, stash: &Path) -> bool {
         "file": file.to_string_lossy(),
         "kind": "mcp",
         "name": entry.name,
+        "disabled_at": epoch_secs(),
         "project": entry.project,
         "removed": removed,
     });
@@ -2223,6 +2255,85 @@ fn remove_mcp_from_file(entry: &McpEntry, file: &Path, stash: &Path) -> bool {
         return false;
     };
     write_atomic(file, &json)
+}
+
+/// Build the off-rows for entries that exist ONLY in the stash.
+///
+/// Without this the panel cannot show a disabled hook or mcp at all: their
+/// disable removes them from config, and every other row is built by scanning
+/// config, so a disabled entry simply stops existing. That is why enable never
+/// had anything to attach to.
+///
+/// `live` is the set of `(name, project)` identities the config scan already
+/// produced. **Config wins**: an entry present in both -- re-added by hand after
+/// a disable, say -- renders as one enabled row, and its stale stash record is
+/// ignored rather than drawn as a ghost off-row beside it. The record is left in
+/// place rather than deleted, because a rescan is not the right moment to throw
+/// away the only copy of something.
+///
+/// Within the stash, the LAST record for an identity wins, matching what
+/// `restore_from_stash` would actually put back.
+fn stashed_rows(
+    records: &[serde_json::Value],
+    kind: &str,
+    live: &std::collections::HashSet<(String, Option<String>)>,
+    stash_path: &Path,
+) -> Vec<HarnessRow> {
+    let mut latest: Vec<(String, Option<String>, Option<u64>)> = Vec::new();
+    for rec in records {
+        if rec.get("kind").and_then(|k| k.as_str()).unwrap_or("hook") != kind {
+            continue;
+        }
+        let Some(name) = rec.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let project = rec
+            .get("project")
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        let at = rec.get("disabled_at").and_then(|t| t.as_u64());
+        let id = (name.to_string(), project.clone());
+        if live.contains(&id) {
+            continue;
+        }
+        match latest.iter_mut().find(|(n, p, _)| (n, p) == (&id.0, &id.1)) {
+            Some(slot) => slot.2 = at,
+            None => latest.push((id.0, id.1, at)),
+        }
+    }
+
+    latest
+        .into_iter()
+        .map(|(name, project, at)| {
+            let scope = match project.as_deref() {
+                Some(cwd) => format!("project scope ({cwd})"),
+                None => "user scope".to_string(),
+            };
+            let mut tooltip = format!("{name} — disabled\n{scope}");
+            if let Some(age) = age_phrase(at) {
+                tooltip.push_str(&format!("\ndisabled {age}"));
+            }
+            // Honest provenance: say where the definition actually lives, so
+            // the row is not asking to be trusted on faith.
+            tooltip.push_str(&format!("\nstashed in: {}", stash_path.display()));
+            tooltip.push_str("\nright-click to enable — restores it exactly as it was");
+            tooltip.push_str("\ntakes effect on next session start/resume");
+            HarnessRow {
+                key: format!("stash:{kind}:{name}"),
+                label: name.clone(),
+                meta: "off".to_string(),
+                state: RowState::Off,
+                tooltip,
+                openable: false,
+                can_disable: false,
+                can_enable: true,
+                applies_when: Some("next session".to_string()),
+                toggle_pending: false,
+                indent: 0,
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Put a stashed entry back where it came from and drop its stash record.
@@ -3107,6 +3218,56 @@ mod tests {
         assert!(!restore_from_stash(&stash, "skill", "only", None));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Config is the source of truth for what EXISTS; the stash only explains
+    /// what is missing. An entry in both -- re-added by hand after a disable --
+    /// must render as one enabled row, never as an on-row plus a ghost off-row
+    /// offering to "enable" something already on.
+    #[test]
+    fn a_reinstated_entry_does_not_render_a_ghost_off_row() {
+        let stash_path = PathBuf::from("/state/harness-disabled.json");
+        let records = vec![
+            serde_json::json!({"kind": "hook", "name": "reinstated", "disabled_at": 0}),
+            serde_json::json!({"kind": "hook", "name": "still-off", "disabled_at": 0}),
+            serde_json::json!({"kind": "mcp", "name": "other-kind", "disabled_at": 0}),
+            // Same identity disabled twice: one row, not two.
+            serde_json::json!({"kind": "hook", "name": "still-off", "disabled_at": 0}),
+        ];
+
+        let mut live = std::collections::HashSet::new();
+        live.insert(("reinstated".to_string(), None));
+
+        let rows = stashed_rows(&records, "hook", &live, &stash_path);
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["still-off"],
+            "config wins for reinstated; kinds do not bleed; duplicates collapse"
+        );
+
+        let row = &rows[0];
+        assert!(row.can_enable, "a stashed row is the enableable case");
+        assert!(!row.can_disable, "it is already off");
+        assert_eq!(row.state, RowState::Off);
+        assert_eq!(row.applies_when.as_deref(), Some("next session"));
+        assert!(
+            row.tooltip.contains("/state/harness-disabled.json"),
+            "tooltip must say where the definition is stashed: {}",
+            row.tooltip
+        );
+
+        // Project scope is part of identity: the same name in a different
+        // project is a different row, and a live global does not mask it.
+        let records = vec![
+            serde_json::json!({"kind": "mcp", "name": "dual", "project": "/w"}),
+            serde_json::json!({"kind": "mcp", "name": "dual"}),
+        ];
+        let mut live = std::collections::HashSet::new();
+        live.insert(("dual".to_string(), None));
+        let rows = stashed_rows(&records, "mcp", &live, &stash_path);
+        assert_eq!(rows.len(), 1, "only the project-scoped one is still off");
+        assert!(rows[0].tooltip.contains("project scope (/w)"));
     }
 
     /// A replace must be all-or-nothing, and must not litter temp files next to
