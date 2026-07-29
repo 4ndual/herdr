@@ -1473,6 +1473,12 @@ pub enum HarnessActionKind {
     DisableSession,
     /// Disable the entry AND its ccp profile source (profile-wide).
     DisableProfile,
+    /// Put a stashed entry back where it came from (session-facing). Only rows
+    /// the host built from the disable stash carry this — a row is enableable
+    /// exactly when a record of its original definition exists.
+    EnableSession,
+    /// Enable the entry AND its ccp profile source (profile-wide).
+    EnableProfile,
     /// Select a profile for the tab-3 global view (host scans it and publishes
     /// its [`harness_manager_model::ProfileView`] into the render model).
     ViewProfile,

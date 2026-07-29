@@ -169,6 +169,11 @@ struct HarnessCache {
     /// from `<plugin_state>/hook-descriptions.json`. Empty ⇒ tooltips fall back
     /// to the raw command. Reloaded on the config rescan.
     hook_descriptions: HashMap<String, String>,
+    /// Raw disable-stash records, reloaded on the config rescan. These are the
+    /// ONLY source for disabled hooks and MCPs: their disable removes them from
+    /// config, and every other row comes from scanning config, so without this
+    /// a disabled entry has no row and nothing to re-enable from.
+    stashed: Vec<serde_json::Value>,
     /// Which agent CLI drives the focused session: "claude", "cx" (Claude Code
     /// routed through the CCR gateway), "codex", "pi", or "terminal". Derived on
     /// the full rescan (cx vs claude comes from which projects root the resolved
@@ -1004,6 +1009,12 @@ fn full_rescan(cache: &mut HarnessCache, _sid: &str, cwd: &str) {
         .map(str::to_string);
 
     // MCP servers: top-level + this project's entry in ~/.claude.json.
+    // Disable stash: what was turned off and is restorable. Read on the same
+    // cadence as config so an enable/disable shows up on the next tick.
+    cache.stashed = read_json(&harness_stash_path())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
     cache.mcps.clear();
     if let Some(root) = read_json(&home.join(".claude.json")) {
         if let Some(servers) = root.get("mcpServers").and_then(|m| m.as_object()) {
@@ -1628,6 +1639,19 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
         });
     }
     rows.truncate(MAX_ROWS * 2);
+    // Disabled hooks live only in the stash — config no longer mentions them —
+    // so append them here or they are invisible and un-enableable.
+    let live: std::collections::HashSet<(String, Option<String>)> = cache
+        .hooks
+        .iter()
+        .map(|h| (h.name.clone(), None))
+        .collect();
+    rows.extend(stashed_rows(
+        &cache.stashed,
+        "hook",
+        &live,
+        &harness_stash_path(),
+    ));
     // Header aggregate: total hook calls + total wall time across the session.
     let mut total_calls = 0u64;
     let mut total_ms = 0u64;
@@ -1743,6 +1767,20 @@ fn mcps_section(cache: &HarnessCache) -> HarnessSection {
         });
     }
     // Header aggregate: total MCP calls + total measured instruction bytes loaded.
+    // Disabled MCPs live only in the stash — their disable removes the whole
+    // definition from ~/.claude.json — so append them or they cannot be
+    // re-enabled from the panel at all.
+    let live: std::collections::HashSet<(String, Option<String>)> = cache
+        .mcps
+        .iter()
+        .map(|m| (m.name.clone(), m.project.clone()))
+        .collect();
+    rows.extend(stashed_rows(
+        &cache.stashed,
+        "mcp",
+        &live,
+        &harness_stash_path(),
+    ));
     let total_calls: u64 = cache.stats.mcp_calls.values().sum();
     let instr_tok: u32 = cache
         .stats
@@ -1975,6 +2013,9 @@ enum ResolvedAction {
     DisableHook(HookEntry, bool),
     DisableMcp(McpEntry),
     DisablePlugin(String),
+    /// Restore a stashed entry: (stash kind, name). Project scope comes from
+    /// the record, so the same name in two scopes restores to its own place.
+    Enable(String, String),
 }
 
 /// Maps a row key's `<kind>:<idx>` halves to the file that row stands for, or
@@ -2017,6 +2058,21 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
         }
         (HarnessActionKind::CopyPath, _) => {
             resolve_row_path(cache, kind, idx).map(ResolvedAction::CopyPath)
+        }
+        // Stash rows carry their identity in the key rather than an index,
+        // because they have no entry in the config-scanned vectors to index
+        // into -- being absent from config is what makes them stash rows.
+        // Key shape: `stash:<kind>:<name>`, with the project scope (if any)
+        // recovered from the record itself at restore time.
+        (
+            HarnessActionKind::EnableSession | HarnessActionKind::EnableProfile,
+            "stash",
+        ) => {
+            let (stash_kind, name) = idx.split_once(':')?;
+            Some(ResolvedAction::Enable(
+                stash_kind.to_string(),
+                name.to_string(),
+            ))
         }
         (_, "hook") => {
             let i: usize = idx.parse().ok()?;
@@ -2092,6 +2148,12 @@ fn write_atomic(path: &Path, json: &str) -> bool {
         return false;
     }
     true
+}
+
+/// Absolute path of the disable stash. One definition, because the disable
+/// writer, the enable reader and the row builder must all agree on it.
+fn harness_stash_path() -> PathBuf {
+    crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID).join(HARNESS_STASH_FILE)
 }
 
 /// Seconds since the unix epoch, for stamping stash records. Zero if the clock
@@ -2515,6 +2577,7 @@ impl App {
                 self.disable_hook(&entry, profile_wide)
             }
             ResolvedAction::DisableMcp(entry) => self.disable_mcp(&entry),
+            ResolvedAction::Enable(kind, name) => self.enable_stashed(&kind, &name),
             ResolvedAction::DisablePlugin(name) => self.disable_plugin(&name),
         };
         if acted {
@@ -2681,8 +2744,7 @@ impl App {
     }
 
     fn disable_hook(&mut self, entry: &HookEntry, profile_wide: bool) -> bool {
-        let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
-            .join(HARNESS_STASH_FILE);
+        let stash = harness_stash_path();
         let mut changed = remove_hook_from_file(entry, &stash);
         if profile_wide {
             // Also remove from the ccp profile source so a profile rebuild
@@ -2716,10 +2778,36 @@ impl App {
         changed
     }
 
+    /// Put a stashed entry back. The project scope is recovered from the record
+    /// rather than the click, so a project-scoped server returns to its own
+    /// project instead of being promoted to global.
+    fn enable_stashed(&mut self, kind: &str, name: &str) -> bool {
+        let stash = harness_stash_path();
+        let project = read_json(&stash)
+            .and_then(|v| v.as_array().cloned())
+            .and_then(|records| {
+                records
+                    .iter()
+                    .rev()
+                    .find(|r| {
+                        r.get("kind").and_then(|k| k.as_str()).unwrap_or("hook") == kind
+                            && r.get("name").and_then(|n| n.as_str()) == Some(name)
+                    })
+                    .map(|r| r.get("project").and_then(|p| p.as_str()).map(str::to_string))
+            })
+            .flatten();
+        if !restore_from_stash(&stash, kind, name, project.as_deref()) {
+            return false;
+        }
+        self.harness_toast(format!(
+            "{kind} {name} restored — takes effect on next session start/resume"
+        ));
+        true
+    }
+
     fn disable_mcp(&mut self, entry: &McpEntry) -> bool {
         let file = home_dir().join(".claude.json");
-        let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
-            .join(HARNESS_STASH_FILE);
+        let stash = harness_stash_path();
         if !remove_mcp_from_file(entry, &file, &stash) {
             return false;
         }
