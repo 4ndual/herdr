@@ -7141,6 +7141,13 @@ mod tests {
         app.session_save_deadline = Some(now + Duration::from_secs(2));
         app.next_resize_poll = now + Duration::from_secs(5);
         app.next_auto_update_check = Some(now + Duration::from_secs(6));
+        // fork(native-dashes): see `next_loop_deadline_with_resize_poll` — the
+        // dashboard tick joins the deadline set on the DESKTOP path only, and
+        // `App::new` initialises `next_dash_tick` to `Instant::now()`, so it is
+        // already in the past here and would win `.min()` over anything this test
+        // sets. Stated explicitly rather than absorbed into the expectation, so
+        // the fork's contribution to this function stays visible.
+        app.next_dash_tick = now + Duration::from_secs(3600);
 
         assert_eq!(
             app.next_loop_deadline(now, false),
@@ -7263,6 +7270,10 @@ mod tests {
         app.selection_autoscroll_deadline = Some(now + Duration::from_millis(5));
         app.next_animation_tick = Some(now + Duration::from_millis(100));
         app.session_save_deadline = Some(now + Duration::from_millis(200));
+        // fork(native-dashes): as above — the desktop-only dash tick is already
+        // due at construction and would otherwise win over the 5ms autoscroll
+        // deadline this test is actually asserting on.
+        app.next_dash_tick = now + Duration::from_secs(3600);
         assert_eq!(
             app.next_loop_deadline(now, false),
             app.selection_autoscroll_deadline
