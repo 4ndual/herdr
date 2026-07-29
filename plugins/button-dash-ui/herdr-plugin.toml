@@ -36,6 +36,24 @@ title = "Full restart"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/full-restart-herdr.sh\" >/dev/null 2>&1 &"]
 
+# handoff-hr: NON-DESTRUCTIVE server swap. Unlike restart-hr / full-restart, this
+# does NOT kill anything: it asks the running server to transfer live pane PTY
+# master fds (SCM_RIGHTS) to a replacement server spawned from the promoted binary,
+# so `claude`/`cx` panes keep the SAME pids and every in-flight subagent survives.
+# Use after `mv`-ing a freshly E2E'd binary into place. On ANY failure it toasts and
+# changes nothing — it deliberately never falls back to a kill, because not killing
+# the agents is the entire point of the button. Same detach model as the restart
+# siblings (nohup + the script's own guarded re-exec; macOS has no `setsid`),
+# because the server that spawned the action is the one being replaced. The script
+# resolves WHICH instance from the inherited HERDR_SESSION + XDG_CONFIG_HOME, so no
+# instance arg is needed here, and pins HERDR_SOCKET_PATH to that instance's SESSION
+# socket — the bare CLI defaults to the GLOBAL socket, which is a different server.
+[[actions]]
+id = "handoff-hr"
+title = "Handoff hr"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/handoff-herdr.sh\" >/dev/null 2>&1 &"]
+
 # fork: fork the CURRENT pane's agent conversation into a NEW TAB (current
 # workspace). Works for claude/cx/codex/pi by reusing herdr's own resume
 # convention + each agent's fork flag (see scripts/fork-conversation.sh). The
@@ -87,6 +105,30 @@ title = "Remote"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
 
+# refresh-cx-token: re-sync the CCR gateway's Claude-Plan OAuth token from the
+# daily Keychain credential. CCR has no Anthropic refresh executor, so when its
+# copied access token expires every Claude-via-gateway request 401s and a LIVE cx
+# session cannot recover — the only other re-sync runs at cx launch. This button
+# is the manual in-place fix (the underlying script is documented MANUAL ONLY;
+# never schedule it). Daily `claude` is direct-to-Anthropic and unaffected; the
+# token value is never printed. Detached like the siblings: it does RPC work only
+# and kills nothing, but detaching keeps the action runner free while the gateway
+# hot-swaps its config (~1s).
+#
+# Invokes the Bun script DIRECTLY (2026-07-28): the former scripts/refresh-cx-token.sh
+# wrapper only resolved the herdr binary, toasted and logged — all of which now live
+# in the script itself behind `--toast`, so the wrapper was a layer that could drift
+# out of sync with the thing it wrapped. `--quiet` keeps stdout silent on the
+# idempotent no-op; the toast/log carry the outcome. `sh -lc` remains for nohup
+# detachment and to pick up bun from the login PATH (the pkg-guard shim), with a
+# literal fallback so a PATH-less action environment still works. CMIX_REFRESH_TOKEN
+# overrides the script path; the script is owned by the cmix repo, not by herdr.
+[[actions]]
+id = "refresh-cx-token"
+title = "Refresh cx token"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", '''nohup "$(command -v bun || echo "$HOME/.bun/bin/bun")" "${CMIX_REFRESH_TOKEN:-$HOME/cmix/scripts/refresh-claude-token.ts}" --toast --quiet >/dev/null 2>&1 &''']
+
 # draw-screenshot: toggle a BLANK draw-on-screen overlay (our own scripts/
 # draw-overlay helper — floats over ANY Space incl. native fullscreen), then
 # capture the annotated screen and fully close it (see scripts/draw-screenshot.sh).
@@ -106,6 +148,33 @@ id = "draw-screenshot-region"
 title = "Draw + screenshot (region)"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" region >/dev/null 2>&1 &"]
+
+# bg-dispatch: dispatch a Claude Code BACKGROUND agent (`claude --bg "<prompt>"`,
+# detached; manage with `claude agents`). `--bg` REQUIRES a prompt and a herdr
+# button cannot take typed input (UiEvent::Key does not reach panel modules), so
+# the button opens a NEW TAB whose root pane runs scripts/bg-prompt.sh — the
+# terminal collects the prompt, dispatches it, and then stays alive so the
+# dispatched agent's id remains visible (see scripts/bg-dispatch.sh). Detached
+# like the siblings: socket work only, nothing is killed.
+[[actions]]
+id = "bg-dispatch"
+title = "Background agent"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/bg-dispatch.sh\" >/dev/null 2>&1 &"]
+
+# relocate: move the CURRENT pane's Claude conversation to the project it is
+# actually about. Claude Code has no mid-session `cd`, so this drives the
+# `relocate` skill's migrate-session.sh (transcript + subagents copied into the
+# target dir's slug) and then resumes there via cx-resume. The destination is
+# INFERRED from the transcript — ranked by distinct files touched per git repo —
+# but never auto-picked: the script opens a tab listing the candidates and the
+# user chooses (see scripts/relocate-conversation.sh). Detached like the
+# siblings: socket work only, and the source session is copied, never destroyed.
+[[actions]]
+id = "relocate"
+title = "Relocate"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/relocate-conversation.sh\" >/dev/null 2>&1 &"]
 
 [[ui_modules]]
 id = "button-ui"

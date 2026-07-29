@@ -385,10 +385,10 @@ mod tests {
                 cwd: "/tmp".to_string(),
                 restorable: true,
                 workspace_name: "myws".to_string(),
-                tab_name: "tab-1".to_string(),
+                tab_name: "main".to_string(),
                 first_prompt: "first".to_string(),
                 last_prompt: "last".to_string(),
-            is_subagent: false,
+                is_subagent: false,
             });
         }
         let model_json = serde_json::to_string(&model).expect("model serializes");

@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# handoff-herdr.sh — NON-DESTRUCTIVE server swap for a herdr instance.
+#
+# The "Handoff hr" button and the global ⌃⌥H (ctrl+option+h) hotkey run this.
+# Unlike restart-herdr.sh (⌃⌥X) and full-restart-herdr.sh (⌃⌥⇧X), this kills
+# NOTHING. It asks the running server to spawn a replacement from the binary on
+# disk and transfer the live pane PTY master fds over a unix socket (SCM_RIGHTS),
+# so every `claude`/`cx` pane keeps the SAME pid and every in-flight subagent,
+# team and Task survives. Only the server process is swapped underneath them.
+#
+# Intended flow (herdr-dev §7): build + E2E on herdrtest, `mv` the SAME binary
+# into place (never `cp` — cp over a running binary SIGKILLs on macOS), then
+# press ⌃⌥H instead of ⌃⌥X.
+#
+# DESIGN: fail loud, never fall back to a kill. Not killing the agents is the
+# entire point of this button; silently degrading to a restart would do exactly
+# what the user pressed it to avoid, at the moment they least expect it. On ANY
+# failure this script toasts the reason, logs it, changes nothing and exits
+# non-zero. `--fallback-restart` is deliberately NOT implemented here.
+#
+# Target resolution, prod refusal and server detection are copied verbatim from
+# restart-herdr.sh; instance identity must not diverge across the restart family.
+#
+# Usage:
+#   handoff-herdr.sh                 # in-app button: instance from inherited env
+#   handoff-herdr.sh hr              # explicit instance name (hotkey path)
+#   handoff-herdr.sh hr <exe>        # $2 overrides the binary to hand off to
+#   HERDR_HANDOFF_IMPORT_EXE=<path>  # same override, via env (button path, since
+#                                    # the button passes no args at all)
+#
+# ($1 is the instance name, per the restart-family convention, so the import-exe
+# override is $2 — the spec's "$1 or the env var" predates that collision.)
+
+set -u
+
+# ---------------------------------------------------------------------------
+# 0. Self-detach: the action runner is a child of the server being replaced.
+# ---------------------------------------------------------------------------
+LOG="${HERDR_HANDOFF_LOG:-$HOME/.herdr-handoff.log}"
+if [[ "${_HERDR_HANDOFF_DETACHED:-}" != "1" ]]; then
+  _HERDR_HANDOFF_DETACHED=1 nohup "$0" "$@" >>"$LOG" 2>&1 < /dev/null &
+  exit 0
+fi
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# Resolve a herdr CLI for toasts/status. PATH LAST: `herdr` on PATH may be a
+# different instance's shim, and the promoted per-instance binaries are the
+# authoritative ones.
+HERDR=""
+for cand in \
+  "${HERDR_BIN:-}" \
+  "$HOME/.herdr-hr/bin/herdr" \
+  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
+  "$HOME/Projects/herdr/target/release/herdr" \
+  "$(command -v herdr 2>/dev/null)"
+do
+  [[ -n "$cand" && -x "$cand" ]] && { HERDR="$cand"; break; }
+done
+
+# Toast, with a macOS fallback when herdr swallows it.
+#
+# `herdr notification show` answers {"shown":false,"reason":"disabled"} whenever
+# `[ui.toast] delivery` is "off" — which is exactly what hr's own config.toml
+# sets. A fail-loud button whose failure message is silently dropped is the
+# cardinal silent-failure sin, and this button's whole contract is that the user
+# LEARNS the handoff did not happen. So: check `shown`, and if herdr did not
+# display it, raise it through Notification Center instead. We deliberately do
+# not touch the user's herdr config to fix this.
+toast() {
+  local title="$1" body="${2:-}" out=""
+  log "TOAST: $title — $body"
+  if [[ -n "$HERDR" ]]; then
+    out="$("$HERDR" notification show "$title" ${body:+--body "$body"} 2>&1)"
+    printf '%s\n' "$out" >>"$LOG"
+    if printf '%s' "$out" | grep -q '"shown":[[:space:]]*true'; then
+      return 0
+    fi
+    log "herdr toast not shown (delivery off/busy) — falling back to Notification Center"
+  fi
+  # AppleScript string literals: escape backslashes first, then double quotes.
+  local t b
+  t="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  b="$(printf '%s' "$body"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+  osascript -e "display notification \"$b\" with title \"$t\"" >>"$LOG" 2>&1 || \
+    log "WARN: osascript fallback also failed — this message reached the log ONLY"
+}
+
+# Every failure toast states that the agents are still alive — that is the fact
+# the user most needs at that moment.
+die() {
+  toast "Handoff FAILED — nothing changed" \
+        "$1 Your agents are still running. Press ⌃⌥X only if you accept losing them."
+  exit "$2"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Resolve target instance identity (session + XDG_CONFIG_HOME).
+# ---------------------------------------------------------------------------
+SESSION=""
+CFG=""
+
+# Path 1: env from inside herdr (button action inherits the server's env).
+if [[ -n "${HERDR_SESSION:-}" && -n "${XDG_CONFIG_HOME:-}" ]]; then
+  SESSION="$HERDR_SESSION"
+  CFG="$XDG_CONFIG_HOME"
+fi
+
+# Path 2: explicit instance name argument (Karabiner passes e.g. `hr`).
+if [[ -n "${1:-}" ]]; then
+  SESSION="$1"
+  # Launcher convention: instance <name> lives under ~/.herdr-<name>.
+  CFG="$HOME/.herdr-${SESSION}/config"
+fi
+
+if [[ -z "$SESSION" || -z "$CFG" ]]; then
+  log "FATAL: could not resolve target instance (need HERDR_SESSION+XDG_CONFIG_HOME or an instance-name arg)"
+  die "Could not resolve which herdr instance to hand off." 2
+fi
+
+# Safety: never touch prod herdr (~/.config/herdr under the real HOME).
+if [[ "$CFG" == "$HOME/.config" || "$CFG" == "$HOME/.config/" ]]; then
+  log "REFUSING to hand off prod herdr ($CFG). Aborting."
+  toast "Handoff refused" "Target is prod herdr ($CFG). Refusing. Nothing was changed."
+  exit 3
+fi
+
+SOCK="$CFG/herdr/sessions/$SESSION/herdr.sock"
+
+# Escape hatch for instances that are NOT on the session-socket convention.
+# Env-only and deliberately unreachable from the button, which passes no env.
+# It exists because a herdr launched with another instance's XDG vars inherited
+# (e.g. started from inside an hr pane) ends up holding that instance's GLOBAL
+# socket, $CFG/herdr/herdr.sock, with an empty HERDR_SESSION — so neither
+# resolution path above can name it. The prod refusal above still applies, and
+# the resolved socket is re-checked against prod below, so this cannot be used
+# to reach ~/.config.
+if [[ -n "${HERDR_HANDOFF_SOCKET:-}" ]]; then
+  SOCK="$HERDR_HANDOFF_SOCKET"
+  log "SOCKET OVERRIDE in effect: $SOCK"
+  case "$SOCK" in
+    "$HOME/.config"/*)
+      log "REFUSING: override points into prod herdr. Aborting."
+      toast "Handoff refused" "Socket override points at prod herdr. Refusing. Nothing was changed."
+      exit 3
+      ;;
+  esac
+fi
+
+log "target: session=$SESSION config=$CFG"
+log "socket: $SOCK"
+
+# Pin the socket for EVERY herdr call below. This is not belt-and-braces: the
+# bare CLI defaults to the GLOBAL socket ($CFG/herdr/herdr.sock), which on this
+# machine is a DIFFERENT live server (herdrtest) from the session socket. An
+# unpinned call would hand off the wrong instance while the user believes their
+# agents are being preserved.
+export HERDR_SOCKET_PATH="$SOCK"
+unset HERDR_CLIENT_SOCKET_PATH 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 2. Detect the live server: pid, binary.
+# ---------------------------------------------------------------------------
+SERVER_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+
+BIN=""
+pid_env() { ps eww "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 "^$2=" | cut -d= -f2-; }
+
+# --- Gate 1: server alive -------------------------------------------------
+if [[ -z "$SERVER_PID" ]]; then
+  log "no live server on socket $SOCK"
+  toast "Handoff refused" \
+        "No live server on $SESSION (stale socket) — there is nothing to hand off. Nothing was changed. Use ⌃⌥X to start it."
+  exit 4
+fi
+log "live server pid: $SERVER_PID"
+BIN="$(ps -o comm= -p "$SERVER_PID" 2>/dev/null | sed 's/ server$//')"
+[[ -n "$BIN" ]] || BIN="$HOME/Projects/herdr/target/release/herdr"
+log "running server binary: $BIN"
+
+# --- Gate 2: handoff supported -------------------------------------------
+STATUS_JSON="$("$HERDR" status server --json 2>>"$LOG")"
+if [[ -z "$STATUS_JSON" ]]; then
+  die "Could not read server status on $SESSION." 5
+fi
+SUPPORTED="$(printf '%s' "$STATUS_JSON" | jq -r '.. | .live_handoff? // empty' 2>/dev/null | head -1)"
+STATUS_SOCK="$(printf '%s' "$STATUS_JSON" | jq -r '.. | .socket? // empty' 2>/dev/null | head -1)"
+log "status: live_handoff=$SUPPORTED socket=$STATUS_SOCK"
+# Paranoia: prove the status we just read came from the instance we targeted.
+if [[ -n "$STATUS_SOCK" && "$STATUS_SOCK" != "$SOCK" ]]; then
+  die "Server status came from $STATUS_SOCK, not $SOCK — refusing to hand off the wrong instance." 6
+fi
+if [[ "$SUPPORTED" != "true" ]]; then
+  toast "Handoff unavailable" \
+        "This server does not advertise live_handoff. Nothing was changed and your agents are still running. Use ⌃⌥X only if you accept losing them."
+  exit 7
+fi
+
+# --- Gate 3: import binary resolvable ------------------------------------
+IMPORT_EXE="${HERDR_HANDOFF_IMPORT_EXE:-}"
+[[ -n "${2:-}" ]] && IMPORT_EXE="$2"
+[[ -n "$IMPORT_EXE" ]] || IMPORT_EXE="$BIN"
+if [[ ! -f "$IMPORT_EXE" ]]; then
+  die "Import binary $IMPORT_EXE does not exist (or is not a regular file)." 8
+fi
+if [[ ! -x "$IMPORT_EXE" ]]; then
+  die "Import binary $IMPORT_EXE is not executable." 9
+fi
+log "import exe: $IMPORT_EXE"
+
+# --- Gate 4: pane count within the FD ceiling ----------------------------
+# MAX_FDS_PER_HANDOFF = 64 (src/server/handoff.rs). Refuse up front rather than
+# discovering it mid-transfer with live agents attached.
+PANE_JSON="$("$HERDR" pane list 2>>"$LOG")"
+PANES="$(printf '%s' "$PANE_JSON" | jq -r '.result.panes | length' 2>/dev/null)"
+if [[ -z "$PANES" || "$PANES" == "null" ]]; then
+  die "Could not count panes on $SESSION." 10
+fi
+log "pane count: $PANES"
+if (( PANES > 64 )); then
+  toast "Handoff refused" \
+        "$PANES panes exceeds the 64-fd handoff ceiling. Nothing was changed and your agents are still running. Use ⌃⌥X only if you accept losing them."
+  exit 11
+fi
+
+# ---------------------------------------------------------------------------
+# 2.5 Drop the restart sentinel BEFORE the handoff, so attached CLIENTS reattach.
+# ---------------------------------------------------------------------------
+# Measured, not assumed: the attached client does NOT survive a live handoff. It
+# exits with "server shut down: live update in progress; reconnect after handoff
+# completes". The pane PROCESSES survive (that is the whole point and it is
+# proven), but the human's terminal falls out of herdr.
+#
+# The launcher (~/.local/bin/<session>) already solves exactly this for the
+# restart buttons: on client exit it relaunches herdr IN THE SAME PTY iff it
+# finds a sentinel touched within RESTART_TTL (20s). A handoff drops no sentinel,
+# so without this the user would be left staring at a dead shell — the precise
+# bug the restart flow exists to avoid. Same file, same convention as
+# restart-herdr.sh §2.5.
+#
+# This kills nothing; it only tells an exiting client to come back.
+XDG_STATE="$(pid_env "$SERVER_PID" XDG_STATE_HOME)"
+[[ -n "$XDG_STATE" ]] || XDG_STATE="$HOME/.herdr-${SESSION}/state"
+SENTINEL="$XDG_STATE/herdr/.restart-request-$SESSION"
+mkdir -p "$XDG_STATE/herdr" 2>/dev/null
+if : > "$SENTINEL" 2>/dev/null; then
+  log "sentinel dropped: $SENTINEL"
+else
+  SENTINEL=""
+  log "WARN: could not write sentinel under $XDG_STATE/herdr — an attached client may not reattach"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. The handoff itself.
+# ---------------------------------------------------------------------------
+# READY_TIMEOUT and COMMIT_TIMEOUT are both 30s server-side; do NOT impose a
+# shorter script timeout and do not race the server's own rollback
+# (cleanup_failed_import_child kills the half-started import server and keeps
+# the old one running, so a failed handoff is a no-op).
+log "handing off: $BIN server live-handoff --import-exe $IMPORT_EXE"
+OUT="$("$BIN" server live-handoff --import-exe "$IMPORT_EXE" 2>&1)"
+RC=$?
+log "live-handoff rc=$RC output: $OUT"
+
+if [[ $RC -ne 0 ]]; then
+  # Nothing was swapped, so no client will exit and none should relaunch. Clear
+  # the sentinel rather than leaving a live one armed for its 20s TTL.
+  # (On SUCCESS we deliberately leave it, exactly as restart-herdr.sh does: with
+  # several clients attached, one wins the race and the losers still need to find
+  # it. Let it age out via TTL so EVERY attached client comes back.)
+  [[ -n "$SENTINEL" ]] && rm -f "$SENTINEL" 2>/dev/null
+  # The CLI reports failures as JSON ({"error":{"code":...,"message":...}}).
+  # Show the message, not the envelope — a toast is read in one glance.
+  REASON="$(printf '%s' "$OUT" | jq -r '.error.message // empty' 2>/dev/null | head -1)"
+  [[ -n "$REASON" ]] || REASON="$(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')"
+  die "${REASON:-live-handoff exited $RC}." 12
+fi
+
+# Confirm a new server actually owns the socket, and report the version applied.
+NEW_PID=""
+for _ in $(seq 1 40); do
+  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]] && break
+  sleep 0.25
+done
+
+if [[ -z "$NEW_PID" ]]; then
+  die "live-handoff reported success but no server owns $SOCK." 13
+fi
+if [[ "$NEW_PID" == "$SERVER_PID" ]]; then
+  die "live-handoff reported success but the server pid is unchanged ($SERVER_PID)." 14
+fi
+
+# --- Did the swap actually take? Compare INODES, not versions. -------------
+# `herdr --version` and version-dash are both FALSE GREENS here: --version
+# executes the ON-DISK binary and reports the promoted build no matter what is
+# actually running, and version-dash's +N is derived from the git source, so it
+# shows the same number whichever image is executing. A handoff that silently
+# kept the old image is indistinguishable from a real one by either.
+#
+# The executing image is the only ground truth: the inode the new server has
+# mapped as its text segment must equal the inode of the file we imported.
+DISK_INO="$(stat -f %i "$IMPORT_EXE" 2>/dev/null)"
+MAPPED_INO="$(lsof -p "$NEW_PID" -a -d txt 2>/dev/null | awk 'NR>1{print $(NF-1)}' | head -1)"
+log "inode check: import_exe=$DISK_INO mapped_by_$NEW_PID=$MAPPED_INO"
+if [[ -z "$MAPPED_INO" || -z "$DISK_INO" ]]; then
+  log "WARN: could not read both inodes — swap NOT verified"
+elif [[ "$MAPPED_INO" != "$DISK_INO" ]]; then
+  # Panes are fine, but the point of the button was not achieved.
+  toast "Handoff applied the WRONG image" \
+        "New server $NEW_PID is running inode $MAPPED_INO, not $DISK_INO from $IMPORT_EXE. Your panes and agents are still running, but the new binary is NOT live."
+  exit 15
+fi
+
+# --- Defense-in-depth: nudge the wasm UI plugin layers. --------------------
+# HISTORY: a live handoff used to drop the layer set (measured on herdrtest,
+# `render_ui_plugin_layers layers=N` fell from 8 to 3 — the dash lost
+# button-dash, version-dash and image-view while usage-dash survived, with no
+# error in any log). That was a HOST defect: the imported server rebuilt its
+# plugin registry but never rebuilt the UiPluginManager from it.
+#
+# FIXED IN THE HOST by herdr 4aaf75bc ("fix: rebuild the ui plugin layer set on
+# handoff import"), verified on herdrtest: 84 consecutive post-import frames at
+# the normal layers=10 with this cycling never running, and every plugin visible
+# in the band. So on a current binary this block is redundant.
+#
+# It stays because the script has to survive a handoff onto an OLDER image too —
+# import_exe is whatever the user points at, and downgrading to a pre-4aaf75bc
+# binary brings the defect back. Cycling any one plugin's enabled state rebuilds
+# the whole layer set, and it is a no-op when the layers are already correct.
+#
+# Best-effort only — never fail the handoff over this, the swap already worked.
+CYCLE_ID="$(printf '%s' "$("$HERDR" plugin list 2>>"$LOG")" \
+  | awk '/^- .* enabled /{print $2; exit}')"
+if [[ -n "$CYCLE_ID" ]]; then
+  log "nudging plugin layers by cycling $CYCLE_ID (redundant on a host with 4aaf75bc)"
+  "$HERDR" plugin disable "$CYCLE_ID" >>"$LOG" 2>&1 \
+    && sleep 1 \
+    && "$HERDR" plugin enable "$CYCLE_ID" >>"$LOG" 2>&1 \
+    && log "plugin layers nudged" \
+    || log "WARN: could not cycle $CYCLE_ID — harmless on a current host, but on a pre-4aaf75bc image the dash may be missing plugins until a restart"
+else
+  log "WARN: no enabled plugin found to cycle — harmless on a current host, but on a pre-4aaf75bc image the dash may be missing plugins until a restart"
+fi
+
+NEW_VER="$("$HERDR" status server --json 2>>"$LOG" | jq -r '.. | .version? // empty' 2>/dev/null | head -1)"
+log "HANDOFF OK: server pid $SERVER_PID -> $NEW_PID, version ${NEW_VER:-unknown}, image inode $MAPPED_INO"
+toast "hr handed off" \
+      "New server live on ${NEW_VER:-the new binary} (pid $NEW_PID). Panes and agents kept running — nothing was restarted."
+exit 0

@@ -624,11 +624,18 @@ pub fn render(
     let (state_line, hw) = state_footer(snap, expanded);
 
     // Assemble body lines, tracking interactive row indices.
-    let mut body: Vec<Line> = usage.clone();
+    //
+    // The host reserves a FIXED number of rows for this surface
+    // (`USAGE_STRIP_HEIGHT`, 7) and the guest cannot ask for more — there is no
+    // height effect in the ABI, only `SetSurfaceCollapsed`. So expanding trades
+    // the gauge/stats rows for the detail region inside the same reserve;
+    // keeping them would push the footer and the detail out of the box, which
+    // is exactly why expanding used to paint nothing.
+    let mut body: Vec<Line> = if expanded { Vec::new() } else { usage.clone() };
 
     let mut stats_row: Option<usize> = None;
     let mut stats_hw: u16 = 0;
-    if has_stats {
+    if has_stats && !expanded {
         stats_row = Some(body.len());
         if stats_shown {
             let mut first = vec![Span::styled("▾ ", Style::default().fg(DIM))];

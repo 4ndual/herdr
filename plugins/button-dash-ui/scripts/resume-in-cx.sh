@@ -34,8 +34,14 @@ log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 # 0. Resolve the herdr client binary + jq.
 # ---------------------------------------------------------------------------
 HERDR=""
-for cand in "${HERDR_BIN:-}" "$(command -v herdr 2>/dev/null)" \
-  "$HOME/Projects/herdr/target/release/herdr" "$HOME/.local/bin/herdr"; do
+# PATH LAST, deliberately: `command -v herdr` resolves to ~/.local/bin/herdr,
+# a symlink to a June-19 pre-prod build missing this fork's subcommands. Putting
+# it first silently ran the wrong binary. Prefer the live instance binary.
+for cand in "${HERDR_BIN:-}" \
+  "$HOME/.herdr-hr/bin/herdr" \
+  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
+  "$HOME/Projects/herdr/target/release/herdr" \
+  "$(command -v herdr 2>/dev/null)"; do
   if [[ -n "$cand" && -x "$cand" ]]; then
     HERDR="$cand"
     break

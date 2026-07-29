@@ -10,14 +10,22 @@
 //! has NO filesystem of its own, so all mutations (archive/restore/fork/delete)
 //! run host-side through param-less `[[actions]]`.
 //!
-//! Passing "which entry" without params: the widget renders each item as a chip
-//! in a fixed slot order (slot 1 = newest, matching the input file). Interaction
-//! invokes the matching slot action via `plugin.action.invoke`:
-//!   left-click a chip   -> `restore-slot-<N>`
+//! Passing "which entry": the widget renders each item as a chip in a fixed slot
+//! order (slot 1 = newest, matching the input file), and interaction invokes one
+//! of three actions with the slot as a PAYLOAD — `InvokePluginAction` carrying
+//! `{"slot":N}`, which the host exports to the script as
+//! `HERDR_PLUGIN_PAYLOAD_JSON`:
+//!   left-click a chip   -> `restore`
 //!   right-click a chip  -> open an inline `[fork] [del]` menu below that chip
-//!     click `[fork]`     -> `fork-slot-<N>`
-//!     click `[del]`      -> `delete-slot-<N>`
+//!     click `[fork]`     -> `fork`
+//!     click `[del]`      -> `delete`
 //! hovering a chip shows its résumé as a tooltip row below the strip.
+//!
+//! This used to be thirty actions (`<verb>-slot-1..10`) because host actions
+//! were param-less. They no longer are — but note the fix is NOT the socket
+//! method `plugin.action.invoke`, which still carries no payload; it is the
+//! guest-side `HostEffect::InvokePluginAction` variant, gated on the
+//! `plugin_actions` capability the manifest now declares.
 //!
 //! Mouse model (why NO declarative hit-rects): the host suppresses raw mouse —
 //! including hover `Move` — over a module's own hit-rects (the F5 click-dedupe).
@@ -118,6 +126,24 @@ enum HostEffectV3 {
         request_id: String,
         method: String,
         params: Value,
+    },
+    /// Run one of THIS plugin's declared actions, with a payload. The host
+    /// exports `payload_json` to the action's script as
+    /// `HERDR_PLUGIN_PAYLOAD_JSON` (`app/api/plugins/runtime.rs:82-87`).
+    ///
+    /// This is the ONLY way a guest passes a parameter to its own script. The
+    /// socket method `plugin.action.invoke` — the [`HostEffectV3::Api`] arm
+    /// above — carries no payload at all, which is why this widget used to
+    /// declare thirty `<verb>-slot-N` actions to encode one integer.
+    ///
+    /// Gated on the `plugin_actions` capability: without it the host silently
+    /// discards the effect (`ui_plugins.rs:1309-1311`), so the manifest must
+    /// declare it or every chip click becomes a no-op.
+    InvokePluginAction {
+        plugin_id: String,
+        action_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        payload_json: Option<String>,
     },
 }
 
@@ -305,10 +331,10 @@ fn handle_mouse(mouse: &MouseInput) -> UiUpdateV3 {
                 *MENU_OPEN.lock().expect("menu mutex poisoned") = None;
                 if let Some(slot) = slot {
                     let action = match which {
-                        MenuButton::Fork => format!("fork-slot-{slot}"),
-                        MenuButton::Delete => format!("delete-slot-{slot}"),
+                        MenuButton::Fork => "fork",
+                        MenuButton::Delete => "delete",
                     };
-                    return render_update(vec![invoke_effect(&action)]);
+                    return render_update(vec![invoke_effect(action, slot)]);
                 }
                 return render_update(Vec::new());
             }
@@ -317,7 +343,7 @@ fn handle_mouse(mouse: &MouseInput) -> UiUpdateV3 {
             *MENU_OPEN.lock().expect("menu mutex poisoned") = None;
             match chip_at(mouse.column, mouse.row) {
                 Some(chip) if !menu_was_open => match slot_of(chip) {
-                    Some(slot) => render_update(vec![invoke_effect(&format!("restore-slot-{slot}"))]),
+                    Some(slot) => render_update(vec![invoke_effect("restore", slot)]),
                     None => render_update(Vec::new()),
                 },
                 // If a menu was open, the click just dismisses it (no restore).
@@ -341,14 +367,16 @@ fn slot_of(chip: usize) -> Option<u32> {
         .map(|i| i.slot)
 }
 
-fn invoke_effect(action_id: &str) -> HostEffectV3 {
-    HostEffectV3::Api {
-        request_id: format!("archive-dash:invoke:{action_id}"),
-        method: "plugin.action.invoke".to_string(),
-        params: json!({
-            "plugin_id": PLUGIN_ID,
-            "action_id": action_id,
-        }),
+/// Run `<action_id>` against the record at `slot` (1-based, newest first).
+///
+/// The slot travels as a payload rather than being baked into the action id.
+/// `payload_json` is a JSON *string*, not an object — the host hands it to the
+/// script verbatim as `HERDR_PLUGIN_PAYLOAD_JSON`.
+fn invoke_effect(action_id: &str, slot: u32) -> HostEffectV3 {
+    HostEffectV3::InvokePluginAction {
+        plugin_id: PLUGIN_ID.to_string(),
+        action_id: action_id.to_string(),
+        payload_json: Some(json!({ "slot": slot }).to_string()),
     }
 }
 
@@ -684,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn left_click_chip_emits_restore_slot_action() {
+    fn left_click_chip_emits_restore_with_slot_payload() {
         let _g = guard();
         reset();
         set_items(vec![item(3, "gamma", "claude", "resume text")]);
@@ -695,15 +723,50 @@ mod tests {
         let col = s.x + s.width / 2;
         let update = handle_mouse(&mouse("left_down", col, 0));
         match update.effects.first().expect("one effect") {
-            HostEffectV3::Api { method, params, .. } => {
-                assert_eq!(method, "plugin.action.invoke");
-                assert_eq!(params["plugin_id"], json!(PLUGIN_ID));
-                // slot 3 -> restore-slot-3
-                assert_eq!(params["action_id"], json!("restore-slot-3"));
+            HostEffectV3::InvokePluginAction {
+                plugin_id,
+                action_id,
+                payload_json,
+            } => {
+                assert_eq!(plugin_id, PLUGIN_ID);
+                // The slot is in the PAYLOAD now, not baked into the action id.
+                assert_eq!(action_id, "restore");
+                assert_eq!(payload_json.as_deref(), Some(r#"{"slot":3}"#));
             }
-            other => panic!("expected Api effect, got {other:?}"),
+            other => panic!("expected InvokePluginAction, got {other:?}"),
         }
         reset();
+    }
+
+    /// The wire form is the actual contract with the host: the tag must be
+    /// `invoke_plugin_action` and `payload_json` must be a JSON *string*, not a
+    /// nested object. Asserting on the enum alone would not catch a serde
+    /// rename, and a wrong tag fails silently — the host drops the effect.
+    #[test]
+    fn invoke_effect_serializes_to_the_payload_wire_shape() {
+        let wire = serde_json::to_value(invoke_effect("delete", 7)).expect("serialize");
+        assert_eq!(wire["kind"], json!("invoke_plugin_action"));
+        assert_eq!(wire["plugin_id"], json!(PLUGIN_ID));
+        assert_eq!(wire["action_id"], json!("delete"));
+        assert_eq!(wire["payload_json"], json!(r#"{"slot":7}"#));
+    }
+
+    /// No action id may encode a slot any more — that explosion is what this
+    /// widget was collapsing. Catches a partial revert.
+    #[test]
+    fn no_effect_encodes_the_slot_in_its_action_id() {
+        for (verb, slot) in [("restore", 1u32), ("fork", 10), ("delete", 4)] {
+            match invoke_effect(verb, slot) {
+                HostEffectV3::InvokePluginAction { action_id, .. } => {
+                    assert_eq!(action_id, verb);
+                    assert!(
+                        !action_id.contains("slot"),
+                        "action id '{action_id}' still encodes a slot"
+                    );
+                }
+                other => panic!("expected InvokePluginAction, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -725,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_and_delete_menu_buttons_emit_their_slot_actions() {
+    fn fork_and_delete_menu_buttons_carry_the_slot_payload() {
         let _g = guard();
         reset();
         set_items(vec![item(7, "y", "claude", "r")]);
@@ -735,10 +798,15 @@ mod tests {
         // fork button (menu row is at oy+1 == row 1)
         let update = handle_mouse(&mouse("left_down", fx + fw / 2, 1));
         match update.effects.first().expect("fork effect") {
-            HostEffectV3::Api { params, .. } => {
-                assert_eq!(params["action_id"], json!("fork-slot-7"));
+            HostEffectV3::InvokePluginAction {
+                action_id,
+                payload_json,
+                ..
+            } => {
+                assert_eq!(action_id, "fork");
+                assert_eq!(payload_json.as_deref(), Some(r#"{"slot":7}"#));
             }
-            other => panic!("expected Api, got {other:?}"),
+            other => panic!("expected InvokePluginAction, got {other:?}"),
         }
         // menu closed after acting
         assert_eq!(*MENU_OPEN.lock().unwrap(), None);
@@ -747,10 +815,15 @@ mod tests {
         *MENU_OPEN.lock().unwrap() = Some(0);
         let update = handle_mouse(&mouse("left_down", dx + dw / 2, 1));
         match update.effects.first().expect("delete effect") {
-            HostEffectV3::Api { params, .. } => {
-                assert_eq!(params["action_id"], json!("delete-slot-7"));
+            HostEffectV3::InvokePluginAction {
+                action_id,
+                payload_json,
+                ..
+            } => {
+                assert_eq!(action_id, "delete");
+                assert_eq!(payload_json.as_deref(), Some(r#"{"slot":7}"#));
             }
-            other => panic!("expected Api, got {other:?}"),
+            other => panic!("expected InvokePluginAction, got {other:?}"),
         }
         reset();
     }

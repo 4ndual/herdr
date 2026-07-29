@@ -15,8 +15,23 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
+
+/// Accent color for an agent kind. Shared by the row identity and the tooltip
+/// agent value so the same agent always reads as the same color (color =
+/// meaning): a glance down the list distinguishes claude/cx/codex/pi rows even
+/// when several are unnamed and therefore share the agent name as their title.
+fn agent_color(agent: &str) -> Color {
+    match agent {
+        "claude" => Color::Magenta,
+        "cx" => Color::Blue,
+        "codex" => Color::Green,
+        "pi" => Color::Yellow,
+        "terminal" => Color::DarkGray,
+        _ => Color::White,
+    }
+}
 
 /// Header collapse button / collapsed-handle expand affordance. Guest-owned:
 /// `lib.rs` flips guest collapse state and emits `SetSurfaceCollapsed` on a
@@ -461,29 +476,25 @@ fn render_full(
     hits
 }
 
-/// The display label for a row and whether it is a *fallback* (rendered dim).
-/// Identity is taken in precedence order:
+/// The single identity string a row shows, in precedence order:
 ///   1. the manual pane label (`label`) — rare, most specific (e.g. "labs");
 ///   2. the pane's TAB display name (`tab_name`) — herdr always assigns one at
 ///      tab creation (a user rename, "new"/"test", or a number), so this is the
-///      name the user scans by and is effectively never empty for a live pane.
-/// Both are real names, so neither reads as a fallback. When both are empty
-/// (legacy records written before `tab_name` was captured) the row shows only
-/// its agent + sid — the agent is already rendered as a separate leading part,
-/// so repeating it here would just print it twice. We deliberately do NOT fall
-/// back to the first user prompt (noisy, not how panes are named) nor to the
-/// cwd/folder name (the project-folder encoding the user explicitly rejected).
-/// The bool is retained for the dim styling contract.
-fn row_label(row: &historial_dash_model::HistorialRow) -> (String, bool) {
+///      name the user scans by and is effectively never empty for a live pane;
+///   3. the agent name (`claude`/`cx`/…) — a last-resort safety net only for
+///      legacy records written before `tab_name` was captured.
+/// We deliberately never substitute the first user prompt (noisy) nor the
+/// cwd/folder name (rejected). All other metadata lives in the hover tooltip.
+fn row_identifier(row: &historial_dash_model::HistorialRow) -> &str {
     let label = row.label.trim();
     if !label.is_empty() {
-        return (label.to_string(), false);
+        return label;
     }
     let tab = row.tab_name.trim();
     if !tab.is_empty() {
-        return (tab.to_string(), false);
+        return tab;
     }
-    (String::new(), false)
+    row.agent.trim()
 }
 
 /// Render the legend overlay (shown while `[?]` is toggled on), describing the
@@ -503,8 +514,9 @@ fn render_legend(
         "[t] show terminal panes".to_string(),
         "[<] collapse panel".to_string(),
         "[?] toggle this help".to_string(),
-        "row: agent  label  sid".to_string(),
-        "  click label = resume".to_string(),
+        "row: pane name (color=agent)".to_string(),
+        "  hover = full details".to_string(),
+        "  click name = resume".to_string(),
         "  [f] fork into new tab".to_string(),
         "  [x] delete record".to_string(),
     ];
@@ -526,58 +538,215 @@ fn render_legend(
     }
 }
 
-/// Draw the hover tooltip (workspace name, first prompt, last prompt) starting at
-/// `start_y`, wrapping each field to the panel width and stopping at the panel
-/// bottom.
+/// Dim fixed-width gutter for tooltip field labels ("agent", "cwd", …) so values
+/// line up in a column.
+const TIP_LABEL_W: usize = 7;
+
+/// One `label   value` tooltip line: dim gutter label, then the type-colored
+/// value (color = field meaning).
+fn tip_field(label: &str, value: String, value_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<TIP_LABEL_W$}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(value, value_style),
+    ])
+}
+
+/// Push a possibly-long value under `label`, wrapping to the tooltip's inner
+/// width: the first visual line carries the dim label gutter, continuations are
+/// indented to align under the value. Capped at `max_lines` (an over-long prompt
+/// must not fill the panel); the last kept line ends in `…` when text remains.
+/// No-op when `text` is empty.
+fn tip_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    text: &str,
+    value_style: Style,
+    inner_w: usize,
+    max_lines: usize,
+) {
+    let text = text.trim();
+    if text.is_empty() || max_lines == 0 {
+        return;
+    }
+    let value_w = inner_w.saturating_sub(TIP_LABEL_W).max(4);
+    let chars: Vec<char> = text.chars().collect();
+    let dim = Style::default().fg(Color::DarkGray);
+    for (i, chunk) in chars.chunks(value_w).enumerate() {
+        if i >= max_lines {
+            break;
+        }
+        let mut value: Vec<char> = chunk.to_vec();
+        // On the last allowed line with more text remaining, mark the cut.
+        if i + 1 == max_lines && (i + 1) * value_w < chars.len() {
+            if let Some(last) = value.last_mut() {
+                *last = '…';
+            }
+        }
+        let gutter = if i == 0 {
+            format!("{label:<TIP_LABEL_W$}")
+        } else {
+            " ".repeat(TIP_LABEL_W)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(gutter, dim),
+            Span::styled(value.into_iter().collect::<String>(), value_style),
+        ]));
+    }
+}
+
+/// Draw the rich hover tooltip: a rounded, dim-bordered box (identity on the
+/// border) holding the row's full metadata, grouped and color-coded — session
+/// (agent / restorability / id), location (workspace / tab / cwd), time
+/// (relative + absolute), and the first/last user prompts. Drawn just beneath
+/// the hovered row (`start_y`); if it would overflow the panel bottom it shifts
+/// up so it stays fully on-screen. All content lives here, not on the row.
 fn render_tooltip(row: &historial_dash_model::HistorialRow, area: Rect, start_y: u16, buf: &mut Buffer) {
     let bottom = area.y + area.height; // exclusive
-    let width = area.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
-
-    if !row.workspace_name.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("@ {}", row.workspace_name),
-            Style::default().fg(Color::Cyan),
-        )));
+    if area.width < 6 || area.height < 4 {
+        return; // too small for a boxed tooltip
     }
-    push_wrapped(&mut lines, "1st: ", &row.first_prompt, width);
-    push_wrapped(&mut lines, "last: ", &row.last_prompt, width);
+    let inner_w = (area.width as usize).saturating_sub(2); // minus L/R border
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // --- session: agent, restorability, full id ---
+    lines.push(tip_field(
+        "agent",
+        row.agent.clone(),
+        Style::default().fg(agent_color(&row.agent)),
+    ));
+    let (status_text, status_color) = if row.restorable {
+        ("resumable", Color::Green)
+    } else {
+        ("no resume", Color::DarkGray)
+    };
+    lines.push(tip_field(
+        "status",
+        status_text.to_string(),
+        Style::default().fg(status_color),
+    ));
+    tip_wrapped(&mut lines, "id", &row.sid, Style::default().fg(Color::Gray), inner_w, 1);
+
+    // --- location: workspace, tab, cwd (blank-line separated group) ---
+    let mut loc: Vec<Line<'static>> = Vec::new();
+    if !row.workspace_name.trim().is_empty() {
+        loc.push(tip_field(
+            "ws",
+            row.workspace_name.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    if !row.tab_name.trim().is_empty() {
+        loc.push(tip_field("tab", row.tab_name.clone(), Style::default().fg(Color::Cyan)));
+    }
+    tip_wrapped(&mut loc, "cwd", &row.cwd, Style::default().fg(Color::Blue), inner_w, 2);
+    if !loc.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(loc);
+    }
+
+    // --- time: relative (accent) then absolute (dim) on one "seen" line ---
+    if !row.reltime.trim().is_empty() || !row.abstime.trim().is_empty() {
+        lines.push(Line::from(""));
+        let mut spans = vec![Span::styled(
+            format!("{:<TIP_LABEL_W$}", "seen"),
+            Style::default().fg(Color::DarkGray),
+        )];
+        if !row.reltime.trim().is_empty() {
+            spans.push(Span::styled(
+                row.reltime.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if !row.abstime.trim().is_empty() {
+            if !row.reltime.trim().is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                row.abstime.clone(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // --- prompts: first (bright) + last (dim), each wrapped and capped ---
+    let mut prompts: Vec<Line<'static>> = Vec::new();
+    tip_wrapped(
+        &mut prompts,
+        "first",
+        &row.first_prompt,
+        Style::default().fg(Color::White),
+        inner_w,
+        3,
+    );
+    tip_wrapped(
+        &mut prompts,
+        "last",
+        &row.last_prompt,
+        Style::default().fg(Color::DarkGray),
+        inner_w,
+        3,
+    );
+    if !prompts.is_empty() {
+        lines.push(Line::from(""));
+        lines.extend(prompts);
+    }
+
     if lines.is_empty() {
         return;
     }
 
+    // Box = content + 2 borders, clamped to the panel (keep the header row). If
+    // it would overflow the bottom, shift up so it stays fully on-screen.
+    let content_h = lines.len() as u16;
+    let max_h = area.height.saturating_sub(1);
+    let box_h = (content_h + 2).min(max_h).max(3);
+    let mut top = start_y;
+    if top + box_h > bottom {
+        top = bottom.saturating_sub(box_h);
+    }
+    if top < area.y + 1 {
+        top = area.y + 1;
+    }
+    let tip_rect = Rect {
+        x: area.x,
+        y: top,
+        width: area.width,
+        height: box_h,
+    };
+
+    let ident = row_identifier(row).to_string();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" {ident} "),
+            Style::default()
+                .fg(agent_color(&row.agent))
+                .add_modifier(Modifier::BOLD),
+        ));
+    Clear.render(tip_rect, buf);
+    let inner = block.inner(tip_rect);
+    block.render(tip_rect, buf);
+
     for (i, line) in lines.into_iter().enumerate() {
-        let y = start_y + i as u16;
-        if y >= bottom {
+        if i as u16 >= inner.height {
             break;
         }
         Paragraph::new(line).render(
             Rect {
-                x: area.x,
-                y,
-                width: area.width,
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
                 height: 1,
             },
             buf,
         );
-    }
-}
-
-/// Push `prefix + text` wrapped to `width` columns as muted tooltip lines.
-/// No-op when `text` is empty.
-fn push_wrapped(lines: &mut Vec<Line<'static>>, prefix: &str, text: &str, width: usize) {
-    if text.trim().is_empty() {
-        return;
-    }
-    let full = format!("{prefix}{text}");
-    let cols = width.max(4);
-    let chars: Vec<char> = full.chars().collect();
-    for chunk in chars.chunks(cols) {
-        let s: String = chunk.iter().collect();
-        lines.push(Line::from(Span::styled(
-            s,
-            Style::default().fg(Color::DarkGray),
-        )));
     }
 }
 
@@ -600,29 +769,22 @@ fn render_row(
     let reserved = reltime_w + actions_w + 2;
     let text_budget = (width as u16).saturating_sub(reserved).max(4) as usize;
 
-    // Row text: "<agent> <pane-label> <sid4?>". The pane label is the primary
-    // display; when the pane had no title/manual label we fall back (dimmed) to
-    // the first prompt words. Never the folder/cwd — a nameless, promptless row
-    // shows just its agent + sid. No cwd column.
-    let (label_text, is_fallback) = row_label(row);
-    let mut parts: Vec<&str> = vec![row.agent.as_str()];
-    if !label_text.is_empty() {
-        parts.push(label_text.as_str());
-    }
-    if !row.sid4.is_empty() {
-        parts.push(row.sid4.as_str());
-    }
-    let label = truncate_to(&parts.join(" "), text_budget);
+    // Row = just the pane's herdr identity (name, or agent name when unnamed),
+    // colored by agent so kinds are distinguishable at a glance. Everything else
+    // (session id, cwd, time, prompts, workspace/tab) is in the hover tooltip.
+    let label = truncate_to(row_identifier(row), text_budget);
     let mut spans: Vec<Span> = Vec::new();
     let restore_w = label.width() as u16;
-    // Real label on a restorable row = bright; fallback text or non-restorable
-    // rows read dim.
-    let fg = if row.restorable && !is_fallback {
-        Color::White
+    // Restorable rows read in their agent color and bold (the actionable ones);
+    // non-restorable rows (dead agent refs, plain terminals) read dim.
+    let style = if row.restorable {
+        Style::default()
+            .fg(agent_color(&row.agent))
+            .add_modifier(Modifier::BOLD)
     } else {
-        Color::DarkGray
+        Style::default().fg(Color::DarkGray)
     };
-    spans.push(Span::styled(label, Style::default().fg(fg)));
+    spans.push(Span::styled(label, style));
 
     // Pad to push reltime + actions to the right edge.
     let used = restore_w + reltime_w + actions_w;
@@ -715,7 +877,7 @@ mod tests {
             cwd: "/home/dev/herdr".to_string(),
             restorable,
             workspace_name: "myws".to_string(),
-            tab_name: "tab-1".to_string(),
+            tab_name: "main".to_string(),
             first_prompt: "first prompt text".to_string(),
             last_prompt: "last prompt text".to_string(),
             is_subagent: false,
@@ -824,52 +986,37 @@ mod tests {
     }
 
     #[test]
-    fn unlabeled_row_never_shows_first_prompt() {
-        // The pane name (label) is the only row title. A row with no pane name
-        // must NOT fall back to the first user prompt — it shows agent + sid only,
-        // matching how the user recognizes panes by their herdr name.
+    fn unlabeled_row_shows_tab_name_never_first_prompt() {
+        // A row with no manual pane label falls back to its TAB display name (the
+        // always-present identifier the user scans by) — NOT the first user
+        // prompt, and NOT the session id (both are tooltip-only).
         let mut r = row("1:w_1_p_1", true);
-        r.label = String::new();
-        r.tab_name = String::new(); // no tab name either: the truly nameless case
+        r.label = String::new(); // no manual pane label
+        r.tab_name = "bitwarden".to_string(); // herdr's tab display name
         r.first_prompt = "fix the historial panel please now urgently".to_string();
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
+        // No hover: only the row is drawn (no tooltip).
         let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let text = buffer_text(&buf);
-        assert!(!text.contains("fix the historial"));
-        assert!(text.contains("claude")); // agent still shown
-        assert!(text.contains("c123")); // sid still shown
+        assert!(text.contains("bitwarden")); // tab name is the row identity
+        assert!(!text.contains("fix the historial")); // never the first prompt
+        assert!(!text.contains("c123")); // sid is tooltip-only
     }
 
     #[test]
-    fn unlabeled_row_falls_back_to_tab_name_not_the_bare_agent() {
-        // The common case: panes are almost never manually renamed, so the tab
-        // display name is what identifies the row. Without this fallback every
-        // unlabeled row collapses to its agent kind and the panel reads as a
-        // column of identical "cx" entries.
+    fn legacy_row_without_tab_falls_back_to_agent() {
+        // A legacy record predating tab_name capture (no manual label, no tab
+        // name) shows the agent kind as a last resort — still never a prompt.
         let mut r = row("1:w_1_p_1", true);
         r.label = String::new();
-        r.tab_name = "overlay-compact-sol".to_string();
+        r.tab_name = String::new();
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
-        assert!(buffer_text(&buf).contains("overlay-compact-sol"));
-    }
-
-    #[test]
-    fn manual_pane_label_outranks_the_tab_name() {
-        let mut r = row("1:w_1_p_1", true);
-        r.label = "labs".to_string();
-        r.tab_name = "overlay-compact-sol".to_string();
-        let model = HistorialRenderModel { rows: vec![r] };
-        let area = Rect::new(0, 0, 60, 12);
-        let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
-        let text = buffer_text(&buf);
-        assert!(text.contains("labs"));
-        assert!(!text.contains("overlay-compact-sol"));
+        assert!(buffer_text(&buf).contains("claude"));
     }
 
     #[test]
@@ -912,8 +1059,9 @@ mod tests {
 
     #[test]
     fn nameless_promptless_row_never_shows_folder() {
-        // A restorable agent row with no pane label and no first prompt must fall
-        // through to agent + sid only — never the cwd basename ("herdr").
+        // A restorable agent row with no pane label, no tab name, and no first
+        // prompt shows its agent name only — never the cwd basename ("herdr").
+        // (No hover, so the tooltip — which does show cwd — is not drawn.)
         let mut r = row("1:w_1_p_1", true);
         r.label = String::new();
         r.tab_name = String::new();
@@ -924,48 +1072,42 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let text = buffer_text(&buf);
-        assert!(text.contains("claude"));
-        assert!(text.contains("c123")); // sid still shown
-        assert!(!text.contains("herdr")); // folder never leaks in
+        assert!(text.contains("claude")); // agent name is the row identity
+        assert!(!text.contains("c123")); // sid is tooltip-only
+        assert!(!text.contains("herdr")); // folder never leaks onto the row
     }
 
     fn terminal_row(key: &str) -> HistorialRow {
         HistorialRow {
             key: key.to_string(),
             agent: "terminal".to_string(),
-            label: String::new(),
-            sid4: String::new(),
-            sid: String::new(),
             reltime: "1h".to_string(),
-            abstime: String::new(),
             cwd: "/home/dev/scratch".to_string(),
             restorable: false,
-            workspace_name: String::new(),
-            tab_name: String::new(),
-            first_prompt: String::new(),
-            last_prompt: String::new(),
-            is_subagent: false,
+            ..Default::default()
         }
     }
 
     #[test]
     fn terminals_hidden_by_default_and_revealed_by_toggle() {
+        let mut agent_row = row("1:w_1_p_1", true);
+        agent_row.label = "myproj".to_string(); // a real, distinct pane name
         let model = HistorialRenderModel {
-            rows: vec![row("1:w_1_p_1", true), terminal_row("2:w_1_p_2")],
+            rows: vec![agent_row, terminal_row("2:w_1_p_2")],
         };
         let area = Rect::new(0, 0, 44, 12);
 
-        // Hidden: the terminal row is not drawn; the claude row is. The folder
-        // name ("scratch") must never appear regardless of the toggle.
+        // Hidden: the terminal row is not drawn; the agent row is (by its pane
+        // name). Neither folder basename ("scratch") appears on any row.
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
         let hidden = buffer_text(&buf);
-        assert!(hidden.contains("claude"));
+        assert!(hidden.contains("myproj"));
         assert!(!hidden.contains("terminal"));
         assert!(!hidden.contains("scratch"));
 
-        // Shown: the terminal row appears (as its agent kind), still never the
-        // folder name.
+        // Shown: the unnamed terminal row appears by its agent-kind identity
+        // ("terminal"), still never the folder name.
         let mut buf = Buffer::empty(area);
         let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         let shown = buffer_text(&buf);
@@ -1004,5 +1146,96 @@ mod tests {
         let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
+    }
+
+    #[test]
+    fn labeled_row_shows_pane_name_not_metadata() {
+        // A named, restorable row shows its pane name as the identity — not the
+        // agent text, sid, or prompt (all of which are tooltip-only).
+        let r = row("1:w_1_p_1", true); // label "herdr", sid "sess-c123"
+        let model = HistorialRenderModel { rows: vec![r] };
+        let area = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let text = buffer_text(&buf);
+        assert!(text.contains("herdr")); // the pane name
+        assert!(!text.contains("sess-c123")); // full sid is tooltip-only
+        assert!(!text.contains("first prompt")); // prompt never on the row
+    }
+
+    #[test]
+    fn hover_tooltip_shows_full_metadata_in_a_box() {
+        // Hovering a row draws the boxed tooltip with every metadata field:
+        // agent, restorability, full session id, workspace, tab, cwd, absolute
+        // time, and both prompts. Uses a tall panel so nothing is clamped away.
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, Some(0), RowFilters::default(), None);
+        let text = buffer_text(&buf);
+        assert!(text.contains("resumable")); // restorability status
+        assert!(text.contains("sess-c123")); // FULL session id (not just sid4)
+        assert!(text.contains("myws")); // workspace
+        assert!(text.contains("main")); // tab
+        assert!(text.contains("/home/dev/herdr")); // cwd
+        assert!(text.contains("2026-07-24 15:57")); // absolute time
+        assert!(text.contains("first prompt text"));
+        assert!(text.contains("last prompt text"));
+        // The box is drawn (rounded corner glyph present).
+        assert!(text.contains('╮') || text.contains('╭'));
+    }
+
+    #[test]
+    fn tooltip_omits_absent_optional_fields() {
+        // A terminal row with no session/workspace/tab/prompts must not render
+        // empty "id"/"ws"/"tab" gutters — those lines are skipped entirely.
+        let model = HistorialRenderModel {
+            rows: vec![terminal_row("1:w_1_p_1")],
+        };
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buf = Buffer::empty(area);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            Some(0),
+            RowFilters { show_terminals: true, ..RowFilters::default() },
+            None,
+        );
+        let text = buffer_text(&buf);
+        assert!(text.contains("no resume")); // status still shown
+        assert!(text.contains("/home/dev/scratch")); // cwd still shown
+        assert!(!text.contains("ws ")); // no empty workspace gutter
+        assert!(!text.contains("first ")); // no empty prompt gutter
+    }
+
+    /// Visual-proof helper (no-op in normal runs): when `HISTORIAL_SNAPSHOT_FILE`
+    /// points at a real `historial_input.json`, render the panel exactly as the
+    /// guest would — first restorable agent row hovered — and print the buffer.
+    /// Lets us capture the true rendered panel + tooltip from live data without a
+    /// running herdr, driving the same `render()` path the wasm guest uses.
+    #[test]
+    fn snapshot_real_projection_when_env_set() {
+        let Ok(path) = std::env::var("HISTORIAL_SNAPSHOT_FILE") else {
+            return;
+        };
+        let json = std::fs::read_to_string(&path).expect("read snapshot json");
+        let model: HistorialRenderModel = serde_json::from_str(&json).expect("parse model");
+        let filters = RowFilters::default(); // terminals hidden, like the live default
+        let visible = visible_rows(&model, filters);
+        let hover = visible
+            .iter()
+            .position(|r| r.restorable && r.agent != "terminal");
+        let area = Rect::new(0, 0, 46, 44);
+        let mut buf = Buffer::empty(area);
+        let _ = render(&model, area, &mut buf, hover, filters, None);
+        eprintln!(
+            "\n===== HISTORIAL PANEL (real data, {} visible rows, hover idx {:?}) =====",
+            visible.len(),
+            hover
+        );
+        eprintln!("{}", buffer_text(&buf));
     }
 }

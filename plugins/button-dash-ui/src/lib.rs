@@ -73,6 +73,22 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "handoff-hr",
+        label: "Handoff hr",
+        emoji: "\u{1F91D}",            // 🤝
+        shortcut: "\u{2303}\u{2325}H", // ⌃⌥H
+        // `warning` resolves to palette.yellow, the same swatch as draw-screenshot.
+        // Every canonically-distinct role is already spoken for (see the allow-list
+        // in the tests below), and warning/yellow is the least misleading of the
+        // remaining pairings: red would sit this button next to full-restart, which
+        // reads as "destructive" — the opposite of what it is.
+        color: "warning",
+        description:
+            "Swap in the new binary WITHOUT killing panes — agents and subagents keep running",
+        action_id: "handoff-hr",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "full-restart",
         label: "Full restart",
         emoji: "\u{267B}\u{FE0F}",              // ♻️
@@ -111,6 +127,16 @@ static BUTTONS: &[ButtonDef] = &[
         color: "accent",
         description: "Fork this claude conversation into a new TAB running under cx (GPT-via-CCR)",
         action_id: "resume-in-cx",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "refresh-cx-token",
+        label: "Refresh cx token",
+        emoji: "\u{1F511}",            // 🔑
+        shortcut: "\u{2303}\u{2325}T", // ⌃⌥T
+        color: "cyan",
+        description: "Re-sync the CCR gateway's Claude token from the Keychain — fixes a live cx session 401ing, no relaunch",
+        action_id: "refresh-cx-token",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
@@ -162,6 +188,32 @@ static BUTTONS: &[ButtonDef] = &[
         description: "Close the current pane and save it to the archive widget (restorable)",
         action_id: "archive",
         plugin: "builtin.archive-dash",
+    },
+    ButtonDef {
+        id: "bg-dispatch",
+        label: "Background agent",
+        emoji: "\u{1F680}",            // 🚀
+        shortcut: "\u{2303}\u{2325}B", // ⌃⌥B
+        color: "magenta",
+        description: "Open a pane to type a prompt, then dispatch it as a detached background agent (claude --bg)",
+        action_id: "bg-dispatch",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "relocate",
+        label: "Relocate",
+        emoji: "\u{1F4E6}",            // 📦
+        shortcut: "\u{2303}\u{2325}L", // ⌃⌥L
+        // Deliberate, allow-listed collision with `fork` (see
+        // ALLOWED_COLOR_COLLISIONS): `success` is an alias of `green`. Every
+        // distinct colour was already taken, so the choice was WHICH pair
+        // collides — fork and relocate are the two "send this conversation
+        // somewhere else" buttons, so sharing a hue reads as a family rather
+        // than as a mistake. Their glyphs (🍴 vs 📦) carry the distinction.
+        color: "success",
+        description: "Move this conversation to the project it is actually about, and continue it there",
+        action_id: "relocate",
+        plugin: PLUGIN_ID,
     },
 ];
 
@@ -641,12 +693,95 @@ mod tests {
         }
     }
 
+    /// Resolve a palette ROLE to the canonical palette field it actually paints,
+    /// mirroring `plugin_span_style` in the host (`herdr/src/ui.rs:993-1012`).
+    ///
+    /// Several roles are ALIASES for the same colour. Comparing the role strings
+    /// therefore proves nothing: two buttons can carry different role names and
+    /// render byte-identical. Verified against a real frame with
+    /// `tmux capture-pane -pe` — `magenta` and `mauve` both emit
+    /// `38;2;203;166;247`.
+    ///
+    /// Note this resolves the FOREGROUND only. `accent` is `blue` plus BOLD; the
+    /// fg is identical, so it is treated as a collision here and the weight is
+    /// recorded as a mitigation, not as a distinct colour. That is the honest
+    /// reading of §1.4 of DESIGN.md: weight is a weaker channel than hue and is
+    /// lost entirely to a bold-averse theme, so it cannot carry distinctness on
+    /// its own.
+    fn canonical_color(role: &str) -> &'static str {
+        match role {
+            "accent" | "blue" => "palette.blue",
+            "muted" => "palette.overlay0",
+            "success" | "green" => "palette.green",
+            "warning" | "yellow" => "palette.yellow",
+            "danger" | "red" => "palette.red",
+            "teal" | "cyan" => "palette.teal",
+            "mauve" | "magenta" => "palette.mauve",
+            "subtext" | "gray" => "palette.subtext0",
+            "peach" => "palette.peach",
+            "panel" => "palette.panel_bg",
+            _ => "palette.text",
+        }
+    }
+
+    /// Collisions that are ACCEPTED, each as a sorted role pair.
+    ///
+    /// The host exposes 11 distinct foreground colours and the registry now has
+    /// more buttons than that, so perfect distinctness is arithmetically
+    /// impossible — the honest end state is "documented collisions, no accidental
+    /// ones". Each pair below is deliberate, and every pair is separated by some
+    /// OTHER channel (all buttons carry unrelated glyphs, per §1.4):
+    ///
+    /// - `("accent", "blue")`   — same fg, `accent` adds BOLD.
+    /// - `("cyan", "teal")`     — pure aliases; predates the alias-aware test.
+    /// - `("magenta", "mauve")` — pure aliases; `bg-dispatch` was specced as
+    ///   `magenta` on the belief that it was a free colour. It is not, and no
+    ///   free colour remains. Giving it a genuinely distinct hue needs a new
+    ///   palette arm in the host, which is a host change and out of scope here.
+    ///
+    /// Note every entry is a pair of DIFFERENT role names. Two buttons sharing
+    /// one role (`"green"` twice) is never allowed and still fails.
+    /// - `("green", "success")` — pure aliases. Chosen deliberately for
+    ///   `relocate` vs `fork`: past the 11-colour ceiling the question is not
+    ///   *whether* to collide but *which* pair should, and these are the two
+    ///   "send this conversation elsewhere" buttons.
+    /// - `("warning", "yellow")` — pure aliases. `handoff-hr` needed a colour and
+    ///   the 11 canonically-distinct roles were already exhausted; of the
+    ///   remaining pairings this is the least misleading, since `danger`/`red`
+    ///   would seat the one NON-destructive restart-family button next to
+    ///   `full-restart` and read as destructive. Its partner, `draw-screenshot`,
+    ///   is unrelated and sits far away in the strip.
+    const ALLOWED_COLOR_COLLISIONS: &[(&str, &str)] = &[
+        ("accent", "blue"),
+        ("cyan", "teal"),
+        ("green", "success"),
+        ("magenta", "mauve"),
+        ("warning", "yellow"),
+    ];
+
     #[test]
     fn button_colors_are_distinct() {
-        let mut colors: Vec<&str> = BUTTONS.iter().map(|b| b.color).collect();
-        colors.sort_unstable();
-        colors.dedup();
-        assert_eq!(colors.len(), BUTTONS.len(), "each button needs its own color");
+        for (i, a) in BUTTONS.iter().enumerate() {
+            for b in BUTTONS.iter().skip(i + 1) {
+                if canonical_color(a.color) != canonical_color(b.color) {
+                    continue;
+                }
+                let mut pair = [a.color, b.color];
+                pair.sort_unstable();
+                assert!(
+                    ALLOWED_COLOR_COLLISIONS.contains(&(pair[0], pair[1])),
+                    "buttons '{}' ({}) and '{}' ({}) both render as {} — \
+                     a colour is only distinct if it RESOLVES distinctly. \
+                     Pick a role with a different canonical colour, or add the \
+                     pair to ALLOWED_COLOR_COLLISIONS with a reason.",
+                    a.id,
+                    a.color,
+                    b.id,
+                    b.color,
+                    canonical_color(a.color),
+                );
+            }
+        }
     }
 
     #[test]
@@ -721,13 +856,28 @@ mod tests {
 
     #[test]
     fn click_at_observed_coords_resolves_fork() {
-        // Regression for the live-observed miss: origin=(128,39) [after the
-        // top-row fix], click col=152 row=39 → rel=24 lands inside the 🍴 fork
-        // segment and must emit the `fork` action invoke.
+        // Regression for the live-observed miss: with origin=(128,39) [after the
+        // top-row fix], a click on the top row must resolve to the button under
+        // it instead of missing entirely (the bug was hit=None for every click).
+        //
+        // The column is DERIVED from fork's own segment rather than hardcoded.
+        // It used to be the observed col=152, but that pins the assertion to the
+        // button ORDER, not to the hit-testing math this test exists to guard —
+        // inserting any button ahead of fork slid a different button under 152
+        // and failed the test for a reason it does not name.
         let _g = guard();
         reset();
         *STRIP_ORIGIN.lock().unwrap() = Some((128, 39));
-        let update = handle_mouse(&mouse("left_down", 152, 39));
+        let fork_idx = BUTTONS
+            .iter()
+            .position(|b| b.action_id == "fork")
+            .expect("fork button exists");
+        let (_, segments) = strip_grid();
+        let seg = segments
+            .iter()
+            .find(|s| s.target == fork_idx)
+            .expect("fork segment");
+        let update = handle_mouse(&mouse("left_down", 128 + seg.x + seg.width / 2, 39 + seg.row));
         match update.effects.first().expect("fork invoke effect") {
             HostEffectV3::Api { params, .. } => {
                 assert_eq!(params["action_id"], json!("fork"));

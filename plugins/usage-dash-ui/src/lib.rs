@@ -5,7 +5,7 @@ use herdr_ui_plugin_api::{
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Mutex;
 use usage_dash_model::{Freshness, UsageRenderInput, VersionToken};
 
@@ -16,6 +16,27 @@ static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// height every frame (a 1-row rect always means collapsed), so host state
 /// wins after restarts and hot-reloads — same pattern as goal-dash's panel.
 static COLLAPSED: AtomicBool = AtomicBool::new(false);
+
+/// Guest-owned expand / stats / scroll state.
+///
+/// These used to live in the host's `App::usage_view` and arrive in the render
+/// input. Nothing could actually change them: the strip declares
+/// `usage:toggle_expand` and `usage:toggle_stats` as v3 hit-rects, and a
+/// declared v3 hit makes the cell guest-owned, so the host's own click path
+/// (`usage_host::route_mouse`, reached only `if !v3_owned_cell`) was skipped and
+/// the click arrived here — where nothing handled it. Both affordances painted,
+/// invited a click, and did nothing.
+///
+/// They are owned here now, the same way [`COLLAPSED`] already was. The host's
+/// copies of these fields remain in the input envelope and are ignored; they go
+/// away with `usage_host.rs` in the wave-2 host commit.
+static EXPANDED: AtomicBool = AtomicBool::new(false);
+/// Stats rows start shown, matching the host default this replaces.
+static STATS_SHOWN: AtomicBool = AtomicBool::new(true);
+/// Scroll offset within the expanded state detail. Only meaningful while
+/// [`EXPANDED`]; reset whenever the detail is collapsed or goes away, so a stale
+/// offset can never leave the panel scrolled past content the user cannot see.
+static SCROLL: AtomicU16 = AtomicU16::new(0);
 
 /// Interaction state for the caption's version tokens, owned by the guest.
 ///
@@ -66,25 +87,26 @@ pub extern "C" fn herdr_ui_static_update_len() -> i32 {
     STATIC_UPDATE.len() as i32
 }
 
-// ── Event handler ──────────────────────────────────────────────────────────
-
 // ── Optional handoff state-carry exposure ──────────────────────────────────
-// A live handoff instantiates the guest fresh, so the collapse state above
-// resets and the strip springs back open under the user. These optional
-// exports carry it across the swap; omitting them means "reset me", which is
-// what every plugin that has not opted in still does.
+// A live handoff instantiates the guest fresh, which reset every toggle above
+// — the exact affordances #11 made work. These optional exports carry the
+// user's intent across the swap; a guest that omits them keeps resetting.
 
 static SAVED_STATE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-/// Park the serialized state so `_len` measures the same buffer, mirroring the
-/// `static_update_ptr`/`_len` contract. Only the guest-owned collapse flag
-/// travels: the render input and version-token hover are re-derived on the next
-/// frame, so carrying them would risk staleness for nothing.
+/// Park the serialized toggles so `_len` measures the same buffer, mirroring the
+/// `static_update_ptr`/`_len` contract. Only the four guest-owned atomics travel:
+/// the render input, version-token hover and the response scratch buffer are all
+/// re-derived on the next frame, so carrying them would risk staleness for
+/// nothing.
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_save_state_ptr() -> i32 {
     let state = format!(
-        r#"{{"v":1,"collapsed":{}}}"#,
-        COLLAPSED.load(Ordering::SeqCst)
+        r#"{{"v":1,"collapsed":{},"expanded":{},"stats_shown":{},"scroll":{}}}"#,
+        COLLAPSED.load(Ordering::SeqCst),
+        EXPANDED.load(Ordering::SeqCst),
+        STATS_SHOWN.load(Ordering::SeqCst),
+        SCROLL.load(Ordering::SeqCst)
     );
     let mut guard = SAVED_STATE.lock().expect("saved state mutex poisoned");
     *guard = state.into_bytes();
@@ -99,9 +121,9 @@ pub extern "C" fn herdr_ui_save_state_len() -> i32 {
         .len() as i32
 }
 
-/// Adopt a blob from the previous server. Returns 0 for anything unrecognised,
-/// which the host treats as "start fresh" — a version bump here degrades to the
-/// old reset behaviour instead of failing the handoff.
+/// Adopt a blob from the previous server. Returns 0 for anything unrecognised so
+/// the host starts this guest fresh — the pre-existing behaviour — rather than
+/// failing the handoff over a toggle.
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_restore_state(ptr: i32, len: i32) -> i32 {
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len.max(0) as usize) };
@@ -111,11 +133,22 @@ pub extern "C" fn herdr_ui_restore_state(ptr: i32, len: i32) -> i32 {
     if value.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
         return 0;
     }
-    if let Some(collapsed) = value.get("collapsed").and_then(serde_json::Value::as_bool) {
-        COLLAPSED.store(collapsed, Ordering::SeqCst);
+    for (key, target) in [
+        ("collapsed", &COLLAPSED),
+        ("expanded", &EXPANDED),
+        ("stats_shown", &STATS_SHOWN),
+    ] {
+        if let Some(flag) = value.get(key).and_then(serde_json::Value::as_bool) {
+            target.store(flag, Ordering::SeqCst);
+        }
+    }
+    if let Some(scroll) = value.get("scroll").and_then(serde_json::Value::as_u64) {
+        SCROLL.store(scroll.min(u16::MAX as u64) as u16, Ordering::SeqCst);
     }
     1
 }
+
+// ── Event handler ──────────────────────────────────────────────────────────
 
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_on_event(ptr: i32, len: i32) -> i32 {
@@ -149,6 +182,19 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         UiEvent::Mouse(m) if m.kind == MouseEventKind::Move => {
             return handle_hover(m.column, m.row)
         }
+        // MouseAll broadcasts every wheel event in the terminal, so the rect
+        // check is what keeps a scroll inside a pane from moving the strip.
+        UiEvent::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            if !in_last_frame(m.column, m.row) {
+                return UiUpdate::default();
+            }
+            return handle_scroll(m.kind == MouseEventKind::ScrollDown);
+        }
         _ => return UiUpdate::default(),
     };
 
@@ -160,10 +206,11 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         _ => return UiUpdate::default(),
     };
 
-    let input: UsageRenderInput = match serde_json::from_str(json) {
+    let mut input: UsageRenderInput = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return UiUpdate::default(),
     };
+    apply_guest_view(&mut input);
 
     let area = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
     // Host state wins: a 1-row carve is the collapsed strip, anything taller
@@ -205,9 +252,10 @@ fn repaint_from_cache() -> UiUpdate {
     let Some((json, (x, y, w, h))) = LAST_FRAME.lock().ok().and_then(|g| g.clone()) else {
         return UiUpdate::default();
     };
-    let Ok(input) = serde_json::from_str::<UsageRenderInput>(&json) else {
+    let Ok(mut input) = serde_json::from_str::<UsageRenderInput>(&json) else {
         return UiUpdate::default();
     };
+    apply_guest_view(&mut input);
     let area = Rect::new(x, y, w, h);
     let version_ui = VERSION_UI.lock().map(|u| *u).unwrap_or_default();
     let mut buf = Buffer::empty(area);
@@ -237,15 +285,7 @@ fn handle_hover(column: u16, row: u16) -> UiUpdate {
     // surface. Reject anything outside the last frame's rect before doing any
     // work: `hovered_token` parses JSON and re-renders, which must not run on
     // every mouse twitch anywhere on screen.
-    let in_rect = LAST_FRAME
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .map(|(_, (x, y, w, h))| {
-            column >= x && column < x.saturating_add(w) && row >= y && row < y.saturating_add(h)
-        })
-        .unwrap_or(false);
-    if !in_rect {
+    if !in_last_frame(column, row) {
         // Leaving the strip must still clear a stale hover, or the caption would
         // keep showing the expanded "→ latest" text after the cursor left.
         let changed = match VERSION_UI.lock() {
@@ -282,7 +322,8 @@ fn handle_hover(column: u16, row: u16) -> UiUpdate {
 /// Resolve a cursor position against the version hit rects from the last frame.
 fn hovered_token(column: u16, row: u16) -> Option<VersionToken> {
     let (json, (x, y, w, h)) = LAST_FRAME.lock().ok().and_then(|g| g.clone())?;
-    let input = serde_json::from_str::<UsageRenderInput>(&json).ok()?;
+    let mut input = serde_json::from_str::<UsageRenderInput>(&json).ok()?;
+    apply_guest_view(&mut input);
     let area = Rect::new(x, y, w, h);
     // Render into a throwaway buffer purely to recover this frame's hit rects.
     // Cheap (a few hundred cells) and keeps one definition of where tokens sit,
@@ -379,6 +420,68 @@ fn handle_version_click(token: VersionToken) -> UiUpdate {
     }
 }
 
+/// Overwrite the host's (now inert) view fields with the guest-owned ones, so
+/// every render path — live frame, cached repaint, hit-rect recovery — draws one
+/// consistent state.
+///
+/// Also re-latches `expanded`/`scroll` off when this frame has no expandable
+/// detail. That mirrors the cleanup the host used to do when the strip reported
+/// no expand hit, and it is what stops a latch set on a Claude pane from leaking
+/// onto the next pane, which may have nothing to expand.
+fn apply_guest_view(input: &mut UsageRenderInput) {
+    if !has_expandable_detail(input) {
+        EXPANDED.store(false, Ordering::SeqCst);
+        SCROLL.store(0, Ordering::SeqCst);
+    }
+    input.expanded = EXPANDED.load(Ordering::SeqCst);
+    input.stats_shown = STATS_SHOWN.load(Ordering::SeqCst);
+    input.scroll = SCROLL.load(Ordering::SeqCst);
+}
+
+/// Whether this frame has state detail worth expanding — the same condition
+/// `render` uses to decide whether to declare the expand hit at all.
+fn has_expandable_detail(input: &UsageRenderInput) -> bool {
+    input
+        .snapshot
+        .as_ref()
+        .and_then(|snap| snap.state_full.as_ref())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Scroll the expanded state detail. Ignored unless the detail is open, so the
+/// wheel keeps its normal meaning over a collapsed strip.
+fn handle_scroll(delta_down: bool) -> UiUpdate {
+    if !EXPANDED.load(Ordering::SeqCst) {
+        return UiUpdate::default();
+    }
+    let current = SCROLL.load(Ordering::SeqCst);
+    // Saturating both ways: a wheel at the top must not wrap to u16::MAX, which
+    // would scroll the detail entirely out of view with no way back.
+    let next = if delta_down {
+        current.saturating_add(1)
+    } else {
+        current.saturating_sub(1)
+    };
+    if next == current {
+        return UiUpdate::default();
+    }
+    SCROLL.store(next, Ordering::SeqCst);
+    repaint_from_cache()
+}
+
+/// Is `(column, row)` inside the last frame's rect?
+fn in_last_frame(column: u16, row: u16) -> bool {
+    LAST_FRAME
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|(_, (x, y, w, h))| {
+            column >= x && column < x.saturating_add(w) && row >= y && row < y.saturating_add(h)
+        })
+        .unwrap_or(false)
+}
+
 fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     // Act on press only; the host routes both left_down and left_up for one
     // physical click, and reacting to both would double-fire the toggle.
@@ -395,6 +498,26 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     // restart the pane from a stray click.
     if let Ok(mut ui) = VERSION_UI.lock() {
         ui.confirming = None;
+    }
+    // Guest-owned view toggles. Repaint from the cached frame rather than
+    // waiting for the next ~1 Hz tick — a toggle that takes a second to appear
+    // reads as a missed click.
+    match action_id {
+        "usage:toggle_expand" => {
+            let expanded = !EXPANDED.load(Ordering::SeqCst);
+            EXPANDED.store(expanded, Ordering::SeqCst);
+            // Closing the detail drops the offset with it; reopening starts at
+            // the top rather than wherever the last read left off.
+            if !expanded {
+                SCROLL.store(0, Ordering::SeqCst);
+            }
+            return repaint_from_cache();
+        }
+        "usage:toggle_stats" => {
+            STATS_SHOWN.fetch_xor(true, Ordering::SeqCst);
+            return repaint_from_cache();
+        }
+        _ => {}
     }
     if action_id != render::ACTION_TOGGLE_COLLAPSE {
         return UiUpdate::default();
@@ -416,6 +539,12 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
 mod tests {
     use super::*;
     use usage_dash_model::{Cli, UsageSnapshot};
+
+    /// The view latches are process-wide statics and `cargo test` runs tests in
+    /// parallel, so every test that asserts on them must hold this first.
+    /// Poisoning is recovered from rather than propagated: one failing test
+    /// should not cascade into false failures in the others.
+    static TOGGLE_LOCK: Mutex<()> = Mutex::new(());
 
     /// Build a `frame` event JSON with `env` as the host env map. Exercises the
     /// real transport: the guest only ever sees a deserialized `UiEvent`.
@@ -453,6 +582,7 @@ mod tests {
 
     #[test]
     fn renders_usage_strip_from_ui_input_env_key() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Host injects the plugin's ui_input_file contents under the generic
         // §7.1 key; the guest must render a usage_strip layer from it.
         let env = format!(
@@ -485,6 +615,7 @@ mod tests {
 
     #[test]
     fn full_render_declares_collapse_hit() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let event: UiEvent = serde_json::from_str(&frame_json(&env_json())).expect("frame parses");
         let update = handle_event(&event);
         assert!(update.layers[0]
@@ -495,6 +626,7 @@ mod tests {
 
     #[test]
     fn one_row_rect_renders_expand_affordance() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let event: UiEvent =
             serde_json::from_str(&frame_json_with_height(&env_json(), 1)).expect("frame parses");
         let update = handle_event(&event);
@@ -510,6 +642,7 @@ mod tests {
 
     #[test]
     fn collapse_action_left_down_emits_set_surface_collapsed() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         COLLAPSED.store(false, Ordering::SeqCst);
         let event: UiEvent =
             serde_json::from_str(&action_json(render::ACTION_TOGGLE_COLLAPSE, "left_down"))
@@ -527,6 +660,7 @@ mod tests {
 
     #[test]
     fn collapse_action_ignores_left_up() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let event: UiEvent =
             serde_json::from_str(&action_json(render::ACTION_TOGGLE_COLLAPSE, "left_up"))
                 .expect("action parses");
@@ -537,8 +671,309 @@ mod tests {
         );
     }
 
+    /// Input whose snapshot has expandable detail, so the strip declares the
+    /// `usage:toggle_expand` hit.
+    fn expandable_input_json() -> String {
+        let mut snap = UsageSnapshot::empty(Cli::Claude);
+        snap.model = Some("Opus 4.8".into());
+        snap.ctx_used_pct = Some(29.0);
+        snap.state_full = Some("some long state detail worth expanding".into());
+        let input = UsageRenderInput {
+            snapshot: Some(snap),
+            expanded: false,
+            collapsed: false,
+            stats_shown: true,
+            scroll: 0,
+            now: 1_000_000,
+            five_hour_abs: String::new(),
+            weekly_abs: String::new(),
+        };
+        format!(
+            "{{\"HERDR_PLUGIN_UI_INPUT_JSON\":{}}}",
+            serde_json::to_string(&serde_json::to_string(&input).expect("input serializes"))
+                .expect("env value serializes")
+        )
+    }
+
+    /// Input carrying an explicit Claude version pair, so the caption declares
+    /// the `usage:version_claude` token in a known freshness state.
+    fn versioned_input_json(current: Option<&str>, latest: Option<&str>) -> String {
+        let mut snap = UsageSnapshot::empty(Cli::Claude);
+        snap.model = Some("Opus 4.8".into());
+        snap.ctx_used_pct = Some(29.0);
+        snap.versions.claude.current = current.map(str::to_string);
+        snap.versions.claude.latest = latest.map(str::to_string);
+        let input = UsageRenderInput {
+            snapshot: Some(snap),
+            expanded: false,
+            collapsed: false,
+            stats_shown: true,
+            scroll: 0,
+            now: 1_000_000,
+            five_hour_abs: String::new(),
+            weekly_abs: String::new(),
+        };
+        format!(
+            "{{\"HERDR_PLUGIN_UI_INPUT_JSON\":{}}}",
+            serde_json::to_string(&serde_json::to_string(&input).expect("input serializes"))
+                .expect("env value serializes")
+        )
+    }
+
+    /// Render one frame of `versioned_input_json`.
+    fn version_frame(current: Option<&str>, latest: Option<&str>) -> UiUpdate {
+        let event: UiEvent =
+            serde_json::from_str(&frame_json(&versioned_input_json(current, latest)))
+                .expect("frame parses");
+        handle_event(&event)
+    }
+
+    /// Centre of the Claude version token's hit rect in the given update.
+    fn claude_token_xy(update: &UiUpdate) -> (u16, u16) {
+        let hit = update.layers[0]
+            .hits
+            .iter()
+            .find(|h| h.action_id == render::ACTION_VERSION_CLAUDE)
+            .expect("the caption must declare the claude version hit");
+        (hit.x + hit.width / 2, hit.y)
+    }
+
+    /// Drive one frame so `LAST_FRAME` is populated, which every repaint path
+    /// depends on, then return the hit ids that frame declared.
+    fn seed_frame() -> Vec<String> {
+        let event: UiEvent =
+            serde_json::from_str(&frame_json(&expandable_input_json())).expect("frame parses");
+        let update = handle_event(&event);
+        update.layers[0]
+            .hits
+            .iter()
+            .map(|h| h.action_id.clone())
+            .collect()
+    }
+
+    fn click(action_id: &str) -> UiUpdate {
+        let event: UiEvent =
+            serde_json::from_str(&action_json(action_id, "left_down")).expect("action parses");
+        handle_event(&event)
+    }
+
+    /// The expand toggle was DEAD before this: the strip declared the hit-rect,
+    /// the guest ignored the id, and the host skipped its own click path because
+    /// a declared v3 hit makes the cell guest-owned
+    /// (`app/input/mod.rs:304`, `if !v3_owned_cell`). It painted, invited a
+    /// click, and did nothing.
+    #[test]
+    fn expand_toggle_flips_state_and_repaints() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXPANDED.store(false, Ordering::SeqCst);
+        SCROLL.store(0, Ordering::SeqCst);
+
+        let ids = seed_frame();
+        assert!(
+            ids.iter().any(|id| id == "usage:toggle_expand"),
+            "the strip must still declare the expand hit; got {ids:?}"
+        );
+
+        let update = click("usage:toggle_expand");
+        assert!(EXPANDED.load(Ordering::SeqCst), "the click must open it");
+        assert!(
+            !update.layers.is_empty(),
+            "it must repaint immediately, not wait for the next ~1 Hz frame"
+        );
+
+        // Scroll is only live while expanded, and it must not wrap at the top.
+        assert!(!handle_scroll(false).layers.is_empty() || SCROLL.load(Ordering::SeqCst) == 0);
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 0, "no wrap to u16::MAX");
+        handle_scroll(true);
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 1);
+
+        // Closing drops the offset with it.
+        click("usage:toggle_expand");
+        assert!(!EXPANDED.load(Ordering::SeqCst));
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 0, "closing resets scroll");
+    }
+
+    #[test]
+    fn stats_toggle_flips_state_and_repaints() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        STATS_SHOWN.store(true, Ordering::SeqCst);
+        seed_frame();
+
+        let update = click("usage:toggle_stats");
+        assert!(!STATS_SHOWN.load(Ordering::SeqCst), "the click must hide stats");
+        assert!(!update.layers.is_empty(), "and repaint immediately");
+
+        click("usage:toggle_stats");
+        assert!(STATS_SHOWN.load(Ordering::SeqCst), "and toggle back");
+    }
+
+    #[test]
+    fn scroll_is_inert_while_collapsed() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXPANDED.store(false, Ordering::SeqCst);
+        SCROLL.store(0, Ordering::SeqCst);
+        let update = handle_scroll(true);
+        assert!(update.layers.is_empty(), "the wheel keeps its normal meaning");
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 0);
+    }
+
+    /// A latch set on a pane with expandable detail must not leak onto the next
+    /// pane, which may have none — otherwise the strip renders as "expanded"
+    /// with nothing to show and no visible way back.
+    #[test]
+    fn a_frame_without_detail_relatches_expand_off() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXPANDED.store(true, Ordering::SeqCst);
+        SCROLL.store(4, Ordering::SeqCst);
+
+        // sample_input_json's snapshot has no state_full.
+        let event: UiEvent =
+            serde_json::from_str(&frame_json(&env_json())).expect("frame parses");
+        handle_event(&event);
+
+        assert!(!EXPANDED.load(Ordering::SeqCst));
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 0);
+    }
+
+    /// All painted text of an update, as one string.
+    fn painted(update: &UiUpdate) -> String {
+        serde_json::to_string(&update.layers).expect("layers serialize")
+    }
+
+    /// The expanded branch must actually be REACHABLE from a click: opening it
+    /// has to paint the detail region, and the wheel has to move that region.
+    #[test]
+    fn expanded_branch_paints_detail_and_scroll_moves_it() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EXPANDED.store(false, Ordering::SeqCst);
+        SCROLL.store(0, Ordering::SeqCst);
+
+        // Render through the frame path each time: `repaint_from_cache` reads a
+        // process-wide LAST_FRAME that the other tests also write, so only a
+        // frame we hand in ourselves is deterministic under a parallel run.
+        let frame = || {
+            let event: UiEvent =
+                serde_json::from_str(&frame_json(&expandable_input_json())).expect("frame parses");
+            painted(&handle_event(&event))
+        };
+
+        let collapsed = frame();
+        assert!(
+            !collapsed.contains("expanding"),
+            "detail must be hidden while collapsed"
+        );
+
+        click("usage:toggle_expand");
+        assert!(EXPANDED.load(Ordering::SeqCst));
+        let opened = frame();
+        assert!(
+            opened.contains("expanding"),
+            "the click must paint the detail region; got {opened}"
+        );
+
+        handle_scroll(true);
+        assert_eq!(SCROLL.load(Ordering::SeqCst), 1);
+        assert_ne!(opened, frame(), "the wheel must move the detail region");
+    }
+
+    /// The whole point of the feature: an outdated CLI paints RED, the first
+    /// click only ARMS an inline confirmation (nothing restarts the pane yet),
+    /// and only the confirming second click invokes the update action.
+    #[test]
+    fn outdated_token_is_red_and_needs_two_clicks_to_update() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut ui) = VERSION_UI.lock() {
+            *ui = render::VersionUi::default();
+        }
+
+        let update = version_frame(Some("2.1.0"), Some("2.2.0"));
+        let red_frame = painted(&update);
+        assert!(
+            red_frame.contains("\"role\":\"danger\""),
+            "outdated must paint red; got {red_frame}"
+        );
+
+        let first = click(render::ACTION_VERSION_CLAUDE);
+        let armed = painted(&first);
+        assert!(
+            armed.contains("click to update?"),
+            "the first click must only arm the confirmation; got {armed}"
+        );
+        assert!(
+            first.effects.is_empty(),
+            "arming must not invoke anything; got {:?}",
+            first.effects
+        );
+
+        let confirmed = click(render::ACTION_VERSION_CLAUDE);
+        assert!(
+            confirmed.effects.iter().any(|e| matches!(
+                e,
+                HostEffect::InvokePluginAction { action_id, .. } if action_id == "update-claude-code"
+            )),
+            "the confirming click must invoke update-claude-code; got {:?}",
+            confirmed.effects
+        );
+    }
+
+    /// Hover is the only way to see what "latest" actually is, so it must reveal
+    /// it in every freshness state — including the ones that are not red.
+    #[test]
+    fn hover_reveals_latest_for_current_and_unknown() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut ui) = VERSION_UI.lock() {
+            *ui = render::VersionUi::default();
+        }
+
+        let update = version_frame(Some("2.2.0"), Some("2.2.0"));
+        let (x, y) = claude_token_xy(&update);
+        let hovered = painted(&handle_hover(x, y));
+        assert!(
+            hovered.contains("(latest 2.2.0)"),
+            "hovering a current token must still name the latest; got {hovered}"
+        );
+
+        // A version we could never check must not read as up to date. Reset the
+        // hover first: hovering the same token twice is a no-op repaint.
+        if let Ok(mut ui) = VERSION_UI.lock() {
+            *ui = render::VersionUi::default();
+        }
+        let update = version_frame(Some("2.2.0"), None);
+        let (x, y) = claude_token_xy(&update);
+        let hovered = painted(&handle_hover(x, y));
+        assert!(
+            hovered.contains("(latest unknown)"),
+            "an unchecked token must say so; got {hovered}"
+        );
+    }
+
+    /// A dead network leaves `latest` unknown. That must never paint red and a
+    /// click must do nothing: we do not know an update exists.
+    #[test]
+    fn unknown_version_is_never_red_and_click_is_inert() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut ui) = VERSION_UI.lock() {
+            *ui = render::VersionUi::default();
+        }
+
+        let update = version_frame(Some("2.2.0"), None);
+        let unknown_frame = painted(&update);
+        assert!(
+            !unknown_frame.contains("\"role\":\"danger\""),
+            "unknown must not be painted as outdated; got {unknown_frame}"
+        );
+
+        let clicked = click(render::ACTION_VERSION_CLAUDE);
+        assert!(
+            clicked.effects.is_empty(),
+            "an unknown token has nothing to update; got {:?}",
+            clicked.effects
+        );
+    }
+
     #[test]
     fn missing_ui_input_env_key_renders_nothing() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let event: UiEvent = serde_json::from_str(&frame_json("{}")).expect("frame parses");
         let update = handle_event(&event);
         assert!(
