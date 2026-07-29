@@ -169,6 +169,25 @@ pub enum ResponseResult {
     PaneGraphicsInfo {
         cell_width_px: u32,
         cell_height_px: u32,
+        /// fork(+130): the pane's CELL extents — its inner rect, chrome
+        /// excluded, which is the rect placements are resolved against.
+        ///
+        /// `cell_*_px` alone was never enough to place anything: it says how big
+        /// one cell is, not how many cells there are, so a caller could compute
+        /// an image's pixel size and still had no idea whether it would fit or
+        /// where the right edge was. That is why `image-view` and
+        /// `claude-image-preview` both ended up with refit logic nothing could
+        /// drive.
+        ///
+        /// `None` when the pane is not currently laid out — a pane in a
+        /// background tab has no rect this frame. Deliberately `Option` rather
+        /// than `0`: `0` is the value the placement API overloads to mean "the
+        /// whole pane" (#40), so reporting it for an unknown extent would tell a
+        /// caller the exact opposite of the truth.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
     },
     AgentExplain {
         explain: serde_json::Value,

@@ -2671,6 +2671,31 @@ impl App {
             // though it can equivalently just use its frame `rect` (same value).
             // Empty object when no panel is currently carved.
             "panel_areas": self.ui_plugin_panel_areas(),
+            // fork(+130): per-pane CELL EXTENTS, keyed by public pane id.
+            //
+            // Before this, a graphics guest could not learn how big a pane was.
+            // The blob carried the sidebar, the terminal area, its own panel
+            // rect and the client size — everything except the one rect a
+            // `pane.graphics`/`pane.text` caller actually paints into. So a
+            // plugin had no way to clamp a preview at the right edge and no way
+            // to notice the pane had been resized under it; `image-view` and
+            // `claude-image-preview` both carry refit logic that nothing could
+            // trigger.
+            //
+            // Delivered HERE rather than as a new `pane.resized` event. The blob
+            // is rebuilt and handed to every v3 guest on EVERY frame, so it is
+            // already the "re-queryable generation" #41 asked for: a guest
+            // compares the extents it sees against the ones it painted for and
+            // refits when they differ. An event would add ABI surface, a
+            // subscription lifecycle, and a second delivery path that can
+            // desynchronise from the frame the guest is drawing — to answer a
+            // question the guest can already answer by looking.
+            //
+            // These are the INNER rect (chrome excluded), the same rect
+            // `pane_graphics_paint`/`pane_text_paint` resolve placements
+            // against. Any other choice would size guests to one rectangle while
+            // the host painted into another.
+            "pane_extents": self.ui_plugin_pane_extents(),
             "client": {
                 "is_foreground": true,
                 "width": client_width,
@@ -2686,6 +2711,43 @@ impl App {
     /// carved plugin `Panel` rect. Zero-sized rects are omitted. This is the
     /// data-driven successor to the old fixed `bottom_dash_area` key — no panel
     /// position is hardcoded here.
+    /// fork(+130): per-pane cell extents for the layout blob's `pane_extents`
+    /// key: `{ "w1:p1": {"cols": 97, "rows": 47} }` over every pane laid out in
+    /// the active tab, keyed by PUBLIC pane id so a guest can use the same
+    /// string it passes to `pane.graphics.set` / `pane.text.set`.
+    ///
+    /// Only `cols`/`rows`, not the origin. A guest places layers in
+    /// pane-relative cells (`viewport_col`/`viewport_row`), so the pane's screen
+    /// position is not its business — publishing it would invite plugins to
+    /// compute absolute coordinates that break the moment the sidebar width or
+    /// a split ratio changes. Size is what a caller needs to clamp and refit.
+    ///
+    /// Panes whose inner rect is empty are omitted rather than reported as
+    /// zero: a zero-sized pane cannot be painted into at all, and `0` is exactly
+    /// the value the placement API overloads to mean "the whole pane" (see #40),
+    /// so publishing it here would hand guests a number that means the opposite
+    /// of what it says.
+    fn ui_plugin_pane_extents(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        let Some(ws_idx) = self.state.active else {
+            return serde_json::Value::Object(map);
+        };
+        for info in &self.state.view.pane_infos {
+            let rect = info.inner_rect;
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            let Some(public_id) = self.public_pane_id(ws_idx, info.id) else {
+                continue;
+            };
+            map.insert(
+                public_id,
+                serde_json::json!({"cols": rect.width, "rows": rect.height}),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
     fn ui_plugin_panel_areas(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         for panel in &self.state.view.panel_rects {
@@ -4050,6 +4112,65 @@ mod tests {
         assert!(!value["usage_dash_area"].is_null());
         assert_eq!(value["client"]["is_foreground"], true);
         assert!(value["client"]["pinned_to"].is_null());
+    }
+
+    /// fork(+130): a graphics guest must be able to read a pane's cell extents
+    /// out of the layout blob, keyed by the SAME public pane id it passes to
+    /// `pane.graphics.set` / `pane.text.set`. If the key were an internal id the
+    /// data would be present and unusable, which is the failure mode this whole
+    /// task exists to remove.
+    #[test]
+    fn pane_extents_are_published_per_public_pane_id() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("extents")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let public_id = app.public_pane_id(0, pane_id).expect("public pane id");
+
+        app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: ratatui::layout::Rect::new(26, 1, 99, 49),
+            inner_rect: ratatui::layout::Rect::new(27, 2, 97, 47),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::ALL,
+            is_focused: true,
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&app.ui_plugin_layout_json(&Default::default()))
+                .expect("valid json");
+        assert_eq!(value["pane_extents"][&public_id]["cols"], 97);
+        assert_eq!(value["pane_extents"][&public_id]["rows"], 47);
+    }
+
+    /// A zero-sized pane is omitted rather than published as `0`. `0` is the
+    /// value the placement API overloads to mean "the whole pane" (#40), so
+    /// reporting it here would tell a guest the opposite of the truth.
+    #[test]
+    fn a_zero_sized_pane_is_omitted_rather_than_reported_as_zero() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("extents")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+
+        app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: ratatui::layout::Rect::default(),
+            inner_rect: ratatui::layout::Rect::default(),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&app.ui_plugin_layout_json(&Default::default()))
+                .expect("valid json");
+        assert_eq!(
+            value["pane_extents"].as_object().map(serde_json::Map::len),
+            Some(0)
+        );
     }
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {

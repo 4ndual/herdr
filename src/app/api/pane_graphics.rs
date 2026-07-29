@@ -16,17 +16,34 @@ impl App {
         id: String,
         target: crate::api::schema::PaneTarget,
     ) -> String {
-        if self.parse_pane_id(&target.pane_id).is_none() {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
             return pane_not_found(id, &target.pane_id);
-        }
+        };
         if !self.state.host_cell_size.is_known() {
             return encode_error(id, "cell_size_unavailable", "host cell size is unavailable");
         }
+        // fork(+130): resolved from the laid-out view rather than from the
+        // pane's PTY size. They agree while a pane is visible, but the view rect
+        // is what placements are measured against, so a caller that clamps to it
+        // clamps to the same box the compositor will clip to. Absent for a pane
+        // that is not laid out this frame (a background tab), which is a real
+        // answer and not an error — the pane exists, it just has no extent right
+        // now, and `cell_*_px` is still useful to a caller preparing an image.
+        let extents = self
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .map(|info| info.inner_rect)
+            .filter(|rect| rect.width > 0 && rect.height > 0);
         encode_success(
             id,
             ResponseResult::PaneGraphicsInfo {
                 cell_width_px: self.state.host_cell_size.width_px,
                 cell_height_px: self.state.host_cell_size.height_px,
+                cols: extents.map(|rect| rect.width),
+                rows: extents.map(|rect| rect.height),
             },
         )
     }
@@ -516,10 +533,64 @@ mod tests {
             ResponseResult::PaneGraphicsInfo {
                 cell_width_px: 11,
                 cell_height_px: 22,
+                ..
             }
         ));
         assert!(app.state.pane_graphics_layers.is_empty());
         assert!(app.state.pane_graphics_streams.is_empty());
+    }
+
+    /// fork(+130): `.info` reports the pane's CELL extents alongside the cell
+    /// pixel size, because pixel-per-cell alone never told a caller how many
+    /// cells there are. A pane that is not laid out this frame OMITS them
+    /// rather than reporting `0` — `0` is the value the placement API overloads
+    /// to mean "the whole pane" (#40).
+    #[test]
+    fn pane_graphics_info_reports_cell_extents_and_omits_them_when_unlaid() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        app.state.host_cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 11,
+            height_px: 22,
+        };
+        let request = || crate::api::schema::Request {
+            id: "graphics-info".into(),
+            method: crate::api::schema::Method::PaneGraphicsInfo(crate::api::schema::PaneTarget {
+                pane_id: public_pane_id.clone(),
+            }),
+        };
+
+        // No layout pass has run, so there is no rect to report.
+        let response = app.handle_api_request(request());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::PaneGraphicsInfo {
+                cols: None,
+                rows: None,
+                ..
+            }
+        ));
+
+        let (_, pane_id) = app.parse_pane_id(&public_pane_id).unwrap();
+        app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+            id: pane_id,
+            rect: ratatui::layout::Rect::new(26, 1, 99, 49),
+            inner_rect: ratatui::layout::Rect::new(27, 2, 97, 47),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::ALL,
+            is_focused: true,
+        }];
+
+        let response = app.handle_api_request(request());
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::PaneGraphicsInfo {
+                cols: Some(97),
+                rows: Some(47),
+                ..
+            }
+        ));
     }
 
     #[test]
