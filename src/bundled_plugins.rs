@@ -104,7 +104,8 @@ fn is_live_user_link(previous_root: &str, bundled_dir: &std::path::Path) -> bool
     if !previous.is_dir() {
         return false;
     }
-    let canonical = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let canonical =
+        |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
     canonical(&previous) != canonical(bundled_dir)
 }
 
