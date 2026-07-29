@@ -302,6 +302,61 @@ fn wait_for_api(socket_path: &Path, timeout: Duration) {
     );
 }
 
+/// Starts an agent in `pane_id`, retrying only while the pane's shell has not
+/// become claimable yet, and returns the successful response.
+///
+/// A pane is not agent-ready the instant `workspace.create` returns: the server
+/// derives an available shell name from the pane child's live process tree
+/// (`available_shell_name`, `src/app/agents.rs`), which needs the shell to have
+/// actually exec'd and be idle. Until then `agent.start` answers
+/// `agent_pane_busy`, and that is a correct answer, not a fault -- so the wait
+/// belongs on this side.
+///
+/// Retrying a call that had a side effect would be wrong; this one is safe
+/// precisely because `agent_pane_busy` is raised BEFORE any input is written to
+/// the pane, so a refused start started nothing.
+fn wait_for_agent_start(
+    socket_path: &Path,
+    pane_id: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let response = request(
+            socket_path,
+            serde_json::json!({
+                "id": "test:agent-start",
+                "method": "agent.start",
+                "params": {
+                    "name": "handoff-agent",
+                    "kind": "pi",
+                    "pane_id": pane_id,
+                    "timeout_ms": 5000
+                }
+            }),
+        );
+        if response.get("result").is_some() {
+            return response;
+        }
+        let busy = response
+            .pointer("/error/code")
+            .and_then(|c| c.as_str())
+            .is_some_and(|code| code == "agent_pane_busy");
+        assert!(
+            busy,
+            "agent.start failed for a reason that waiting cannot fix: {response}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane_id} never became an available shell within {timeout:?} \
+             ({attempts} attempts); last response: {response}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn write_plugin_manifest(root: &Path, plugin_id: &str) {
     fs::create_dir_all(root).unwrap();
     fs::write(
@@ -1348,19 +1403,18 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         .unwrap()
         .to_string();
 
-    let started = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent-start",
-            "method": "agent.start",
-            "params": {
-                "name": "handoff-agent",
-                "kind": "pi",
-                "pane_id": pane_id,
-                "timeout_ms": 5000
-            }
-        }),
-    );
+    // `agent.start` refuses a pane whose shell is not yet claimable: the server
+    // resolves a shell NAME from the pane child's live process tree, and a pane
+    // that was created microseconds ago has usually not exec'd its shell yet.
+    // `workspace.create` returning does NOT mean the pane can host an agent.
+    //
+    // So the start is polled rather than issued once. `agent_pane_busy` is the
+    // one retryable outcome and it is retried BY CODE, never by a fixed sleep --
+    // a sleep long enough for a loaded machine is dead time on an idle one, and
+    // this is exactly the class of "flake" that a sleep hides instead of fixing.
+    // Every other error still fails immediately, so a genuine start regression
+    // is not laundered into a timeout.
+    let started = wait_for_agent_start(&api_socket, &pane_id, Duration::from_secs(10));
     assert_ok(started);
     support::wait_for_file(&started_marker, Duration::from_secs(5));
 
