@@ -2156,6 +2156,8 @@ fn remove_hook_from_file(entry: &HookEntry, stash: &Path) -> bool {
     // Refusing to disable is recoverable; a silent unrecoverable delete is not.
     let record = serde_json::json!({
         "file": entry.file.to_string_lossy(),
+        "kind": "hook",
+        "name": entry.name,
         "event": entry.event,
         "matcher": entry.matcher,
         "removed": removed,
@@ -2221,6 +2223,159 @@ fn remove_mcp_from_file(entry: &McpEntry, file: &Path, stash: &Path) -> bool {
         return false;
     };
     write_atomic(file, &json)
+}
+
+/// Put a stashed entry back where it came from and drop its stash record.
+/// Returns whether the config file changed.
+///
+/// Matches the LAST record for this identity, so re-disabling and re-enabling
+/// the same thing restores the most recent definition rather than a stale one.
+///
+/// Ordering is the mirror of disable, for the same reason: the config is
+/// written FIRST and the stash record is dropped only once the entry is safely
+/// back. If the prune then fails, the cost is a duplicate record -- restoring
+/// twice is harmless because the second restore just overwrites with the same
+/// value -- whereas pruning first would let a failed restore lose the entry for
+/// good.
+///
+/// `project` scopes MCP rows: `None` = top-level, `Some(cwd)` = that project's
+/// map. A row is restored to its recorded location, never promoted or demoted.
+fn restore_from_stash(stash: &Path, kind: &str, name: &str, project: Option<&str>) -> bool {
+    let Some(stashed) = read_json(stash) else {
+        return false;
+    };
+    let Some(records) = stashed.as_array() else {
+        return false;
+    };
+    // Records written before `kind` existed are all hooks.
+    let idx = records.iter().rposition(|r| {
+        r.get("kind").and_then(|k| k.as_str()).unwrap_or("hook") == kind
+            && r.get("name").and_then(|n| n.as_str()) == Some(name)
+            && r.get("project").and_then(|p| p.as_str()) == project
+    });
+    let Some(idx) = idx else {
+        tracing::warn!(kind, name, "harness enable: no stash record");
+        return false;
+    };
+    let record = &records[idx];
+    let (Some(file), Some(removed)) = (
+        record
+            .get("file")
+            .and_then(|f| f.as_str())
+            .map(PathBuf::from),
+        record.get("removed").cloned(),
+    ) else {
+        tracing::warn!(kind, name, "harness enable: stash record malformed");
+        return false;
+    };
+    let Some(mut root) = read_json(&file) else {
+        tracing::warn!(file = %file.display(), "harness enable: config unreadable");
+        return false;
+    };
+
+    let restored = match kind {
+        "mcp" => {
+            let map = match project {
+                None => root
+                    .as_object_mut()
+                    .map(|r| {
+                        r.entry("mcpServers")
+                            .or_insert_with(|| serde_json::json!({}))
+                    })
+                    .and_then(|m| m.as_object_mut()),
+                Some(cwd) => root
+                    .as_object_mut()
+                    .map(|r| r.entry("projects").or_insert_with(|| serde_json::json!({})))
+                    .and_then(|p| p.as_object_mut())
+                    .map(|p| p.entry(cwd).or_insert_with(|| serde_json::json!({})))
+                    .and_then(|p| p.as_object_mut())
+                    .map(|p| {
+                        p.entry("mcpServers")
+                            .or_insert_with(|| serde_json::json!({}))
+                    })
+                    .and_then(|m| m.as_object_mut()),
+            };
+            match map {
+                Some(m) => {
+                    m.insert(name.to_string(), removed);
+                    true
+                }
+                None => false,
+            }
+        }
+        "hook" => {
+            let (Some(event), Some(matcher)) = (
+                record.get("event").and_then(|e| e.as_str()),
+                record.get("matcher").and_then(|m| m.as_str()),
+            ) else {
+                return false;
+            };
+            let groups = root
+                .as_object_mut()
+                .map(|r| r.entry("hooks").or_insert_with(|| serde_json::json!({})))
+                .and_then(|h| h.as_object_mut())
+                .map(|h| {
+                    h.entry(event.to_string())
+                        .or_insert_with(|| serde_json::json!([]))
+                })
+                .and_then(|g| g.as_array_mut());
+            match groups {
+                // The matcher group may itself have been pruned when the last
+                // hook in it was disabled, so recreate it rather than failing.
+                Some(groups) => {
+                    match groups
+                        .iter_mut()
+                        .find(|g| g.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+                        .and_then(|g| g.get_mut("hooks"))
+                        .and_then(|h| h.as_array_mut())
+                    {
+                        Some(hooks) => hooks.push(removed),
+                        None => groups.push(serde_json::json!({
+                            "matcher": matcher,
+                            "hooks": [removed],
+                        })),
+                    }
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => {
+            tracing::warn!(kind, "harness enable: unknown stash kind");
+            false
+        }
+    };
+    if !restored {
+        return false;
+    }
+
+    // Settings files are pretty-printed; ~/.claude.json is kept compact.
+    let json = if kind == "mcp" {
+        serde_json::to_string(&root)
+    } else {
+        serde_json::to_string_pretty(&root)
+    };
+    let Ok(json) = json else {
+        return false;
+    };
+    if !write_atomic(&file, &json) {
+        return false;
+    }
+
+    // Entry is back; now drop its record. A failure here is logged, not fatal.
+    let mut remaining = records.clone();
+    remaining.remove(idx);
+    match serde_json::to_string_pretty(&serde_json::Value::Array(remaining)) {
+        Ok(pruned) => {
+            if !write_atomic(stash, &pruned) {
+                tracing::warn!(kind, name, "harness enable: restored, but stash prune failed");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "harness enable: stash prune serialize failed");
+        }
+    }
+    true
 }
 
 impl App {
@@ -2867,6 +3022,89 @@ mod tests {
         assert!(!remove_mcp_from_file(&missing, &file, &stash));
         let stashed = read_json(&stash).expect("stash readable");
         assert_eq!(stashed.as_array().map(|a| a.len()), Some(2), "no phantom");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round trip the stash exists for: disable then enable must put the
+    /// entry back exactly where it came from, with its definition intact, and
+    /// consume the stash record so a second enable is not offered.
+    #[test]
+    fn disable_then_enable_restores_the_original_exactly() {
+        let dir = std::env::temp_dir().join(format!("harness-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let stash = dir.join("state").join(HARNESS_STASH_FILE);
+
+        // --- MCP, project-scoped: must come back to its project, not global.
+        let cfg = dir.join("claude.json");
+        let definition = serde_json::json!({
+            "command": "npx",
+            "env": {"API_KEY": "secret-value"},
+        });
+        let before = serde_json::json!({
+            "mcpServers": {"global-one": {"command": "keep"}},
+            "projects": {"/w": {"mcpServers": {"scoped": definition}}},
+        });
+        std::fs::write(&cfg, serde_json::to_string(&before).expect("serialize"))
+            .expect("write cfg");
+
+        let entry = McpEntry {
+            name: "scoped".to_string(),
+            project: Some("/w".to_string()),
+        };
+        assert!(remove_mcp_from_file(&entry, &cfg, &stash));
+        assert!(restore_from_stash(&stash, "mcp", "scoped", Some("/w")));
+        assert_eq!(
+            read_json(&cfg).expect("cfg readable"),
+            before,
+            "config must be identical to before the disable"
+        );
+        // Record consumed: a second enable has nothing to restore.
+        assert!(!restore_from_stash(&stash, "mcp", "scoped", Some("/w")));
+
+        // --- Hook: the matcher group is PRUNED when its last hook goes, so
+        // restore has to recreate the group rather than assume it survived.
+        let settings = dir.join("settings.json");
+        let before = serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "/bin/echo only"}
+            ]}]}
+        });
+        std::fs::write(
+            &settings,
+            serde_json::to_string_pretty(&before).expect("serialize"),
+        )
+        .expect("write settings");
+
+        let hook = HookEntry {
+            file: settings.clone(),
+            event: "PreToolUse".to_string(),
+            matcher: "Bash".to_string(),
+            matcher_idx: 0,
+            hook_idx: 0,
+            name: "only".to_string(),
+            command: "/bin/echo only".to_string(),
+            script: None,
+        };
+        assert!(remove_hook_from_file(&hook, &stash));
+        // Precondition for the interesting case: the group really is gone.
+        let emptied = read_json(&settings).expect("settings readable");
+        assert_eq!(
+            emptied["hooks"]["PreToolUse"].as_array().map(|a| a.len()),
+            Some(0),
+            "the matcher group should have been pruned"
+        );
+        assert!(restore_from_stash(&stash, "hook", "only", None));
+        assert_eq!(
+            read_json(&settings).expect("settings readable"),
+            before,
+            "hook must return to its original matcher group"
+        );
+
+        // Unknown identities and kinds restore nothing rather than guessing.
+        assert!(!restore_from_stash(&stash, "hook", "never-existed", None));
+        assert!(!restore_from_stash(&stash, "skill", "only", None));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
