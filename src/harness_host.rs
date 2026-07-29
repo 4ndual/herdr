@@ -2173,6 +2173,56 @@ fn remove_hook_from_file(entry: &HookEntry, stash: &Path) -> bool {
     true
 }
 
+/// Remove `entry` from the `mcpServers` map in the config JSON at `file`,
+/// stashing the removed definition in `stash` FIRST. Returns whether the file
+/// changed.
+///
+/// Both paths are parameters rather than derived from `home_dir()` inside, so
+/// this is testable against a temp dir: a function that can only be exercised
+/// against the user's real `~/.claude.json` is untestable by construction, and
+/// this one deletes credential-bearing config.
+fn remove_mcp_from_file(entry: &McpEntry, file: &Path, stash: &Path) -> bool {
+    let Some(mut root) = read_json(file) else {
+        return false;
+    };
+    // Keep the removed VALUE, not just whether something was removed. It is the
+    // server's whole definition -- command, args, env, and whatever credentials
+    // live in that env -- and dropping it made "disable" an unrecoverable delete.
+    let removed = match &entry.project {
+        None => root
+            .get_mut("mcpServers")
+            .and_then(|m| m.as_object_mut())
+            .and_then(|m| m.remove(&entry.name)),
+        Some(cwd) => root
+            .get_mut("projects")
+            .and_then(|p| p.get_mut(cwd))
+            .and_then(|p| p.get_mut("mcpServers"))
+            .and_then(|m| m.as_object_mut())
+            .and_then(|m| m.remove(&entry.name)),
+    };
+    let Some(removed) = removed else {
+        return false;
+    };
+    // Stash before the delete lands, same ordering and same refusal as hooks.
+    let record = serde_json::json!({
+        "file": file.to_string_lossy(),
+        "kind": "mcp",
+        "name": entry.name,
+        "project": entry.project,
+        "removed": removed,
+    });
+    if !stash_record(stash, record) {
+        tracing::warn!(name = %entry.name, "harness disable: stash failed; not editing config");
+        return false;
+    }
+    // Compact, matching how this file is already written: it is large and
+    // machine-managed, and pretty-printing it would rewrite every line.
+    let Ok(json) = serde_json::to_string(&root) else {
+        return false;
+    };
+    write_atomic(file, &json)
+}
+
 impl App {
     /// Drain and apply a pending harness-manager action (open / disable)
     /// recorded by the mouse handler. Returns true if it acted.
@@ -2402,48 +2452,9 @@ impl App {
 
     fn disable_mcp(&mut self, entry: &McpEntry) -> bool {
         let file = home_dir().join(".claude.json");
-        let Some(mut root) = read_json(&file) else {
-            return false;
-        };
-        // Keep the removed VALUE, not just whether something was removed. It is
-        // the server's whole definition -- command, args, env, and whatever
-        // credentials live in that env -- and dropping it on the floor made
-        // "disable" an unrecoverable delete.
-        let removed = match &entry.project {
-            None => root
-                .get_mut("mcpServers")
-                .and_then(|m| m.as_object_mut())
-                .and_then(|m| m.remove(&entry.name)),
-            Some(cwd) => root
-                .get_mut("projects")
-                .and_then(|p| p.get_mut(cwd))
-                .and_then(|p| p.get_mut("mcpServers"))
-                .and_then(|m| m.as_object_mut())
-                .and_then(|m| m.remove(&entry.name)),
-        };
-        let Some(removed) = removed else {
-            return false;
-        };
-        // Stash before the delete lands, same ordering as hooks.
         let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
             .join(HARNESS_STASH_FILE);
-        let record = serde_json::json!({
-            "file": file.to_string_lossy(),
-            "kind": "mcp",
-            "name": entry.name,
-            "project": entry.project,
-            "removed": removed,
-        });
-        if !stash_record(&stash, record) {
-            tracing::warn!(name = %entry.name, "harness disable: stash failed; not editing ~/.claude.json");
-            return false;
-        }
-        // Compact, matching how this file is already written: it is large and
-        // machine-managed, and pretty-printing it would rewrite every line.
-        let Ok(json) = serde_json::to_string(&root) else {
-            return false;
-        };
-        if !write_atomic(&file, &json) {
+        if !remove_mcp_from_file(entry, &file, &stash) {
             return false;
         }
         self.harness_toast(format!(
@@ -2787,6 +2798,76 @@ mod tests {
         );
         let after = read_json(&file).expect("settings still readable");
         assert_eq!(after, original, "settings must be byte-for-byte untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disabling an MCP must stash enough to reconstruct it: the full
+    /// definition, not just the name. The env is the part that matters -- it is
+    /// where credentials live, and it is what the old boolean-only code threw
+    /// away irrecoverably.
+    #[test]
+    fn disabling_an_mcp_stashes_its_whole_definition() {
+        let dir = std::env::temp_dir().join(format!("harness-mcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("claude.json");
+        let stash = dir.join("state").join(HARNESS_STASH_FILE);
+
+        let definition = serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "some-server"],
+            "env": {"API_KEY": "secret-value"},
+        });
+        std::fs::write(
+            &file,
+            serde_json::to_string(&serde_json::json!({
+                "mcpServers": {"keepme": {"command": "other"}, "gone": definition},
+                "projects": {"/w": {"mcpServers": {"scoped": definition}}},
+            }))
+            .expect("serialize"),
+        )
+        .expect("write config");
+
+        let entry = McpEntry {
+            name: "gone".to_string(),
+            project: None,
+        };
+        assert!(remove_mcp_from_file(&entry, &file, &stash));
+
+        // Removed from config, and only the one key -- siblings survive.
+        let after = read_json(&file).expect("config still readable");
+        assert!(after["mcpServers"].get("gone").is_none());
+        assert!(after["mcpServers"].get("keepme").is_some());
+
+        // The stash holds the whole definition, including the env.
+        let stashed = read_json(&stash).expect("stash written");
+        let rec = &stashed[0];
+        assert_eq!(rec["kind"], "mcp");
+        assert_eq!(rec["name"], "gone");
+        assert_eq!(rec["project"], serde_json::Value::Null);
+        assert_eq!(rec["removed"], definition);
+
+        // Project-scoped rows record their scope, so enable can put it back
+        // where it came from rather than promoting it to global.
+        let scoped = McpEntry {
+            name: "scoped".to_string(),
+            project: Some("/w".to_string()),
+        };
+        assert!(remove_mcp_from_file(&scoped, &file, &stash));
+        let stashed = read_json(&stash).expect("stash written");
+        assert_eq!(stashed.as_array().map(|a| a.len()), Some(2), "appends");
+        assert_eq!(stashed[1]["project"], "/w");
+        assert_eq!(stashed[1]["removed"], definition);
+
+        // A name that is not there changes nothing and stashes nothing.
+        let missing = McpEntry {
+            name: "never".to_string(),
+            project: None,
+        };
+        assert!(!remove_mcp_from_file(&missing, &file, &stash));
+        let stashed = read_json(&stash).expect("stash readable");
+        assert_eq!(stashed.as_array().map(|a| a.len()), Some(2), "no phantom");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
