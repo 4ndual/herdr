@@ -60,6 +60,36 @@ log "sanity-checking fresh binary --version"
 FRESH_VER="$("$FRESH" --version 2>/dev/null)" || die "fresh binary won't report --version"
 log "fresh build: $FRESH_VER"
 
+# Downgrade guard. The default HERDR_REPO is the shared checkout, which routinely
+# sits on an older branch than the tip that was last promoted — so "build the
+# repo and install it" can quietly REPLACE a newer verified binary with an older
+# one, and a downgrade past the fork commits also disables the WASM plugin layer.
+# The same rule the hr launcher enforces at snapshot time is enforced here at
+# install time, because this path is a user-facing button.
+version_ge() { # version_ge A B → true when A >= B
+  local IFS='.'
+  local -a a=($1) b=($2)
+  local i x y
+  for i in 0 1 2; do
+    x="${a[i]:-0}"; y="${b[i]:-0}"
+    x="${x%%[^0-9]*}"; y="${y%%[^0-9]*}"
+    if (( 10#${x:-0} > 10#${y:-0} )); then return 0; fi
+    if (( 10#${x:-0} < 10#${y:-0} )); then return 1; fi
+  done
+  return 0
+}
+
+if [[ -x "$VD_TEST_BIN" && "${VD_ALLOW_DOWNGRADE:-0}" != "1" ]]; then
+  NEW_V="$(printf '%s' "$FRESH_VER" | awk '{print $NF}')"
+  CUR_V="$("$VD_TEST_BIN" --version 2>/dev/null | awk '{print $NF}')"
+  if [[ -n "$NEW_V" && -n "$CUR_V" ]] && ! version_ge "$NEW_V" "$CUR_V"; then
+    die "refusing to install $NEW_V over the installed $CUR_V from $HERDR_REPO.
+   That checkout is on an older branch than the binary you already have.
+   Point HERDR_REPO at the tree holding the fork tip, or set
+   VD_ALLOW_DOWNGRADE=1 if the downgrade is genuinely what you want."
+  fi
+fi
+
 DEST_DIR="$(dirname "$VD_TEST_BIN")"
 mkdir -p "$DEST_DIR"
 # Stage on the SAME volume as the destination, then atomic mv. A cp/mv from a

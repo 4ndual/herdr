@@ -50,18 +50,34 @@ align = "start"
 size = "1"
 z = 55
 
-# Staged-promotion update pipeline (right-click on an instance token). Commands
-# run from the plugin root with HERDR_* env set (HERDR_BIN_PATH, HERDR_PLUGIN_ID,
-# …). Each script builds/stages a binary NEXT TO its destination on the same
-# volume, then atomic-mv's over the target and restarts that instance.
+# ── the two-button update pipeline (right-click on an instance token) ──────
+#
+# Button 1 (test) installs the fork tip into herdrtest and PROVES it in the
+# running process. Button 2 (hr) promotes that exact, proven build into hr.
+# Button 2 is inert until button 1 has written a passing, sha-bound receipt —
+# enforced twice: the guest greys the token out, and update-hr.sh refuses on its
+# own even if it is invoked directly.
+#
+# Actions run from the plugin root with HERDR_* env set (HERDR_BIN_PATH,
+# HERDR_PLUGIN_ID, HERDR_PLUGIN_STATE_DIR, …). HERDR_PLUGIN_STATE_DIR is what
+# makes the scripts act on the instance the user actually clicked in.
+#
+# NEITHER ACTION RESTARTS hr. Button 2 ends in `awaiting_restart` and waits for
+# ⌃⌥X. There is no flag, env var, or error path that changes that.
 [[actions]]
 id = "update-herdrtest-from-latest"
-title = "Update herdrtest from latest (fork integration tip)"
-description = "Build the current fork integration-tip release and promote it into herdrtest"
+title = "Update herdrtest and verify it"
+description = "Install the fork tip into herdrtest, restart it, and prove the plugin bridge and every plugin actually loaded"
 command = ["bash", "scripts/update-herdrtest.sh"]
 
 [[actions]]
 id = "update-hr-from-herdrtest"
-title = "Update hr from herdrtest"
-description = "Promote the EXACT build currently running in herdrtest into hr (hr may only take the test build)"
+title = "Update hr from the verified herdrtest build"
+description = "Promote the EXACT build herdrtest was verified on into hr, then wait for you to restart with ⌃⌥X"
 command = ["bash", "scripts/update-hr.sh"]
+
+[[actions]]
+id = "show-latest-notes"
+title = "Show release notes for the latest version"
+description = "Open the cached patch notes for the newest release in a pane (offline — no network at click time)"
+command = ["bash", "scripts/show-latest-notes.sh"]

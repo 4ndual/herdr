@@ -43,6 +43,9 @@ const INSTANCE_ACTION_PREFIX: &str = "version:instance:";
 const ACTION_UPDATE_TEST: &str = "update-herdrtest-from-latest";
 const ACTION_UPDATE_HR: &str = "update-hr-from-herdrtest";
 
+/// Manifest action that opens the cached release notes in a pane.
+const ACTION_SHOW_NOTES: &str = "show-latest-notes";
+
 /// Cache of the last input we rendered, so a click can build its toast from the
 /// same data the strip is showing without re-reading any file.
 static LAST_INPUT: Mutex<Option<VersionRenderInput>> = Mutex::new(None);
@@ -184,11 +187,42 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     let Some(label) = action_id.strip_prefix(INSTANCE_ACTION_PREFIX) else {
         return UiUpdate::default();
     };
+    // The `latest` token is not an instance and owns no binary, so neither the
+    // toast nor the promotion path applies: EITHER button opens the release
+    // notes. Discoverability beats button purity here — a user who right-clicks
+    // it is asking the same question as one who left-clicks it, and the answer
+    // is never destructive.
+    if label == render::LATEST_LABEL {
+        return match kind {
+            UiActionKind::LeftDown | UiActionKind::RightDown => notes_effect(),
+            _ => UiUpdate::default(),
+        };
+    }
+
     match kind {
         // Fire once per physical click (press only).
         UiActionKind::LeftDown => toast_effect(label),
         UiActionKind::RightDown => update_effect(label),
         _ => UiUpdate::default(),
+    }
+}
+
+/// Click on `latest`: open the release notes for it.
+///
+/// The notes are served from the collector's offline cache (`latest_notes.md`),
+/// written on every successful fetch, so the click never waits on the network
+/// and still works with no connectivity at all. When no notes have ever been
+/// cached the action script says so in a pane rather than failing silently.
+fn notes_effect() -> UiUpdate {
+    UiUpdate {
+        layers: Vec::new(),
+        effects: vec![HostEffect::InvokePluginAction {
+            plugin_id: PLUGIN_ID.to_string(),
+            action_id: ACTION_SHOW_NOTES.to_string(),
+            payload_json: None,
+        }],
+        scope: UiUpdateScope::Partial,
+        consumed_action_ids: Vec::new(),
     }
 }
 
@@ -209,15 +243,58 @@ fn toast_effect(label: &str) -> UiUpdate {
     }
 }
 
-/// Right-click: invoke the staged-update action for the clicked instance. The
-/// enforcement (hr may only take the exact test build) lives in the action
-/// script; the guest just fires the intent for the matching instance.
+/// Right-click: invoke the staged-update action for the clicked instance —
+/// but only when that promotion is currently permitted.
+///
+/// # The inert-button rule
+///
+/// The hazard this closes is a right-click on `hr` succeeding when it never
+/// should have been offered. Promoting `test` → `hr` is allowed ONLY while
+/// `test` is `Verified`: a sha-bound receipt proving the verification gate ran
+/// against the exact binary now installed in herdrtest. Anything weaker — in
+/// particular `UpToDate`, which an unbridged upstream binary earns merely by
+/// reporting a current version number — leaves the path CLOSED.
+///
+/// Closed, not warned and not confirm-dialogued. "Are you sure?" is not a safety
+/// mechanism; it asks the user to adjudicate a question they clicked precisely
+/// because they did not want to think about it. The action is simply not
+/// invoked, and a toast says why.
+///
+/// This is one of TWO enforcement points, and deliberately the weaker one. The
+/// promotion script re-derives the same rule from the same shared model before
+/// touching a byte, so hiding the action is not what makes it safe — it is what
+/// makes the UI honest about what it will do.
 fn update_effect(label: &str) -> UiUpdate {
     let action_id = match label {
         "hr" => ACTION_UPDATE_HR,
         "test" => ACTION_UPDATE_TEST,
         _ => return UiUpdate::default(),
     };
+
+    let block = {
+        let guard = LAST_INPUT.lock().expect("input mutex poisoned");
+        match guard.as_ref() {
+            // No snapshot yet ⇒ nothing can be proven ⇒ refuse. Fail closed.
+            None => Some("no version data yet".to_string()),
+            Some(input) => match label {
+                "hr" => input.hr_promotion_block(),
+                "test" => input.test_promotion_block(),
+                _ => Some("unknown instance".to_string()),
+            },
+        }
+    };
+
+    if let Some(reason) = block {
+        return UiUpdate {
+            layers: Vec::new(),
+            effects: vec![HostEffect::ShowToast {
+                message: format!("update {label}: blocked \u{2014} {reason}"),
+            }],
+            scope: UiUpdateScope::Partial,
+            consumed_action_ids: Vec::new(),
+        };
+    }
+
     UiUpdate {
         layers: Vec::new(),
         effects: vec![HostEffect::InvokePluginAction {
@@ -253,10 +330,21 @@ fn toast_message(input: &VersionRenderInput, label: &str) -> String {
                 Some(n) if n > 0 => format!(" (+{n} local)"),
                 _ => String::new(),
             };
+            // Exhaustive on purpose: a new state must be given words here
+            // rather than silently inheriting someone else's label.
             let state = match inst.state {
-                version_dash_model::InstanceState::UpToDate => "up to date",
+                version_dash_model::InstanceState::Verified => "VERIFIED — safe to promote",
+                version_dash_model::InstanceState::UpToDate => "version current, NOT verified",
                 version_dash_model::InstanceState::Behind => "update available",
                 version_dash_model::InstanceState::Broken => "BROKEN",
+                version_dash_model::InstanceState::Working => "update running now",
+                version_dash_model::InstanceState::AwaitingRestart => {
+                    "new build installed — press \u{2303}\u{2325}X to finish"
+                }
+                version_dash_model::InstanceState::UnsafeRestart => {
+                    "UNVERIFIED build staged — do NOT restart"
+                }
+                version_dash_model::InstanceState::Escalated => "handed to an agent",
                 version_dash_model::InstanceState::Unknown => "unknown",
             };
             parts.push(format!(
@@ -296,6 +384,7 @@ mod tests {
             version: Some(ver.into()),
             local_changes: changes,
             state,
+            detail: None,
         }
     }
 
@@ -338,6 +427,7 @@ mod tests {
 
     #[test]
     fn renders_panel_layer_with_per_instance_hits() {
+        let _guard = test_guard();
         let event: UiEvent = serde_json::from_str(&frame_json(&env_with_input(&sample_input())))
             .expect("frame parses");
         let update = handle_event(&event);
@@ -351,6 +441,7 @@ mod tests {
 
     #[test]
     fn missing_input_env_renders_nothing() {
+        let _guard = test_guard();
         let event: UiEvent = serde_json::from_str(&frame_json("{}")).expect("frame parses");
         assert!(handle_event(&event).layers.is_empty());
     }
@@ -360,9 +451,20 @@ mod tests {
         let (_, ranges) = render::build(&sample_input());
         let panel = Rect::new(3, 9, 40, 1);
         let hits = instance_hits(panel, &ranges);
-        assert_eq!(hits.len(), 2);
+        // Two instances + `latest`.
+        assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].x, 3); // first token at panel.x
-        assert!(hits[0].x + hits[0].width <= hits[1].x); // disjoint, in order
+        for pair in hits.windows(2) {
+            // disjoint, in order — a token that overlaps its neighbour steals
+            // its clicks, which is exactly how a click lands on the wrong
+            // instance and promotes the wrong binary.
+            assert!(
+                pair[0].x + pair[0].width <= pair[1].x,
+                "{:?} overlaps {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
         for h in &hits {
             assert!(h.x + h.width <= panel.x + panel.width, "clamped to panel");
             assert_eq!(h.y, 9);
@@ -372,6 +474,7 @@ mod tests {
 
     #[test]
     fn left_click_hr_toasts_hr_detail() {
+        let _guard = test_guard();
         *LAST_INPUT.lock().unwrap() = Some(sample_input());
         let action: UiEvent =
             serde_json::from_str(&action_json("version:instance:hr", "left_down")).expect("action");
@@ -387,8 +490,186 @@ mod tests {
         }
     }
 
+    /// `LAST_INPUT` is process-global guest state, so tests that seed it must
+    /// not run concurrently — otherwise one test's pipeline status leaks into
+    /// another's click and the failure looks like a logic bug. Every test that
+    /// seeds or clicks takes this lock first.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the serialization lock, tolerating a previous test's panic.
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Seed the guest's cached input, as a frame would.
+    fn seed(input: VersionRenderInput) {
+        *LAST_INPUT.lock().unwrap() = Some(input);
+    }
+
+    fn input_with_test_state(state: InstanceState) -> VersionRenderInput {
+        VersionRenderInput {
+            instances: vec![
+                inst("hr", "0.7.3", Some(107), InstanceState::UpToDate),
+                inst("test", "0.7.5", Some(0), state),
+            ],
+            latest: Some("0.7.5".into()),
+            ..Default::default()
+        }
+    }
+
+    fn right_click(label: &str) -> UiUpdate {
+        let action: UiEvent = serde_json::from_str(&action_json(
+            &format!("version:instance:{label}"),
+            "right_down",
+        ))
+        .expect("action");
+        handle_event(&action)
+    }
+
+    fn invoked_action(update: &UiUpdate) -> Option<&str> {
+        update.effects.iter().find_map(|e| match e {
+            HostEffect::InvokePluginAction { action_id, .. } => Some(action_id.as_str()),
+            _ => None,
+        })
+    }
+
+    // ── the `latest` token: notes, never a binary ──────────────────────────
+
+    fn click_latest(kind: &str) -> UiUpdate {
+        let action: UiEvent = serde_json::from_str(&action_json(
+            &format!("version:instance:{}", render::LATEST_LABEL),
+            kind,
+        ))
+        .expect("action");
+        handle_event(&action)
+    }
+
+    #[test]
+    fn either_click_on_latest_opens_the_release_notes() {
+        let _guard = test_guard();
+        seed(input_with_test_state(InstanceState::Verified));
+        for kind in ["left_down", "right_down"] {
+            assert_eq!(
+                invoked_action(&click_latest(kind)),
+                Some(ACTION_SHOW_NOTES),
+                "clicking latest ({kind}) must open the notes"
+            );
+        }
+    }
+
+    /// The dangerous confusion would be `latest` inheriting instance semantics —
+    /// a right-click there must never reach a promotion action, whatever state
+    /// the instances are in.
+    #[test]
+    fn clicking_latest_never_invokes_a_promotion() {
+        let _guard = test_guard();
+        for state in InstanceState::ALL {
+            seed(input_with_test_state(state));
+            for kind in ["left_down", "right_down"] {
+                let update = click_latest(kind);
+                let invoked = invoked_action(&update);
+                assert_ne!(invoked, Some(ACTION_UPDATE_HR), "state {state:?}");
+                assert_ne!(invoked, Some(ACTION_UPDATE_TEST), "state {state:?}");
+            }
+        }
+    }
+
+    /// The notes click must not depend on the collector having produced a
+    /// snapshot yet: it reads a file cache, not the guest's in-memory input.
+    #[test]
+    fn latest_notes_open_even_with_no_input_seeded() {
+        let _guard = test_guard();
+        *LAST_INPUT.lock().unwrap() = None;
+        assert_eq!(
+            invoked_action(&click_latest("left_down")),
+            Some(ACTION_SHOW_NOTES)
+        );
+    }
+
+    // ── the inert-button rule, at the click boundary ───────────────────────
+
+    #[test]
+    fn right_click_hr_is_inert_while_test_is_unverified() {
+        let _guard = test_guard();
+        // UpToDate is the dangerous case: a bridge-less upstream 0.7.5 reports a
+        // current version and lands here. Clicking hr must NOT invoke anything.
+        for state in [
+            InstanceState::UpToDate,
+            InstanceState::Behind,
+            InstanceState::Broken,
+            InstanceState::Unknown,
+            InstanceState::Working,
+            InstanceState::Escalated,
+            InstanceState::AwaitingRestart,
+        ] {
+            seed(input_with_test_state(state));
+            let update = right_click("hr");
+            assert!(
+                invoked_action(&update).is_none(),
+                "hr promotion must not be invoked while test is {state:?}"
+            );
+            // …and the refusal is explained rather than silent.
+            assert!(
+                matches!(update.effects.first(), Some(HostEffect::ShowToast { message }) if message.contains("blocked")),
+                "{state:?} must explain the refusal, got {:?}",
+                update.effects
+            );
+        }
+    }
+
+    #[test]
+    fn right_click_hr_works_once_test_is_verified() {
+        let _guard = test_guard();
+        seed(input_with_test_state(InstanceState::Verified));
+        let update = right_click("hr");
+        assert_eq!(
+            invoked_action(&update),
+            Some(ACTION_UPDATE_HR),
+            "effects were {:?}",
+            update.effects
+        );
+    }
+
+    #[test]
+    fn right_click_with_no_data_at_all_fails_closed() {
+        let _guard = test_guard();
+        *LAST_INPUT.lock().unwrap() = None;
+        for label in ["hr", "test"] {
+            let update = right_click(label);
+            assert!(
+                invoked_action(&update).is_none(),
+                "{label} must fail closed with no snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn right_click_test_is_blocked_while_a_run_is_in_flight() {
+        let _guard = test_guard();
+        let mut input = input_with_test_state(InstanceState::Verified);
+        input.pipeline = Some(version_dash_model::PipelineStatus {
+            stage: Some(version_dash_model::PipelineStage::Test),
+            phase: version_dash_model::PipelinePhase::Running,
+            ..Default::default()
+        });
+        seed(input);
+        assert!(invoked_action(&right_click("test")).is_none());
+        assert!(invoked_action(&right_click("hr")).is_none());
+    }
+
+    #[test]
+    fn right_click_test_still_works_when_test_is_broken() {
+        let _guard = test_guard();
+        // Rebuilding herdrtest is the recovery path; a broken test must not lock
+        // the user out of the button that fixes it.
+        seed(input_with_test_state(InstanceState::Broken));
+        assert_eq!(invoked_action(&right_click("test")), Some(ACTION_UPDATE_TEST));
+    }
+
     #[test]
     fn right_click_test_invokes_update_from_latest() {
+        let _guard = test_guard();
+        seed(input_with_test_state(InstanceState::Verified));
         let action: UiEvent =
             serde_json::from_str(&action_json("version:instance:test", "right_down"))
                 .expect("action");
@@ -409,6 +690,9 @@ mod tests {
 
     #[test]
     fn right_click_hr_invokes_update_from_herdrtest() {
+        let _guard = test_guard();
+        // Only reachable with a VERIFIED test build — see the inert-button tests.
+        seed(input_with_test_state(InstanceState::Verified));
         let action: UiEvent =
             serde_json::from_str(&action_json("version:instance:hr", "right_down"))
                 .expect("action");
@@ -423,6 +707,7 @@ mod tests {
 
     #[test]
     fn left_up_is_ignored() {
+        let _guard = test_guard();
         let action: UiEvent =
             serde_json::from_str(&action_json("version:instance:hr", "left_up")).expect("action");
         assert!(handle_event(&action).effects.is_empty());
@@ -430,6 +715,7 @@ mod tests {
 
     #[test]
     fn unknown_action_id_ignored() {
+        let _guard = test_guard();
         let action: UiEvent =
             serde_json::from_str(&action_json("something:else", "left_down")).expect("action");
         assert!(handle_event(&action).effects.is_empty());
