@@ -2378,6 +2378,63 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    /// Copy-path must resolve the SAME file open does, for every row kind that
+    /// has one — and must decline the ones that do not, so the guest never
+    /// offers a copy that would silently do nothing.
+    #[test]
+    fn copy_path_resolves_the_same_file_open_does() {
+        fn hook(script: Option<PathBuf>) -> HookEntry {
+            HookEntry {
+                file: PathBuf::from("/w/.claude/settings.json"),
+                event: "PreToolUse".to_string(),
+                matcher: "*".to_string(),
+                matcher_idx: 0,
+                hook_idx: 0,
+                name: "h".to_string(),
+                command: "h.sh".to_string(),
+                script,
+            }
+        }
+
+        let cache = HarnessCache {
+            ctx_paths: vec![PathBuf::from("/w/CLAUDE.md")],
+            mem_index: Some(PathBuf::from("/w/memory/MEMORY.md")),
+            mem_files: vec![PathBuf::from("/w/memory/one.md")],
+            skills: vec![SkillEntry {
+                name: "s".to_string(),
+                path: PathBuf::from("/w/skills/s/SKILL.md"),
+                desc_bytes: 0,
+            }],
+            agents: vec![("rev".to_string(), PathBuf::from("/w/agents/rev.md"))],
+            hooks: vec![
+                hook(Some(PathBuf::from("/w/hooks/h.sh"))),
+                // A hook with no script: nothing to open, nothing to copy.
+                hook(None),
+            ],
+            ..Default::default()
+        };
+
+        for (key, want) in [
+            ("ctx:0", Some("/w/CLAUDE.md")),
+            ("memidx:0", Some("/w/memory/MEMORY.md")),
+            ("mem:0", Some("/w/memory/one.md")),
+            ("skill:0", Some("/w/skills/s/SKILL.md")),
+            ("agent:0", Some("/w/agents/rev.md")),
+            ("hook:0", Some("/w/hooks/h.sh")),
+            ("hook:1", None),
+            ("ctx:9", None),
+            ("mcp:0", None),
+        ] {
+            let (kind, idx) = key.split_once(':').expect("test key shape");
+            let got = resolve_row_path(&cache, kind, idx);
+            assert_eq!(
+                got.as_deref().and_then(|p| p.to_str()),
+                want,
+                "resolve_row_path({key})"
+            );
+        }
+    }
     use super::*;
 
     #[test]
