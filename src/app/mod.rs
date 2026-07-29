@@ -1185,6 +1185,18 @@ impl App {
 
         app.no_session = false;
         app.state.installed_plugins = load_plugin_registry(app.no_session);
+        // fork(wave-2): an import builds its App through `new(no_session = true)`, so
+        // the registry starts empty and the `UiPluginManager` is constructed with no
+        // modules. Reloading the registry above is not enough on its own: the manager
+        // and the derived render state are only built inside `new`, and overwriting
+        // `installed_plugins` also discards the bundled merge done there. Without this
+        // an imported server silently paints only the layers a bare manager produced,
+        // so every linked UI plugin stops rendering after a live handoff — no error,
+        // no toast, cleared only by a lifecycle change or a restart. Re-merge the
+        // bundled manifests and run the same resync a `plugin enable` uses, so an
+        // imported server arms its layer set exactly the way a fresh boot does.
+        crate::bundled_plugins::merge_bundled_ui_plugins(&mut app.state.installed_plugins);
+        app.resync_ui_plugins_after_lifecycle_change();
         let now = Instant::now();
         if background_update_check_enabled(app.no_session, app.update_version_check_enabled) {
             app.next_auto_update_check = app
@@ -4226,6 +4238,116 @@ mod tests {
         } else {
             std::env::remove_var("XDG_STATE_HOME");
         }
+    }
+
+    /// fork(wave-2): a live handoff must arm the UI plugin layer set the way a
+    /// fresh boot does. `new_from_handoff` builds its App through
+    /// `new(no_session = true)`, which yields an empty registry and a bare
+    /// `UiPluginManager`; before the fix it reloaded the registry but left the
+    /// manager empty, so every linked UI plugin silently stopped painting after
+    /// a swap. The module registers even though the wasm path is absent, which is
+    /// what makes this assertion independent of a real wasm fixture.
+    #[cfg(unix)]
+    #[test]
+    fn handoff_import_arms_ui_plugin_layers_from_the_registry() {
+        use crate::api::schema::{
+            PluginHotReloadMode, PluginManifestUiModule, PluginUiModuleKind, PluginUiSurface,
+        };
+
+        let _guard = config_env_lock().lock().unwrap();
+        let config_home = temp_config_path("handoff-import-ui-plugins")
+            .parent()
+            .expect("temp config path has a parent")
+            .to_path_buf();
+        let original_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+
+        let mut plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: "example.handoff-ui".to_string(),
+            name: "Handoff UI".to_string(),
+            version: "0.1.0".to_string(),
+            min_herdr_version: crate::build_info::BASE_VERSION.to_string(),
+            description: None,
+            manifest_path: config_home
+                .join("example.handoff-ui/herdr-plugin.toml")
+                .display()
+                .to_string(),
+            plugin_root: config_home.join("example.handoff-ui").display().to_string(),
+            enabled: true,
+            platforms: None,
+            build: vec![],
+            startup: vec![],
+            actions: vec![],
+            events: vec![],
+            panes: vec![],
+            ui_modules: vec![],
+            link_handlers: vec![],
+            source: Default::default(),
+            warnings: vec![],
+        };
+        plugin.ui_modules.push(PluginManifestUiModule {
+            max_layers_per_pane: None,
+            id: "handoff-ui".into(),
+            title: "Handoff UI".into(),
+            description: None,
+            platforms: None,
+            kind: PluginUiModuleKind::Wasm,
+            api_version: 1,
+            module: "dist/handoff-ui.wasm".into(),
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: vec![PluginUiSurface::Header],
+            placement: None,
+            capabilities: vec![],
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            collector: None,
+        });
+        crate::persist::plugin_registry::save_to_path(
+            &crate::config::config_dir().join("plugins.json"),
+            std::slice::from_ref(&plugin),
+        )
+        .expect("write plugin registry");
+
+        let snapshot = crate::persist::SessionSnapshot {
+            version: 0,
+            workspaces: Vec::new(),
+            active: None,
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new_from_handoff(
+            &Config::default(),
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+            &snapshot,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect("handoff import app");
+
+        assert!(
+            app.ui_plugins
+                .all()
+                .iter()
+                .any(|module| module.plugin_id == "example.handoff-ui"),
+            "imported server must register the registry's ui modules, got {:?}",
+            app.ui_plugins
+                .all()
+                .iter()
+                .map(|module| module.plugin_id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        if let Some(value) = original_config_home {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&config_home);
     }
 
     #[test]
