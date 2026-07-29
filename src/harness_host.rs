@@ -1627,6 +1627,7 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
             tooltip,
             openable: entry.script.is_some(),
             can_disable: true,
+            applies_when: Some("next session".to_string()),
             indent: 0,
             group: Some(entry.event.clone()),
             tok_loaded: None,
@@ -1739,6 +1740,7 @@ fn mcps_section(cache: &HarnessCache) -> HarnessSection {
             ),
             openable: false,
             can_disable: true,
+            applies_when: Some("next session".to_string()),
             indent: 0,
             tok_loaded,
             tok_full: None,
@@ -1830,9 +1832,21 @@ fn plugins_section(cache: &HarnessCache) -> HarnessSection {
                 label: name.clone(),
                 meta: String::new(),
                 state: if off { RowState::Off } else { RowState::Idle },
-                tooltip: "claude code plugin (enabledPlugins in ~/.claude/settings.json)\ncontext cost folds into the skills/agents/MCP it registers (not separable per plugin)\nright-click to disable".to_string(),
+                // An off plugin used to advertise "right-click to disable" and
+                // then offer nothing, which is the drawn-but-dead affordance
+                // DESIGN.md §1.2 forbids. Each state now names the verb it
+                // actually has.
+                tooltip: format!(
+                    "claude code plugin (enabledPlugins in ~/.claude/settings.json)\n\
+                     context cost folds into the skills/agents/MCP it registers (not separable per plugin)\n\
+                     right-click to {}\n\
+                     takes effect on next session start/resume",
+                    if off { "enable" } else { "disable" }
+                ),
                 openable: false,
                 can_disable: !off,
+                can_enable: off,
+                applies_when: Some("next session".to_string()),
                 indent: 0,
                 tok_src: Some("not determinable".to_string()),
                 ..Default::default()
@@ -2013,6 +2027,7 @@ enum ResolvedAction {
     DisableHook(HookEntry, bool),
     DisableMcp(McpEntry),
     DisablePlugin(String),
+    EnablePlugin(String),
     /// Restore a stashed entry: (stash kind, name). Project scope comes from
     /// the record, so the same name in two scopes restores to its own place.
     Enable(String, String),
@@ -2085,6 +2100,16 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
         (_, "mcp") => {
             let i: usize = idx.parse().ok()?;
             cache.mcps.get(i).cloned().map(ResolvedAction::DisableMcp)
+        }
+        // A plugin is the one kind whose disable is a flag flip rather than a
+        // deletion, so its row survives being off and enable is the same edit
+        // in reverse -- no stash is involved. Matching on the action kind here
+        // rather than falling through the wildcard matters: without it, an
+        // enable click on a plugin row resolves to DisablePlugin and the row
+        // does the opposite of what it offered.
+        (HarnessActionKind::EnableSession | HarnessActionKind::EnableProfile, "plugin") => {
+            let i: usize = idx.parse().ok()?;
+            cache.plugins.get(i).cloned().map(ResolvedAction::EnablePlugin)
         }
         (_, "plugin") => {
             let i: usize = idx.parse().ok()?;
@@ -2578,7 +2603,8 @@ impl App {
             }
             ResolvedAction::DisableMcp(entry) => self.disable_mcp(&entry),
             ResolvedAction::Enable(kind, name) => self.enable_stashed(&kind, &name),
-            ResolvedAction::DisablePlugin(name) => self.disable_plugin(&name),
+            ResolvedAction::DisablePlugin(name) => self.set_claude_plugin_enabled(&name, false),
+            ResolvedAction::EnablePlugin(name) => self.set_claude_plugin_enabled(&name, true),
         };
         if acted {
             // Force a full rescan + immediate republish so the panel (and the
@@ -2818,7 +2844,20 @@ impl App {
         true
     }
 
-    fn disable_plugin(&mut self, name: &str) -> bool {
+    /// Flip a CLAUDE CODE plugin's `enabledPlugins` entry — not a herdr plugin.
+    /// The name carries the distinction because `App` already has an inherent
+    /// `set_plugin_enabled` for herdr's own plugins, and the two would silently
+    /// collide on a reader long before they collide on the compiler.
+    ///
+    /// Both directions are the same
+    /// edit, so they are the same function: a plugin is never removed from the
+    /// map, only set false, which is why its row survives being off and why it
+    /// needs no stash.
+    ///
+    /// The write goes through `write_atomic` for the same reason the hook and
+    /// mcp edits do -- a truncated `~/.claude/settings.json` costs the user
+    /// every setting in it, not just the one plugin this click was about.
+    fn set_claude_plugin_enabled(&mut self, name: &str, enabled: bool) -> bool {
         let file = home_dir().join(".claude/settings.json");
         let Some(mut root) = read_json(&file) else {
             return false;
@@ -2833,16 +2872,16 @@ impl App {
         if !map.contains_key(clean) {
             return false;
         }
-        map.insert(clean.to_string(), serde_json::Value::Bool(false));
+        map.insert(clean.to_string(), serde_json::Value::Bool(enabled));
         let Ok(json) = serde_json::to_string_pretty(&root) else {
             return false;
         };
-        if let Err(err) = std::fs::write(&file, json) {
-            tracing::warn!(error = %err, "harness disable: settings write failed");
+        if !write_atomic(&file, &json) {
             return false;
         }
+        let verb = if enabled { "enabled" } else { "disabled" };
         self.harness_toast(format!(
-            "plugin {clean} disabled — takes effect on next session start/resume"
+            "plugin {clean} {verb} — takes effect on next session start/resume"
         ));
         true
     }
@@ -2850,6 +2889,61 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    /// A plugin is the one kind that keeps its row while off, so it is the one
+    /// kind that can advertise the wrong verb forever without anyone noticing:
+    /// the off row said "right-click to disable" and had `can_disable: false`,
+    /// offering a control it could not perform and hiding the one it could.
+    #[test]
+    fn an_off_plugin_row_offers_enable_and_an_on_row_offers_disable() {
+        let cache = HarnessCache {
+            plugins: vec!["alive".to_string(), "dead (off)".to_string()],
+            ..Default::default()
+        };
+        let rows = plugins_section(&cache).rows;
+
+        let on = &rows[0];
+        assert!(on.can_disable && !on.can_enable, "an on plugin disables");
+        assert!(
+            on.tooltip.contains("right-click to disable"),
+            "on-row tooltip names the wrong verb: {}",
+            on.tooltip
+        );
+
+        let off = &rows[1];
+        assert!(off.can_enable && !off.can_disable, "an off plugin enables");
+        assert!(
+            off.tooltip.contains("right-click to enable"),
+            "off-row tooltip names the wrong verb: {}",
+            off.tooltip
+        );
+    }
+
+    /// Every row that offers a toggle must also say when the toggle lands.
+    /// Claude Code reads hooks, MCPs and plugins at session start, so a flip
+    /// that looks instant and is not is the silent failure DESIGN.md §1.1 is
+    /// about — the user re-clicks, sees nothing, and concludes it is broken.
+    #[test]
+    fn a_row_that_offers_a_toggle_always_says_when_it_applies() {
+        let cache = HarnessCache {
+            plugins: vec!["alive".to_string(), "dead (off)".to_string()],
+            ..Default::default()
+        };
+        let mut checked = 0;
+        for section in [plugins_section(&cache)] {
+            for row in &section.rows {
+                if row.can_disable || row.can_enable {
+                    assert!(
+                        row.applies_when.is_some(),
+                        "row {} offers a toggle with no latency stated",
+                        row.key
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "no toggleable rows were examined at all");
+    }
 
     /// Copy-path must resolve the SAME file open does, for every row kind that
     /// has one — and must decline the ones that do not, so the guest never
