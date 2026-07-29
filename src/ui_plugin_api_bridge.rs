@@ -45,6 +45,22 @@ const WRITE_METHODS: &[&str] = &[
     "pane.split",
     "pane.resize",
     "pane.close",
+    // fork(+129): pane reordering. Deliberately NOT split into its own
+    // capability, unlike `PaneGraphics` / `ApiInput` / `PluginAdmin`, because it
+    // is not a new KIND of power: `layout.apply` is already in this row and can
+    // rearrange every pane in the tab wholesale. Withholding `pane.swap` while
+    // allowing `layout.apply` would not protect the user from anything — it
+    // would only force a plugin that wants to swap two panes to rebuild and
+    // reapply the entire layout, which is strictly more destructive and more
+    // likely to lose state. Granting these makes an already-reachable outcome
+    // ergonomic and precise; it does not widen the blast radius.
+    //
+    // `pane.move` relocates a pane to another tab/workspace. It stays here with
+    // `pane.swap` for the same reason: `layout.apply` and `pane.close` (both
+    // already `ApiWrite`) can each make a pane leave the user's current view,
+    // and `pane.move` at least keeps it alive somewhere they can get back to.
+    "pane.swap",
+    "pane.move",
     "tab.create",
     "tab.close",
     "tab.focus",
@@ -258,6 +274,34 @@ mod tests {
                 "{method} must not ride along with ApiWrite"
             );
         }
+    }
+
+    /// fork(+129): the two reorder methods must be reachable, and must resolve
+    /// to `ApiWrite` rather than to a bespoke capability — the whole argument for
+    /// granting them is that they add no power `layout.apply` did not already
+    /// carry. If someone later splits them out, this test should be deleted
+    /// deliberately, with the new reasoning written down, not silently updated.
+    #[test]
+    fn pane_reorder_is_reachable_as_an_ordinary_structural_write() {
+        for method in ["pane.swap", "pane.move"] {
+            assert_eq!(
+                decide(method),
+                ApiMethodDecision::Allow(PluginUiCapability::ApiWrite),
+                "{method} must be reachable through ApiWrite"
+            );
+        }
+    }
+
+    /// The companion to the row comment: `layout.apply` really is already
+    /// allowed at the same level. If this ever stops being true, the rationale
+    /// for granting `pane.swap`/`pane.move` collapses and they must be
+    /// re-examined rather than left behind as an unjustified grant.
+    #[test]
+    fn the_reorder_rationale_still_holds_because_layout_apply_is_api_write() {
+        assert_eq!(
+            decide("layout.apply"),
+            ApiMethodDecision::Allow(PluginUiCapability::ApiWrite)
+        );
     }
 
     #[test]
