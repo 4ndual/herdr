@@ -2042,6 +2042,81 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
     }
 }
 
+/// Serialize `value` and replace `path` with it atomically: write a temp file in
+/// the SAME directory, fsync it, then rename over the destination. Returns
+/// whether the destination now holds the new content.
+///
+/// These writes land on the user's real `settings.json` and `~/.claude.json`.
+/// A plain `fs::write` truncates first and streams after, so an interrupted
+/// write leaves a partial file -- and `~/.claude.json` holds far more than the
+/// one key we came to edit, so that trades a single disabled MCP for the user's
+/// whole Claude config. Rename on the same filesystem is atomic, so a reader
+/// sees either the entire old file or the entire new one. The fsync is what
+/// makes that true across a crash rather than only across a concurrent read.
+/// Filename of the disable stash, under the harness plugin's state dir. Every
+/// non-destructive disable appends its removed entry here; it is the only record
+/// of what a delete-shaped disable took away, so both the hook and MCP paths
+/// must agree on it.
+const HARNESS_STASH_FILE: &str = "harness-disabled.json";
+
+/// Callers pass already-serialized text rather than a `Value` so each keeps its
+/// own formatting: settings files are pretty-printed, but `~/.claude.json` is
+/// written compact and re-pretty-printing that whole file would rewrite every
+/// line of a file we only came to remove one key from.
+fn write_atomic(path: &Path, json: &str) -> bool {
+    use std::io::Write as _;
+
+    let Some(dir) = path.parent() else {
+        tracing::warn!(path = %path.display(), "harness write: no parent dir");
+        return false;
+    };
+    // Same directory ⇒ same filesystem ⇒ the rename below is atomic.
+    let tmp = dir.join(format!(
+        ".{}.herdr-tmp-{}",
+        path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+        std::process::id()
+    ));
+    let write_and_sync = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()
+    };
+    if let Err(err) = write_and_sync() {
+        tracing::warn!(error = %err, path = %tmp.display(), "harness write: temp write failed");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        tracing::warn!(error = %err, path = %path.display(), "harness write: rename failed");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
+/// Append `record` to the disable stash at `stash`, atomically. Returns whether
+/// the record is durably on disk.
+///
+/// Callers MUST treat `false` as "do not proceed with the delete": the stash is
+/// the only record of what was removed, so writing it after the deletion (or
+/// ignoring its failure) is how a disable becomes data loss.
+fn stash_record(stash: &Path, record: serde_json::Value) -> bool {
+    if let Some(dir) = stash.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut stashed: Vec<serde_json::Value> = read_json(stash)
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    stashed.push(record);
+    match serde_json::to_string_pretty(&serde_json::Value::Array(stashed)) {
+        Ok(json) => write_atomic(stash, &json),
+        Err(err) => {
+            tracing::warn!(error = %err, "harness disable: stash serialize failed");
+            false
+        }
+    }
+}
+
 /// Remove `hooks[event][matcher_idx].hooks[hook_idx]` from the settings JSON at
 /// `file`, pruning empty containers, and stash the removed entry in `stash` so
 /// the disable is reversible by hand. Returns whether the file changed.
@@ -2075,28 +2150,25 @@ fn remove_hook_from_file(entry: &HookEntry, stash: &Path) -> bool {
         tracing::warn!(file = %entry.file.display(), event = %entry.event, "harness disable: hook entry drifted; not editing");
         return false;
     };
-    let Ok(json) = serde_json::to_string_pretty(&root) else {
-        return false;
-    };
-    if let Err(err) = std::fs::write(&entry.file, json) {
-        tracing::warn!(error = %err, file = %entry.file.display(), "harness disable: settings write failed");
-        return false;
-    }
-    // Append to the stash (best effort, reversible-by-hand record).
+    // Stash BEFORE the delete lands. The stash is the only record of what was
+    // removed, so a stash written afterwards (or a failure merely logged) leaves
+    // a window where the entry is gone from settings and recorded nowhere.
+    // Refusing to disable is recoverable; a silent unrecoverable delete is not.
     let record = serde_json::json!({
         "file": entry.file.to_string_lossy(),
         "event": entry.event,
         "matcher": entry.matcher,
         "removed": removed,
     });
-    let mut stashed: Vec<serde_json::Value> = read_json(stash)
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
-    stashed.push(record);
-    if let Ok(json) = serde_json::to_string_pretty(&stashed) {
-        if let Err(err) = std::fs::write(stash, json) {
-            tracing::warn!(error = %err, "harness disable: stash write failed");
-        }
+    if !stash_record(stash, record) {
+        tracing::warn!(file = %entry.file.display(), "harness disable: stash failed; not editing settings");
+        return false;
+    }
+    let Ok(json) = serde_json::to_string_pretty(&root) else {
+        return false;
+    };
+    if !write_atomic(&entry.file, &json) {
+        return false;
     }
     true
 }
@@ -2294,7 +2366,7 @@ impl App {
 
     fn disable_hook(&mut self, entry: &HookEntry, profile_wide: bool) -> bool {
         let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
-            .join("harness-disabled.json");
+            .join(HARNESS_STASH_FILE);
         let mut changed = remove_hook_from_file(entry, &stash);
         if profile_wide {
             // Also remove from the ccp profile source so a profile rebuild
@@ -2333,28 +2405,45 @@ impl App {
         let Some(mut root) = read_json(&file) else {
             return false;
         };
+        // Keep the removed VALUE, not just whether something was removed. It is
+        // the server's whole definition -- command, args, env, and whatever
+        // credentials live in that env -- and dropping it on the floor made
+        // "disable" an unrecoverable delete.
         let removed = match &entry.project {
             None => root
                 .get_mut("mcpServers")
                 .and_then(|m| m.as_object_mut())
-                .and_then(|m| m.remove(&entry.name))
-                .is_some(),
+                .and_then(|m| m.remove(&entry.name)),
             Some(cwd) => root
                 .get_mut("projects")
                 .and_then(|p| p.get_mut(cwd))
                 .and_then(|p| p.get_mut("mcpServers"))
                 .and_then(|m| m.as_object_mut())
-                .and_then(|m| m.remove(&entry.name))
-                .is_some(),
+                .and_then(|m| m.remove(&entry.name)),
         };
-        if !removed {
+        let Some(removed) = removed else {
+            return false;
+        };
+        // Stash before the delete lands, same ordering as hooks.
+        let stash = crate::plugin_paths::plugin_state_dir(crate::app::HARNESS_PLUGIN_ID)
+            .join(HARNESS_STASH_FILE);
+        let record = serde_json::json!({
+            "file": file.to_string_lossy(),
+            "kind": "mcp",
+            "name": entry.name,
+            "project": entry.project,
+            "removed": removed,
+        });
+        if !stash_record(&stash, record) {
+            tracing::warn!(name = %entry.name, "harness disable: stash failed; not editing ~/.claude.json");
             return false;
         }
+        // Compact, matching how this file is already written: it is large and
+        // machine-managed, and pretty-printing it would rewrite every line.
         let Ok(json) = serde_json::to_string(&root) else {
             return false;
         };
-        if let Err(err) = std::fs::write(&file, json) {
-            tracing::warn!(error = %err, "harness disable: ~/.claude.json write failed");
+        if !write_atomic(&file, &json) {
             return false;
         }
         self.harness_toast(format!(
@@ -2652,6 +2741,82 @@ mod tests {
         assert_eq!(stats.mcp_calls["claude-in-chrome"], 1);
         assert_eq!(stats.skill_calls["telegram"], 1);
         assert_eq!(stats.in_tokens, 10);
+    }
+
+    /// The stash is the only record of what a disable removed, so it must be
+    /// durable BEFORE the edit lands. If it cannot be written, the disable must
+    /// not happen at all -- a refused disable is recoverable, a delete recorded
+    /// nowhere is not.
+    #[test]
+    fn a_failed_stash_leaves_the_hook_in_place() {
+        let dir = std::env::temp_dir().join(format!("harness-stashfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("settings.json");
+        let original = serde_json::json!({
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": "/bin/echo hi"}
+            ]}]}
+        });
+        std::fs::write(
+            &file,
+            serde_json::to_string_pretty(&original).expect("serialize"),
+        )
+        .expect("write settings");
+
+        // Make the stash unwritable: its PARENT is a regular file, so both
+        // create_dir_all and the temp-file create beneath it must fail.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a directory").expect("write blocker");
+        let stash = blocker.join("harness-disabled.json");
+
+        let entry = HookEntry {
+            file: file.clone(),
+            event: "PreToolUse".to_string(),
+            matcher: "*".to_string(),
+            matcher_idx: 0,
+            hook_idx: 0,
+            name: "echo".to_string(),
+            command: "/bin/echo hi".to_string(),
+            script: None,
+        };
+
+        assert!(
+            !remove_hook_from_file(&entry, &stash),
+            "disable must refuse when it cannot record what it removed"
+        );
+        let after = read_json(&file).expect("settings still readable");
+        assert_eq!(after, original, "settings must be byte-for-byte untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replace must be all-or-nothing, and must not litter temp files next to
+    /// the user's config when it fails.
+    #[test]
+    fn write_atomic_replaces_wholly_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("harness-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("conf.json");
+        std::fs::write(&f, "{\"old\":true}").expect("seed");
+
+        assert!(write_atomic(&f, "{\"new\":true}"));
+        assert_eq!(
+            std::fs::read_to_string(&f).expect("read"),
+            "{\"new\":true}"
+        );
+
+        // Exactly the destination remains -- no leftover temp file beside it.
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["conf.json".to_string()], "stray files: {left:?}");
+
+        // Undrivable destination fails cleanly rather than half-writing.
+        assert!(!write_atomic(&dir.join("nope").join("conf.json"), "{}"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
