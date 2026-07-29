@@ -29,6 +29,83 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+/// Paths whose change means "the git state moved, so re-stamp the binary".
+///
+/// WHY THIS IS NOT JUST `.git/HEAD`: in a **git worktree** `.git` is a FILE
+/// holding `gitdir: <path>`, not a directory, so `<manifest>/.git/HEAD` cannot
+/// be opened -- the OS reports ENOTDIR, not ENOENT. Cargo cannot stat a declared
+/// `rerun-if-changed` path, so it takes the safe route and reruns this script on
+/// EVERY invocation. That is not a harmless extra build: the script rerunning
+/// relinks the binary, and two consequences follow.
+///
+/// 1. Every `cargo build` in a worktree relinks herdr even with zero changes.
+/// 2. Worse, wasmtime keys its compile-cache namespace on the executable's mtime
+///    under `debug_assertions` (`{compiler}-{GIT_REV}-{exe_mtime_ms}`), so a
+///    binary relinked on every build gets a FRESH cache namespace every time and
+///    the cache never hits once. Each spawned server then pays a full cranelift
+///    compile per bundled wasm module, and N concurrent integration-test servers
+///    starve the harness's socket waits. Measured: 215 dead namespaces / 387 MB
+///    of write-only cache, and pinning the mtime cut a run's CPU 13.24s -> 1.42s.
+///
+/// Release builds use wasmtime's stable `GIT_REV` branch and were never affected.
+///
+/// So the invariant here is: **only ever emit paths that exist.** A path that
+/// does not resolve silently converts this from "rerun on git change" into
+/// "rerun always", which is the exact bug -- and it fails in the direction that
+/// looks like it is working, since the stamp does stay correct.
+fn git_provenance_watch_paths(manifest_dir: &std::path::Path) -> Vec<PathBuf> {
+    let dot_git = manifest_dir.join(".git");
+    let Ok(metadata) = fs::metadata(&dot_git) else {
+        // No git at all (source tarball). Watch nothing; `describe` falls back to
+        // "unknown" and there is no git state that could change under us.
+        return Vec::new();
+    };
+
+    let git_dir = if metadata.is_dir() {
+        dot_git
+    } else {
+        // Worktree (or submodule): `.git` is a file containing `gitdir: <path>`.
+        // The path may be relative to the worktree, so resolve it against the
+        // manifest dir rather than the process cwd.
+        let Ok(contents) = fs::read_to_string(&dot_git) else {
+            return Vec::new();
+        };
+        let Some(rest) = contents.split_once("gitdir:") else {
+            return Vec::new();
+        };
+        let raw = PathBuf::from(rest.1.trim());
+        if raw.is_absolute() {
+            raw
+        } else {
+            manifest_dir.join(raw)
+        }
+    };
+
+    // HEAD moves on commit, checkout and branch switch -- that is the signal.
+    // `commondir` points at the shared git dir in a worktree, where tags live;
+    // `describe --tags` reads those, so a new tag must also re-stamp.
+    let mut candidates = vec![git_dir.join("HEAD")];
+    if let Ok(common) = fs::read_to_string(git_dir.join("commondir")) {
+        let raw = PathBuf::from(common.trim());
+        let common_dir = if raw.is_absolute() {
+            raw
+        } else {
+            git_dir.join(raw)
+        };
+        candidates.push(common_dir.join("refs/tags"));
+        candidates.push(common_dir.join("packed-refs"));
+    } else {
+        candidates.push(git_dir.join("refs/tags"));
+        candidates.push(git_dir.join("packed-refs"));
+    }
+
+    // The invariant, enforced: a candidate that does not exist would restore the
+    // unconditional-rerun bug, so drop it. `packed-refs` in particular is absent
+    // in a freshly cloned repo and appears later after `git gc`.
+    candidates.retain(|path| path.exists());
+    candidates
+}
+
 /// Bake this build's own git provenance into the binary.
 ///
 /// WHY: the version strip renders a `+N` local-changes marker that Andres uses
@@ -44,8 +121,8 @@ fn env_bool(name: &str) -> Option<bool> {
 fn emit_fork_provenance(manifest_dir: &std::path::Path) {
     println!("cargo:rerun-if-env-changed=HERDR_FORK_PROVENANCE");
     // A git dir change (new commit, checkout) must re-stamp the binary.
-    for path in ["/.git/HEAD", "/.git"] {
-        println!("cargo:rerun-if-changed={}{}", manifest_dir.display(), path);
+    for path in git_provenance_watch_paths(manifest_dir) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     let provenance = env::var("HERDR_FORK_PROVENANCE").ok().or_else(|| {
         Command::new("git")

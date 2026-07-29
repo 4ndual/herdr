@@ -223,6 +223,31 @@ impl PluginRuntime {
         if let Err(err) = config.cache_config_load_default() {
             tracing::warn!(error = %err, "wasm ui plugin compilation cache disabled");
         }
+        // fork(#49): the `Err` branch above is not the only way this cache can be
+        // useless -- and for two years it was useless in the way that does NOT
+        // log. Under `debug_assertions` wasmtime names the cache namespace
+        // `{compiler}-{GIT_REV}-{exe_mtime_ms}`, so a binary that gets relinked
+        // between runs starts cold every time while `cache_config_load_default`
+        // returns `Ok` and says nothing. That is what happened here: a
+        // `rerun-if-changed` on a path that cannot exist in a git worktree made
+        // cargo relink on every build, and the cache accumulated 215 write-only
+        // namespaces without one hit. Fixed in build.rs, but the silence was the
+        // real defect -- an inert cache must at least be an audible one, so say
+        // out loud which namespace a debug build is using. Release builds key on
+        // GIT_REV and are stable, so this is debug-only and costs them nothing.
+        if cfg!(debug_assertions) {
+            let exe_mtime = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.metadata().ok())
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|dur| dur.as_millis());
+            tracing::debug!(
+                ?exe_mtime,
+                "wasm ui plugin cache namespace is keyed on this binary's mtime \
+                 (debug build); a relink between runs means a cold cache"
+            );
+        }
         let engine =
             Engine::new(&config).map_err(|err| format!("failed to build wasm ui engine: {err}"))?;
         let ticker = EpochTicker::spawn(&engine);
