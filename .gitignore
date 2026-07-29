@@ -37,3 +37,8 @@ node_modules/
 .DS_Store
 /.wrangler/
 **/.wrangler/
+
+# Plugin build output. 2,764 of these were committed by 856493ae and rode along
+# in every fork commit since; they are regenerable and must never be tracked.
+plugins/*/target/
+plugins/*/target-*/

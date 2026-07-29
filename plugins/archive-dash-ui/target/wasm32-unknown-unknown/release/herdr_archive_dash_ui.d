@@ -1,1 +1,0 @@
-/Users/andual/Projects/herdr/plugins/archive-dash-ui/target/wasm32-unknown-unknown/release/herdr_archive_dash_ui.wasm: /Users/andual/Projects/herdr/crates/herdr-ui-plugin-api/src/lib.rs /Users/andual/Projects/herdr/plugins/archive-dash-ui/src/lib.rs
