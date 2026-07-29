@@ -315,11 +315,7 @@ fn wait_for_api(socket_path: &Path, timeout: Duration) {
 /// Retrying a call that had a side effect would be wrong; this one is safe
 /// precisely because `agent_pane_busy` is raised BEFORE any input is written to
 /// the pane, so a refused start started nothing.
-fn wait_for_agent_start(
-    socket_path: &Path,
-    pane_id: &str,
-    timeout: Duration,
-) -> serde_json::Value {
+fn wait_for_agent_start(socket_path: &Path, pane_id: &str, timeout: Duration) -> serde_json::Value {
     let deadline = Instant::now() + timeout;
     let mut attempts = 0;
     loop {
