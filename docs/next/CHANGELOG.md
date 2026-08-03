@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+
 ## [0.8.0] - 2026-08-03
 
 ### Added
