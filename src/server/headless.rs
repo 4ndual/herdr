@@ -4222,8 +4222,15 @@ impl HeadlessServer {
                         } else {
                             crate::kitty_graphics::HostCellSize::default()
                         };
+                    let preserved_scroll = (!is_foreground).then_some((
+                        self.app.state.workspace_scroll,
+                        self.app.state.agent_panel_scroll,
+                        self.app.state.tab_scroll,
+                        self.app.state.mobile_switcher_scroll,
+                    ));
                     // fork: `pin_badge` is the fork's non-foreground clipping badge;
                     // re-anchored onto upstream 0.7.5's single-call render shape.
+                    // `mut` because the fork paints half-block images into the buffer below.
                     let (mut buffer, cursor) =
                         crate::server::render_stream::render_virtual_with_runtime_registry(
                             &mut self.app.state,
@@ -4262,6 +4269,14 @@ impl HeadlessServer {
                     // `app/mod.rs` and getting a layer that existed in state and
                     // never appeared on screen.
                     crate::pane_text_paint::paint_pane_text(&self.app.state, &mut buffer);
+                    // upstream(#2280): a non-foreground client must not have its
+                    // sidebar/tab scroll clobbered by this render.
+                    if let Some((workspace, agent_panel, tab, mobile_switcher)) = preserved_scroll {
+                        self.app.state.workspace_scroll = workspace;
+                        self.app.state.agent_panel_scroll = agent_panel;
+                        self.app.state.tab_scroll = tab;
+                        self.app.state.mobile_switcher_scroll = mobile_switcher;
+                    }
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
