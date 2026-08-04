@@ -442,7 +442,7 @@ impl Workspace {
     }
 
     pub fn switch_tab(&mut self, idx: usize) {
-        if idx < self.tabs.len() {
+        if idx < self.tabs.len() && !self.tabs[idx].hidden {
             self.active_tab = idx;
             if let Some(tab) = self.tabs.get_mut(idx) {
                 for pane in tab.panes.values_mut() {
@@ -450,6 +450,22 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    pub fn next_visible_tab(&self, forward: bool) -> Option<usize> {
+        let visible = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| (!tab.hidden).then_some(idx))
+            .collect::<Vec<_>>();
+        let current = visible.iter().position(|idx| *idx == self.active_tab)?;
+        let next = if forward {
+            (current + 1) % visible.len()
+        } else {
+            (current + visible.len() - 1) % visible.len()
+        };
+        visible.get(next).copied()
     }
 
     pub fn create_tab(
@@ -556,6 +572,34 @@ impl Workspace {
         self.register_new_pane_with_number(tab.root_pane, pane_number);
         self.tabs.push(tab);
         Ok((self.tabs.len() - 1, terminal, runtime))
+    }
+
+    pub fn set_tab_hidden(&mut self, idx: usize, hidden: bool) -> bool {
+        let Some(tab) = self.tabs.get(idx) else {
+            return false;
+        };
+        if tab.hidden == hidden {
+            return true;
+        }
+        if hidden {
+            let visible_count = self.tabs.iter().filter(|tab| !tab.hidden).count();
+            if visible_count <= 1 {
+                return false;
+            }
+        }
+        self.tabs[idx].hidden = hidden;
+        if hidden && self.active_tab == idx {
+            let replacement = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| !tab.hidden)
+                .min_by_key(|(candidate, _)| candidate.abs_diff(idx))
+                .map(|(candidate, _)| candidate)
+                .expect("hiding a tab leaves one visible tab");
+            self.active_tab = replacement;
+        }
+        true
     }
 
     pub fn close_tab(&mut self, idx: usize) -> bool {
@@ -1194,6 +1238,7 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(terminal_id));
         let tab = Tab {
             custom_name: None,
+            hidden: false,
             number: 1,
             root_pane: root_id,
             layout,
@@ -1247,6 +1292,7 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
         let tab = Tab {
             custom_name: name.map(str::to_string),
+            hidden: false,
             number: self.next_public_tab_number,
             root_pane: root_id,
             layout,

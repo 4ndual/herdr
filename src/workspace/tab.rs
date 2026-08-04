@@ -37,6 +37,8 @@ enum SplitCommand<'a> {
 
 pub struct Tab {
     pub custom_name: Option<String>,
+    /// Hidden from the tab bar while retaining all panes and terminal runtimes.
+    pub hidden: bool,
     pub number: usize,
     /// Identity source for this tab's pane tree.
     pub root_pane: PaneId,
@@ -170,6 +172,7 @@ impl Tab {
         Ok((
             Self {
                 custom_name: None,
+                hidden: false,
                 number,
                 root_pane: root_id,
                 layout,
@@ -446,6 +449,7 @@ impl Tab {
         panes.insert(pane_id, moved.pane_state);
         Self {
             custom_name,
+            hidden: false,
             number,
             root_pane: pane_id,
             layout: TileLayout::from_saved(Node::Pane(pane_id), pane_id),

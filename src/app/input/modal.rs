@@ -784,6 +784,19 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Make invisible")) => {
+            if state
+                .workspaces
+                .get_mut(ws_idx)
+                .is_some_and(|ws| ws.set_tab_hidden(tab_idx, true))
+            {
+                state.mark_session_dirty();
+                if state.active == Some(ws_idx) {
+                    state.refresh_tab_bar_view();
+                }
+            }
+            leave_modal(state);
+        }
         (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
             // Archive this tab's focused pane via the archive-dash plugin
             // action; the outer App/event loop dispatches the request.
@@ -1273,6 +1286,20 @@ impl App {
                         });
                 } else {
                     tracing::warn!(ws_idx, tab_idx, "fork context menu: no pane to fork");
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Make invisible")) => {
+                if self
+                    .state
+                    .workspaces
+                    .get_mut(ws_idx)
+                    .is_some_and(|ws| ws.set_tab_hidden(tab_idx, true))
+                {
+                    self.state.mark_session_dirty();
+                    if self.state.active == Some(ws_idx) {
+                        self.state.refresh_tab_bar_view();
+                    }
                 }
                 leave_modal(&mut self.state);
             }

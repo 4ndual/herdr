@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, TabCreateParams, TabListParams,
-    TabMoveParams, TabRenameParams, TabTarget,
+    TabMoveParams, TabRenameParams, TabTarget, TabVisibilityParams,
 };
 use crate::app::{App, Mode};
 
@@ -17,13 +17,15 @@ impl App {
             let Some(_) = self.state.workspaces.get(ws_idx) else {
                 return workspace_not_found(id, &workspace_id);
             };
-            self.tab_list_info(ws_idx)
+            self.tab_list_info_filtered(ws_idx, params.hidden)
         } else {
             let mut tabs = Vec::new();
             for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
                 for tab_idx in 0..ws.tabs.len() {
                     if let Some(tab) = self.tab_info(ws_idx, tab_idx) {
-                        tabs.push(tab);
+                        if params.hidden.map_or(true, |hidden| tab.hidden == hidden) {
+                            tabs.push(tab);
+                        }
                     }
                 }
             }
@@ -408,16 +410,50 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
-    fn tab_list_info(&self, ws_idx: usize) -> Vec<crate::api::schema::TabInfo> {
+    pub(super) fn handle_tab_show(&mut self, id: String, params: TabVisibilityParams) -> String {
+        let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
+            return tab_not_found(id, &params.tab_id);
+        };
+        let changed = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .is_some_and(|ws| ws.set_tab_hidden(tab_idx, false));
+        if !changed {
+            return tab_not_found(id, &params.tab_id);
+        }
+        if params.focus {
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.state.mode = Mode::Terminal;
+        }
+        self.state.mark_session_dirty();
+        if self.state.active == Some(ws_idx) {
+            self.state.refresh_tab_bar_view();
+        }
+        self.schedule_session_save();
+        let tab = self.tab_info(ws_idx, tab_idx).expect("shown tab exists");
+        encode_success(id, ResponseResult::TabInfo { tab })
+    }
+
+    fn tab_list_info_filtered(
+        &self,
+        ws_idx: usize,
+        hidden: Option<bool>,
+    ) -> Vec<crate::api::schema::TabInfo> {
         self.state
             .workspaces
             .get(ws_idx)
             .map(|ws| {
                 (0..ws.tabs.len())
                     .filter_map(|idx| self.tab_info(ws_idx, idx))
+                    .filter(|tab| hidden.is_none_or(|hidden| tab.hidden == hidden))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn tab_list_info(&self, ws_idx: usize) -> Vec<crate::api::schema::TabInfo> {
+        self.tab_list_info_filtered(ws_idx, None)
     }
 }
 

@@ -418,7 +418,7 @@ fn restore_workspace(
             public_pane_numbers,
             next_public_pane_number,
             next_public_tab_number,
-            active_tab: snap.active_tab.min(tabs.len().saturating_sub(1)),
+            active_tab: restored_active_tab(&tabs, snap.active_tab),
             tabs,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
@@ -426,6 +426,17 @@ fn restore_workspace(
         .map(|workspace| (workspace, terminals, terminal_runtimes)),
         failed_imports,
     )
+}
+
+fn restored_active_tab(tabs: &[crate::workspace::Tab], requested: usize) -> usize {
+    let requested = requested.min(tabs.len().saturating_sub(1));
+    if tabs.get(requested).is_some_and(|tab| !tab.hidden) {
+        return requested;
+    }
+    tabs.iter()
+        .enumerate()
+        .find_map(|(idx, tab)| (!tab.hidden).then_some(idx))
+        .unwrap_or(requested)
 }
 
 fn restored_worktree_space_membership(
@@ -709,6 +720,7 @@ fn restore_tab(
         Some((
             crate::workspace::Tab {
                 custom_name: snap.custom_name.clone(),
+                hidden: snap.hidden,
                 number,
                 root_pane,
                 layout,
@@ -1174,6 +1186,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1254,6 +1267,7 @@ mod tests {
                 public_tab_numbers: vec![5],
                 next_public_tab_number: 6,
                 tabs: vec![TabSnapshot {
+                    hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: super::super::snapshot::DirectionSnapshot::Horizontal,
@@ -1364,6 +1378,7 @@ mod tests {
                 next_public_tab_number: 6,
                 tabs: vec![
                     TabSnapshot {
+                        hidden: false,
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(10),
                         panes: HashMap::from([pane_snap("10")]),
@@ -1372,6 +1387,7 @@ mod tests {
                         root_pane: Some(10),
                     },
                     TabSnapshot {
+                        hidden: false,
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(11),
                         panes: HashMap::from([pane_snap("11")]),
@@ -1380,6 +1396,7 @@ mod tests {
                         root_pane: Some(11),
                     },
                     TabSnapshot {
+                        hidden: false,
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(12),
                         panes: HashMap::from([pane_snap("12")]),
@@ -1388,6 +1405,7 @@ mod tests {
                         root_pane: Some(12),
                     },
                     TabSnapshot {
+                        hidden: false,
                         custom_name: None,
                         layout: LayoutSnapshot::Pane(13),
                         panes: HashMap::from([(13, final_pane)]),
@@ -1446,6 +1464,7 @@ mod tests {
             public_tab_numbers: Vec::new(),
             next_public_tab_number: 0,
             tabs: vec![TabSnapshot {
+                hidden: false,
                 custom_name: None,
                 layout: LayoutSnapshot::Split {
                     direction: super::super::snapshot::DirectionSnapshot::Horizontal,
@@ -1485,6 +1504,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1694,6 +1714,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,

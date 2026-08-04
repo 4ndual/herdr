@@ -1060,20 +1060,14 @@ impl AppState {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
-                            if !ws.tabs.is_empty() {
-                                let prev = if ws.active_tab == 0 {
-                                    ws.tabs.len() - 1
-                                } else {
-                                    ws.active_tab - 1
-                                };
+                            if let Some(prev) = ws.next_visible_tab(false) {
                                 return Some(MouseAction::FocusTab { tab_idx: prev });
                             }
                         }
                     }
                     MouseEventKind::ScrollDown => {
                         if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
-                            if !ws.tabs.is_empty() {
-                                let next = (ws.active_tab + 1) % ws.tabs.len();
+                            if let Some(next) = ws.next_visible_tab(true) {
                                 return Some(MouseAction::FocusTab { tab_idx: next });
                             }
                         }

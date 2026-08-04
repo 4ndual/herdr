@@ -22,6 +22,17 @@ pub struct TabCreateParams {
 pub struct TabListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// When set, restrict the result to tabs with this visibility state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TabVisibilityParams {
+    pub tab_id: String,
+    /// Reveal the tab and focus it when true. Defaults to false.
+    #[serde(default)]
+    pub focus: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -45,4 +56,5 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,
+    pub hidden: bool,
 }

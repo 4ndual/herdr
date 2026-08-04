@@ -367,6 +367,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorktreeRemove(_) => "worktree.remove",
         Method::TabCreate(_) => "tab.create",
         Method::TabList(_) => "tab.list",
+        Method::TabShow(_) => "tab.show",
         Method::TabGet(_) => "tab.get",
         Method::TabFocus(_) => "tab.focus",
         Method::TabRename(_) => "tab.rename",

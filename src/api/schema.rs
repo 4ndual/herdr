@@ -91,6 +91,8 @@ pub enum Method {
     TabCreate(TabCreateParams),
     #[serde(rename = "tab.list")]
     TabList(TabListParams),
+    #[serde(rename = "tab.show")]
+    TabShow(TabVisibilityParams),
     #[serde(rename = "tab.get")]
     TabGet(TabTarget),
     #[serde(rename = "tab.focus")]

@@ -48,6 +48,9 @@ fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, scroll: us
     let mut x = area.x;
     let right = area.x + area.width;
     for (idx, rect) in rects.iter_mut().enumerate().skip(scroll) {
+        if ws.tabs[idx].hidden {
+            continue;
+        }
         if x >= right {
             break;
         }
@@ -61,7 +64,14 @@ fn layout_tab_hit_areas(ws: &crate::workspace::Workspace, area: Rect, scroll: us
 }
 
 fn centered_tab_scroll(ws: &crate::workspace::Workspace, area: Rect) -> usize {
-    let mut best_scroll = ws.active_tab;
+    let mut best_scroll = ws
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, tab)| !tab.hidden)
+        .map(|(idx, _)| idx)
+        .next()
+        .unwrap_or(0);
     let mut best_distance = u16::MAX;
     let viewport_center = area.x.saturating_mul(2).saturating_add(area.width);
 
@@ -281,7 +291,7 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         .map(|(idx, _)| idx);
     let can_scroll_left = app.view.tab_scroll_left_hit_area.width > 0 && app.tab_scroll > 0;
     let can_scroll_right = app.view.tab_scroll_right_hit_area.width > 0
-        && last_visible_idx.is_some_and(|idx| idx + 1 < ws.tabs.len());
+        && last_visible_idx.is_some_and(|idx| ws.tabs.iter().skip(idx + 1).any(|tab| !tab.hidden));
 
     if app.mouse_capture && app.view.tab_scroll_left_hit_area.width > 0 {
         let style = if can_scroll_left {
@@ -379,7 +389,7 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
                 .set_style(Style::default().fg(p.overlay0));
         }
     }
-    if last_visible_idx.is_some_and(|idx| idx + 1 < ws.tabs.len()) {
+    if last_visible_idx.is_some_and(|idx| ws.tabs.iter().skip(idx + 1).any(|tab| !tab.hidden)) {
         let x = if app.mouse_capture && app.view.tab_scroll_right_hit_area.width > 0 {
             app.view.tab_scroll_right_hit_area.x.saturating_sub(1)
         } else {

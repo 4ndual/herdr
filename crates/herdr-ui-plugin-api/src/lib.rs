@@ -22,6 +22,8 @@ pub enum AgentKind {
 /// env, and `UiEvent::FocusChanged`. The host fills it from its own `AppState`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FocusInput {
+    /// Public pane identifier matching the pane API roster (for example `w1:p1`).
+    pub pane_id: Option<String>,
     /// Agent session id keyed into the usage store (often a transcript stem).
     /// For path-backed sessions like pi, herdr derives this from the session
     /// file stem so the reader can still resolve transcript files.

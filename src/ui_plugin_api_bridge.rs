@@ -426,3 +426,4 @@ mod tests {
         );
     }
 }
+    "tab.show",
