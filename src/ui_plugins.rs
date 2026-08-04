@@ -1602,35 +1602,44 @@ fn filter_effects_for_module(
 ) -> Vec<HostEffect> {
     effects
         .iter()
-        .filter(|effect| match effect {
-            HostEffect::CopyText { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::ClipboardWrite)
+        .filter_map(|effect| match effect {
+            HostEffect::CopyText { .. } => module
+                .requests(crate::api::schema::PluginUiCapability::ClipboardWrite)
+                .then(|| effect.clone()),
+            HostEffect::SendPaneKeys { .. } => module
+                .requests(crate::api::schema::PluginUiCapability::PaneInput)
+                .then(|| effect.clone()),
+            HostEffect::ShowToast { .. } => module
+                .requests(crate::api::schema::PluginUiCapability::Toasts)
+                .then(|| effect.clone()),
+            HostEffect::OpenPluginPane { entrypoint, .. } => {
+                if module.requests(crate::api::schema::PluginUiCapability::OpenPluginPanes) {
+                    Some(effect.clone())
+                } else {
+                    Some(HostEffect::ShowToast {
+                        message: format!(
+                            "Plugin {} cannot open pane '{}': capability not granted",
+                            module.plugin_id, entrypoint
+                        ),
+                    })
+                }
             }
-            HostEffect::SendPaneKeys { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::PaneInput)
-            }
-            HostEffect::ShowToast { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::Toasts)
-            }
-            HostEffect::OpenPluginPane { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::OpenPluginPanes)
-            }
-            HostEffect::InvokePluginAction { .. } => {
-                module.requests(crate::api::schema::PluginUiCapability::PluginActions)
-            }
+            HostEffect::InvokePluginAction { .. } => module
+                .requests(crate::api::schema::PluginUiCapability::PluginActions)
+                .then(|| effect.clone()),
             // §7.2 own-surface guard: a module may only collapse/expand
             // surfaces it declares in its manifest — no capability required.
             HostEffect::SetSurfaceCollapsed { surface, .. } => module
                 .surfaces
                 .iter()
-                .any(|declared| map_surface(*declared) == *surface),
+                .any(|declared| map_surface(*declared) == *surface)
+                .then(|| effect.clone()),
             // Api effects are never routed through this generic capability
             // filter: `dispatch_event_for_module` extracts and queues them
             // separately (via `queue_api_effects`) before this function ever
             // sees `other_effects`, so this arm exists only for exhaustiveness.
-            HostEffect::Api { .. } => false,
+            HostEffect::Api { .. } => None,
         })
-        .cloned()
         .collect()
 }
 
@@ -1751,6 +1760,43 @@ mod tests {
         PluginHotReloadMode, PluginManifestUiModule, PluginUiCapability, PluginUiModuleKind,
         PluginUiSurface,
     };
+
+    #[test]
+    fn denied_open_plugin_pane_surfaces_a_toast() {
+        let mut module = sample_plugin().ui_modules[0].clone();
+        module.capabilities.retain(|capability| {
+            *capability != PluginUiCapability::OpenPluginPanes
+        });
+        let registered = RegisteredUiModule {
+            plugin_id: "example.demo".into(),
+            module_id: "demo".into(),
+            title: "Demo".into(),
+            module_path: std::path::PathBuf::from("demo.wasm"),
+            manifest_path: std::path::PathBuf::from("herdr-plugin.toml"),
+            api_version: 3,
+            negotiated_version: 3,
+            hot_reload: PluginHotReloadMode::On,
+            surfaces: module.surfaces.clone(),
+            placement: None,
+            requested_capabilities: module.capabilities,
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            max_layers_per_pane: None,
+        };
+        let effects = filter_effects_for_module(
+            &registered,
+            &[HostEffect::OpenPluginPane {
+                plugin_id: "example.demo".into(),
+                entrypoint: "update".into(),
+                payload_json: None,
+            }],
+        );
+        assert!(matches!(
+            effects.as_slice(),
+            [HostEffect::ShowToast { message }] if message.contains("capability not granted")
+        ));
+    }
 
     #[test]
     fn set_surface_collapsed_requires_declared_surface() {
