@@ -44,6 +44,21 @@ pub(crate) struct PaneTextLayer {
     pub layer_id: String,
 }
 
+/// fork(+131): one owner's reserved edge band on a pane.
+///
+/// Deliberately tiny and free of geometry: an edge and a thickness, resolved
+/// against the pane's live inner rect at render time. Storing a resolved Rect
+/// instead would go stale the moment the user split, zoomed, or resized the
+/// window — the failure the extents work (#41) exists to let guests avoid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneCarve {
+    pub edge: crate::api::schema::PaneCarveEdge,
+    pub cells: u16,
+    /// `plugin:<plugin_id>` through the UI-plugin bridge, `None` over the
+    /// socket. Same privilege rule as the layer maps: `None` is the user.
+    pub owner: Option<String>,
+}
+
 impl PaneTextLayer {
     /// Retained UTF-8 bytes, for per-plugin footprint accounting. Counts only
     /// the text: the styling fields are fixed-size and a plugin cannot inflate
@@ -1894,6 +1909,20 @@ pub struct AppState {
     /// call order, which is precisely the kind of bug a plugin author cannot
     /// diagnose from outside the host.
     pub(crate) pane_text_layers: std::collections::HashMap<PaneId, Vec<PaneTextLayer>>,
+    /// fork(+131): CARVES per pane — reserved edge bands that shrink the pane's
+    /// TEXT region so the terminal reflows around them, rather than being
+    /// painted over each frame.
+    ///
+    /// Separate from the layer maps because a carve is categorically different:
+    /// the layer maps are per-frame compositing state that `PaneState` never
+    /// sees, while a carve resizes the PTY and the program in the pane observes
+    /// it. Folding them together would invite treating a carve as cheap to
+    /// churn, and every change here costs a real reflow.
+    ///
+    /// Keyed by pane, then one entry per owner. Bands on the same edge from
+    /// different owners SUM; a repeat from the same owner REPLACES. A plugin
+    /// asking twice means "this is my band now", not "give me a second one".
+    pub(crate) pane_carves: std::collections::HashMap<PaneId, Vec<PaneCarve>>,
     /// Active streaming graphics owner token by pane id.
     pub(crate) pane_graphics_streams: std::collections::HashMap<PaneId, String>,
     /// Monotonic marker for accepted pane graphics mutations.
@@ -2254,6 +2283,108 @@ impl AppState {
             self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
         }
         removed
+    }
+
+
+    /// fork(+131): drop every carve owned by `owner` and report how many went.
+    ///
+    /// This is the function that makes carve safe to hand to a plugin. A plugin
+    /// gets no unload/disable event, so if cleanup lived guest-side a crashed
+    /// or disabled plugin would leave the user staring at a permanently
+    /// shrunken pane with nothing to blame. Called from the same disable and
+    /// unlink paths that clear graphics and text layers.
+    pub(crate) fn clear_pane_carves_for_owner(&mut self, owner: &str) -> usize {
+        let mut removed = 0_usize;
+        for carves in self.pane_carves.values_mut() {
+            let before = carves.len();
+            carves.retain(|carve| carve.owner.as_deref() != Some(owner));
+            removed += before - carves.len();
+        }
+        self.pane_carves.retain(|_, carves| !carves.is_empty());
+        removed
+    }
+
+    /// Upsert one owner's carve on a pane. Returns whether an existing carve was
+    /// replaced; both outcomes succeed.
+    pub(crate) fn upsert_pane_carve(&mut self, pane_id: PaneId, carve: PaneCarve) -> bool {
+        let carves = self.pane_carves.entry(pane_id).or_default();
+        match carves.iter_mut().find(|held| held.owner == carve.owner) {
+            Some(held) => {
+                *held = carve;
+                true
+            }
+            None => {
+                carves.push(carve);
+                false
+            }
+        }
+    }
+
+    /// Release carves on a pane. A plugin (`Some(owner)`) releases only its own;
+    /// the socket caller (`None`) releases the pane outright, because the user
+    /// at the CLI outranks any plugin and needs an escape hatch.
+    pub(crate) fn clear_pane_carves(&mut self, pane_id: PaneId, owner: Option<&str>) -> usize {
+        let Some(carves) = self.pane_carves.get_mut(&pane_id) else {
+            return 0;
+        };
+        let before = carves.len();
+        match owner {
+            Some(owner) => carves.retain(|carve| carve.owner.as_deref() != Some(owner)),
+            None => carves.clear(),
+        }
+        let removed = before - carves.len();
+        if carves.is_empty() {
+            self.pane_carves.remove(&pane_id);
+        }
+        removed
+    }
+
+    /// Same totals, but ignoring one owner's own band. The floor check needs
+    /// this so a caller REPLACING its own carve is measured against what the
+    /// pane would look like after the replacement, not before it — otherwise a
+    /// plugin shrinking its own band could be refused for exceeding a floor its
+    /// old, larger band was the cause of.
+    pub(crate) fn pane_carve_totals_excluding(
+        &self,
+        pane_id: PaneId,
+        owner: Option<&str>,
+    ) -> (u16, u16, u16, u16) {
+        let mut totals = (0_u16, 0_u16, 0_u16, 0_u16);
+        let Some(carves) = self.pane_carves.get(&pane_id) else {
+            return totals;
+        };
+        for carve in carves {
+            if carve.owner.as_deref() == owner {
+                continue;
+            }
+            let slot = match carve.edge {
+                crate::api::schema::PaneCarveEdge::Top => &mut totals.0,
+                crate::api::schema::PaneCarveEdge::Bottom => &mut totals.1,
+                crate::api::schema::PaneCarveEdge::Left => &mut totals.2,
+                crate::api::schema::PaneCarveEdge::Right => &mut totals.3,
+            };
+            *slot = slot.saturating_add(carve.cells);
+        }
+        totals
+    }
+
+    /// Total reserved cells per edge for a pane: `(top, bottom, left, right)`.
+    /// Bands from different owners on the same edge sum.
+    pub(crate) fn pane_carve_totals(&self, pane_id: PaneId) -> (u16, u16, u16, u16) {
+        let mut totals = (0_u16, 0_u16, 0_u16, 0_u16);
+        let Some(carves) = self.pane_carves.get(&pane_id) else {
+            return totals;
+        };
+        for carve in carves {
+            let slot = match carve.edge {
+                crate::api::schema::PaneCarveEdge::Top => &mut totals.0,
+                crate::api::schema::PaneCarveEdge::Bottom => &mut totals.1,
+                crate::api::schema::PaneCarveEdge::Left => &mut totals.2,
+                crate::api::schema::PaneCarveEdge::Right => &mut totals.3,
+            };
+            *slot = slot.saturating_add(carve.cells);
+        }
+        totals
     }
 
     /// fork(+128): upsert a text overlay, keyed on the `(owner, layer_id)` pair
@@ -2745,6 +2876,7 @@ impl AppState {
             plugin_panes: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
             pane_text_layers: std::collections::HashMap::new(),
+            pane_carves: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
             popup_pane: None,

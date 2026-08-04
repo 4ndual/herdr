@@ -750,3 +750,73 @@ pub struct PaneReadResult {
     pub revision: u64,
     pub truncated: bool,
 }
+
+/// fork(+131): which edge of a pane a carve reserves.
+///
+/// A carve is not an overlay and cannot borrow the overlay's free placement. A
+/// PTY is a RECTANGLE: `resize` takes a row count and a column count and
+/// nothing else, so the only regions a terminal can be made to stop using are
+/// full-width bands at the top or bottom and full-height columns at the left or
+/// right. There is no way to carve a hole in the middle — the terminal has no
+/// concept of one.
+///
+/// Hence a distinct type rather than reusing `PaneGraphicsPlacementParams`.
+/// Accepting a free `viewport_col`/`grid_cols` placement here would accept
+/// placements the host cannot honour and then quietly do something else, which
+/// is the failure this API family has now been bitten by twice (#33's silently
+/// defaulted field names, #40's `0`-means-whole-pane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCarveEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// The text region a carve must never shrink below. A carve that ate the whole
+/// pane would be the zero-extent footgun again in a new costume — a "success"
+/// that leaves the user with a pane they cannot read or type into. Rejecting it
+/// at the boundary keeps the failure loud and local to the caller.
+pub const PANE_CARVE_MIN_TEXT_COLS: u16 = 20;
+pub const PANE_CARVE_MIN_TEXT_ROWS: u16 = 3;
+
+/// fork(+131): reserve part of a pane so the TERMINAL stops using it.
+///
+/// Unlike `pane.graphics.set`/`pane.text.set`, this is not a compositing call.
+/// It resizes the PTY, so the program in the pane reflows and its scrollback is
+/// rewritten — ordinary resize behaviour that shells and agents already handle
+/// (the user causes it constantly with splits and zooms), but a real side
+/// effect rather than a per-frame paint. That is the difference +127 deferred:
+/// not that reflow is hazardous, but that doing it ACCIDENTALLY is.
+///
+/// Identity is `(owner, pane_id)` — one carve per owner per pane, replaced on
+/// repeat rather than accumulated, because a plugin asking twice means "this is
+/// my band now", not "give me two". Cleanup on owner loss is mandatory and
+/// lives host-side: a plugin gets no unload event, and a dead plugin must never
+/// leave a pane permanently shrunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneCarveSetParams {
+    pub pane_id: String,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
+    pub edge: PaneCarveEdge,
+    /// Thickness in CELLS: rows for a top/bottom band, columns for left/right.
+    pub cells: u16,
+}
+
+/// fork(+131): release a carve and let the pane re-expand. Same asymmetry as
+/// the other clear methods: a plugin releases only its own, while a socket
+/// caller (`owner` empty) releases the pane outright, because the user at the
+/// CLI outranks any plugin — and this is the manual escape hatch if a carve
+/// ever outlives its owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaneCarveClearParams {
+    pub pane_id: String,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub owner: String,
+}

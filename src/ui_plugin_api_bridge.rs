@@ -109,6 +109,15 @@ const PANE_GRAPHICS_METHODS: &[&str] = &[
     // stops being true, this row is the wrong home for it.
     "pane.text.set",
     "pane.text.clear",
+    // fork(+131): carve sits here too, and this is the first entry in the row
+    // that is NOT a pure compositing call — it resizes the PTY. It still does
+    // not warrant a capability of its own: a `pane_graphics` holder can already
+    // paint over every cell of a pane, so it can already make the pane's text
+    // unreadable. Carve makes the pane SMALLER, which is strictly less than
+    // that, and unlike an overlay it is visible to the program in the pane and
+    // reversible by the user with `pane.carve.clear`.
+    "pane.carve.set",
+    "pane.carve.clear",
 ];
 
 /// fork: flip an already-installed plugin's enabled bit, gated on `PluginAdmin`.

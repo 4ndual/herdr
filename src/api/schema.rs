@@ -191,6 +191,13 @@ pub enum Method {
     /// terminal — same lifetime, same identity, same capability.
     #[serde(rename = "pane.text.set")]
     PaneTextSet(PaneTextSetParams),
+    /// fork(+131): carve — reserve an edge band so the TERMINAL stops using it.
+    /// Beside the compositing methods because it serves the same feature, but a
+    /// distinct pair because it is a distinct ACT: these two resize the PTY.
+    #[serde(rename = "pane.carve.set")]
+    PaneCarveSet(PaneCarveSetParams),
+    #[serde(rename = "pane.carve.clear")]
+    PaneCarveClear(PaneCarveClearParams),
     #[serde(rename = "pane.text.clear")]
     PaneTextClear(PaneTextClearParams),
     #[serde(rename = "pane.graphics.stream")]

@@ -411,6 +411,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGraphicsClear(_) => "pane.graphics.clear",
         Method::PaneGraphicsInfo(_) => "pane.graphics.info",
         Method::PaneTextSet(_) => "pane.text.set",
+        Method::PaneCarveSet(_) => "pane.carve.set",
+        Method::PaneCarveClear(_) => "pane.carve.clear",
         Method::PaneTextClear(_) => "pane.text.clear",
         Method::PaneGraphicsStream(_) => "pane.graphics.stream",
         Method::PaneGraphicsStreamSet(_) => "pane.graphics.stream.set",
