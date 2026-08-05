@@ -472,6 +472,7 @@ fn compute_view_internal(
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
+        frame_area: area,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
         tab_bar_rect,
@@ -905,6 +906,7 @@ fn compute_mobile_view(
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
+        frame_area: area,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
@@ -1172,6 +1174,13 @@ fn ui_plugin_node_action_at(
 }
 
 pub(crate) fn ui_plugin_frame_area(app: &AppState) -> Rect {
+    // The frame the renderer actually used, when a layout pass has run. The
+    // union below is only a fallback for callers reaching in before the first
+    // `compute_view` (tests, early API calls); it cannot see rows that no view
+    // rect covers, which is what shifted panel origins away from their paint.
+    if app.view.frame_area.width != 0 && app.view.frame_area.height != 0 {
+        return app.view.frame_area;
+    }
     let rects = [
         app.view.sidebar_rect,
         app.view.tab_bar_rect,
@@ -2782,6 +2791,49 @@ mod tests {
     fn only_panel_rect(app: &crate::app::state::AppState) -> Rect {
         assert_eq!(app.view.panel_rects.len(), 1, "expected exactly one panel");
         app.view.panel_rects[0].rect
+    }
+
+    /// The origin a guest is handed must be the one the renderer paints at.
+    /// `ui_plugin_frame_area` used to rebuild the frame as a union of the other
+    /// view rects, so any row no view rect covered was missing from it and the
+    /// carve resolved above its paint — every raw-mouse chip resolved to the
+    /// wrong row (archive-dash restored/deleted the wrong archive).
+    #[test]
+    fn ui_plugin_frame_area_is_the_frame_the_renderer_laid_out() {
+        let mut app = app_with_usage_strip();
+        app.ui_surface_layers = vec![bottom_band_layer("[a]  [b]")];
+        let area = Rect::new(0, 0, 200, 40);
+        compute_view(&mut app, area);
+
+        assert_eq!(
+            ui_plugin_frame_area(&app),
+            area,
+            "plugin geometry must resolve against the real frame, not a union"
+        );
+
+        // The failure mode itself: a frame with rows no view rect reaches. The
+        // union cannot see them and comes back short, so a bottom band carved
+        // from it lands above its paint. Measured on Linux/0.8.0 as a 2-row
+        // shift; here the shortfall is forced so the assertion is not vacuous.
+        app.view.frame_area = Rect::new(area.x, area.y, area.width, area.height + 6);
+        assert_eq!(
+            ui_plugin_frame_area(&app).height,
+            area.height + 6,
+            "rows outside every view rect still belong to the frame"
+        );
+        app.view.frame_area = area;
+        // …and the origin published to the guest is the rect that gets painted.
+        // Identity-aware, like both the renderer and the frame dispatch: the bare
+        // `Panel` surface cannot say which module's placement is meant.
+        let painted = only_panel_rect(&app);
+        let published = ui_plugin_owner_surface_rect(
+            &app,
+            ui_plugin_frame_area(&app),
+            UiSurface::Panel,
+            "builtin.button-dash",
+            "button-ui",
+        );
+        assert_eq!(published, painted, "guest origin must be the painted rect");
     }
 
     #[test]

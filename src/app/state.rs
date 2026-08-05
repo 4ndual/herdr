@@ -883,6 +883,14 @@ pub enum ViewLayout {
 
 pub struct ViewState {
     pub layout: ViewLayout,
+    /// The whole frame `compute_view` last laid out, recorded verbatim.
+    ///
+    /// The renderer resolves a plugin panel against the real frame area, so the
+    /// origin published to a guest has to come from the same rect or the two
+    /// disagree. Reconstructing it as a union of the other view rects (the old
+    /// `ui_plugin_frame_area` behaviour) drops any row no view rect covers, and
+    /// a band carved from a short frame lands above where it is painted.
+    pub frame_area: Rect,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
@@ -2751,6 +2759,7 @@ impl AppState {
             mobile_switcher_scroll: 0,
             view: ViewState {
                 layout: ViewLayout::Desktop,
+                frame_area: Rect::default(),
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
