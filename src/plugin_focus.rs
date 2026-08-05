@@ -111,6 +111,12 @@ pub fn focus_input(state: &AppState) -> FocusInput {
     };
 
     FocusInput {
+        // The public pane id from the pane API roster (`w1:p1`), resolved the
+        // same way `app::ids::public_pane_id` does it, so a plugin can join a
+        // focus payload against `pane.list` without a second lookup.
+        pane_id: ws
+            .public_pane_number(pane_id)
+            .map(|number| crate::workspace::public_pane_id_for_number(&ws.id, number)),
         session_id,
         session_ref,
         cwd: Some(terminal.cwd.clone()),

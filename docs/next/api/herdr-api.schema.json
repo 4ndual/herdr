@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 17,
+  "protocol": 19,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -200,6 +200,38 @@
                 "type",
                 "workspace_id",
                 "insert_index",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
                 "workspaces"
               ],
               "type": "object"
@@ -702,6 +734,7 @@
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
+            "workspace_reordered",
             "workspace_focused",
             "worktree_created",
             "worktree_opened",
@@ -1004,6 +1037,9 @@
             "focused": {
               "type": "boolean"
             },
+            "hidden": {
+              "type": "boolean"
+            },
             "label": {
               "type": "string"
             },
@@ -1031,7 +1067,8 @@
             "label",
             "focused",
             "pane_count",
-            "agent_status"
+            "agent_status",
+            "hidden"
           ],
           "type": "object"
         },
@@ -2141,7 +2178,9 @@
             "hermes",
             "qodercli",
             "cursor",
-            "mastracode"
+            "mastracode",
+            "antigravity_cli",
+            "grok"
           ],
           "type": "string"
         },
@@ -2397,6 +2436,54 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "PaneCarveClearParams": {
+          "additionalProperties": false,
+          "description": "fork(+131): release a carve and let the pane re-expand. Same asymmetry as\nthe other clear methods: a plugin releases only its own, while a socket\ncaller (`owner` empty) releases the pane outright, because the user at the\nCLI outranks any plugin — and this is the manual escape hatch if a carve\never outlives its owner.",
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        "PaneCarveEdge": {
+          "description": "fork(+131): which edge of a pane a carve reserves.\n\nA carve is not an overlay and cannot borrow the overlay's free placement. A\nPTY is a RECTANGLE: `resize` takes a row count and a column count and\nnothing else, so the only regions a terminal can be made to stop using are\nfull-width bands at the top or bottom and full-height columns at the left or\nright. There is no way to carve a hole in the middle — the terminal has no\nconcept of one.\n\nHence a distinct type rather than reusing `PaneGraphicsPlacementParams`.\nAccepting a free `viewport_col`/`grid_cols` placement here would accept\nplacements the host cannot honour and then quietly do something else, which\nis the failure this API family has now been bitten by twice (#33's silently\ndefaulted field names, #40's `0`-means-whole-pane).",
+          "enum": [
+            "top",
+            "bottom",
+            "left",
+            "right"
+          ],
+          "type": "string"
+        },
+        "PaneCarveSetParams": {
+          "additionalProperties": false,
+          "description": "fork(+131): reserve part of a pane so the TERMINAL stops using it.\n\nUnlike `pane.graphics.set`/`pane.text.set`, this is not a compositing call.\nIt resizes the PTY, so the program in the pane reflows and its scrollback is\nrewritten — ordinary resize behaviour that shells and agents already handle\n(the user causes it constantly with splits and zooms), but a real side\neffect rather than a per-frame paint. That is the difference +127 deferred:\nnot that reflow is hazardous, but that doing it ACCIDENTALLY is.\n\nIdentity is `(owner, pane_id)` — one carve per owner per pane, replaced on\nrepeat rather than accumulated, because a plugin asking twice means \"this is\nmy band now\", not \"give me two\". Cleanup on owner loss is mandatory and\nlives host-side: a plugin gets no unload event, and a dead plugin must never\nleave a pane permanently shrunk.",
+          "properties": {
+            "cells": {
+              "description": "Thickness in CELLS: rows for a top/bottom band, columns for left/right.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "edge": {
+              "$ref": "#/schemas/request/$defs/PaneCarveEdge"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "edge",
+            "cells"
+          ],
+          "type": "object"
         },
         "PaneClearAgentAuthorityParams": {
           "properties": {
@@ -3868,6 +3955,18 @@
             {
               "properties": {
                 "type": {
+                  "const": "workspace.reordered",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
                   "const": "workspace.closed",
                   "type": "string"
                 }
@@ -4196,6 +4295,13 @@
         },
         "TabListParams": {
           "properties": {
+            "hidden": {
+              "description": "When set, restrict the result to tabs with this visibility state.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
             "workspace_id": {
               "type": [
                 "string",
@@ -4248,6 +4354,22 @@
           ],
           "type": "object"
         },
+        "TabVisibilityParams": {
+          "properties": {
+            "focus": {
+              "default": false,
+              "description": "Reveal the tab and focus it when true. Defaults to false.",
+              "type": "boolean"
+            },
+            "tab_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id"
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -4282,6 +4404,26 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "WorkspaceMoveBlockParams": {
+          "properties": {
+            "before_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspace_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "workspace_ids"
+          ],
           "type": "object"
         },
         "WorkspaceMoveParams": {
@@ -4778,6 +4920,22 @@
         {
           "properties": {
             "method": {
+              "const": "workspace.move_block",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceMoveBlockParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "workspace.report_metadata",
               "type": "string"
             },
@@ -4895,6 +5053,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/TabListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.show",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabVisibilityParams"
             }
           },
           "required": [
@@ -5600,6 +5774,39 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneTextSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "fork(+131): carve — reserve an edge band so the TERMINAL stops using it.\nBeside the compositing methods because it serves the same feature, but a\ndistinct pair because it is a distinct ACT: these two resize the PTY.",
+          "properties": {
+            "method": {
+              "const": "pane.carve.set",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCarveSetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.carve.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCarveClearParams"
             }
           },
           "required": [
@@ -6621,6 +6828,38 @@
             },
             {
               "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "type": {
                   "const": "workspace_focused",
                   "type": "string"
@@ -7132,6 +7371,7 @@
             "workspace_closed",
             "workspace_renamed",
             "workspace_moved",
+            "workspace_reordered",
             "workspace_focused",
             "worktree_created",
             "worktree_opened",
@@ -7288,7 +7528,9 @@
             "hermes",
             "qodercli",
             "cursor",
-            "mastracode"
+            "mastracode",
+            "antigravity_cli",
+            "grok"
           ],
           "type": "string"
         },
@@ -10373,6 +10615,9 @@
             "focused": {
               "type": "boolean"
             },
+            "hidden": {
+              "type": "boolean"
+            },
             "label": {
               "type": "string"
             },
@@ -10400,7 +10645,8 @@
             "label",
             "focused",
             "pane_count",
-            "agent_status"
+            "agent_status",
+            "hidden"
           ],
           "type": "object"
         },

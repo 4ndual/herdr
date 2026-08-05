@@ -47,7 +47,13 @@ fn tab_list(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    super::runtime::tab_list(TabListParams { workspace_id })
+    // ADR-001: `None` is "no visibility filter", the same default the `tab.list`
+    // API uses. The CLI stays a thin wrapper over that contract rather than
+    // inventing a second default, so a hidden tab is still discoverable here.
+    super::runtime::tab_list(TabListParams {
+        workspace_id,
+        hidden: None,
+    })
 }
 
 fn tab_create(args: &[String]) -> std::io::Result<i32> {

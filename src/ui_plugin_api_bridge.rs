@@ -65,6 +65,12 @@ const WRITE_METHODS: &[&str] = &[
     "tab.close",
     "tab.focus",
     "tab.rename",
+    // fork(ADR-001/ADR-003): restoring a hidden tab is an `api_write` power so
+    // `invisible-dash` can put a tab the user hid back on the tab bar. It sits
+    // with the other `tab.*` writes rather than in its own capability: it can
+    // only make an already-owned tab visible again, which is strictly less
+    // destructive than `tab.close`, already allowed here.
+    "tab.show",
     "workspace.create",
     "workspace.focus",
     "workspace.rename",
@@ -426,4 +432,3 @@ mod tests {
         );
     }
 }
-    "tab.show",

@@ -356,6 +356,7 @@ impl App {
             argv,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -408,6 +409,7 @@ impl App {
                     extra_env,
                     self.state.pane_scrollback_limit_bytes,
                     self.state.host_terminal_theme,
+                    self.state.host_terminal_appearance,
                     focus,
                 )
             })

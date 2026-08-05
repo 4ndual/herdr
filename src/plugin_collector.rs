@@ -148,9 +148,13 @@ fn run_collector(
     state_dir: &Path,
     focus_json: &str,
 ) -> Result<CollectorOutcome, String> {
-    let mut command = crate::plugin_command::command_for_argv(program, args);
+    // 0.8.0: upstream's plugin v1 replaced `command_for_argv` with
+    // `command_for_argv_in_dir`, which sets the cwd itself and resolves a
+    // relative `./collector`-style program against it. That is exactly the
+    // plugin-root execution environment ADR-003 requires, so the collector
+    // adopts upstream's helper instead of keeping a fork-local spawn path.
+    let mut command = crate::plugin_command::command_for_argv_in_dir(program, args, plugin_root);
     command
-        .current_dir(plugin_root)
         .env("HERDR_PLUGIN_STATE_DIR", state_dir)
         .env("HERDR_FOCUS_JSON", focus_json)
         .stdin(std::process::Stdio::null())

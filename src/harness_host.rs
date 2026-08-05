@@ -2679,6 +2679,7 @@ impl App {
         let (rows, cols) = self.state.estimate_pane_size();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let result = self
             .state
             .workspaces
@@ -2693,6 +2694,7 @@ impl App {
                     Vec::new(),
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                 )
             });
         match result {
@@ -2740,6 +2742,7 @@ impl App {
         let previous_focus = self.state.current_pane_focus_target();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let result = self.state.workspaces.get_mut(ws_idx).and_then(|ws| {
             ws.split_pane_argv_command(
                 target_pane,
@@ -2751,6 +2754,7 @@ impl App {
                 Vec::new(),
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 true,
             )
         });

@@ -74,6 +74,7 @@ impl App {
             crate::pane::AgentDetection::Disabled,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -86,8 +87,7 @@ impl App {
             result_file,
         });
         self.state.mode = Mode::ResumePicker;
-        self.render_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_dirty.request_generic();
         self.render_notify.notify_one();
         Ok(())
     }
@@ -105,8 +105,7 @@ impl App {
         if self.state.mode == Mode::ResumePicker {
             self.state.mode = Mode::Terminal;
         }
-        self.render_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_dirty.request_generic();
         self.render_notify.notify_one();
     }
 
@@ -136,8 +135,7 @@ impl App {
         if let Some(command) = command {
             self.open_resume_command_tab(command);
         }
-        self.render_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_dirty.request_generic();
         self.render_notify.notify_one();
         true
     }
@@ -153,6 +151,7 @@ impl App {
         let (rows, cols) = self.state.estimate_pane_size();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let argv = vec!["sh".to_string(), "-lc".to_string(), command];
 
         let result = self
@@ -169,6 +168,7 @@ impl App {
                     Vec::new(),
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                 )
             });
         if let Ok((tab_idx, terminal, runtime)) = result {
