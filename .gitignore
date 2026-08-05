@@ -53,3 +53,5 @@ plugins/*/target-*/
 # `git status --porcelain` non-empty, which merge-upstream.sh reads as a dirty
 # checkout and refuses to merge into.
 /target-*/
+!/docs/adr/
+!/docs/adr/**
