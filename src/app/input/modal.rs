@@ -2341,6 +2341,87 @@ mod tests {
         assert!(fork < close, "Fork must come before Close");
     }
 
+    // fork(ADR-001): "Make invisible" mutates core tab state, so it stays
+    // host-owned in BOTH dispatch paths and there is no `tab.hide` API method to
+    // cover it from outside. The three tests below pin the dispatch itself —
+    // previously only the menu row and its mouse index were covered, which an
+    // upstream merge that reworked the handlers could pass while silently
+    // dropping the effect.
+    fn tab_menu_at(ws_idx: usize, tab_idx: usize) -> ContextMenuState {
+        ContextMenuState {
+            kind: ContextMenuKind::Tab { ws_idx, tab_idx },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        }
+    }
+
+    fn make_invisible_row(menu: &ContextMenuState) -> usize {
+        menu.items()
+            .iter()
+            .position(|item| *item == "Make invisible")
+            .expect("Make invisible row")
+    }
+
+    #[test]
+    fn tab_context_menu_make_invisible_hides_tab_and_moves_focus_to_visible_neighbor() {
+        let mut state = state_with_workspaces(&["main"]);
+        let second = state.workspaces[0].test_add_tab(Some("hidden-me"));
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.workspaces[0].active_tab = second;
+        let kept_pane = state.workspaces[0].tabs[second].root_pane;
+        let menu = tab_menu_at(0, second);
+        let idx = make_invisible_row(&menu);
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        let ws = &state.workspaces[0];
+        assert!(ws.tabs[second].hidden, "the tab must be marked hidden");
+        assert_ne!(ws.active_tab, second, "focus must move off the hidden tab");
+        assert!(!ws.tabs[ws.active_tab].hidden, "focus must land on a visible tab");
+        assert_eq!(ws.tabs.len(), 2, "hiding must not close the tab");
+        assert_eq!(
+            ws.tabs[second].root_pane, kept_pane,
+            "hiding must preserve pane ownership"
+        );
+    }
+
+    #[test]
+    fn api_context_menu_make_invisible_hides_tab() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        let second = app.state.workspaces[0].test_add_tab(Some("hidden-me"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.mode = Mode::ContextMenu;
+        let menu = tab_menu_at(0, second);
+        let idx = make_invisible_row(&menu);
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        let ws = &app.state.workspaces[0];
+        assert!(ws.tabs[second].hidden, "the API path must hide the tab too");
+        assert_eq!(ws.tabs.len(), 2, "hiding must not close the tab");
+    }
+
+    #[test]
+    fn tab_context_menu_make_invisible_refuses_the_last_visible_tab() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.active = Some(0);
+        let menu = tab_menu_at(0, 0);
+        let idx = make_invisible_row(&menu);
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        assert!(
+            !state.workspaces[0].tabs[0].hidden,
+            "the only visible tab must never be hideable"
+        );
+    }
+
     #[test]
     fn tab_context_menu_fork_requests_button_dash_plugin_action_for_focused_pane() {
         let mut state = state_with_workspaces(&["main"]);

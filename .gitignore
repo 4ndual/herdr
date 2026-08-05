@@ -46,3 +46,10 @@ node_modules/
 # in every fork commit since; they are regenerable and must never be tracked.
 plugins/*/target/
 plugins/*/target-*/
+
+# Isolated cargo target dirs used by the update pipeline (VD_TARGET_DIR) and by
+# any build that must not touch /target, which hr snapshots from. Same class as
+# the plugin output above: regenerable, and leaving it untracked made
+# `git status --porcelain` non-empty, which merge-upstream.sh reads as a dirty
+# checkout and refuses to merge into.
+/target-*/
