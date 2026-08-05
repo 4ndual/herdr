@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use harness_manager_model::{HarnessRenderModel, HarnessRow, HarnessSection, RowState};
+use harness_manager_model::{HarnessRenderModel, ProfileRef, ProfileView, ResourceCatalogEntry, HarnessRow, HarnessSection, RowState};
 
 use crate::app::state::{HarnessActionKind, PendingHarnessAction};
 use crate::app::App;
@@ -195,6 +195,15 @@ struct HarnessCache {
     /// SESSION header aggregate: total RAM + CPU over the WHOLE process tree
     /// (e.g. "1.2GB rss · 34% cpu · 22 procs · gpu n/det"). Empty until resolved.
     session_agg: String,
+    /// Tab-3 profile picker list, refreshed on the slow config cadence.
+    profiles: Vec<ProfileInfo>,
+    /// Cached scan of the ACTIVE profile (tab 2), mtime-gated.
+    active_scan: Option<ProfileScan>,
+    /// Tab-3 current selection (the last `harness:profile:<name>` clicked).
+    /// `None` ⇒ the active profile is selected.
+    selected_profile: Option<String>,
+    /// Cached scan of the selected profile (tab 3), when it differs from active.
+    selected_scan: Option<ProfileScan>,
 }
 
 /// App-derived, per-tick facts the pure `refresh`/`full_rescan` path cannot get
@@ -1296,7 +1305,7 @@ fn display_path(p: &Path) -> String {
     }
 }
 
-fn render_json(cache: &HarnessCache) -> Option<String> {
+fn render_json(cache: &mut HarnessCache) -> Option<String> {
     let mut sections = Vec::new();
     let target = match &cache.target {
         Some((sid, cwd)) => {
@@ -1320,9 +1329,23 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
         sections.push(skills_section(cache));
         sections.push(agents_section(cache));
     }
+    // Tabs 2 and 3. Built only once a target is focused, because the active
+    // profile is derived from the focused session's transcript path; with no
+    // target there is no "active" profile to describe and the guest shows its
+    // empty state rather than an arbitrary one.
+    let (profiles, profile_view, selected_profile, selected_view) = if cache.target.is_some() {
+        build_profile_model(cache)
+    } else {
+        (Vec::new(), None, None, None)
+    };
     let model = HarnessRenderModel {
         target,
         sections,
+        catalog: resource_catalog_fixtures(),
+        profiles,
+        profile_view,
+        selected_profile,
+        selected_view,
         generated_at: Some(usage_dash_core::util::now_unix()),
     };
     match serde_json::to_string(&model) {
@@ -2901,6 +2924,485 @@ impl App {
         ));
         true
     }
+}
+
+/// Deterministic offline catalog fixtures used by the plugin-owned Resource Hub.
+/// External activation remains explicitly unavailable until a host contract exists.
+fn resource_catalog_fixtures() -> Vec<ResourceCatalogEntry> {
+    [
+        ("agent", "fixture-agent", "Private Hub", "1", "2026-07-30", "agent definition"),
+        ("skill", "fixture-skill", "Private Hub", "1", "2026-07-30", "skill"),
+        ("mcp", "fixture-mcp", "Official MCP Registry", "1", "2026-07-30", "MCP server"),
+        ("plugin", "fixture-plugin@official", "Anthropic official marketplace", "1", "2026-07-30", "plugin"),
+        ("hook", "fixture-hook", "Anthropic official marketplace", "1", "2026-07-30", "hook"),
+    ].into_iter().map(|(kind, id, source, version, updated, label)| ResourceCatalogEntry {
+        kind: kind.into(), id: id.into(), label: label.into(), source: source.into(),
+        version: version.into(), updated: updated.into(), license: None,
+        trust: "unverified fixture; provenance retained".into(), installed: false,
+        desired: "available".into(), effective: "unavailable".into(),
+        reason: "external activation unavailable through current plugin contract".into(),
+        can_change: false,
+    }).collect()
+}
+
+/// A harness profile discovered for the tab-3 picker: the plain daily
+/// `~/.claude`, a `~/.claude-code-router/profiles/<name>` (ccr), or a ccp
+/// `~/claude-hub/profiles/<name>`. `config_root` is where its `.claude`-shaped
+/// config actually lives (a ccr profile nests it under `<dir>/claude`).
+#[derive(Clone)]
+struct ProfileInfo {
+    name: String,
+    kind: &'static str, // "daily" | "ccr" | "ccp"
+    config_root: PathBuf,
+}
+
+/// A profile's parsed GLOBAL config, cached by an mtime signature so it is
+/// re-parsed only when something under `config_root` changed (R4). Projected to
+/// [`ProfileView`] sections by [`profile_view_sections`].
+#[derive(Default, Clone)]
+struct ProfileScan {
+    name: String,
+    display_root: String,
+    /// (path, bytes) for the profile-level context files (CLAUDE.md, settings).
+    ctx: Vec<(PathBuf, usize)>,
+    hooks: Vec<HookEntry>,
+    plugins: Vec<String>,
+    skills: Vec<SkillEntry>,
+    agents: Vec<(String, PathBuf)>,
+    /// mtime signature of `config_root`; a change forces a re-parse.
+    sig: u64,
+}
+
+/// Enumerate the harness profiles for the tab-3 picker: the plain daily
+/// `~/.claude`, every `~/.claude-code-router/profiles/<name>` (ccr — its config
+/// nests under `<name>/claude`), and every `~/claude-hub/profiles/<name>` (ccp).
+/// A profile with no usable config root is still listed (it renders empty).
+fn discover_profiles(home: &Path) -> Vec<ProfileInfo> {
+    let mut out = vec![ProfileInfo {
+        name: "daily".to_string(),
+        kind: "daily",
+        config_root: home.join(".claude"),
+    }];
+    let listing = |dir: PathBuf, kind: &'static str, out: &mut Vec<ProfileInfo>| {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut names: Vec<(String, PathBuf)> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+                .collect();
+            names.sort();
+            for (name, dir) in names {
+                // ccr nests the .claude-shaped config under <profile>/claude.
+                let nested = dir.join("claude");
+                let config_root = if nested.is_dir() { nested } else { dir };
+                out.push(ProfileInfo {
+                    name,
+                    kind,
+                    config_root,
+                });
+            }
+        }
+    };
+    listing(home.join(".claude-code-router/profiles"), "ccr", &mut out);
+    listing(home.join("claude-hub/profiles"), "ccp", &mut out);
+    out
+}
+
+/// mtime signature over a profile's config root (settings + skills/agents
+/// listings + CLAUDE.md), so a scan is re-parsed only on change (R4).
+fn profile_signature(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mtime = |p: &Path| -> u64 {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    for p in [
+        root.join("settings.json"),
+        root.join("settings.local.json"),
+        root.join("CLAUDE.md"),
+        root.join("skills"),
+        root.join("agents"),
+    ] {
+        mtime(&p).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Parse a profile's global config under `config_root` into a [`ProfileScan`].
+/// Independent of any session: no transcript, no process, no per-project memory.
+fn scan_profile(info: &ProfileInfo) -> ProfileScan {
+    let root = &info.config_root;
+    let mut ctx = Vec::new();
+    for name in ["CLAUDE.md", "settings.json"] {
+        let p = root.join(name);
+        if let Ok(m) = std::fs::metadata(&p) {
+            ctx.push((p, m.len() as usize));
+        }
+    }
+
+    let mut hooks = Vec::new();
+    collect_hooks_from(&root.join("settings.json"), &mut hooks);
+    collect_hooks_from(&root.join("settings.local.json"), &mut hooks);
+
+    let mut plugins = Vec::new();
+    if let Some(settings) = read_json(&root.join("settings.json")) {
+        if let Some(map) = settings.get("enabledPlugins").and_then(|m| m.as_object()) {
+            for (name, enabled) in map {
+                if enabled.as_bool().unwrap_or(false) {
+                    plugins.push(name.clone());
+                } else {
+                    plugins.push(format!("{name} (off)"));
+                }
+            }
+        }
+    }
+
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("skills")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let skill_md = p.join("SKILL.md");
+                let desc_bytes = frontmatter_field(&skill_md, "description")
+                    .map(|d| d.len())
+                    .unwrap_or(0);
+                skills.push(SkillEntry {
+                    name,
+                    path: skill_md,
+                    desc_bytes,
+                });
+            }
+        }
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    let mut agents = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("agents")) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                let name = frontmatter_field(&p, "name")
+                    .unwrap_or_else(|| basename(&p).trim_end_matches(".md").to_string());
+                agents.push((name, p));
+            }
+        }
+        agents.sort();
+    }
+
+    ProfileScan {
+        name: info.name.clone(),
+        display_root: display_path(root),
+        ctx,
+        hooks,
+        plugins,
+        skills,
+        agents,
+        sig: profile_signature(root),
+    }
+}
+
+/// Ensure `slot` holds a fresh scan of `info`, re-parsing only when the mtime
+/// signature moved (R4). Returns a reference into the refreshed slot.
+fn ensure_profile_scan<'a>(
+    slot: &'a mut Option<ProfileScan>,
+    info: &ProfileInfo,
+) -> &'a ProfileScan {
+    let sig = profile_signature(&info.config_root);
+    let stale = slot
+        .as_ref()
+        .map(|s| s.sig != sig || s.name != info.name)
+        .unwrap_or(true);
+    if stale {
+        *slot = Some(scan_profile(info));
+    }
+    slot.as_ref().expect("profile scan just populated")
+}
+
+/// The profile driving the focused session: a cx session runs under a ccr
+/// profile (transcript path carries `.claude-code-router/profiles/<name>`),
+/// otherwise the plain daily profile.
+fn active_profile_name(cache: &HarnessCache) -> String {
+    if let Some(p) = &cache.transcript {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.split(".claude-code-router/profiles/").nth(1) {
+            if let Some(name) = rest.split('/').next() {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    "daily".to_string()
+}
+
+/// Project a [`ProfileScan`] into the profile-global sections shown on tabs 2
+/// and 3. No SESSION section, no per-session "loaded now"/eviction, no
+/// session-scoped rows — every row is profile-global (G) with if-loaded costs
+/// and on-disk file sizes.
+fn profile_view_sections(scan: &ProfileScan) -> Vec<HarnessSection> {
+    let mut sections = Vec::new();
+
+    // CONTEXT: the profile-level files loaded at start in every session.
+    let mut ctx_rows = Vec::new();
+    let mut ctx_tok = 0u32;
+    for (i, (path, bytes)) in scan.ctx.iter().take(MAX_ROWS).enumerate() {
+        let tok = estimate_tokens(*bytes);
+        ctx_tok += tok;
+        ctx_rows.push(HarnessRow {
+            key: format!("pctx:{i}"),
+            label: display_path(path),
+            meta: format!("{} {}", fmt_bytes(*bytes), fmt_tokens(tok)),
+            state: RowState::None,
+            tooltip: format!(
+                "loaded at start of every session · {} on disk",
+                fmt_bytes(*bytes)
+            ),
+            openable: false,
+            group: Some("persistent".to_string()),
+            tok_loaded: Some(tok),
+            tok_full: Some(tok),
+            tok_src: Some(format!("file {}", fmt_bytes(*bytes))),
+            load_when: Some("start".to_string()),
+            scope: Some("global".to_string()),
+            ..Default::default()
+        });
+    }
+    sections.push(HarnessSection {
+        title: "CONTEXT".to_string(),
+        summary: fmt_tokens(ctx_tok),
+        agg: Some(format!("{} loaded", fmt_tokens(ctx_tok))),
+        collapsed_default: false,
+        rows: ctx_rows,
+    });
+
+    // HOOKS: profile-configured, no per-session firing stats. Capped and with a
+    // one-line tooltip so the profile view fits the host's ui-input byte budget
+    // (session sections + this view + a selected-profile view share one file).
+    let mut hook_rows = Vec::new();
+    for (i, entry) in scan.hooks.iter().take(MAX_ROWS).enumerate() {
+        hook_rows.push(HarnessRow {
+            key: format!("phook:{i}"),
+            label: entry.name.clone(),
+            meta: String::new(),
+            state: RowState::Idle,
+            tooltip: format!(
+                "event {} · matcher \"{}\" · profile-global",
+                entry.event, entry.matcher
+            ),
+            openable: false,
+            group: Some(entry.event.clone()),
+            tok_src: Some("not determinable".to_string()),
+            scope: Some("global".to_string()),
+            ..Default::default()
+        });
+    }
+    sections.push(HarnessSection {
+        title: "HOOKS".to_string(),
+        summary: format!("{}", scan.hooks.len()),
+        agg: Some(format!("{} configured", scan.hooks.len())),
+        collapsed_default: false,
+        rows: hook_rows,
+    });
+
+    // PLUGINS.
+    let enabled = scan
+        .plugins
+        .iter()
+        .filter(|n| !n.ends_with(" (off)"))
+        .count();
+    let plugin_rows = scan
+        .plugins
+        .iter()
+        .take(MAX_ROWS)
+        .enumerate()
+        .map(|(i, name)| {
+            let off = name.ends_with(" (off)");
+            HarnessRow {
+                key: format!("pplugin:{i}"),
+                label: name.clone(),
+                state: if off { RowState::Off } else { RowState::Idle },
+                tooltip: "profile-global plugin (enabledPlugins)".to_string(),
+                scope: Some("global".to_string()),
+                tok_src: Some("not determinable".to_string()),
+                ..Default::default()
+            }
+        })
+        .collect();
+    sections.push(HarnessSection {
+        title: "PLUGINS".to_string(),
+        summary: format!("{}", scan.plugins.len()),
+        agg: Some(format!("{enabled} enabled")),
+        collapsed_default: false,
+        rows: plugin_rows,
+    });
+
+    // SKILLS: catalog with description (loaded) + body (if-invoked) costs.
+    let mut skill_rows = Vec::new();
+    let mut listing_tok = 0u32;
+    for (i, skill) in scan.skills.iter().take(MAX_ROWS).enumerate() {
+        let desc_tok = estimate_tokens(skill.desc_bytes);
+        listing_tok += desc_tok;
+        let body_bytes = std::fs::metadata(&skill.path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let body_tok = estimate_tokens(body_bytes);
+        skill_rows.push(HarnessRow {
+            key: format!("pskill:{i}"),
+            label: skill.name.clone(),
+            meta: fmt_tokens(desc_tok),
+            state: RowState::Off,
+            tooltip: format!(
+                "loaded {} (description) · if invoked +{} (SKILL.md body, {})",
+                fmt_tokens(desc_tok),
+                fmt_tokens(body_tok),
+                fmt_bytes(body_bytes)
+            ),
+            openable: false,
+            tok_loaded: Some(desc_tok),
+            tok_full: Some(body_tok),
+            tok_src: Some(format!(
+                "desc {}B · body {}",
+                skill.desc_bytes,
+                fmt_bytes(body_bytes)
+            )),
+            load_when: Some("on-invoke".to_string()),
+            scope: Some("global".to_string()),
+            ..Default::default()
+        });
+    }
+    // Estimate the whole catalog's loaded description cost from the sum of the
+    // capped rows plus the remaining skills' descriptions.
+    let all_desc_tok = estimate_tokens(scan.skills.iter().map(|s| s.desc_bytes).sum());
+    let _ = listing_tok;
+    sections.push(HarnessSection {
+        title: "SKILLS".to_string(),
+        summary: format!("{}", scan.skills.len()),
+        agg: Some(format!("{} loaded", fmt_tokens(all_desc_tok))),
+        collapsed_default: false,
+        rows: skill_rows,
+    });
+
+    // AGENTS: description (loaded) + body (if-spawned) costs.
+    let mut agent_rows = Vec::new();
+    let mut agent_tok = 0u32;
+    for (i, (name, path)) in scan.agents.iter().take(MAX_ROWS).enumerate() {
+        let desc_bytes = frontmatter_field(path, "description")
+            .map(|d| d.len())
+            .unwrap_or(0);
+        let desc_tok = estimate_tokens(desc_bytes);
+        agent_tok += desc_tok;
+        let body_bytes = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        let body_tok = estimate_tokens(body_bytes);
+        agent_rows.push(HarnessRow {
+            key: format!("pagent:{i}"),
+            label: name.clone(),
+            meta: fmt_tokens(desc_tok),
+            state: RowState::Idle,
+            tooltip: format!(
+                "loaded {} (description) · if spawned +{} (body, {})",
+                fmt_tokens(desc_tok),
+                fmt_tokens(body_tok),
+                fmt_bytes(body_bytes)
+            ),
+            openable: false,
+            tok_loaded: Some(desc_tok),
+            tok_full: Some(body_tok),
+            load_when: Some("on-spawn".to_string()),
+            scope: Some("global".to_string()),
+            ..Default::default()
+        });
+    }
+    sections.push(HarnessSection {
+        title: "AGENTS".to_string(),
+        summary: format!("{}", scan.agents.len()),
+        agg: Some(format!("{} loaded", fmt_tokens(agent_tok))),
+        collapsed_default: false,
+        rows: agent_rows,
+    });
+
+    sections
+}
+
+/// Build the `profiles`/`profile_view`/`selected_*` fields of the render model
+/// from the cache, refreshing the active and selected profile scans (mtime-
+/// gated). Threaded mutable so the two scan slots can be updated in place.
+fn build_profile_model(
+    cache: &mut HarnessCache,
+) -> (
+    Vec<ProfileRef>,
+    Option<ProfileView>,
+    Option<String>,
+    Option<ProfileView>,
+) {
+    if cache.profiles.is_empty() {
+        return (Vec::new(), None, None, None);
+    }
+    let active_name = active_profile_name(cache);
+    // Resolve the active ProfileInfo (fall back to daily / first).
+    let active_info = cache
+        .profiles
+        .iter()
+        .find(|p| p.name == active_name)
+        .or_else(|| cache.profiles.first())
+        .cloned();
+    let Some(active_info) = active_info else {
+        return (Vec::new(), None, None, None);
+    };
+
+    let refs: Vec<ProfileRef> = cache
+        .profiles
+        .iter()
+        .map(|p| ProfileRef {
+            name: p.name.clone(),
+            root: display_path(&p.config_root),
+            active: p.name == active_info.name,
+            kind: p.kind.to_string(),
+        })
+        .collect();
+
+    let active_scan = ensure_profile_scan(&mut cache.active_scan, &active_info).clone();
+    let profile_view = Some(ProfileView {
+        name: active_scan.name.clone(),
+        root: active_scan.display_root.clone(),
+        sections: profile_view_sections(&active_scan),
+    });
+
+    // Selected profile (tab 3). Default to active; scan a distinct selection.
+    let selected_name = cache
+        .selected_profile
+        .clone()
+        .filter(|n| cache.profiles.iter().any(|p| &p.name == n))
+        .unwrap_or_else(|| active_info.name.clone());
+    let (selected_profile, selected_view) = if selected_name == active_info.name {
+        (Some(active_info.name.clone()), None)
+    } else if let Some(info) = cache
+        .profiles
+        .iter()
+        .find(|p| p.name == selected_name)
+        .cloned()
+    {
+        let scan = ensure_profile_scan(&mut cache.selected_scan, &info).clone();
+        (
+            Some(selected_name.clone()),
+            Some(ProfileView {
+                name: scan.name.clone(),
+                root: scan.display_root.clone(),
+                sections: profile_view_sections(&scan),
+            }),
+        )
+    } else {
+        (Some(active_info.name.clone()), None)
+    };
+
+    (refs, profile_view, selected_profile, selected_view)
 }
 
 #[cfg(test)]
