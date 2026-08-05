@@ -387,13 +387,19 @@ fn foreground_group_changed(
         && (foreground_pgid.is_some() || last_foreground_pgid.is_some())
 }
 
-// Only kernel-observed foreground groups drive change detection. Remembering an
-// inferred group would look like a change on every tick while the kernel stays silent.
+// Only kernel-observed foreground groups drive change detection once an agent is
+// already identified — remembering an inferred group there would look like a change
+// on every tick while the kernel stays silent. Before identification, an inferred
+// group must still count so the acquisition retry cadence stays responsive; that
+// cadence is what notices a newly spawned agent process in the first place.
 fn process_group_for_change_tracking(
     observed_foreground_pgid: Option<u32>,
     probed_process_group_id: Option<u32>,
+    has_identified_agent: bool,
 ) -> Option<u32> {
-    observed_foreground_pgid?;
+    if has_identified_agent {
+        observed_foreground_pgid?;
+    }
     probed_process_group_id.or(observed_foreground_pgid)
 }
 
@@ -730,8 +736,11 @@ fn spawn_basic_detection_task(
                 has_process_probe = true;
                 let probe = probe_foreground_process(pid, foreground_pgid);
                 let process_group_id = probe.process_group_id;
-                let tracked_process_group_id =
-                    process_group_for_change_tracking(foreground_pgid, process_group_id);
+                let tracked_process_group_id = process_group_for_change_tracking(
+                    foreground_pgid,
+                    process_group_id,
+                    agent.is_some(),
+                );
                 let foreground_is_pane_shell = probe.foreground_is_pane_shell;
                 let mut new_agent = probe.agent;
                 if let Some(suppressed_agent) = suppressed_agent {
@@ -2205,6 +2214,7 @@ impl PaneRuntime {
                             let tracked_process_group_id = process_group_for_change_tracking(
                                 foreground_pgid,
                                 process_group_id,
+                                agent.is_some(),
                             );
                             let foreground_is_pane_shell = probe.foreground_is_pane_shell;
                             let mut new_agent = probe.agent;
@@ -3792,13 +3802,34 @@ mod tests {
 
     #[test]
     fn inferred_group_does_not_trigger_a_probe_on_every_tick() {
-        let tracked = process_group_for_change_tracking(None, Some(300));
+        let tracked = process_group_for_change_tracking(None, Some(300), true);
         assert_eq!(tracked, None);
         assert!(!should_probe_foreground_job(ProcessProbeInput {
             current_agent: Some(Agent::Claude),
             foreground_pgid: None,
             last_foreground_pgid: tracked,
             elapsed_since_process_check: std::time::Duration::from_millis(300),
+            ..process_probe_input()
+        }));
+    }
+
+    #[test]
+    fn inferred_group_still_drives_acquisition_before_an_agent_is_identified() {
+        // Before an agent is identified, the kernel may never report a foreground
+        // group (e.g. platforms without a cheap tpgid read) while the process probe
+        // still infers one via job/leader lookup. That inferred group must still be
+        // remembered so the next tick's `foreground_group_changed` fires and the fast
+        // acquisition retry cadence kicks in, instead of falling back to the 30s
+        // missing-foreground-group recheck and starving detection within the test's
+        // acquisition window.
+        let tracked = process_group_for_change_tracking(None, Some(300), false);
+        assert_eq!(tracked, Some(300));
+        assert!(foreground_group_changed(None, tracked));
+        assert!(should_probe_foreground_job(ProcessProbeInput {
+            current_agent: None,
+            foreground_pgid: None,
+            last_foreground_pgid: tracked,
+            elapsed_since_process_check: std::time::Duration::from_millis(50),
             ..process_probe_input()
         }));
     }
