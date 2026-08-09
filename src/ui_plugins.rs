@@ -53,6 +53,13 @@ pub(crate) struct RegisteredUiModule {
     pub graphics_roots: Vec<String>,
     /// fork(+127): manifest `max_layers_per_pane`, or `None` for the host default.
     pub max_layers_per_pane: Option<usize>,
+    /// fork(host-actions): manifest `host_actions`, kept as declared. Resolution
+    /// to real controls and the capability check both happen in
+    /// `host_action_claims`, so an unheld capability is visible here as
+    /// "declared but not granted" rather than erased at registration.
+    pub host_actions: Vec<String>,
+    /// fork(host-actions): manifest `host_action_mode`, defaulted to observe.
+    pub host_action_mode: crate::api::schema::PluginHostActionMode,
 }
 
 /// One `(plugin_id, module_id)`-owned layer, as exposed to rendering/hit-testing
@@ -148,6 +155,10 @@ pub(crate) struct UiPluginManager {
     /// `App::apply_ui_plugin_effects`. Includes budget-refused entries so every
     /// request still resolves to exactly one result (§5.4).
     pending_api_effects: Vec<PendingApiEffect>,
+    /// fork(host-actions): keyboard-capture requests extracted from module
+    /// updates, identity-tagged like `pending_api_effects` because the generic
+    /// `pending_effects` channel deliberately carries no module identity.
+    pending_keyboard_captures: Vec<(String, String, bool)>,
 }
 
 /// Background thread that increments the shared engine epoch so a guest call
@@ -628,6 +639,7 @@ impl UiPluginManager {
             pending_effects: Vec::new(),
             pending_notifications: Vec::new(),
             pending_api_effects: Vec::new(),
+            pending_keyboard_captures: Vec::new(),
             runtime,
         };
         // Boot is just a sync against an empty registry: every enabled module is
@@ -692,6 +704,8 @@ impl UiPluginManager {
                     image_file: module.image_file.clone(),
                     graphics_roots: module.graphics_roots.clone(),
                     max_layers_per_pane: module.max_layers_per_pane,
+                    host_actions: module.host_actions.clone(),
+                    host_action_mode: module.host_action_mode.unwrap_or_default(),
                 };
                 let key = module_key(&registered);
                 if let Some(mtime) = old_mtimes.get(&registered.module_path).copied() {
@@ -989,6 +1003,100 @@ impl UiPluginManager {
         out
     }
 
+    /// fork(host-actions): resolve every module's manifest `host_actions` into
+    /// the claim table `AppState` consults on each click.
+    ///
+    /// Two filters, both deliberate:
+    ///
+    /// - A module that names controls without holding the `host_actions`
+    ///   capability contributes nothing. The capability is the user-visible
+    ///   grant; the id list is only which controls it applies to.
+    /// - An id that does not resolve to a real [`HostAction`] is dropped with a
+    ///   warning rather than kept. A claim that can never fire would otherwise
+    ///   sit in the table looking live, which is precisely the class of silent
+    ///   failure this codebase refuses elsewhere.
+    ///
+    /// First claimant wins on a contested control, in the registration order
+    /// `sync_to_registry` already fixes (plugin_id asc, then manifest order), so
+    /// the winner is deterministic rather than HashMap-order-dependent. The
+    /// loser is warned about — two plugins fighting over the new-tab button is a
+    /// configuration mistake the user needs told about, not resolved silently.
+    pub(crate) fn host_action_claims(&self) -> crate::ui_host_actions::HostActionClaims {
+        use crate::api::schema::{PluginHostActionMode, PluginUiCapability};
+        use crate::ui_host_actions::{HostAction, HostActionClaim, HostActionMode};
+
+        let mut claims = crate::ui_host_actions::HostActionClaims::default();
+        for module in &self.modules {
+            if module.host_actions.is_empty() {
+                continue;
+            }
+            if !module.requests(PluginUiCapability::HostActions) {
+                tracing::warn!(
+                    plugin_id = %module.plugin_id,
+                    module_id = %module.module_id,
+                    "ui module declares host_actions without the host_actions capability; ignoring"
+                );
+                continue;
+            }
+            let mode = match module.host_action_mode {
+                PluginHostActionMode::Observe => HostActionMode::Observe,
+                PluginHostActionMode::Replace => HostActionMode::Replace,
+            };
+            for declared in &module.host_actions {
+                let Some(action) = HostAction::from_id(declared) else {
+                    tracing::warn!(
+                        plugin_id = %module.plugin_id,
+                        module_id = %module.module_id,
+                        action_id = %declared,
+                        "unknown host action id in manifest host_actions; ignoring"
+                    );
+                    continue;
+                };
+                match claims.entry(action.id()) {
+                    std::collections::hash_map::Entry::Occupied(existing) => {
+                        tracing::warn!(
+                            plugin_id = %module.plugin_id,
+                            module_id = %module.module_id,
+                            action_id = %action.id(),
+                            held_by = %existing.get().plugin_id,
+                            "host action already claimed by another module; ignoring"
+                        );
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(HostActionClaim {
+                            plugin_id: module.plugin_id.clone(),
+                            module_id: module.module_id.clone(),
+                            mode,
+                        });
+                    }
+                }
+            }
+        }
+        claims
+    }
+
+    /// fork(host-actions): deliver a claimed control's activation to its owner.
+    pub(crate) fn dispatch_host_action(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        action_id: &'static str,
+        mode: crate::ui_host_actions::HostActionMode,
+    ) -> bool {
+        let event = UiEvent::HostAction {
+            action_id: action_id.to_string(),
+            mode: match mode {
+                crate::ui_host_actions::HostActionMode::Observe => {
+                    herdr_ui_plugin_api::UiHostActionMode::Observe
+                }
+                crate::ui_host_actions::HostActionMode::Replace => {
+                    herdr_ui_plugin_api::UiHostActionMode::Replace
+                }
+            },
+        };
+        self.dispatch_event_for_module(plugin_id, module_id, &event)
+    }
+
     /// Spec §4: deterministic overlap ownership. Iterates `self.modules` (a
     /// `Vec`, already sorted `plugin_id` then `module_id` at registration) so the
     /// input is never HashMap-order-dependent, then applies the exact total sort
@@ -1214,6 +1322,7 @@ impl UiPluginManager {
         !self.pending_notifications.is_empty()
             || !self.pending_effects.is_empty()
             || !self.pending_api_effects.is_empty()
+            || !self.pending_keyboard_captures.is_empty()
     }
 
     /// API v3 (§5): effects awaiting policy check + execution by
@@ -1227,6 +1336,28 @@ impl UiPluginManager {
     /// instead of being dropped.
     pub(crate) fn park_pending_api_effects(&mut self, mut effects: Vec<PendingApiEffect>) {
         self.pending_api_effects.append(&mut effects);
+    }
+
+    /// fork(host-actions): drain capture requests in emission order (last one
+    /// wins at the applier).
+    pub(crate) fn take_pending_keyboard_captures(&mut self) -> Vec<(String, String, bool)> {
+        std::mem::take(&mut self.pending_keyboard_captures)
+    }
+
+    /// fork(host-actions): deliver one key press to ONE module — the capture
+    /// path. The broadcast path (`dispatch_crossterm_key_event`) stays
+    /// untouched; while capture is held the host calls this instead and skips
+    /// its own key handling entirely.
+    pub(crate) fn dispatch_key_to_module(
+        &mut self,
+        plugin_id: &str,
+        module_id: &str,
+        key: crossterm::event::KeyEvent,
+    ) -> bool {
+        let Some(event) = map_crossterm_key_event(key) else {
+            return false;
+        };
+        self.dispatch_event_for_module(plugin_id, module_id, &UiEvent::Key(event))
     }
 
     /// API v3 (§5.3): whether the still-registered module `(plugin_id,
@@ -1439,6 +1570,31 @@ impl UiPluginManager {
             .iter()
             .cloned()
             .partition(|effect| matches!(effect, HostEffect::Api { .. }));
+        // fork(host-actions): peel capture requests off before the identity-less
+        // filter. Capability-gated here, where the module is still in hand; an
+        // ungranted request degrades to a toast so the author learns why their
+        // form is typing into the pane instead of silently misbehaving.
+        let mut other_effects = other_effects;
+        other_effects.retain(|effect| {
+            let HostEffect::SetKeyboardCapture { captured } = effect else {
+                return true;
+            };
+            if module.requests(crate::api::schema::PluginUiCapability::KeyboardCapture) {
+                self.pending_keyboard_captures.push((
+                    module.plugin_id.clone(),
+                    module.module_id.clone(),
+                    *captured,
+                ));
+            } else {
+                self.pending_effects.push(HostEffect::ShowToast {
+                    message: format!(
+                        "Plugin {} requested keyboard capture without the keyboard_capture capability",
+                        module.plugin_id
+                    ),
+                });
+            }
+            false
+        });
         self.pending_effects
             .extend(filter_effects_for_module(&module, &other_effects));
         queue_api_effects(
@@ -1593,6 +1749,14 @@ fn module_accepts_event(module: &RegisteredUiModule, event: &UiEvent) -> bool {
         // negotiated-v3 modules. No new capability gate — §4 hits and §5
         // requests already imply wanting the corresponding event.
         UiEvent::Action { .. } | UiEvent::ApiResult { .. } => module.negotiated_version == 3,
+        // fork(host-actions): gated on the capability, not on a version number.
+        // The host only ever dispatches this to the module that claimed the
+        // control, so the check here is a backstop against a claim outliving the
+        // capability that granted it (a manifest hot-reload dropping the grant
+        // while the click was already queued).
+        UiEvent::HostAction { .. } => {
+            module.requests(crate::api::schema::PluginUiCapability::HostActions)
+        }
     }
 }
 
@@ -1639,6 +1803,11 @@ fn filter_effects_for_module(
             // separately (via `queue_api_effects`) before this function ever
             // sees `other_effects`, so this arm exists only for exhaustiveness.
             HostEffect::Api { .. } => None,
+            // fork(host-actions): like `Api`, capture requests need the emitting
+            // module's identity, which this identity-less filter cannot carry.
+            // `dispatch_event_for_module` extracts them into
+            // `pending_keyboard_captures` first; this arm is exhaustiveness only.
+            HostEffect::SetKeyboardCapture { .. } => None,
         })
         .collect()
 }
@@ -1750,6 +1919,8 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::ApiInput => UiCapability::ApiInput,
         crate::api::schema::PluginUiCapability::PaneGraphics => UiCapability::PaneGraphics,
         crate::api::schema::PluginUiCapability::PluginAdmin => UiCapability::PluginAdmin,
+        crate::api::schema::PluginUiCapability::HostActions => UiCapability::HostActions,
+        crate::api::schema::PluginUiCapability::KeyboardCapture => UiCapability::KeyboardCapture,
     }
 }
 
@@ -1764,9 +1935,9 @@ mod tests {
     #[test]
     fn denied_open_plugin_pane_surfaces_a_toast() {
         let mut module = sample_plugin().ui_modules[0].clone();
-        module.capabilities.retain(|capability| {
-            *capability != PluginUiCapability::OpenPluginPanes
-        });
+        module
+            .capabilities
+            .retain(|capability| *capability != PluginUiCapability::OpenPluginPanes);
         let registered = RegisteredUiModule {
             plugin_id: "example.demo".into(),
             module_id: "demo".into(),
@@ -1783,6 +1954,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             max_layers_per_pane: None,
+            host_actions: Vec::new(),
+            host_action_mode: Default::default(),
         };
         let effects = filter_effects_for_module(
             &registered,
@@ -1816,6 +1989,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             max_layers_per_pane: None,
+            host_actions: Vec::new(),
+            host_action_mode: Default::default(),
         };
         let effect = HostEffect::SetSurfaceCollapsed {
             surface: UiSurface::UsageStrip,
@@ -1986,6 +2161,8 @@ mod tests {
                 graphics_roots: Vec::new(),
                 max_layers_per_pane: None,
                 collector: None,
+                host_actions: Vec::new(),
+                host_action_mode: None,
             }],
             link_handlers: vec![],
             source: Default::default(),

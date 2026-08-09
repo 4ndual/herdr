@@ -115,6 +115,8 @@ mod terminal_modes;
 mod terminal_notify;
 mod terminal_theme;
 mod ui;
+// fork(host-actions): stable ids + claim table for host-drawn controls.
+mod ui_host_actions;
 mod ui_plugin_api_bridge;
 mod ui_plugins;
 mod update;

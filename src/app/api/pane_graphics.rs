@@ -703,6 +703,8 @@ mod tests {
                 image_file: None,
                 graphics_roots: roots,
                 collector: None,
+                host_actions: Vec::new(),
+                host_action_mode: None,
             }],
             link_handlers: vec![],
             source: Default::default(),

@@ -20,6 +20,8 @@ mod popup;
 mod resume_picker;
 mod runtime;
 mod runtime_mutations;
+// fork(host-actions): exclusive keyboard routing for plugin modals.
+mod ui_capture;
 mod session;
 pub mod state;
 mod terminal_targets;
@@ -1041,6 +1043,9 @@ impl App {
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             ui_context_menu_items: Vec::new(),
+            ui_host_action_claims: Default::default(),
+            pending_host_actions: Vec::new(),
+            ui_keyboard_capture: None,
             ui_surface_layers: Vec::new(),
             pending_plugin_action_invocation: None,
             pending_plugin_ui_action: None,
@@ -1093,6 +1098,7 @@ impl App {
         let ui_plugins =
             crate::ui_plugins::UiPluginManager::from_installed_plugins(&state.installed_plugins);
         state.ui_context_menu_items = ui_plugins.context_menu_items();
+        state.ui_host_action_claims = ui_plugins.host_action_claims();
         state.ui_surface_layers = ui_plugins.surface_layers();
 
         let last_focus = state.active.and_then(|idx| {
@@ -2269,6 +2275,11 @@ impl App {
                     let key = self.input_leases.normalize_press(&lease_key, key);
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
+                            // fork(host-actions): a capture-holding plugin
+                            // modal owns the keyboard outright; see ui_capture.
+                            if self.dispatch_key_to_captured_module(key.as_key_event()) {
+                                continue;
+                            }
                             self.offer_key_to_ui_plugins(key.as_key_event());
                             let initial_context = self.terminal_input_context();
                             let target = if initial_context.is_some() {
@@ -2436,6 +2447,22 @@ impl App {
             }
             acted = true;
         }
+        // fork(host-actions): claimed host-control clicks. Drained here for the
+        // same reason as everything above it — `AppState` recorded them without
+        // a runtime handle, and this is the first place that has one.
+        for pending in std::mem::take(&mut self.state.pending_host_actions) {
+            if self.ui_plugins.dispatch_host_action(
+                &pending.plugin_id,
+                &pending.module_id,
+                pending.action_id,
+                pending.mode,
+            ) {
+                self.refresh_ui_plugin_state_from_manager();
+                self.apply_ui_plugin_notifications();
+                self.apply_ui_plugin_effects();
+            }
+            acted = true;
+        }
         if self.apply_pending_historial_action() {
             acted = true;
         }
@@ -2496,6 +2523,7 @@ impl App {
 
     pub(crate) fn refresh_ui_plugin_state_from_manager(&mut self) {
         self.state.ui_context_menu_items = self.ui_plugins.context_menu_items();
+        self.state.ui_host_action_claims = self.ui_plugins.host_action_claims();
         self.state.ui_surface_layers = self.ui_plugins.surface_layers();
         self.sync_usage_view_hits_from_layers();
     }
@@ -3207,6 +3235,10 @@ impl App {
     const MAX_API_BRIDGE_ROUNDS_PER_TURN: usize = 4;
 
     pub(crate) fn apply_ui_plugin_effects(&mut self) {
+        // fork(host-actions): capture requests ride the same flush cadence as
+        // host effects so `SetKeyboardCapture` in a module's update takes
+        // effect before the next key arrives.
+        self.apply_pending_keyboard_captures();
         self.apply_ui_plugin_host_effects();
         for _ in 0..Self::MAX_API_BRIDGE_ROUNDS_PER_TURN {
             let pending = self.ui_plugins.take_pending_api_effects();
@@ -3514,6 +3546,15 @@ impl App {
                         request_id = %request_id,
                         method = %method,
                         "ui plugin api effect reached the host-effect queue unexpectedly; dropping (should have been routed to pending_api_effects)"
+                    );
+                }
+                // fork(host-actions): like Api, capture requests are extracted
+                // identity-tagged at queue time (pending_keyboard_captures) and
+                // applied by apply_pending_keyboard_captures; one reaching this
+                // identity-less queue is a routing bug.
+                herdr_ui_plugin_api::HostEffect::SetKeyboardCapture { .. } => {
+                    tracing::warn!(
+                        "ui plugin keyboard-capture effect reached the host-effect queue unexpectedly; dropping"
                     );
                 }
             }
@@ -4736,6 +4777,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         });
         crate::persist::plugin_registry::save_to_path(
             &crate::config::config_dir().join("plugins.json"),
@@ -4875,6 +4918,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         });
         crate::persist::plugin_registry::save_to_path(
             &crate::config::config_dir().join("plugins.json"),
@@ -5558,6 +5603,8 @@ mod tests {
                     graphics_roots: Vec::new(),
                     max_layers_per_pane: None,
                     collector,
+                    host_actions: Vec::new(),
+                    host_action_mode: None,
                 }],
                 link_handlers: vec![],
                 source: Default::default(),
@@ -9033,6 +9080,8 @@ last_pane = "prefix+tab"
                 graphics_roots: Vec::new(),
                 max_layers_per_pane: None,
                 collector: None,
+                host_actions: Vec::new(),
+                host_action_mode: None,
             }],
             link_handlers: vec![],
             source: Default::default(),

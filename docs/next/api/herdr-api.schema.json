@@ -8534,6 +8534,21 @@
           ],
           "type": "string"
         },
+        "PluginHostActionMode": {
+          "description": "fork(host-actions): schema mirror of the host's `HostActionMode`.",
+          "oneOf": [
+            {
+              "const": "observe",
+              "description": "The host runs its default body and the module is also told.",
+              "type": "string"
+            },
+            {
+              "const": "replace",
+              "description": "The host skips its default body; the module owns the outcome.",
+              "type": "string"
+            }
+          ]
+        },
         "PluginHotReloadMode": {
           "enum": [
             "off",
@@ -8895,6 +8910,24 @@
               },
               "type": "array"
             },
+            "host_action_mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PluginHostActionMode"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "fork(host-actions): whether claiming a control suppresses the host's own\nbehaviour. Omitted means [`PluginHostActionMode::Observe`] — a manifest\nthat names a control without saying more gets the events and changes\nnothing the user can see."
+            },
+            "host_actions": {
+              "description": "fork(host-actions): stable `host.*` ids of host-drawn controls this\nmodule wants. An id the host does not define fails the manifest LOAD\nrather than being dropped later — a claim that cannot resolve to a real\ncontrol would otherwise sit in `plugin list` looking live while doing\nnothing, which is the silent-failure mode this lane exists to prevent.\n\nOnly honoured together with the `host_actions` capability.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "hot_reload": {
               "$ref": "#/schemas/success_response/$defs/PluginHotReloadMode",
               "default": "on"
@@ -9181,6 +9214,11 @@
             {
               "const": "pane_graphics",
               "description": "fork: `pane.graphics.*` via `HostEffect::Api` — painting an image into a\npane's cell grid. Deliberately NOT folded into `ApiWrite`: drawing over a\npane is a different power from splitting or closing one, it is the only\ncapability that puts pixels on screen outside the plugin's own surface,\nand separating it means `plugin list` shows exactly which plugin holds\nthe right to draw into the user's panes.",
+              "type": "string"
+            },
+            {
+              "const": "host_actions",
+              "description": "fork(host-actions): observe or replace the host-drawn controls named in\n`host_actions`. Kept out of `MouseAll` because that one only lets a\nmodule SEE clicks, while this one lets it suppress a native button —\na different power, so a separate, refusable, `plugin list`-visible grant.",
               "type": "string"
             },
             {

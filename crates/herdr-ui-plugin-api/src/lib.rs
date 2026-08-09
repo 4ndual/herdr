@@ -105,6 +105,22 @@ pub enum UiCapability {
     /// host-reserved: installing code from a path is a strictly larger power
     /// than flipping an already-installed plugin's enabled bit.
     PluginAdmin,
+    /// fork(host-actions): observe or replace a host-drawn control named in the
+    /// module's manifest `host_actions`. Its own capability rather than a fold
+    /// into `MouseAll` because the powers differ in kind: `MouseAll` is a
+    /// read-only firehose of coordinates, while this one can SUPPRESS a native
+    /// button. A user granting "see my clicks" has not granted "turn off my
+    /// new-tab button", and `plugin list` should show which is which.
+    HostActions,
+    /// fork(host-actions): request exclusive keyboard routing via
+    /// `HostEffect::SetKeyboardCapture`. Split from `KeyboardInput` because the
+    /// powers differ in kind: `KeyboardInput` is a broadcast COPY of keys (the
+    /// pane still receives them — the documented non-consumable semantics that
+    /// doctor-dash's safety argument depends on), while capture REDIRECTS keys
+    /// away from the pane and the host's own mode handlers. A module holding
+    /// only `KeyboardInput` must never be able to starve the user's terminal
+    /// of keystrokes.
+    KeyboardCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +222,22 @@ pub enum UiEvent {
         row: u16,
         kind: UiActionKind,
     },
+    /// fork(host-actions): a host-drawn control this module claimed was
+    /// activated. `action_id` is one of the host's stable `host.*` ids, never a
+    /// module-private one, which is what separates this from [`Self::Action`].
+    ///
+    /// `mode` echoes the manifest claim so a module holding both kinds can tell
+    /// "the host already did this, you are being told" from "the host did
+    /// nothing, this is yours to handle" without tracking its own manifest.
+    ///
+    /// Deliberately NOT gated on a new `API_VERSION`: delivery is gated on the
+    /// module having NAMED the action in its manifest, which is a stronger and
+    /// more honest opt-in than a version number, and it leaves the negotiation
+    /// table (`2 | 3`) untouched for upstream.
+    HostAction {
+        action_id: String,
+        mode: UiHostActionMode,
+    },
     /// API v3 (§5.2): the synchronous result of a `HostEffect::Api` request,
     /// delivered only to v3 modules that are still registered at dispatch time.
     ApiResult {
@@ -216,6 +248,18 @@ pub enum UiEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+/// fork(host-actions): whether the host still ran its own default body for a
+/// claimed control. Mirrors the manifest `host_action_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiHostActionMode {
+    /// The host ran its default; this is a notification.
+    #[default]
+    Observe,
+    /// The host skipped its default; the module owns the outcome.
+    Replace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -342,6 +386,20 @@ pub enum HostEffect {
     SetSurfaceCollapsed {
         surface: UiSurface,
         collapsed: bool,
+    },
+    /// fork(host-actions): claim (or release) exclusive keyboard routing.
+    /// While a module holds capture, the host delivers every key press to THAT
+    /// module only — the focused pane and the host's own mode handlers see
+    /// nothing. This is what makes a plugin-drawn form with text fields
+    /// possible at all: without it keys are broadcast, so typing into an
+    /// overlay would also type into the terminal underneath.
+    ///
+    /// Gated on [`UiCapability::KeyboardCapture`]. The host force-releases on
+    /// ctrl+escape (a failsafe the guest cannot override), when the module
+    /// unloads, and when its instance traps — a buggy guest must never be able
+    /// to hold the user's keyboard hostage.
+    SetKeyboardCapture {
+        captured: bool,
     },
 }
 
@@ -523,6 +581,7 @@ mod host_effect_tests {
                 surface: UiSurface::UsageStrip,
                 collapsed: true,
             },
+            HostEffect::SetKeyboardCapture { captured: true },
         ];
 
         for effect in effects {

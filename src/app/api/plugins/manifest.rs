@@ -137,6 +137,12 @@ struct RawPluginManifestUiModule {
     // fork(wave-2): optional collector argv (see PluginManifestUiModule::collector).
     #[serde(default)]
     collector: Option<Vec<String>>,
+    // fork(host-actions): host-drawn controls this module claims
+    // (see PluginManifestUiModule::host_actions).
+    #[serde(default)]
+    host_actions: Vec<String>,
+    #[serde(default)]
+    host_action_mode: Option<crate::api::schema::PluginHostActionMode>,
 }
 
 /// Raw string platform value from the manifest, validated before conversion.
@@ -599,6 +605,11 @@ fn normalize_manifest_ui_module(
         Some(command) => Some(normalize_command(command)?),
         None => None,
     };
+    // fork(host-actions): a claimed control has to name one the host actually
+    // draws, so an unknown id is a manifest ERROR here rather than a warning
+    // later. Catching it at load is the difference between "your plugin failed
+    // to install, here is the bad id" and a button that silently never fires.
+    let host_actions = normalize_host_actions(module.host_actions)?;
     Ok(PluginManifestUiModule {
         id,
         title,
@@ -616,7 +627,34 @@ fn normalize_manifest_ui_module(
         graphics_roots,
         max_layers_per_pane: module.max_layers_per_pane,
         collector,
+        host_actions,
+        host_action_mode: module.host_action_mode,
     })
+}
+
+/// fork(host-actions): validate `host_actions`, rejecting ids the host does not
+/// define and de-duplicating the rest.
+///
+/// Deliberately strict. The alternative — accept anything and drop it at
+/// registration — leaves a typo sitting in `plugin list` looking like a live
+/// claim, which is the failure mode a bad `pane.graphics` placement key already
+/// cost this project hours of diagnosis.
+fn normalize_host_actions(declared: Vec<String>) -> Result<Vec<String>, (&'static str, String)> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in declared {
+        let id = raw.trim();
+        let Some(action) = crate::ui_host_actions::HostAction::from_id(id) else {
+            return Err((
+                "invalid_plugin_ui_module_host_action",
+                format!("unknown host action id `{id}`"),
+            ));
+        };
+        let id = action.id().to_string();
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Validate a module's `image_file`: a single non-empty path segment, no
@@ -896,6 +934,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
@@ -917,6 +957,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         })
         .unwrap_err();
         assert_eq!(err.0, "invalid_plugin_ui_module_surfaces");
@@ -952,6 +994,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         })
         .unwrap();
         assert_eq!(module.id, "goal-ui");
@@ -980,6 +1024,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         }
     }
 
@@ -1055,5 +1101,53 @@ mod tests {
         raw.collector = Some(vec!["".into()]);
         let err = normalize_manifest_ui_module(raw).expect_err("blank collector argv0 is rejected");
         assert_eq!(err.0, "invalid_plugin_command");
+    }
+
+    // fork(host-actions)
+
+    #[test]
+    fn host_actions_accept_known_ids_and_trim_them() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.host_actions = vec![" host.tab.new ".into(), "host.sidebar.toggle".into()];
+        let module = normalize_manifest_ui_module(raw).expect("known ids are accepted");
+        assert_eq!(
+            module.host_actions,
+            vec![
+                "host.tab.new".to_string(),
+                "host.sidebar.toggle".to_string()
+            ]
+        );
+    }
+
+    /// A typo'd id must fail the LOAD, not be dropped later. Accepting it here
+    /// and warning at registration would leave a dead claim sitting in
+    /// `plugin list` looking live — the same silent-misconfiguration shape that
+    /// a mis-keyed graphics placement already cost this project hours of
+    /// diagnosis.
+    #[test]
+    fn host_actions_reject_an_unknown_id_at_load() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.host_actions = vec!["host.tab.nwe".into()];
+        let err = normalize_manifest_ui_module(raw).expect_err("unknown ids must be rejected");
+        assert_eq!(err.0, "invalid_plugin_ui_module_host_action");
+        assert!(err.1.contains("host.tab.nwe"), "{}", err.1);
+    }
+
+    #[test]
+    fn host_actions_deduplicate_repeated_ids() {
+        let mut raw = ui_module_with_input_file("usage_input.json");
+        raw.host_actions = vec!["host.tab.new".into(), "host.tab.new".into()];
+        let module = normalize_manifest_ui_module(raw).expect("duplicates are tolerated");
+        assert_eq!(module.host_actions, vec!["host.tab.new".to_string()]);
+    }
+
+    /// A manifest that says nothing about host actions must round-trip to
+    /// exactly the pre-fork shape, so an upstream plugin keeps loading unchanged.
+    #[test]
+    fn a_manifest_without_host_actions_stays_empty_and_unset() {
+        let module = normalize_manifest_ui_module(ui_module_with_input_file("usage_input.json"))
+            .expect("module without host actions loads");
+        assert!(module.host_actions.is_empty());
+        assert_eq!(module.host_action_mode, None);
     }
 }

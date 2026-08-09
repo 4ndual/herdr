@@ -313,6 +313,8 @@ mod tests {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         }];
         plugin
     }

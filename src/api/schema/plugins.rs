@@ -445,6 +445,34 @@ pub struct PluginManifestUiModule {
     /// | `{"outcome":"clear"}`). Only meaningful together with `ui_input_file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<Vec<String>>,
+    /// fork(host-actions): stable `host.*` ids of host-drawn controls this
+    /// module wants. An id the host does not define fails the manifest LOAD
+    /// rather than being dropped later — a claim that cannot resolve to a real
+    /// control would otherwise sit in `plugin list` looking live while doing
+    /// nothing, which is the silent-failure mode this lane exists to prevent.
+    ///
+    /// Only honoured together with the `host_actions` capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_actions: Vec<String>,
+    /// fork(host-actions): whether claiming a control suppresses the host's own
+    /// behaviour. Omitted means [`PluginHostActionMode::Observe`] — a manifest
+    /// that names a control without saying more gets the events and changes
+    /// nothing the user can see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_action_mode: Option<PluginHostActionMode>,
+}
+
+/// fork(host-actions): schema mirror of the host's `HostActionMode`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostActionMode {
+    /// The host runs its default body and the module is also told.
+    #[default]
+    Observe,
+    /// The host skips its default body; the module owns the outcome.
+    Replace,
 }
 
 #[derive(
@@ -577,6 +605,16 @@ pub enum PluginUiCapability {
     /// and separating it means `plugin list` shows exactly which plugin holds
     /// the right to draw into the user's panes.
     PaneGraphics,
+    /// fork(host-actions): observe or replace the host-drawn controls named in
+    /// `host_actions`. Kept out of `MouseAll` because that one only lets a
+    /// module SEE clicks, while this one lets it suppress a native button —
+    /// a different power, so a separate, refusable, `plugin list`-visible grant.
+    HostActions,
+    /// fork(host-actions): exclusive keyboard routing while a plugin modal is
+    /// open (`HostEffect::SetKeyboardCapture`). Separate from `keyboard_input`
+    /// (a broadcast copy) because capture REDIRECTS keys away from the pane —
+    /// a strictly larger power that must be its own visible grant.
+    KeyboardCapture,
     /// fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Kept out of
     /// `ApiWrite` for the same reason as the two above: a module holding this
     /// can switch OTHER modules off, so it has to be declared and visible in

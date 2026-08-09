@@ -964,6 +964,8 @@ fn plugin_link_list_unlink_round_trip() {
             image_file: None,
             graphics_roots: Vec::new(),
             collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
         }],
         link_handlers: vec![PluginManifestLinkHandler {
             id: "github-pr".into(),

@@ -155,6 +155,12 @@ impl AppState {
         terminal_runtimes: &mut TerminalRuntimeRegistry,
         mouse: MouseEvent,
     ) -> Option<MouseAction> {
+        // fork(host-actions): the ONE interception point. Everything it needs
+        // lives in `super::host_actions`; see that module for why this is a
+        // single door rather than a guard inside each control's branch below.
+        if self.intercept_host_action(mouse) == super::host_actions::HostActionIntercept::Consumed {
+            return None;
+        }
         if self.mode == Mode::Onboarding {
             self.handle_onboarding_mouse(mouse);
             return None;
@@ -1425,7 +1431,9 @@ impl AppState {
             })
     }
 
-    fn mode_bar_covers_tab_row(&self, col: u16, row: u16) -> bool {
+    // fork(host-actions): widened from private so the host-action resolver can
+    // reproduce this check without duplicating it.
+    pub(super) fn mode_bar_covers_tab_row(&self, col: u16, row: u16) -> bool {
         self.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
             && matches!(
                 self.mode,
@@ -1609,7 +1617,8 @@ impl AppState {
         let _ = pane_id;
     }
 
-    fn clickable_toast_at(&self, col: u16, row: u16) -> bool {
+    // fork(host-actions): widened from private for the host-action resolver.
+    pub(super) fn clickable_toast_at(&self, col: u16, row: u16) -> bool {
         self.toast
             .as_ref()
             .is_some_and(|toast| toast.target.is_some())

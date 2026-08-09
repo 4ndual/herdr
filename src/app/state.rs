@@ -1925,6 +1925,15 @@ pub struct AppState {
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
     /// Context-menu items surfaced by loaded UI plugins.
     pub(crate) ui_context_menu_items: Vec<UiActionRef>,
+    /// fork(host-actions): which host-drawn controls plugins have claimed,
+    /// republished from `UiPluginManager` wherever `ui_context_menu_items` is.
+    /// Pure data, so `handle_mouse` can decide synchronously without a runtime.
+    pub(crate) ui_host_action_claims: crate::ui_host_actions::HostActionClaims,
+    /// fork(host-actions): claimed clicks awaiting guest dispatch by `App`.
+    pub(crate) pending_host_actions: Vec<crate::ui_host_actions::PendingHostAction>,
+    /// fork(host-actions): the module currently holding exclusive keyboard
+    /// routing, or `None`. See `app::ui_capture` for routing and failsafes.
+    pub(crate) ui_keyboard_capture: Option<(String, String)>,
     /// Static surface layers surfaced by loaded UI plugins, each tagged with its
     /// owning `(plugin_id, module_id)` and negotiated API version (§4 identity
     /// threading). Ordered `(z_index desc, plugin_id asc, module_id asc)`.
@@ -2871,6 +2880,9 @@ impl AppState {
             popup_pane: None,
             plugin_command_logs: Vec::new(),
             ui_context_menu_items: Vec::new(),
+            ui_host_action_claims: Default::default(),
+            pending_host_actions: Vec::new(),
+            ui_keyboard_capture: None,
             ui_surface_layers: Vec::new(),
             plugin_panel_skips: Vec::new(),
             pending_plugin_action_invocation: None,

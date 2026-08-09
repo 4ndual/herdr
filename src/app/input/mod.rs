@@ -38,6 +38,8 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 
 mod clipboard;
 mod copy_mode;
+// fork(host-actions): plugin interception for host-drawn controls.
+mod host_actions;
 mod lease;
 mod modal;
 mod mouse;
@@ -90,6 +92,11 @@ impl App {
             return None;
         }
 
+        // fork(host-actions): a capture-holding plugin modal owns the keyboard
+        // outright; see app::ui_capture for routing and failsafes.
+        if self.dispatch_key_to_captured_module(key_event) {
+            return None;
+        }
         if self.ui_plugins.dispatch_crossterm_key_event(key_event) {
             self.refresh_ui_plugin_state_from_manager();
             self.apply_ui_plugin_effects();
