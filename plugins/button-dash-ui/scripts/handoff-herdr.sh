@@ -44,6 +44,64 @@ fi
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
+# This script was written on macOS and is now also run on Linux (the box). The
+# four places where the two genuinely differ are routed through the helpers
+# below rather than sprinkled inline, so the divergence stays in one block.
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+
+# Inode of a file. BSD/macOS stat is `-f %i`; GNU/Linux stat is `-c %i`.
+file_inode() {
+  case "$UNAME_S" in
+    Darwin) stat -f %i "$1" 2>/dev/null ;;
+    *)      stat -c %i "$1" 2>/dev/null ;;
+  esac
+}
+
+# ABSOLUTE path of the executable a pid is running.
+#
+# The original used `ps -o comm=`, which is correct ONLY on macOS: there `comm`
+# is the full executable path. On Linux `comm` is the bare 15-char process name
+# (`herdr-bridge`), so every downstream use — the -f/-x gates and the exec at
+# the end — was handed a name that resolves to nothing. That was the bug that
+# made this button dead on this box.
+#
+# On Linux /proc/<pid>/exe is the ground truth. When the binary has been
+# replaced underneath the running server — which is the ENTIRE intended flow of
+# this button (`mv` a fresh build into place, then press it) — the kernel
+# appends " (deleted)" to that link. Stripping the suffix yields the path of the
+# NEW on-disk file, which is exactly the image we want to hand off to.
+exe_path() {
+  local pid="$1" p=""
+  if [[ -r "/proc/$pid/exe" ]]; then
+    p="$(readlink "/proc/$pid/exe" 2>/dev/null)"
+    p="${p% (deleted)}"
+  fi
+  [[ -n "$p" ]] || p="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's/ server$//')"
+  printf '%s' "$p"
+}
+
+# Pid of the server LISTENING on a unix socket path.
+#
+# `lsof -t <sock> | head -1` is not safe on Linux: lsof also reports processes
+# holding OTHER unix sockets, so the -t list is polluted and the first entry is
+# whichever unrelated process sorts first (measured here: gvfsd-trash, pid
+# 163293, whose socket is /run/user/1000/gvfsd/socket-*). Picking that pid would
+# sail through the "server alive" gate and then hand off against a random
+# process. Match the NAME field against the socket path instead, and prefer the
+# LISTEN row — the listener is the server; the CONNECTED rows are its clients.
+socket_pid() {
+  local sock="$1" out=""
+  out="$(lsof -- "$sock" 2>/dev/null)" || true
+  [[ -n "$out" ]] || return 0
+  printf '%s\n' "$out" \
+    | awk -v s="$sock" '
+        { for (i = 1; i <= NF; i++) if ($i == s) {
+            if (index($0, "LISTEN")) { listen = $2 } else if (!any) { any = $2 }
+            break
+          } }
+        END { print (listen ? listen : any) }'
+}
+
 # Resolve a herdr CLI for toasts/status. PATH LAST: `herdr` on PATH may be a
 # different instance's shim, and the promoted per-instance binaries are the
 # authoritative ones.
@@ -78,12 +136,31 @@ toast() {
     fi
     log "herdr toast not shown (delivery off/busy) — falling back to Notification Center"
   fi
-  # AppleScript string literals: escape backslashes first, then double quotes.
-  local t b
-  t="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-  b="$(printf '%s' "$body"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-  osascript -e "display notification \"$b\" with title \"$t\"" >>"$LOG" 2>&1 || \
-    log "WARN: osascript fallback also failed — this message reached the log ONLY"
+  # Desktop-notification fallback. This is not cosmetic: hr's config sets
+  # [ui.toast] delivery = "off", so EVERY message this button emits — including
+  # "Handoff FAILED" — reaches the user only through this path. On Linux the
+  # osascript call could never run, which is why the button read as "does
+  # nothing" instead of "failed for this reason".
+  case "$UNAME_S" in
+    Darwin)
+      # AppleScript string literals: escape backslashes first, then double quotes.
+      local t b
+      t="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+      b="$(printf '%s' "$body"  | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+      osascript -e "display notification \"$b\" with title \"$t\"" >>"$LOG" 2>&1 || \
+        log "WARN: osascript fallback also failed — this message reached the log ONLY"
+      ;;
+    *)
+      # notify-send needs a display to talk to; the action runner inherits the
+      # server's env, which has one. Failures are logged, never fatal.
+      if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a herdr -u critical -- "$title" "$body" >>"$LOG" 2>&1 || \
+          log "WARN: notify-send fallback failed — this message reached the log ONLY"
+      else
+        log "WARN: no notify-send on PATH — this message reached the log ONLY"
+      fi
+      ;;
+  esac
 }
 
 # Every failure toast states that the agents are still alive — that is the fact
@@ -161,7 +238,7 @@ unset HERDR_CLIENT_SOCKET_PATH 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # 2. Detect the live server: pid, binary.
 # ---------------------------------------------------------------------------
-SERVER_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+SERVER_PID="$(socket_pid "$SOCK")"
 
 BIN=""
 pid_env() { ps eww "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 "^$2=" | cut -d= -f2-; }
@@ -174,8 +251,8 @@ if [[ -z "$SERVER_PID" ]]; then
   exit 4
 fi
 log "live server pid: $SERVER_PID"
-BIN="$(ps -o comm= -p "$SERVER_PID" 2>/dev/null | sed 's/ server$//')"
-[[ -n "$BIN" ]] || BIN="$HOME/Projects/herdr/target/release/herdr"
+BIN="$(exe_path "$SERVER_PID")"
+[[ -n "$BIN" && -x "$BIN" ]] || BIN="$HOME/Projects/herdr/target/release/herdr"
 log "running server binary: $BIN"
 
 # --- Gate 2: handoff supported -------------------------------------------
@@ -279,7 +356,7 @@ fi
 # Confirm a new server actually owns the socket, and report the version applied.
 NEW_PID=""
 for _ in $(seq 1 40); do
-  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  NEW_PID="$(socket_pid "$SOCK")"
   [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]] && break
   sleep 0.25
 done
@@ -300,8 +377,14 @@ fi
 #
 # The executing image is the only ground truth: the inode the new server has
 # mapped as its text segment must equal the inode of the file we imported.
-DISK_INO="$(stat -f %i "$IMPORT_EXE" 2>/dev/null)"
+DISK_INO="$(file_inode "$IMPORT_EXE")"
 MAPPED_INO="$(lsof -p "$NEW_PID" -a -d txt 2>/dev/null | awk 'NR>1{print $(NF-1)}' | head -1)"
+# Linux: /proc is authoritative and needs no lsof. Note the running image may be
+# an unlinked inode after a `mv`, which is precisely the mismatch this gate is
+# built to catch, so resolve it via the pid's own view, not the path.
+if [[ -z "$MAPPED_INO" && -r "/proc/$NEW_PID/exe" ]]; then
+  MAPPED_INO="$(stat -L -c %i "/proc/$NEW_PID/exe" 2>/dev/null)"
+fi
 log "inode check: import_exe=$DISK_INO mapped_by_$NEW_PID=$MAPPED_INO"
 if [[ -z "$MAPPED_INO" || -z "$DISK_INO" ]]; then
   log "WARN: could not read both inodes — swap NOT verified"
