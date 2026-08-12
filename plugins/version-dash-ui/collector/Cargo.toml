@@ -2,7 +2,8 @@
 # (not the sibling wasm `version-dash-ui` nested workspace) so it builds into
 # `<workspace>/target/release/version-dash-collector`. It is NOT referenced by a
 # `collector` manifest field (that routes only through the usage-dash tick);
-# instead a LaunchAgent runs it on a 10-minute cadence — see ../scripts/.
+# instead a per-user scheduled job (launchd on macOS, a systemd user timer on
+# Linux) runs it on a 10-minute cadence — see ../scripts/.
 [package]
 name = "version-dash-collector"
 version = "0.1.0"

@@ -1,5 +1,4 @@
 [env]
-ZIG = "/opt/homebrew/opt/zig@0.15/bin/zig"
 # Marks every build from this tree as a custom fork build. `force = true` so a
 # stray environment value cannot accidentally clear it. It gates only the
 # self-update refusal (`herdr update`/`herdr channel` abort on fork builds, which

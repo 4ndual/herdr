@@ -7,6 +7,10 @@ description = "usage-dash data + render core, embeddable in herdr (Phase 2 fills
 
 [dependencies]
 herdr-ui-plugin-api = { path = "../herdr-ui-plugin-api" }
+# Local-timezone + calendar math. Already in the workspace tree (goal-dash-core
+# depends on the same version/features), so this adds no new dependency — it
+# replaces `date(1)` shell-outs that only ever worked with the BSD/macOS flags.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 usage-dash-model = { path = "../usage-dash-model" }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 serde = { version = "1", features = ["derive"] }

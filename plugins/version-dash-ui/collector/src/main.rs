@@ -1,6 +1,7 @@
 //! Out-of-process version-dash collector.
 //!
-//! Run on a cadence (a 10-minute LaunchAgent — see ../scripts/), it:
+//! Run on a cadence (every 10 minutes, from a launchd agent on macOS or a
+//! systemd user timer on Linux — see ../scripts/), it:
 //!   1. fetches the release-channel manifest (`herdr.dev/latest.json`) with
 //!      `curl`, the same URL the in-app updater uses, to learn the latest stable
 //!      version + release-notes URL;
@@ -65,10 +66,13 @@ const SOCK_TIMEOUT: Duration = Duration::from_millis(750);
 /// 10-minute cadence. Overridable with `HERDR_VERSION_STALE_SECS`.
 const DEFAULT_STALE_SECS: u64 = 1800;
 
-/// Default fork source checkout used for the local-changes git count.
+/// Default fork source checkout used for the local-changes git count, relative
+/// to `$HOME`. Point `HERDR_VERSION_GIT_REPO` at the real checkout on machines
+/// that keep it elsewhere; when neither resolves to a git repo the count is
+/// simply absent, never fatal.
 const DEFAULT_GIT_REPO: &str = "Projects/herdr";
-/// Default per-instance binary + socket layout on Andres's machine. Every path is
-/// env-overridable so the sandbox E2E can point at throwaway clones.
+/// Default per-instance binary + socket layout. Every path is env-overridable so
+/// the sandbox E2E can point at throwaway clones.
 const DEFAULT_HR_BIN: &str = ".herdr-hr/bin/herdr";
 /// XDG roots, used to ask each instance's running server what it executes.
 const DEFAULT_HR_ROOT: &str = ".herdr-hr";
@@ -1055,7 +1059,7 @@ fn output_path() -> PathBuf {
 }
 
 /// Replicate herdr's `config::state_dir()`: `$XDG_STATE_HOME/herdr` when set,
-/// else the platform default. The version-dash LaunchAgent exports the hr
+/// else the platform default. The version-dash scheduled job exports the hr
 /// instance's `XDG_STATE_HOME`, so the file lands where the hr host reads it.
 fn state_dir() -> PathBuf {
     if let Some(xdg) = env_nonempty("XDG_STATE_HOME") {
@@ -1268,6 +1272,8 @@ mod tests {
         let m = Manifest {
             version: "0.7.2".into(),
             assets,
+            notes: None,
+            releases: std::collections::HashMap::new(),
         };
         assert_eq!(
             notes_url_from_manifest(&m).as_deref(),
@@ -1282,6 +1288,8 @@ mod tests {
         let m = Manifest {
             version: "0.7.2".into(),
             assets,
+            notes: None,
+            releases: std::collections::HashMap::new(),
         };
         assert_eq!(notes_url_from_manifest(&m), None);
     }
@@ -1325,15 +1333,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_binary_resolves_unknown_not_broken_for_hr() {
-        // hr has no socket ⇒ never broken; a missing binary is Unknown.
+    fn missing_binary_is_broken_even_without_socket() {
+        // Broken is a property of the binary, not of a process (see
+        // resolve_instance): a file that will not report its version is Broken
+        // for hr too — liveness only ever reaches `detail`, never the glyph.
         let cfg = InstanceCfg {
             label: "hr",
             bin: PathBuf::from("/nonexistent/herdr-bin-xyz"),
             sock: None,
+            root: None,
+            session: None,
         };
-        let status = resolve_instance(&cfg, Some("0.7.5"));
-        assert_eq!(status.state, InstanceState::Unknown);
+        let status = resolve_instance(&cfg, Some("0.7.5"), &std::env::temp_dir(), None);
+        assert_eq!(status.state, InstanceState::Broken);
         assert_eq!(status.version, None);
         assert_eq!(status.local_changes, None);
     }
@@ -1356,8 +1368,10 @@ mod tests {
             label: "test",
             bin: PathBuf::from("/nonexistent/herdrtest-xyz"),
             sock: Some(PathBuf::from("/nonexistent/herdr.sock")),
+            root: None,
+            session: None,
         };
-        let status = resolve_instance(&cfg, Some("0.7.5"));
+        let status = resolve_instance(&cfg, Some("0.7.5"), &std::env::temp_dir(), None);
         assert_eq!(status.state, InstanceState::Broken);
     }
 }

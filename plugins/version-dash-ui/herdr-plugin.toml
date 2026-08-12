@@ -30,7 +30,7 @@ capabilities = ["layout_read", "focused_session", "toasts", "plugin_actions"]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
 # out-of-process `version-dash-collector` writes it on a 10-minute cadence (via a
-# LaunchAgent — see scripts/), so there is NO in-host writer and NO `collector`
+# scheduled user job — see scripts/), so there is NO in-host writer and NO `collector`
 # manifest field (that field routes exclusively through the usage-dash tick).
 #
 # v1 +N caveat: the `+N` local-changes count is git-source-derived
