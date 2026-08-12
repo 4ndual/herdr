@@ -261,6 +261,16 @@ impl App {
                     "cleared pane text layers owned by unlinked plugin"
                 );
             }
+            // Carved bands leave with their owner too — otherwise the pane
+            // stays shrunk with nothing on screen to blame (pane_carve §3).
+            let cleared_carves = self.state.clear_pane_carves_for_owner(&source);
+            if cleared_carves > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared = cleared_carves,
+                    "released pane carves owned by unlinked plugin"
+                );
+            }
         }
         if removed {
             // fork(wave-2): unmount the unlinked plugin's UI modules from the
@@ -920,6 +930,16 @@ impl App {
                     plugin_id = %plugin_id,
                     cleared = cleared_text,
                     "cleared pane text layers owned by disabled plugin"
+                );
+            }
+            // Carved bands leave with their owner too — otherwise the pane
+            // stays shrunk with nothing on screen to blame (pane_carve §3).
+            let cleared_carves = self.state.clear_pane_carves_for_owner(&source);
+            if cleared_carves > 0 {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    cleared = cleared_carves,
+                    "released pane carves owned by disabled plugin"
                 );
             }
         }
