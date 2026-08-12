@@ -37,6 +37,17 @@ if [[ "${_HERDR_FULL_RESTART_DETACHED:-}" != "1" ]]; then
   exit 0
 fi
 
+# Shared helpers, sourced only in the DETACHED run (the first pass does nothing
+# but re-exec). Provides exe_path / socket_pid / socket_pids / instance_binary —
+# the process resolution that makes this script work on Linux — plus
+# desktop_notify, which matters more here than anywhere else: this script kills
+# the agents too, so a failure leaves the user with nothing left to toast into.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "full-restart: dash-common.sh missing" >&2; exit 3; }
+
+# Redefine AFTER sourcing: this script's stdout is already the log file (nohup
+# above), so it logs by printing, not by appending to $LOG a second time.
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
 # ---------------------------------------------------------------------------
@@ -76,7 +87,11 @@ log "socket: $SOCK"
 # ---------------------------------------------------------------------------
 # 2. Detect the live server: pid, binary, XDG roots, tmux host session.
 # ---------------------------------------------------------------------------
-SERVER_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+# socket_pid (not `lsof -t | head -1`): the server's own CLIENTS hold this socket
+# too, so head -1 was a coin flip between the server and whoever connected to it.
+# Getting this wrong is far worse here than in the soft restart — SERVER_PID is
+# the ROOT of the subtree this script hard-kills. See dash-common.sh.
+SERVER_PID="$(socket_pid "$SOCK")"
 
 BIN=""
 XDG_STATE=""
@@ -90,7 +105,6 @@ pid_env() { ps eww "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 "^$2=" | cut -d= -f
 CLIENT_PID=""
 if [[ -n "$SERVER_PID" ]]; then
   log "live server pid: $SERVER_PID"
-  BIN="$(ps -o comm= -p "$SERVER_PID" 2>/dev/null | sed 's/ server$//')"
   XDG_STATE="$(pid_env "$SERVER_PID" XDG_STATE_HOME)"
   XDG_DATA="$(pid_env "$SERVER_PID" XDG_DATA_HOME)"
   CLIENT_PID="$(ps -o ppid= -p "$SERVER_PID" 2>/dev/null | tr -d ' ')"
@@ -106,13 +120,19 @@ else
   log "no live server on socket (already dead/hung with stale socket)"
 fi
 
+# The binary to relaunch with: the live server's real image (via /proc on Linux,
+# `ps -o comm=` on macOS), else the host-injected $HERDR_BIN_PATH, else PATH.
+# This used to be `ps -o comm=` with a hardcoded ~/Projects fallback, which on
+# Linux yielded the bare string "herdr" — non-empty, so the fallback never fired,
+# and not executable, so the relaunch line pointed at nothing.
+BIN="$(instance_binary "$SERVER_PID")"
+
 # Fallbacks by convention when the live server couldn't supply a value.
-[[ -z "$BIN"        ]] && BIN="$HOME/Projects/herdr/target/release/herdr"
 [[ -z "$XDG_STATE"  ]] && XDG_STATE="$HOME/.herdr-${SESSION}/state"
 [[ -z "$XDG_DATA"   ]] && XDG_DATA="$HOME/.herdr-${SESSION}/data"
 [[ -z "$TMUX_HOST"  ]] && TMUX_HOST="${SESSION}-host"
 
-log "binary: $BIN"
+log "binary: ${BIN:-<unresolved>}"
 log "xdg: config=$CFG state=$XDG_STATE data=$XDG_DATA"
 log "tmux host: $TMUX_HOST  geom=${GEOM_X}x${GEOM_Y}"
 
@@ -229,8 +249,12 @@ old_mark=()
 for p in "${VICTIMS[@]:-}"; do [[ -n "$p" ]] && old_mark[$p]=1; done
 [[ -n "${SERVER_PID:-}" ]] && old_mark[$SERVER_PID]=1
 for _ in 1 2 3 4 5; do
-  STRAG="$(lsof -t "$SOCK" 2>/dev/null)"
-  [[ -z "$STRAG" ]] && break
+  # socket_pids matches the socket's NAME field (see dash-common.sh). The
+  # old_mark gate below is the real safety net here — it already refused to kill
+  # anything that was not part of the old world — but the two together mean this
+  # loop cannot reach an unrelated process even if lsof reports one.
+  STRAG="$(socket_pids "$SOCK" | tr '\n' ' ')"
+  [[ -z "${STRAG// /}" ]] && break
   killed_any=0
   for sp in $STRAG; do
     if [[ -n "${old_mark[$sp]:-}" ]]; then
@@ -278,7 +302,7 @@ log "old instance is fully down"
 # repaints itself, no detached tmux.
 NEW_PID=""
 for _ in $(seq 1 48); do   # ~12s: client exit + settle(0.5) + fresh server boot
-  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  NEW_PID="$(socket_pid "$SOCK")"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
     break
   fi
@@ -301,16 +325,24 @@ LAUNCHER="$HOME/.local/bin/$SESSION"
 if [[ -x "$LAUNCHER" ]]; then
   LAUNCH_CMD="$LAUNCHER"
   log "fallback relaunch via launcher: $LAUNCHER"
-else
+elif [[ -n "$BIN" ]]; then
   LAUNCH_CMD="env XDG_CONFIG_HOME=$CFG XDG_STATE_HOME=$XDG_STATE XDG_DATA_HOME=$XDG_DATA HERDR_SESSION=$SESSION $BIN --session $SESSION"
   log "fallback relaunch via reconstructed exec line"
+else
+  # Refuse to build a launch line around an empty/bogus binary path. This script
+  # has just hard-killed the agents; a tmux session running a nonexistent command
+  # would leave the user with everything dead and no explanation anywhere.
+  log "FATAL: no herdr binary resolved for session $SESSION — cannot relaunch"
+  desktop_notify "herdr full restart FAILED" \
+    "'$SESSION' and its agents were stopped but no herdr binary could be resolved to relaunch it"
+  exit 6
 fi
 
 tmux kill-session -t "$TMUX_HOST" 2>/dev/null
 tmux new-session -d -s "$TMUX_HOST" -x "$GEOM_X" -y "$GEOM_Y" "$LAUNCH_CMD"
 
 for _ in $(seq 1 40); do
-  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  NEW_PID="$(socket_pid "$SOCK")"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
     break
   fi
@@ -321,6 +353,10 @@ if [[ -n "$NEW_PID" ]]; then
   log "FULL RESTART OK (detached-tmux fallback): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
   exit 0
 else
+  # herdr and its agents are gone, so a herdr toast is impossible by definition —
+  # go straight to the desktop notifier.
   log "ERROR: new server did not come up on $SOCK"
+  desktop_notify "herdr full restart FAILED" \
+    "'$SESSION' was stopped but no new server came up on its socket — see $LOG"
   exit 5
 fi

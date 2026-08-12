@@ -27,72 +27,39 @@
 set -u
 
 LOG="${HERDR_RELOCATE_LOG:-$HOME/.herdr-relocate.log}"
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "relocate: dash-common.sh missing" >&2; exit 3; }
+
 PICK_SCRIPT="$SCRIPT_DIR/relocate-pick.sh"
-
-# ---------------------------------------------------------------------------
-# 0. Resolve the herdr client binary (prefer the fork build; never assume PATH).
-#    PATH LAST, deliberately: `command -v herdr` resolves to ~/.local/bin/herdr,
-#    a symlink to a June-19 pre-prod build missing this fork's subcommands.
-# ---------------------------------------------------------------------------
-HERDR=""
-for cand in "${HERDR_BIN:-}" \
-  "$HOME/.herdr-hr/bin/herdr" \
-  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
-  "$HOME/Projects/herdr/target/release/herdr" \
-  "$(command -v herdr 2>/dev/null)"; do
-  if [[ -n "$cand" && -x "$cand" ]]; then
-    HERDR="$cand"
-    break
-  fi
-done
-
-hd() { "$HERDR" "$@"; }
-
-toast() {
-  local title="$1" body="${2:-}"
-  log "TOAST: $title — $body"
-  [[ -n "$HERDR" ]] || return 0
-  hd notification show "$title" ${body:+--body "$body"} >>"$LOG" 2>&1 || true
-}
 
 if [[ -z "$HERDR" ]]; then
   log "FATAL: no herdr binary found"
+  desktop_notify "Relocate failed" "no herdr binary found"
   exit 3
 fi
 
-if ! command -v jq >/dev/null 2>&1; then
-  for j in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq; do
-    [[ -x "$j" ]] && { export PATH="$(dirname "$j"):$PATH"; break; }
-  done
-fi
-command -v jq >/dev/null 2>&1 || { toast "Relocate failed" "jq not found"; exit 3; }
+command -v jq >/dev/null 2>&1 || { toast "Relocate failed" "jq is not installed"; exit 3; }
 
 # The migration itself belongs to the relocate skill. Overridable, absolute
 # default — never a relative path escape.
 MIGRATE="${HERDR_RELOCATE_MIGRATE:-$HOME/.claude/skills/relocate/scripts/migrate-session.sh}"
 if [[ ! -f "$MIGRATE" ]]; then
-  toast "Relocate failed" "relocate skill not installed (migrate-session.sh missing)"
+  toast "Relocate unavailable" \
+    "the relocate skill is not installed — expected migrate-session.sh at $MIGRATE (override with HERDR_RELOCATE_MIGRATE)"
   exit 3
 fi
 [[ -x "$PICK_SCRIPT" ]] || { toast "Relocate failed" "relocate-pick.sh missing or not executable"; exit 3; }
 
 # ---------------------------------------------------------------------------
-# 1. Resolve the SOURCE pane (button: HERDR_PANE_ID; hotkey: focused pane).
+# 1. Resolve the SOURCE pane (button: HERDR_PANE_ID; tab context: focused pane).
 # ---------------------------------------------------------------------------
-PANE="${HERDR_PANE_ID:-}"
-if [[ -z "$PANE" ]]; then
-  PANE="$(hd pane list 2>/dev/null | jq -r '.result.panes[] | select(.focused) | .pane_id' | head -1)"
-fi
-if [[ -z "$PANE" || "$PANE" == "null" ]]; then
+if ! PANE="$(current_pane)"; then
   toast "Relocate failed" "could not resolve the current pane"
   exit 4
 fi
 
-PANE_JSON="$(hd pane get "$PANE" 2>/dev/null)"
-if [[ $? -ne 0 || -z "$PANE_JSON" ]]; then
+if ! PANE_JSON="$(hd pane get "$PANE" 2>/dev/null)" || [[ -z "$PANE_JSON" ]]; then
   toast "Relocate failed" "could not read the current pane"
   exit 4
 fi
@@ -114,9 +81,10 @@ log "pane=$PANE agent=$AGENT sid=$SID cwd=$CWD"
 #    slug + `--resume`); codex/pi store sessions differently.
 # ---------------------------------------------------------------------------
 case "$AGENT" in
-  claude) ;;
+  # "cx" is a cosmetic display label for Claude Code, not a separate runtime.
+  claude | cx) ;;
   "") toast "Relocate: no agent here" "This pane has no Claude conversation to relocate."; exit 0 ;;
-  *)  toast "Relocate not available" "Relocation is a Claude Code mechanism — this pane runs '$AGENT'."; exit 0 ;;
+  *)  toast "Relocate is claude only" "Relocation rewrites a Claude Code transcript slug — this pane runs '$AGENT', which stores its sessions differently."; exit 0 ;;
 esac
 
 if [[ -z "$SID" ]]; then
@@ -125,22 +93,18 @@ if [[ -z "$SID" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Find the transcript. A cx (GPT-via-CCR) session's transcript lives ONLY
-#    under the CCR profile dir; herdr labels cx and daily claude identically, so
-#    discriminate by WHERE the file is — the same signal cx-resume uses. This
-#    also selects the projects root the migration must write into.
+# 3. Find the transcript under the single Claude Code projects root. This also
+#    names the projects root the migration must write into, which the picker
+#    passes through to migrate-session.sh as CLAUDE_PROJECTS_DIR.
 # ---------------------------------------------------------------------------
-CCR_DIR="${CCR_DIR:-$HOME/.claude-code-router/profiles/default-claude-code/claude}"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 PROJECTS_DIR=""
 TRANSCRIPT=""
-for base in "$HOME/.claude" "$CCR_DIR"; do
-  found="$(find "$base/projects" -maxdepth 2 -type f -name "$SID.jsonl" 2>/dev/null | head -1)"
-  if [[ -n "$found" ]]; then
-    PROJECTS_DIR="$base/projects"
-    TRANSCRIPT="$found"
-    break
-  fi
-done
+found="$(find "$CLAUDE_DIR/projects" -maxdepth 2 -type f -name "$SID.jsonl" 2>/dev/null | head -1)"
+if [[ -n "$found" ]]; then
+  PROJECTS_DIR="$CLAUDE_DIR/projects"
+  TRANSCRIPT="$found"
+fi
 if [[ -z "$TRANSCRIPT" ]]; then
   toast "Relocate failed" "no transcript on disk for session $SID"
   exit 6

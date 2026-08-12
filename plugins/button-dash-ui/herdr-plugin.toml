@@ -39,7 +39,7 @@ command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/full-restart-herdr.s
 # handoff-hr: NON-DESTRUCTIVE server swap. Unlike restart-hr / full-restart, this
 # does NOT kill anything: it asks the running server to transfer live pane PTY
 # master fds (SCM_RIGHTS) to a replacement server spawned from the promoted binary,
-# so `claude`/`cx` panes keep the SAME pids and every in-flight subagent survives.
+# so agent panes keep the SAME pids and every in-flight subagent survives.
 # Use after `mv`-ing a freshly E2E'd binary into place. On ANY failure it toasts and
 # changes nothing — it deliberately never falls back to a kill, because not killing
 # the agents is the entire point of the button. Same detach model as the restart
@@ -55,11 +55,18 @@ contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/handoff-herdr.sh\" >/dev/null 2>&1 &"]
 
 # fork: fork the CURRENT pane's agent conversation into a NEW TAB (current
-# workspace). Works for claude/cx/codex/pi by reusing herdr's own resume
-# convention + each agent's fork flag (see scripts/fork-conversation.sh). The
-# script reads the source pane from the inherited HERDR_PANE_ID and resolves the
-# agent/session/cwd live via `herdr pane get`. Detached so it outlives the action
-# runner (it does socket work only; nothing is killed, unlike the restart buttons).
+# workspace), by reusing herdr's own resume convention + each agent's fork flag:
+#   claude -> claude --resume <id> --fork-session
+#   codex  -> codex fork <id>
+#   pi     -> pi --fork <id>
+#   jcode  -> REFUSED with a toast; jcode has no fork flag, and resuming the same
+#             session in a second pane is two writers on one conversation, not a
+#             branch. The single source of truth is `agent_launch_cmd` in
+#             scripts/dash-common.sh, shared with the archive dash.
+# The script reads the source pane from the inherited HERDR_PANE_ID and resolves
+# the agent/session/cwd live via `herdr pane get`; from the TAB menu that env var
+# is absent by design, so it falls back to the focused pane. Detached so it
+# outlives the action runner (socket work only; nothing is killed).
 [[actions]]
 id = "fork"
 title = "Fork → tab"
@@ -73,83 +80,38 @@ title = "Fork → workspace"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh\" workspace >/dev/null 2>&1 &"]
 
-# resume-in-cx: fork the CURRENT claude pane's conversation into a NEW TAB running
-# UNDER cx (GPT-via-CCR gateway), leaving the original conversation untouched (see
-# scripts/resume-in-cx.sh). Claude-family panes only; codex/pi/terminal get a toast.
-# Detached so it outlives the action runner (socket work only; nothing is killed).
-[[actions]]
-id = "resume-in-cx"
-title = "Resume in cx"
-contexts = ["tab", "pane"]
-command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/resume-in-cx.sh\" >/dev/null 2>&1 &"]
-
-# resume-search: open the resume-search picker (searches ALL claude-family
-# transcripts) in a NEW TAB whose root pane runs the picker; on Enter/click it
-# execs the resumed session into that same pane (see
-# ../resume-picker/bin/resume-picker.sh). A plain terminal pane runs it in place.
-# Detached so it outlives the action runner (socket work only; nothing is killed).
+# resume-search: open the resume-search picker as an in-app overlay; on
+# Enter/click it execs the resumed session into a pane.
+#
+# The picker is a SEPARATE standalone bun tool, not part of this repo, so the
+# script only resolves its wrapper path and hands it to `herdr resume-picker
+# open --wrapper`. Resolution is configuration-free ($HERDR_PLUGIN_ROOT-relative,
+# then this script's own dir, then PATH) with $HERDR_RESUME_PICKER_WRAPPER as the
+# override; when it is not installed the button toasts that plainly instead of
+# failing silently. Detached so it outlives the action runner.
 [[actions]]
 id = "resume-search"
 title = "Resume search"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-resume-picker.sh\" >/dev/null 2>&1 &"]
 
-# remote: enable Claude Code Remote Control on the CURRENT pane's LIVE conversation
-# so it can be continued from the phone / claude.ai. For a claude orchestrator it
-# types the `/remote-control` slash command into the running agent; codex/cx/pi
-# panes get a toast (the phone can't bridge into a non-claude orchestrator). See
-# scripts/remote-control.sh. Detached so it outlives the action runner.
+# remote: CLAUDE ONLY. Enable Claude Code Remote Control on the CURRENT pane's
+# LIVE conversation so it can be continued from the phone / claude.ai. For a
+# claude pane it types the `/remote-control` slash command into the running
+# agent; codex, pi and jcode panes get one plain toast saying so, because Remote
+# Control is a Claude Code feature with no equivalent elsewhere — a claude
+# orchestrator can still call those agents locally. See scripts/remote-control.sh.
+# Detached so it outlives the action runner.
 [[actions]]
 id = "remote"
 title = "Remote"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/remote-control.sh\" >/dev/null 2>&1 &"]
 
-# refresh-cx-token: re-sync the CCR gateway's Claude-Plan OAuth token from the
-# daily Keychain credential. CCR has no Anthropic refresh executor, so when its
-# copied access token expires every Claude-via-gateway request 401s and a LIVE cx
-# session cannot recover — the only other re-sync runs at cx launch. This button
-# is the manual in-place fix (the underlying script is documented MANUAL ONLY;
-# never schedule it). Daily `claude` is direct-to-Anthropic and unaffected; the
-# token value is never printed. Detached like the siblings: it does RPC work only
-# and kills nothing, but detaching keeps the action runner free while the gateway
-# hot-swaps its config (~1s).
-#
-# Invokes the Bun script DIRECTLY (2026-07-28): the former scripts/refresh-cx-token.sh
-# wrapper only resolved the herdr binary, toasted and logged — all of which now live
-# in the script itself behind `--toast`, so the wrapper was a layer that could drift
-# out of sync with the thing it wrapped. `--quiet` keeps stdout silent on the
-# idempotent no-op; the toast/log carry the outcome. `sh -lc` remains for nohup
-# detachment and to pick up bun from the login PATH (the pkg-guard shim), with a
-# literal fallback so a PATH-less action environment still works. CMIX_REFRESH_TOKEN
-# overrides the script path; the script is owned by the cmix repo, not by herdr.
-[[actions]]
-id = "refresh-cx-token"
-title = "Refresh cx token"
-contexts = ["tab", "pane"]
-command = ["sh", "-lc", '''nohup "$(command -v bun || echo "$HOME/.bun/bin/bun")" "${CMIX_REFRESH_TOKEN:-$HOME/cmix/scripts/refresh-claude-token.ts}" --toast --quiet >/dev/null 2>&1 &''']
-
-# draw-screenshot: toggle a BLANK draw-on-screen overlay (our own scripts/
-# draw-overlay helper — floats over ANY Space incl. native fullscreen), then
-# capture the annotated screen and fully close it (see scripts/draw-screenshot.sh).
-# Press once to start drawing on-screen; press again (or RETURN) to screenshot +
-# close, ESC cancels. Detached so it outlives the action runner. Needs Screen
-# Recording (screencapture) permission for the herdr process.
-[[actions]]
-id = "draw-screenshot"
-title = "Draw + screenshot"
-contexts = ["tab", "pane"]
-command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" >/dev/null 2>&1 &"]
-
-# draw-screenshot-region: same toggle, but the finishing capture is an
-# interactive drag-selection (screencapture -i) instead of instant fullscreen.
-[[actions]]
-id = "draw-screenshot-region"
-title = "Draw + screenshot (region)"
-contexts = ["tab", "pane"]
-command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/draw-screenshot.sh\" region >/dev/null 2>&1 &"]
-
-# bg-dispatch: dispatch a Claude Code BACKGROUND agent (`claude --bg "<prompt>"`,
+# bg-dispatch: CLAUDE ONLY (a `--bg` primitive exists nowhere else), and
+# deliberately independent of the source pane's agent — only its cwd is
+# inherited, so you can dispatch a background agent from a codex or pi pane.
+# Dispatches a Claude Code BACKGROUND agent (`claude --bg "<prompt>"`,
 # detached; manage with `claude agents`). `--bg` REQUIRES a prompt and a herdr
 # button cannot take typed input (UiEvent::Key does not reach panel modules), so
 # the button opens a NEW TAB whose root pane runs scripts/bg-prompt.sh — the
@@ -162,10 +124,12 @@ title = "Background agent"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/bg-dispatch.sh\" >/dev/null 2>&1 &"]
 
-# relocate: move the CURRENT pane's Claude conversation to the project it is
+# relocate: CLAUDE ONLY — it rewrites a Claude Code transcript slug, and codex /
+# pi / jcode store sessions differently; those panes get a toast. Move the
+# CURRENT pane's conversation to the project it is
 # actually about. Claude Code has no mid-session `cd`, so this drives the
 # `relocate` skill's migrate-session.sh (transcript + subagents copied into the
-# target dir's slug) and then resumes there via cx-resume. The destination is
+# target dir's slug) and then resumes there via `claude --resume`. The destination is
 # INFERRED from the transcript — ranked by distinct files touched per git repo —
 # but never auto-picked: the script opens a tab listing the candidates and the
 # user chooses (see scripts/relocate-conversation.sh). Detached like the
@@ -203,14 +167,21 @@ capabilities = ["layout_read", "toasts", "api_read", "api_write", "mouse_all"]
 # This reproduces the old BottomDash result exactly: a snug slot on the RIGHT of
 # the usage band, leaving the usage dash at least 24 columns.
 [ui_modules.placement]
-# Fixed width (not "auto"): the compact GRID wraps 4 buttons per row (~43
-# cells wide); a fixed 45-cell slot means the panel NEVER resizes when a hover tooltip /
-# expanded list appears, so the buttons can't shift horizontally on hover (the
-# tooltip rows are kept narrower than the strip — see detail_spans). "auto"
-# regrew the panel to the widest row each frame, which moved the buttons under
-# the cursor. Bump this if you add buttons.
+# Fixed width (not "auto"): the compact GRID wraps 4 buttons per row, so a fixed
+# slot means the panel NEVER resizes when a hover tooltip / expanded list appears
+# and the buttons can't shift horizontally under the cursor (the tooltip rows are
+# kept narrower than the strip — see detail_spans). "auto" regrew the panel to the
+# widest row each frame, which moved the buttons under the cursor.
+#
+# 42 = the widest rendered grid row for the current 10 buttons + toggle. It is
+# NOT a free-hand number: the guest computes the same value in widest_grid_row()
+# and the `manifest_panel_size_matches_grid` test reads this key and fails with
+# the correct replacement when they disagree. Too small clips the strip; too
+# large silently steals columns from the usage dash sharing this band (it kept
+# 45 for a while after four buttons were deleted). Run `cargo test` after adding
+# or removing a button and use the number it prints.
 region = "bottom_band"
 align = "end"
-size = "45"
+size = "42"
 min_peer = 24
 z = 60

@@ -61,82 +61,42 @@ struct ButtonDef {
     plugin: &'static str,
 }
 
+/// ORDER IS THE UI. The grid wraps at [`BUTTONS_PER_ROW`], so this array is
+/// read left-to-right, top-to-bottom, and it is grouped on purpose:
+///
+///   rows 1-2 — act on the CONVERSATION in the focused pane (fork, resume,
+///              relocate, archive, background agent, remote). Non-destructive:
+///              the worst case is an extra tab.
+///   row 3   — act on HERDR ITSELF, ending with the two that kill processes.
+///              They sit last so the pointer never crosses `Full restart` on
+///              the way to `Fork`, and so the destructive pair reads as one
+///              group rather than as three unrelated lifecycle buttons
+///              scattered through the strip.
+///
+/// Per-agent support is stated in each `description` because it genuinely
+/// differs — `Remote` and `Background agent` are Claude Code features, `fork`
+/// covers three of the four runtimes, and jcode has no fork primitive at all.
+/// The backing scripts refuse (and toast) rather than guess; see
+/// scripts/dash-common.sh `agent_launch_cmd`.
 static BUTTONS: &[ButtonDef] = &[
-    ButtonDef {
-        id: "restart-hr",
-        label: "Restart hr",
-        emoji: "\u{1F504}",            // 🔄
-        shortcut: "\u{2303}\u{2325}X", // ⌃⌥X
-        color: "blue",
-        description: "Fully kill & relaunch this herdr instance, restoring the session",
-        action_id: "restart-hr",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "handoff-hr",
-        label: "Handoff hr",
-        emoji: "\u{1F91D}",            // 🤝
-        shortcut: "\u{2303}\u{2325}H", // ⌃⌥H
-        // `warning` resolves to palette.yellow, the same swatch as draw-screenshot.
-        // Every canonically-distinct role is already spoken for (see the allow-list
-        // in the tests below), and warning/yellow is the least misleading of the
-        // remaining pairings: red would sit this button next to full-restart, which
-        // reads as "destructive" — the opposite of what it is.
-        color: "warning",
-        description:
-            "Swap in the new binary WITHOUT killing panes — agents and subagents keep running",
-        action_id: "handoff-hr",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "full-restart",
-        label: "Full restart",
-        emoji: "\u{267B}\u{FE0F}",              // ♻️
-        shortcut: "\u{2303}\u{2325}\u{21E7}X",  // ⌃⌥⇧X
-        color: "red",
-        description:
-            "Hard kill tmux + Claude Code + server (reclaim all RAM), relaunch fresh & resume",
-        action_id: "full-restart",
-        plugin: PLUGIN_ID,
-    },
     ButtonDef {
         id: "fork",
         label: "Fork",
         emoji: "\u{1F374}",            // 🍴
         shortcut: "\u{2303}\u{2325}F", // ⌃⌥F
         color: "green",
-        description: "Fork this conversation into a new TAB (claude/cx/codex/pi)",
+        description: "Fork this conversation into a new TAB — claude, codex and pi; jcode has no fork flag and is refused",
         action_id: "fork",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
         id: "fork-workspace",
         label: "Fork \u{2192} workspace",
-        emoji: "\u{1F531}",                     // 🔱
-        shortcut: "\u{2303}\u{2325}\u{21E7}F",  // ⌃⌥⇧F
+        emoji: "\u{1F531}",                    // 🔱
+        shortcut: "\u{2303}\u{2325}\u{21E7}F", // ⌃⌥⇧F
         color: "mauve",
-        description: "Fork this conversation into a new WORKSPACE (claude/cx/codex/pi)",
+        description: "Fork this conversation into a new WORKSPACE — claude, codex and pi; jcode has no fork flag and is refused",
         action_id: "fork-workspace",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "resume-in-cx",
-        label: "Resume in cx",
-        emoji: "\u{1F916}",            // 🤖
-        shortcut: "\u{2303}\u{2325}C", // ⌃⌥C
-        color: "accent",
-        description: "Fork this claude conversation into a new TAB running under cx (GPT-via-CCR)",
-        action_id: "resume-in-cx",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "refresh-cx-token",
-        label: "Refresh cx token",
-        emoji: "\u{1F511}",            // 🔑
-        shortcut: "\u{2303}\u{2325}T", // ⌃⌥T
-        color: "cyan",
-        description: "Re-sync the CCR gateway's Claude token from the Keychain — fixes a live cx session 401ing, no relaunch",
-        action_id: "refresh-cx-token",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
@@ -145,58 +105,8 @@ static BUTTONS: &[ButtonDef] = &[
         emoji: "\u{1F50E}", // 🔎
         shortcut: "\u{2303}\u{2325}S", // ⌃⌥S (display only; spec proposed ⌃⌥R but that already binds Remote)
         color: "muted",
-        description: "Search ALL claude-family transcripts and resume the picked session in the same pane",
+        description: "Search Claude Code transcripts and resume the picked session (needs the resume-picker overlay installed)",
         action_id: "resume-search",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "remote",
-        label: "Remote",
-        emoji: "\u{1F4F1}",            // 📱
-        shortcut: "\u{2303}\u{2325}R", // ⌃⌥R
-        color: "subtext",
-        description: "Enable Remote Control (/remote-control) to continue this claude session from the phone / claude.ai",
-        action_id: "remote",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "draw-screenshot",
-        label: "Draw + shot",
-        emoji: "\u{1F58A}\u{FE0F}",    // 🖊️
-        shortcut: "\u{2325}\u{21E7}5", // ⌥⇧5
-        color: "yellow",
-        description: "Toggle a blank DrawPen overlay to draw on-screen; press again to screenshot + close",
-        action_id: "draw-screenshot",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "draw-screenshot-region",
-        label: "Draw + shot (region)",
-        emoji: "\u{1F4D0}",                     // 📐
-        shortcut: "\u{2325}\u{21E7}4",  // ⌥⇧4
-        color: "peach",
-        description: "Same overlay toggle, but finish by drag-selecting the capture region",
-        action_id: "draw-screenshot-region",
-        plugin: PLUGIN_ID,
-    },
-    ButtonDef {
-        id: "archive",
-        label: "Archive pane",
-        emoji: "\u{1F5C4}\u{FE0F}",   // 🗄️
-        shortcut: "\u{2303}\u{2325}A", // ⌃⌥A
-        color: "teal",
-        description: "Close the current pane and save it to the archive widget (restorable)",
-        action_id: "archive",
-        plugin: "builtin.archive-dash",
-    },
-    ButtonDef {
-        id: "bg-dispatch",
-        label: "Background agent",
-        emoji: "\u{1F680}",            // 🚀
-        shortcut: "\u{2303}\u{2325}B", // ⌃⌥B
-        color: "magenta",
-        description: "Open a pane to type a prompt, then dispatch it as a detached background agent (claude --bg)",
-        action_id: "bg-dispatch",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
@@ -211,8 +121,77 @@ static BUTTONS: &[ButtonDef] = &[
         // somewhere else" buttons, so sharing a hue reads as a family rather
         // than as a mistake. Their glyphs (🍴 vs 📦) carry the distinction.
         color: "success",
-        description: "Move this conversation to the project it is actually about, and continue it there",
+        description: "Move this conversation to the project it is actually about and continue it there (claude only)",
         action_id: "relocate",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "archive",
+        label: "Archive pane",
+        emoji: "\u{1F5C4}\u{FE0F}",    // 🗄️
+        shortcut: "\u{2303}\u{2325}A", // ⌃⌥A
+        color: "teal",
+        description: "Close the current pane and save it to the archive widget, restorable for claude, codex and pi",
+        action_id: "archive",
+        plugin: "builtin.archive-dash",
+    },
+    ButtonDef {
+        id: "bg-dispatch",
+        label: "Background agent",
+        emoji: "\u{1F680}",            // 🚀
+        shortcut: "\u{2303}\u{2325}B", // ⌃⌥B
+        color: "magenta",
+        description: "Open a pane to type a prompt, then dispatch it as a detached background agent (claude --bg; claude only)",
+        action_id: "bg-dispatch",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "remote",
+        label: "Remote",
+        emoji: "\u{1F4F1}",            // 📱
+        shortcut: "\u{2303}\u{2325}R", // ⌃⌥R
+        color: "subtext",
+        description: "Claude only: enable Remote Control (/remote-control) to continue this session from the phone or claude.ai",
+        action_id: "remote",
+        plugin: PLUGIN_ID,
+    },
+    // ── herdr lifecycle; the two that kill processes come last ──────────────
+    ButtonDef {
+        id: "handoff-hr",
+        label: "Handoff hr",
+        emoji: "\u{1F91D}",            // 🤝
+        shortcut: "\u{2303}\u{2325}H", // ⌃⌥H
+        // `warning` resolves to palette.yellow. It used to collide with
+        // draw-screenshot's `yellow`; that button is gone, so this is now an
+        // unshared swatch. Kept as `warning` rather than promoted to a "free"
+        // role because red would group it with full-restart, which reads as
+        // "destructive" — the opposite of what it is. It leads the lifecycle
+        // group for the same reason: safest first.
+        color: "warning",
+        description:
+            "Swap in the new binary WITHOUT killing panes — agents and subagents keep running",
+        action_id: "handoff-hr",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "restart-hr",
+        label: "Restart hr",
+        emoji: "\u{1F504}",            // 🔄
+        shortcut: "\u{2303}\u{2325}X", // ⌃⌥X
+        color: "blue",
+        description: "Fully kill & relaunch this herdr instance, restoring the session",
+        action_id: "restart-hr",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "full-restart",
+        label: "Full restart",
+        emoji: "\u{267B}\u{FE0F}",             // ♻️
+        shortcut: "\u{2303}\u{2325}\u{21E7}X", // ⌃⌥⇧X
+        color: "red",
+        description:
+            "Hard kill tmux + agents + server (reclaim all RAM), relaunch fresh & resume",
+        action_id: "full-restart",
         plugin: PLUGIN_ID,
     },
 ];
@@ -476,7 +455,11 @@ fn origin_from_rect(x: u16, y: u16, width: u16, height: u16) -> Option<(u16, u16
 
 /// Buttons per grid row: the strip wraps into a compact multi-row BLOCK instead
 /// of one long line, so the panel stays narrow and the usage dash keeps its
-/// width. 7 buttons + the toggle = exactly 2 rows of 4.
+/// width. 10 buttons + the toggle = 3 rows (4 / 4 / 2 + toggle).
+///
+/// The manifest's `[ui_modules.placement].size` must match the widest row this
+/// produces — see [`widest_grid_row`], which the test suite pins to that value
+/// so adding a button can't silently start clipping the strip.
 const BUTTONS_PER_ROW: usize = 4;
 
 /// One clickable segment on the compact grid: its action target and its
@@ -564,9 +547,33 @@ fn strip_grid() -> (Vec<Vec<UiTextSpan>>, Vec<Segment>) {
 }
 
 /// Number of grid rows the compact block occupies (detail rows render below).
+// Test-only helper: the render path derives the same count from `strip_grid()`
+// directly, so the wasm build legitimately never calls it.
+#[allow(dead_code)]
 fn grid_rows() -> u16 {
     let (rows, _) = strip_grid();
     rows.len() as u16
+}
+
+/// Cell width of the widest rendered grid row — i.e. exactly how many columns
+/// the panel slot needs to show the strip without clipping.
+///
+/// The manifest pins a FIXED `[ui_modules.placement].size` rather than `auto`,
+/// because `auto` regrows the panel to the widest row every frame and that
+/// moved the buttons under the cursor whenever a hover tooltip appeared. A
+/// fixed size means this number and the manifest's have to agree by hand — the
+/// slot was left at 45 after four buttons were deleted, quietly reserving dead
+/// columns that the usage dash could have used. `manifest_panel_size_matches_grid`
+/// is what stops that from happening again.
+// Test-only helper: the guest never needs its own width at runtime (the host
+// hands it a rect), so only `manifest_panel_size_matches_grid` calls this.
+#[allow(dead_code)]
+fn widest_grid_row() -> u16 {
+    let (rows, _) = strip_grid();
+    rows.iter()
+        .map(|spans| spans.iter().map(|s| cell_width(&s.text)).sum::<u16>())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Resolve which target (button index / toggle) covers an absolute cell, or
@@ -757,8 +764,6 @@ mod tests {
     /// ones". Each pair below is deliberate, and every pair is separated by some
     /// OTHER channel (all buttons carry unrelated glyphs, per §1.4):
     ///
-    /// - `("accent", "blue")`   — same fg, `accent` adds BOLD.
-    /// - `("cyan", "teal")`     — pure aliases; predates the alias-aware test.
     /// - `("magenta", "mauve")` — pure aliases; `bg-dispatch` was specced as
     ///   `magenta` on the belief that it was a free colour. It is not, and no
     ///   free colour remains. Giving it a genuinely distinct hue needs a new
@@ -770,19 +775,17 @@ mod tests {
     ///   `relocate` vs `fork`: past the 11-colour ceiling the question is not
     ///   *whether* to collide but *which* pair should, and these are the two
     ///   "send this conversation elsewhere" buttons.
-    /// - `("warning", "yellow")` — pure aliases. `handoff-hr` needed a colour and
-    ///   the 11 canonically-distinct roles were already exhausted; of the
-    ///   remaining pairings this is the least misleading, since `danger`/`red`
-    ///   would seat the one NON-destructive restart-family button next to
-    ///   `full-restart` and read as destructive. Its partner, `draw-screenshot`,
-    ///   is unrelated and sits far away in the strip.
-    const ALLOWED_COLOR_COLLISIONS: &[(&str, &str)] = &[
-        ("accent", "blue"),
-        ("cyan", "teal"),
-        ("green", "success"),
-        ("magenta", "mauve"),
-        ("warning", "yellow"),
-    ];
+    ///
+    /// Trimmed when the cx/CCR and draw-overlay buttons were removed: dropping
+    /// `resume-in-cx` (accent), `refresh-cx-token` (cyan) and `draw-screenshot`
+    /// (yellow) left `("accent","blue")`, `("cyan","teal")` and
+    /// `("warning","yellow")` with no colliding pair to excuse. They are deleted
+    /// rather than kept "just in case": a stale allow-list entry silently
+    /// pre-approves a future collision nobody argued for, which is exactly the
+    /// accidental-collision case this test exists to catch. `handoff-hr` keeps
+    /// `warning` and is now unpaired.
+    const ALLOWED_COLOR_COLLISIONS: &[(&str, &str)] =
+        &[("green", "success"), ("magenta", "mauve")];
 
     #[test]
     fn button_colors_are_distinct() {
@@ -933,6 +936,72 @@ mod tests {
         reset();
     }
 
+    /// The panel is a FIXED width, so the manifest carries a number that has to
+    /// equal what the guest actually draws. Nothing else enforces that: a wrong
+    /// value is not a compile error, not a runtime error, and not visible
+    /// unless you count columns — too small silently clips the strip, too large
+    /// silently steals width from the usage dash it shares the band with.
+    ///
+    /// This reads the real manifest so the two cannot drift: add a button and
+    /// this test tells you the new number instead of the next person finding it
+    /// with a ruler.
+    #[test]
+    fn manifest_panel_size_matches_grid() {
+        let _g = guard();
+        reset();
+        let manifest = include_str!("../herdr-plugin.toml");
+        // Scan for the table HEADER line rather than splitting on the name:
+        // the string `[ui_modules.placement]` also appears inside a comment
+        // further up, and splitting there reads a chunk with no keys in it.
+        let raw = manifest
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[ui_modules.placement]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix("size"))
+            .and_then(|rest| rest.trim().strip_prefix('='))
+            .map(|rest| rest.trim().trim_matches('"').to_string())
+            .expect("[ui_modules.placement] declares a size");
+        let declared: u16 = raw
+            .parse()
+            .unwrap_or_else(|_| panic!("size = \"{raw}\" is not a fixed cell count"));
+        assert_eq!(
+            declared,
+            widest_grid_row(),
+            "herdr-plugin.toml pins the panel at {declared} cells but the button grid \
+             renders {} — set size = \"{}\"",
+            widest_grid_row(),
+            widest_grid_row(),
+        );
+    }
+
+    /// The lifecycle buttons are the ones that kill processes, so they live at
+    /// the END of the strip: the pointer must never cross `Full restart` to
+    /// reach a conversation button. Pins the grouping, not the exact order
+    /// within it.
+    #[test]
+    fn destructive_lifecycle_buttons_are_last() {
+        let lifecycle = ["handoff-hr", "restart-hr", "full-restart"];
+        let first_lifecycle = BUTTONS
+            .iter()
+            .position(|b| lifecycle.contains(&b.id))
+            .expect("lifecycle buttons exist");
+        assert!(
+            BUTTONS[first_lifecycle..]
+                .iter()
+                .all(|b| lifecycle.contains(&b.id)),
+            "a conversation button sits after a herdr-lifecycle button; \
+             the restart group must stay at the end of the strip"
+        );
+        assert_eq!(
+            BUTTONS.last().map(|b| b.id),
+            Some("full-restart"),
+            "the most destructive button must be last"
+        );
+    }
+
     #[test]
     fn fork_buttons_are_registered() {
         assert!(BUTTONS.iter().any(|b| b.action_id == "fork"));
@@ -940,9 +1009,27 @@ mod tests {
     }
 
     #[test]
-    fn resume_cx_and_remote_buttons_are_registered() {
-        assert!(BUTTONS.iter().any(|b| b.action_id == "resume-in-cx"));
+    fn remote_button_is_registered() {
         assert!(BUTTONS.iter().any(|b| b.action_id == "remote"));
+    }
+
+    /// The cx/CCR buttons and the macOS-only draw-overlay buttons are gone for
+    /// good. Asserting their ABSENCE is what stops a future "restore the old
+    /// registry" edit from silently reintroducing a button whose backing script
+    /// no longer exists — every id here would dispatch to a deleted action.
+    #[test]
+    fn removed_buttons_stay_removed() {
+        for gone in [
+            "resume-in-cx",
+            "refresh-cx-token",
+            "draw-screenshot",
+            "draw-screenshot-region",
+        ] {
+            assert!(
+                !BUTTONS.iter().any(|b| b.action_id == gone),
+                "button '{gone}' was removed (cx/CCR or macOS-only) and must not come back"
+            );
+        }
     }
 
     #[test]

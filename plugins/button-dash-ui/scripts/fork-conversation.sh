@@ -2,22 +2,16 @@
 # fork-conversation.sh — fork the CURRENT pane's agent conversation into a new
 # pane, either in a NEW TAB (current workspace) or a NEW WORKSPACE.
 #
-# The "Fork" / "Fork → workspace" buttons and the ⌃⌥F / ⌃⌥⇧F Karabiner hotkeys
-# all run this. It works for every agent herdr can resume — Claude Code, cx
-# (GPT-via-CCR, detected as claude), Codex, and pi — by reusing herdr's OWN
+# The "Fork" / "Fork → workspace" buttons run this. It works for every agent
+# herdr can resume — Claude Code, Codex, pi and jcode — by reusing herdr's OWN
 # per-agent invocation convention (see src/agent_resume.rs) and appending each
 # agent's fork flag so the ORIGINAL conversation is left intact and the fork
-# gets a fresh session id:
-#
-#   claude / cx : cx-resume <id> --fork-session
-#                 (cx-resume routes cx-origin vs daily by transcript location and
-#                  forwards --fork-session to `claude --resume <id> --fork-session`)
-#   codex       : codex fork <id>
-#   pi          : pi --fork <value>
+# gets a fresh session id. The exact per-agent argv lives in ONE place,
+# `agent_launch_cmd` in dash-common.sh, shared with the archive dash.
 #
 # Nothing is hardcoded: pane, agent, session ref and cwd are all read live from
 # `herdr pane get <pane>`; the herdr binary and socket are detected from the env
-# (button path) or supplied by the Karabiner rule.
+# (button path) or resolved from the focused pane (tab-context path).
 #
 # Usage:  fork-conversation.sh [tab|workspace]
 #   tab        (default) new tab in the CURRENT workspace, running the fork
@@ -27,11 +21,16 @@
 # single root pane; we run the fork command IN that root pane via `pane run`
 # (no stray empty pane, unlike `agent start` which adds a second pane). herdr's
 # own agent detection then re-labels the pane from the running process.
+#
+# Every refusal toasts. A fork that silently does nothing is indistinguishable
+# from a dead button.
 
 set -u
 
 LOG="${HERDR_FORK_LOG:-$HOME/.herdr-fork.log}"
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "fork: dash-common.sh missing" >&2; exit 3; }
 
 PLACEMENT="${1:-tab}"
 case "$PLACEMENT" in
@@ -42,50 +41,25 @@ case "$PLACEMENT" in
     ;;
 esac
 
-# ---------------------------------------------------------------------------
-# 0. Resolve the herdr client binary (prefer the fork build; never assume PATH).
-# ---------------------------------------------------------------------------
-HERDR=""
-# PATH LAST, deliberately: `command -v herdr` resolves to ~/.local/bin/herdr,
-# a symlink to a June-19 pre-prod build missing this fork's subcommands. Putting
-# it first silently ran the wrong binary. Prefer the live instance binary.
-for cand in "${HERDR_BIN:-}" \
-  "$HOME/.herdr-hr/bin/herdr" \
-  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
-  "$HOME/Projects/herdr/target/release/herdr" \
-  "$(command -v herdr 2>/dev/null)"; do
-  if [[ -n "$cand" && -x "$cand" ]]; then
-    HERDR="$cand"
-    break
-  fi
-done
 if [[ -z "$HERDR" ]]; then
-  log "FATAL: no herdr binary found"
+  # No binary means no toast channel through herdr either; desktop_notify still
+  # works, and it is the only way the user learns the button did nothing.
+  log "FATAL: no herdr binary found (HERDR_BIN/HERDR_BIN_PATH unset and none on PATH)"
+  desktop_notify "Fork failed" "no herdr binary found"
   exit 3
 fi
 
 # jq is required to parse the JSON responses.
-if ! command -v jq >/dev/null 2>&1; then
-  # Homebrew default location as a fallback when PATH is minimal (Karabiner).
-  for j in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq; do
-    [[ -x "$j" ]] && { export PATH="$(dirname "$j"):$PATH"; break; }
-  done
-fi
-command -v jq >/dev/null 2>&1 || { log "FATAL: jq not found"; exit 3; }
-
-hd() { "$HERDR" "$@"; }
+command -v jq >/dev/null 2>&1 || { toast "Fork failed" "jq is not installed"; exit 3; }
 
 # ---------------------------------------------------------------------------
 # 1. Resolve the SOURCE pane.
 #    Button path: HERDR_PANE_ID is inherited from the server env.
-#    Karabiner path: no pane env — pick the focused pane from `pane list`.
+#    Tab-context path: no pane env (the host clears focused_pane_id for a
+#    tab-scoped invocation) — pick the focused pane from `pane list`.
 # ---------------------------------------------------------------------------
-PANE="${HERDR_PANE_ID:-}"
-if [[ -z "$PANE" ]]; then
-  PANE="$(hd pane list 2>/dev/null | jq -r '.result.panes[] | select(.focused) | .pane_id' | head -1)"
-fi
-if [[ -z "$PANE" || "$PANE" == "null" ]]; then
-  log "FATAL: could not resolve source pane (no HERDR_PANE_ID and no focused pane)"
+if ! PANE="$(current_pane)"; then
+  toast "Fork failed" "could not resolve the current pane"
   exit 4
 fi
 log "source pane: $PANE (placement=$PLACEMENT)"
@@ -103,57 +77,43 @@ WS="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.workspace_id // empty')"
 log "agent=$AGENT kind=$KIND value=$VALUE cwd=$CWD ws=$WS"
 
 if [[ -z "$AGENT" ]]; then
-  log "FATAL: pane $PANE has no detected agent — nothing to fork"
+  toast "Fork: no agent here" "This pane has no running agent to fork."
   exit 5
 fi
 
 # ---------------------------------------------------------------------------
-# 2b. Fallback: agent detected but no session ref reported yet. For claude/cx,
+# 2b. Fallback: agent detected but no session ref reported yet. For claude,
 #     recover the newest transcript id for this cwd (mirror cmux-fork-session).
 # ---------------------------------------------------------------------------
 if [[ -z "$VALUE" ]]; then
   case "$AGENT" in
     claude)
+      # Claude Code names a project dir by mapping every non-alphanumeric char
+      # of the cwd to '-'. One root only: ~/.claude/projects.
       ENC="$(printf '%s' "$CWD" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
-      for base in "$HOME/.claude-code-router/profiles/default-claude-code/claude" "$HOME/.claude"; do
-        newest="$(ls -t "$base/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
-        if [[ -n "$newest" ]]; then
-          VALUE="$(basename "$newest" .jsonl)"
-          KIND="id"
-          log "recovered claude session $VALUE from $base"
-          break
-        fi
-      done
+      newest="$(ls -t "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
+      if [[ -n "$newest" ]]; then
+        VALUE="$(basename "$newest" .jsonl)"
+        KIND="id"
+        log "recovered claude session $VALUE"
+      fi
       ;;
   esac
 fi
 if [[ -z "$VALUE" ]]; then
-  log "FATAL: no session ref for agent=$AGENT on pane $PANE"
+  toast "Fork failed" "no session id reported for this $AGENT pane yet"
   exit 6
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Build the per-agent fork command (reuses herdr's resume convention +
-#    each agent's fork flag; leaves the original conversation intact).
+# 3. Build the per-agent fork command. The matrix (and every refusal reason)
+#    lives in dash-common.sh so the archive dash cannot drift away from it.
 # ---------------------------------------------------------------------------
-FORK_CMD=""
-case "$AGENT" in
-  claude)
-    # Covers both plain Claude Code and cx (cx-resume auto-dispatches by where
-    # the transcript lives; --fork-session threads through to claude).
-    FORK_CMD="cx-resume $(printf '%q' "$VALUE") --fork-session"
-    ;;
-  codex)
-    FORK_CMD="codex fork $(printf '%q' "$VALUE")"
-    ;;
-  pi | omp)
-    FORK_CMD="pi --fork $(printf '%q' "$VALUE")"
-    ;;
-  *)
-    log "FATAL: fork not supported for agent '$AGENT'"
-    exit 7
-    ;;
-esac
+# On refusal the helper prints the REASON instead of a command (see its header).
+if ! FORK_CMD="$(agent_launch_cmd fork "$AGENT" "$VALUE")"; then
+  toast "Fork not available" "$FORK_CMD"
+  exit 7
+fi
 log "fork cmd: $FORK_CMD"
 
 # ---------------------------------------------------------------------------
@@ -183,7 +143,7 @@ log "fork label: $LABEL (source tab=$TAB_ID)"
 # ---------------------------------------------------------------------------
 case "$PLACEMENT" in
   tab)
-    [[ -z "$WS" ]] && WS="$HERDR_WORKSPACE_ID"
+    [[ -z "$WS" ]] && WS="${HERDR_WORKSPACE_ID:-}"
     CREATE_JSON="$(hd tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --focus 2>/dev/null)"
     ROOT_PANE="$(printf '%s' "$CREATE_JSON" | jq -r '.result.root_pane.pane_id // empty')"
     ;;
@@ -194,7 +154,8 @@ case "$PLACEMENT" in
 esac
 
 if [[ -z "$ROOT_PANE" || "$ROOT_PANE" == "null" ]]; then
-  log "FATAL: could not create $PLACEMENT (response: $CREATE_JSON)"
+  log "tab/workspace create response: $CREATE_JSON"
+  toast "Fork failed" "could not create the new $PLACEMENT"
   exit 8
 fi
 log "destination root pane: $ROOT_PANE"
@@ -204,6 +165,9 @@ sleep 0.4
 
 # Run the fork. `exec` replaces the shell so closing the agent closes the pane,
 # matching how a normal agent pane behaves.
-hd pane run "$ROOT_PANE" "exec $FORK_CMD" >>"$LOG" 2>&1
+if ! hd pane run "$ROOT_PANE" "exec $FORK_CMD" >>"$LOG" 2>&1; then
+  toast "Fork failed" "created the $PLACEMENT but could not start $AGENT in it"
+  exit 9
+fi
 log "FORK OK: $AGENT $VALUE -> $ROOT_PANE ($PLACEMENT)"
 exit 0

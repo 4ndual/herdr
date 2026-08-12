@@ -33,6 +33,16 @@ if [[ "${_HERDR_RESTART_DETACHED:-}" != "1" ]]; then
   exit 0
 fi
 
+# Shared helpers, sourced only in the DETACHED run (the first pass does nothing
+# but re-exec). Provides exe_path / socket_pid / socket_pids / instance_binary —
+# the process resolution that makes this script work on Linux — plus
+# desktop_notify for the one failure the user must not have to find in a log.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "restart: dash-common.sh missing" >&2; exit 3; }
+
+# Redefine AFTER sourcing: this script's stdout is already the log file (nohup
+# above), so it logs by printing, not by appending to $LOG a second time.
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
 # ---------------------------------------------------------------------------
@@ -72,7 +82,10 @@ log "socket: $SOCK"
 # ---------------------------------------------------------------------------
 # 2. Detect the live server: pid, binary, XDG roots, tmux host session.
 # ---------------------------------------------------------------------------
-SERVER_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+# socket_pid (not `lsof -t | head -1`): the server's own CLIENTS hold this socket
+# too, so head -1 was a coin flip between the server and whoever connected to it.
+# See dash-common.sh.
+SERVER_PID="$(socket_pid "$SOCK")"
 
 BIN=""
 XDG_STATE=""
@@ -85,7 +98,6 @@ pid_env() { ps eww "$1" 2>/dev/null | tr ' ' '\n' | grep -m1 "^$2=" | cut -d= -f
 
 if [[ -n "$SERVER_PID" ]]; then
   log "live server pid: $SERVER_PID"
-  BIN="$(ps -o comm= -p "$SERVER_PID" 2>/dev/null | sed 's/ server$//')"
   XDG_STATE="$(pid_env "$SERVER_PID" XDG_STATE_HOME)"
   XDG_DATA="$(pid_env "$SERVER_PID" XDG_DATA_HOME)"
   # tmux host = the pane whose pid is the server's parent (the herdr client).
@@ -102,13 +114,19 @@ else
   log "no live server on socket (already dead/hung with stale socket)"
 fi
 
+# The binary to relaunch with: the live server's real image (via /proc on Linux,
+# `ps -o comm=` on macOS), else the host-injected $HERDR_BIN_PATH, else PATH.
+# This used to be `ps -o comm=` with a hardcoded ~/Projects fallback, which on
+# Linux yielded the bare string "herdr" — non-empty, so the fallback never fired,
+# and not executable, so the relaunch line pointed at nothing.
+BIN="$(instance_binary "$SERVER_PID")"
+
 # Fallbacks by convention when the live server couldn't supply a value.
-[[ -z "$BIN"        ]] && BIN="$HOME/Projects/herdr/target/release/herdr"
 [[ -z "$XDG_STATE"  ]] && XDG_STATE="$HOME/.herdr-${SESSION}/state"
 [[ -z "$XDG_DATA"   ]] && XDG_DATA="$HOME/.herdr-${SESSION}/data"
 [[ -z "$TMUX_HOST"  ]] && TMUX_HOST="${SESSION}-host"
 
-log "binary: $BIN"
+log "binary: ${BIN:-<unresolved>}"
 log "xdg: config=$CFG state=$XDG_STATE data=$XDG_DATA"
 log "tmux host: $TMUX_HOST  geom=${GEOM_X}x${GEOM_Y}"
 
@@ -146,9 +164,11 @@ fi
 # this restart flow is fixing.
 
 # Sweep any straggler process still bound to this instance's socket.
+# socket_pids matches the socket's NAME field, so this `kill -9` can only ever
+# reach processes actually holding THIS path.
 for _ in 1 2 3 4 5; do
-  STRAG="$(lsof -t "$SOCK" 2>/dev/null)"
-  [[ -z "$STRAG" ]] && break
+  STRAG="$(socket_pids "$SOCK" | tr '\n' ' ')"
+  [[ -z "${STRAG// /}" ]] && break
   log "straggler on socket: $STRAG — killing"
   kill -9 $STRAG 2>/dev/null
   sleep 0.3
@@ -170,7 +190,7 @@ log "old instance is down"
 # user's real terminal (Ghostty/tmux) repaints itself.
 NEW_PID=""
 for _ in $(seq 1 48); do   # ~12s: client exit + settle(0.5) + fresh server boot
-  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  NEW_PID="$(socket_pid "$SOCK")"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
     break
   fi
@@ -197,16 +217,25 @@ LAUNCHER="$HOME/.local/bin/$SESSION"
 if [[ -x "$LAUNCHER" ]]; then
   LAUNCH_CMD="$LAUNCHER"
   log "fallback relaunch via launcher: $LAUNCHER"
-else
+elif [[ -n "$BIN" ]]; then
   LAUNCH_CMD="env XDG_CONFIG_HOME=$CFG XDG_STATE_HOME=$XDG_STATE XDG_DATA_HOME=$XDG_DATA HERDR_SESSION=$SESSION $BIN --session $SESSION"
   log "fallback relaunch via reconstructed exec line"
+else
+  # Refuse to build a launch line around an empty/bogus binary path. That is how
+  # the old `ps -o comm=` value ("herdr") got here and produced a tmux session
+  # running a command that does not exist — indistinguishable from "the button
+  # did nothing", with the server already dead.
+  log "FATAL: no herdr binary resolved for session $SESSION — cannot relaunch"
+  desktop_notify "herdr restart FAILED" \
+    "the server for '$SESSION' was stopped but no herdr binary could be resolved to relaunch it"
+  exit 6
 fi
 
 tmux kill-session -t "$TMUX_HOST" 2>/dev/null
 tmux new-session -d -s "$TMUX_HOST" -x "$GEOM_X" -y "$GEOM_Y" "$LAUNCH_CMD"
 
 for _ in $(seq 1 40); do
-  NEW_PID="$(lsof -t "$SOCK" 2>/dev/null | head -1)"
+  NEW_PID="$(socket_pid "$SOCK")"
   if [[ -n "$NEW_PID" && "$NEW_PID" != "$SERVER_PID" ]]; then
     break
   fi
@@ -217,6 +246,10 @@ if [[ -n "$NEW_PID" ]]; then
   log "RESTART OK (detached-tmux fallback): new server pid $NEW_PID (old was ${SERVER_PID:-none})"
   exit 0
 else
+  # The server is dead and nothing replaced it. herdr itself is gone, so a herdr
+  # toast is impossible — go straight to the desktop notifier.
   log "ERROR: new server did not come up on $SOCK"
+  desktop_notify "herdr restart FAILED" \
+    "'$SESSION' was stopped but no new server came up on its socket — see $LOG"
   exit 5
 fi

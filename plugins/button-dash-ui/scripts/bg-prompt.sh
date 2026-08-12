@@ -7,7 +7,8 @@
 # modules) — so the prompt is collected HERE, by the terminal, which has no such
 # limitation.
 #
-# The pane deliberately STAYS ALIVE afterwards (`exec "$SHELL" -l`): this is the
+# The pane deliberately STAYS ALIVE afterwards (`exec "$SHELL" -l`, falling back
+# to /bin/sh rather than the macOS-only /bin/zsh): this is the
 # only place the dispatched agent's id is ever shown, and it lets the user re-run
 # `claude agents` at will.
 #
@@ -19,18 +20,15 @@ set -u
 LOG="${HERDR_BG_LOG:-$HOME/.herdr-bg-dispatch.log}"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
-# Resolve `claude` as a BINARY. In the user's zsh, `claude` is a function that
-# re-launches itself inside tmux; a non-interactive bash never sees it, but be
-# explicit so a stray PATH can't surprise us.
-CLAUDE=""
-for cand in "${CLAUDE_BIN:-}" "$(command -v claude 2>/dev/null)" \
-  "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude"; do
-  [[ -n "$cand" && -x "$cand" ]] && { CLAUDE="$cand"; break; }
-done
+# Resolve `claude` as a BINARY. In an interactive shell `claude` may be a
+# function that re-launches itself inside tmux; a non-interactive bash never
+# sees it, but be explicit so a stray PATH can't surprise us.
+CLAUDE="${CLAUDE_BIN:-$(command -v claude 2>/dev/null)}"
+[[ -n "$CLAUDE" && -x "$CLAUDE" ]] || CLAUDE=""
 if [[ -z "$CLAUDE" ]]; then
   echo "claude not found — cannot dispatch a background agent."
   log "FATAL(bg-prompt): claude not found"
-  exec "${SHELL:-/bin/zsh}" -l
+  exec "${SHELL:-/bin/sh}" -l
 fi
 
 printf 'Prompt for the background agent (Ctrl-C to cancel):\n> '
@@ -38,7 +36,7 @@ IFS= read -r PROMPT || PROMPT=""
 if [[ -z "$PROMPT" ]]; then
   echo "cancelled — nothing dispatched"
   log "cancelled at prompt (cwd=$PWD)"
-  exec "${SHELL:-/bin/zsh}" -l
+  exec "${SHELL:-/bin/sh}" -l
 fi
 
 log "dispatching background agent (cwd=$PWD): $PROMPT"
@@ -47,7 +45,7 @@ RC=$?
 if [[ $RC -ne 0 ]]; then
   echo "claude --bg exited with status $RC — nothing was dispatched."
   log "FATAL(bg-prompt): claude --bg rc=$RC"
-  exec "${SHELL:-/bin/zsh}" -l
+  exec "${SHELL:-/bin/sh}" -l
 fi
 log "dispatched OK (cwd=$PWD)"
 
@@ -63,4 +61,4 @@ else
   "$CLAUDE" agents --json --cwd "$PWD" 2>/dev/null || true
 fi
 
-exec "${SHELL:-/bin/zsh}" -l
+exec "${SHELL:-/bin/sh}" -l

@@ -3,8 +3,7 @@
 #
 # Shows the ranked candidate projects, takes the user's pick, migrates the
 # session on disk into that project's slug, and continues the conversation there
-# with `cx-resume` (which routes a cx session back through the CCR gateway and a
-# daily session through plain claude, by looking at where the transcript lives).
+# with `claude --resume`.
 #
 # The choice is made HERE, by a human, on purpose: the ranking is evidence and
 # the top two candidates are frequently a near-tie.
@@ -22,7 +21,10 @@ log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
 hold() {
   printf '\n'
-  exec "${SHELL:-/bin/zsh}" -l
+  # /bin/sh, not /bin/zsh: zsh is the macOS default login shell but is not
+  # installed on a stock Linux box, so the old fallback exec'd a missing binary
+  # and killed the pane on every error path this function exists to survive.
+  exec "${SHELL:-/bin/sh}" -l
 }
 
 [[ -r "$PAYLOAD" ]] || { echo "relocate: candidate list missing ($PAYLOAD)"; log "FATAL(pick): payload unreadable"; hold; }
@@ -39,7 +41,7 @@ done <"$PAYLOAD"
 
 # Candidate lines are everything after the `--` marker: "<score>\t<path>".
 # Plain read loop, not `mapfile`: macOS ships bash 3.2, which has neither
-# mapfile nor associative arrays.
+# mapfile nor associative arrays, and this must stay runnable there too.
 ROWS=()
 while IFS= read -r row; do
   [[ -n "$row" ]] && ROWS+=("$row")
@@ -98,8 +100,7 @@ printf '\nrelocating into %s …\n' "$TARGET"
 log "migrating sid=$SID -> $TARGET (projects_dir=$PROJECTS_DIR)"
 
 # The migration is the relocate skill's job. Point it at the projects root the
-# transcript actually lives under, so a cx session is not migrated into the
-# daily tree (where cx-resume would then fail to find it).
+# transcript actually lives under.
 if ! CLAUDE_PROJECTS_DIR="$PROJECTS_DIR" sh "$MIGRATE" "$TARGET" "$SID"; then
   echo
   echo "relocate: migration FAILED — nothing was moved. The original conversation is untouched."
@@ -110,16 +111,12 @@ log "migrated OK sid=$SID -> $TARGET"
 
 cd "$TARGET" || { echo "relocate: cannot enter $TARGET"; hold; }
 
-# cx-resume routes by where the transcript lives, so it brings a cx session back
-# up as cx and a daily session as plain claude. Fall back to claude directly.
 printf 'resuming in %s …\n\n' "$TARGET"
-if command -v cx-resume >/dev/null 2>&1; then
-  exec cx-resume "$SID"
-elif command -v claude >/dev/null 2>&1; then
+if command -v claude >/dev/null 2>&1; then
   exec claude --resume "$SID"
 fi
 
-echo "relocate: migrated, but neither cx-resume nor claude is on PATH."
+echo "relocate: migrated, but claude is not on PATH."
 echo "run:  cd '$TARGET' && claude --resume $SID"
-log "FATAL(pick): no resume binary on PATH"
+log "FATAL(pick): claude not on PATH"
 hold

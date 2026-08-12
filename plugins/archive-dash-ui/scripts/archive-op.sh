@@ -13,12 +13,12 @@
 # same ordering the widget input file uses, so slot N here == chip N there.
 #
 #   restore : resume the SAME session (no fork flag) in a new tab
-#             claude/cx -> cx-resume <id> ; codex -> codex resume <id> ;
-#             pi -> pi --session <value>
 #   fork    : resume with each agent's fork flag (fresh session id) in a new tab
-#             claude/cx -> cx-resume <id> --fork-session ; codex -> codex fork <id> ;
-#             pi -> pi --fork <value>
 #   delete  : drop the record from the store (no tab), regenerate the input file
+#
+# The exact per-agent argv for restore/fork lives in ONE place —
+# `agent_launch_cmd` in dash-common.sh — so this script and the button dash's
+# fork button can never disagree about how to resume a codex or pi session.
 #
 # Restore/fork DO NOT remove the record (you can restore the same session again);
 # delete is the only mutation. Every path regenerates the widget input file.
@@ -31,42 +31,25 @@ ARCHIVE_DIR="$HOME/.herdr-archive"
 STORE="$ARCHIVE_DIR/archive.json"
 LOG="$ARCHIVE_DIR/archive.log"
 mkdir -p "$ARCHIVE_DIR" 2>/dev/null
-log() { printf '%s [%s#%s] %s\n' "$(date '+%H:%M:%S')" "$VERB" "${SLOT:-?}" "$*" >>"$LOG" 2>/dev/null; }
 
-# ── binary + jq ───────────────────────────────────────────────────────────────
-# PATH LAST, deliberately: `command -v herdr` resolves to ~/.local/bin/herdr, a
-# symlink to a June-19 pre-prod build missing this fork's subcommands. This loop
-# used to try PATH third and could silently run the wrong binary — the same root
-# cause that left the resume-search button broken for weeks. Order matches the
-# other plugins' scripts verbatim.
-HERDR=""
-for cand in "${HERDR_BIN:-}" "${HERDR_BIN_PATH:-}" \
-  "$HOME/.herdr-hr/bin/herdr" \
-  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
-  "$HOME/Projects/herdr/target/release/herdr" \
-  "$(command -v herdr 2>/dev/null)"; do
-  if [[ -n "$cand" && -x "$cand" ]]; then HERDR="$cand"; break; fi
-done
-hd() { "$HERDR" "$@"; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "archive: dash-common.sh missing" >&2; exit 3; }
+
+# Keep this plugin's richer log prefix (verb + slot) over the shared plain one.
+log() { printf '%s [%s#%s] %s\n' "$(date '+%H:%M:%S')" "$VERB" "${SLOT:-?}" "$*" >>"$LOG" 2>/dev/null; }
 
 # Surface every failure to the user. The widget fires and forgets, so a silent
 # exit here is indistinguishable from a dead button.
-toast() {
-  local title="$1" body="${2:-}"
-  log "TOAST: $title — $body"
-  [[ -n "$HERDR" ]] || return 0
-  hd notification show "$title" ${body:+--body "$body"} >>"$LOG" 2>&1 || true
-}
-die() { toast "Archive: $VERB failed" "$1"; exit "$2"; }
+die() { toast "Archive $VERB failed" "$1"; exit "$2"; }
 
-[[ -z "$HERDR" ]] && { log "FATAL: no herdr binary"; exit 3; }
-
-if ! command -v jq >/dev/null 2>&1; then
-  for j in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq; do
-    [[ -x "$j" ]] && { export PATH="$(dirname "$j"):$PATH"; break; }
-  done
+if [[ -z "$HERDR" ]]; then
+  log "FATAL: no herdr binary"
+  desktop_notify "Archive $VERB failed" "no herdr binary found"
+  exit 3
 fi
-command -v jq >/dev/null 2>&1 || die "jq not found" 3
+
+command -v jq >/dev/null 2>&1 || die "jq is not installed" 3
 
 case "$VERB" in restore | fork | delete) ;; *) die "unknown verb '$VERB'" 2 ;; esac
 
@@ -124,17 +107,17 @@ if [[ "$VERB" == "delete" ]]; then
 fi
 
 # ── restore / fork: build the per-agent command ───────────────────────────────
-[[ -z "$AGENT" || -z "$VALUE" ]] && die "archived record has no agent/session to resume" 7
-CMD=""
-case "$VERB:$AGENT" in
-  restore:claude) CMD="cx-resume $(printf '%q' "$VALUE")" ;;
-  restore:codex)  CMD="codex resume $(printf '%q' "$VALUE")" ;;
-  restore:pi | restore:omp) CMD="pi --session $(printf '%q' "$VALUE")" ;;
-  fork:claude)    CMD="cx-resume $(printf '%q' "$VALUE") --fork-session" ;;
-  fork:codex)     CMD="codex fork $(printf '%q' "$VALUE")" ;;
-  fork:pi | fork:omp) CMD="pi --fork $(printf '%q' "$VALUE")" ;;
-  *) die "$VERB is not supported for agent '$AGENT'" 8 ;;
-esac
+[[ -z "$AGENT" || -z "$VALUE" ]] && die "this archived record has no agent/session to resume" 7
+# The widget's verb is "restore"; the shared matrix speaks "resume". Map here
+# rather than teaching the matrix a second name for one thing — the two
+# vocabularies belong to different layers and only meet at this line.
+LAUNCH_VERB="$VERB"
+[[ "$VERB" == "restore" ]] && LAUNCH_VERB="resume"
+# On refusal the helper prints the REASON instead of a command (see its header).
+if ! CMD="$(agent_launch_cmd "$LAUNCH_VERB" "$AGENT" "$VALUE")"; then
+  toast "Archive $VERB not available" "$CMD"
+  exit 8
+fi
 log "cmd: $CMD"
 
 # Label the new tab after the archived session.

@@ -17,66 +17,36 @@
 set -u
 
 LOG="${HERDR_BG_LOG:-$HOME/.herdr-bg-dispatch.log}"
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "bg-dispatch: dash-common.sh missing" >&2; exit 3; }
+
 PROMPT_SCRIPT="$SCRIPT_DIR/bg-prompt.sh"
 
-# ---------------------------------------------------------------------------
-# 0. Resolve the herdr client binary (prefer the fork build; never assume PATH).
-#    PATH LAST, deliberately: `command -v herdr` resolves to ~/.local/bin/herdr,
-#    a symlink to a June-19 pre-prod build missing this fork's subcommands —
-#    the root cause of the broken resume-search button.
-# ---------------------------------------------------------------------------
-HERDR=""
-for cand in "${HERDR_BIN:-}" \
-  "$HOME/.herdr-hr/bin/herdr" \
-  "$HOME/Projects/herdr-worktrees/imgapi-127/target/release/herdr" \
-  "$HOME/Projects/herdr/target/release/herdr" \
-  "$(command -v herdr 2>/dev/null)"; do
-  if [[ -n "$cand" && -x "$cand" ]]; then
-    HERDR="$cand"
-    break
-  fi
-done
-
-hd() { "$HERDR" "$@"; }
-
-# Surface a short message to the user. Prefer a herdr toast; always log too.
-toast() {
-  local title="$1" body="${2:-}"
-  log "TOAST: $title — $body"
-  [[ -n "$HERDR" ]] || return 0
-  hd notification show "$title" ${body:+--body "$body"} >>"$LOG" 2>&1 || true
-}
-
 if [[ -z "$HERDR" ]]; then
-  # No binary means no toast channel either; the log is all we have.
   log "FATAL: no herdr binary found"
+  desktop_notify "Background agent failed" "no herdr binary found"
   exit 3
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-  for j in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq; do
-    [[ -x "$j" ]] && { export PATH="$(dirname "$j"):$PATH"; break; }
-  done
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  toast "Background agent failed" "jq not found"
+  toast "Background agent failed" "jq is not installed"
   exit 3
 fi
 
 # ---------------------------------------------------------------------------
 # 0b. `claude` must exist — dispatching is pointless otherwise, and failing here
 #     is far clearer than failing inside a freshly-opened pane.
+#
+#     This button is claude-only BY DESIGN, and not because of the pane it was
+#     pressed over: `--bg` is a Claude Code primitive with no codex / pi / jcode
+#     equivalent, so the source pane's agent is deliberately NOT consulted — you
+#     can dispatch a claude background agent from any pane, and the new tab
+#     inherits only its cwd.
 # ---------------------------------------------------------------------------
-CLAUDE=""
-for cand in "${CLAUDE_BIN:-}" "$(command -v claude 2>/dev/null)" \
-  "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude"; do
-  [[ -n "$cand" && -x "$cand" ]] && { CLAUDE="$cand"; break; }
-done
-if [[ -z "$CLAUDE" ]]; then
-  toast "Background agent failed" "claude not found"
+if ! CLAUDE="$(find_exe claude)"; then
+  toast "Background agent unavailable" \
+    "background agents are a Claude Code feature (claude --bg) and claude is not installed"
   exit 3
 fi
 
@@ -86,13 +56,9 @@ if [[ ! -x "$PROMPT_SCRIPT" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Resolve the SOURCE pane (button: HERDR_PANE_ID; hotkey: focused pane).
+# 1. Resolve the SOURCE pane (button: HERDR_PANE_ID; tab context: focused pane).
 # ---------------------------------------------------------------------------
-PANE="${HERDR_PANE_ID:-}"
-if [[ -z "$PANE" ]]; then
-  PANE="$(hd pane list 2>/dev/null | jq -r '.result.panes[] | select(.focused) | .pane_id' | head -1)"
-fi
-if [[ -z "$PANE" || "$PANE" == "null" ]]; then
+if ! PANE="$(current_pane)"; then
   toast "Background agent failed" "could not resolve the current pane"
   exit 4
 fi
@@ -101,8 +67,7 @@ log "source pane: $PANE"
 # ---------------------------------------------------------------------------
 # 2. Read the source pane's cwd (the agent's project context) and workspace.
 # ---------------------------------------------------------------------------
-PANE_JSON="$(hd pane get "$PANE" 2>/dev/null)"
-if [[ $? -ne 0 || -z "$PANE_JSON" ]]; then
+if ! PANE_JSON="$(hd pane get "$PANE" 2>/dev/null)" || [[ -z "$PANE_JSON" ]]; then
   toast "Background agent failed" "could not read the current pane"
   exit 4
 fi

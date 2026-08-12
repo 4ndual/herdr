@@ -6,7 +6,7 @@
 #   1. Resolve the pane: HERDR_PANE_ID (set by the action env), else the focused
 #      pane from `herdr pane list`.
 #   2. Read agent / session / cwd / workspace / tab-label via `herdr pane get`.
-#   3. Generate a short résumé (claude/cx: first+last user message from the
+#   3. Generate a short résumé (claude: first+last user message from the
 #      session jsonl; other agents: "agent + cwd + date").
 #   4. Append a record to ~/.herdr-archive/archive.json (array; created if
 #      missing; full history kept — the widget shows the last 10).
@@ -19,22 +19,17 @@ ARCHIVE_DIR="$HOME/.herdr-archive"
 STORE="$ARCHIVE_DIR/archive.json"
 LOG="$ARCHIVE_DIR/archive.log"
 mkdir -p "$ARCHIVE_DIR" 2>/dev/null
-log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
-# ── resolve binary + jq ───────────────────────────────────────────────────────
-HERDR=""
-for cand in "${HERDR_BIN:-}" "${HERDR_BIN_PATH:-}" "$(command -v herdr 2>/dev/null)" \
-  "$HOME/Projects/herdr/target/release/herdr" "$HOME/.local/bin/herdr"; do
-  if [[ -n "$cand" && -x "$cand" ]]; then HERDR="$cand"; break; fi
-done
-[[ -z "$HERDR" ]] && { log "FATAL: no herdr binary"; exit 3; }
-if ! command -v jq >/dev/null 2>&1; then
-  for j in /opt/homebrew/bin/jq /usr/local/bin/jq /usr/bin/jq; do
-    [[ -x "$j" ]] && { export PATH="$(dirname "$j"):$PATH"; break; }
-  done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=dash-common.sh
+. "$SCRIPT_DIR/dash-common.sh" || { echo "archive: dash-common.sh missing" >&2; exit 3; }
+
+if [[ -z "$HERDR" ]]; then
+  log "FATAL: no herdr binary"
+  desktop_notify "Archive failed" "no herdr binary found"
+  exit 3
 fi
-command -v jq >/dev/null 2>&1 || { log "FATAL: jq not found"; exit 3; }
-hd() { "$HERDR" "$@"; }
+command -v jq >/dev/null 2>&1 || { toast "Archive failed" "jq is not installed"; exit 3; }
 
 # ── source-of-truth for the widget input file ─────────────────────────────────
 STATE_DIR="${HERDR_PLUGIN_STATE_DIR:-}"
@@ -59,11 +54,10 @@ regen_input() {
 }
 
 # ── 1. resolve pane ───────────────────────────────────────────────────────────
-PANE="${HERDR_PANE_ID:-}"
-if [[ -z "$PANE" || "$PANE" == "null" ]]; then
-  PANE="$(hd pane list 2>/dev/null | jq -r '.result.panes[] | select(.focused) | .pane_id' | head -1)"
+if ! PANE="$(current_pane)"; then
+  toast "Archive failed" "could not resolve the current pane"
+  exit 4
 fi
-[[ -z "$PANE" || "$PANE" == "null" ]] && { log "FATAL: no pane to archive"; exit 4; }
 log "archiving pane: $PANE"
 
 # ── 2. read pane metadata ─────────────────────────────────────────────────────
@@ -87,30 +81,28 @@ fi
 [[ -z "$LABEL" ]] && LABEL="$(basename "$CWD")"
 [[ -z "$LABEL" ]] && LABEL="session"
 
-# ── 2b. recover claude/cx session id if not reported yet ──────────────────────
-CLAUDE_BASES=(
-  "$HOME/.claude-code-router/profiles/default-claude-code/claude"
-  "$HOME/.claude"
-)
+# ── 2b. recover claude session id if not reported yet ─────────────────────────
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 ENC="$(printf '%s' "$CWD" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
-if [[ -z "$VALUE" && "$AGENT" == "claude" ]]; then
-  for base in "${CLAUDE_BASES[@]}"; do
-    newest="$(ls -t "$base/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
-    if [[ -n "$newest" ]]; then
-      VALUE="$(basename "$newest" .jsonl)"; KIND="id"
-      log "recovered claude session $VALUE from $base"; break
-    fi
-  done
+if [[ -z "$VALUE" && ("$AGENT" == "claude" || "$AGENT" == "cx") ]]; then
+  newest="$(ls -t "$CLAUDE_DIR/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
+  if [[ -n "$newest" ]]; then
+    VALUE="$(basename "$newest" .jsonl)"; KIND="id"
+    log "recovered claude session $VALUE"
+  fi
 fi
 
 # ── 3. résumé ─────────────────────────────────────────────────────────────────
 DATE_NOW="$(date '+%Y-%m-%d %H:%M')"
 RESUME=""
-if [[ "$AGENT" == "claude" && -n "$VALUE" ]]; then
-  for base in "${CLAUDE_BASES[@]}"; do
-    JSONL="$base/projects/$ENC/$VALUE.jsonl"
-    if [[ -f "$JSONL" ]]; then
-      RESUME="$(jq -rs '
+# Only Claude Code keeps a readable per-session jsonl at a path we can derive
+# from the cwd, so only claude gets a real résumé; the others fall back to the
+# generic one-liner below. (This used to loop over several transcript roots to
+# cover a gateway profile dir; there is one root.)
+if [[ ("$AGENT" == "claude" || "$AGENT" == "cx") && -n "$VALUE" ]]; then
+  JSONL="$CLAUDE_DIR/projects/$ENC/$VALUE.jsonl"
+  if [[ -f "$JSONL" ]]; then
+    RESUME="$(jq -rs '
         [ .[]
           | select((.type? == "user") or (.message.role? == "user"))
           | (.message.content // .content)
@@ -123,12 +115,13 @@ if [[ "$AGENT" == "claude" && -n "$VALUE" ]]; then
           elif ($m | length) == 1 then $m[0]
           else ($m[0] + " … " + $m[-1]) end
       ' "$JSONL" 2>>"$LOG")"
-      [[ -n "$RESUME" ]] && { log "résumé from $JSONL"; break; }
-    fi
-  done
+    [[ -n "$RESUME" ]] && log "résumé from $JSONL"
+  fi
 fi
 if [[ -z "$RESUME" ]]; then
-  RESUME="$AGENT session in $(basename "$CWD") — archived $DATE_NOW"
+  # "${AGENT:-terminal}": an agent-less pane produced a leading-space
+  # " session in …" chip that read like a truncated string.
+  RESUME="${AGENT:-terminal} session in $(basename "$CWD") — archived $DATE_NOW"
 fi
 # collapse whitespace + cap length
 # collapse whitespace + cap at 400 chars (jq slice is codepoint-safe, unlike cut -c)
@@ -148,8 +141,16 @@ jq \
     session_kind: $kind, session_value: $value, cwd: $cwd,
     workspace_id: $ws, resume: $resume
   }]' "$STORE" >"$TMP" 2>>"$LOG" && mv -f "$TMP" "$STORE" \
-  || { log "FATAL: could not append record"; exit 5; }
+  || { toast "Archive failed" "could not write the archive store — the pane was left open"; exit 5; }
 log "record appended (ts=$TS label=$LABEL)"
+
+# Say so when the chip will not be restorable. The pane is still archived and
+# closed (that is the button's job), but a chip that can only ever answer "no
+# session to resume" should not be a surprise ten minutes from now.
+if [[ -z "$VALUE" ]]; then
+  toast "Archive saved without a session" \
+    "'$LABEL' had no resumable agent session, so its chip records the cwd only."
+fi
 
 # ── 5. regenerate widget input ────────────────────────────────────────────────
 regen_input
