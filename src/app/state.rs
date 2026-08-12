@@ -1468,17 +1468,16 @@ pub enum HarnessActionKind {
     CopyPath,
     /// Disable the entry in the settings file that defines it (session-facing).
     DisableSession,
-    /// Disable the entry AND its ccp profile source (profile-wide).
+    /// Disable the entry AND its user-global definition in
+    /// `~/.claude/settings.json`, the scope every project inherits.
     DisableProfile,
     /// Put a stashed entry back where it came from (session-facing). Only rows
     /// the host built from the disable stash carry this — a row is enableable
     /// exactly when a record of its original definition exists.
     EnableSession,
-    /// Enable the entry AND its ccp profile source (profile-wide).
+    /// Enable the entry AND its user-global definition in
+    /// `~/.claude/settings.json`.
     EnableProfile,
-    /// Select a profile for the tab-3 global view (host scans it and publishes
-    /// its [`harness_manager_model::ProfileView`] into the render model).
-    ViewProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1493,7 +1492,7 @@ pub enum HistorialActionKind {
 
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&str> {
-        let mut items = self.builtin_items().iter().copied().collect::<Vec<_>>();
+        let mut items = self.builtin_items().to_vec();
         items.extend(self.plugin_items.iter().map(|item| item.label.as_str()));
         items
     }
@@ -1593,6 +1592,9 @@ impl ContextMenuState {
         }
     }
 
+    // Only reachable from the `#[cfg(test)]` `apply_context_menu_action` mirror;
+    // the live click path resolves plugin items from hit-rects in `input/mouse.rs`.
+    #[cfg(test)]
     pub fn plugin_item(&self, idx: usize) -> Option<&UiActionRef> {
         idx.checked_sub(self.builtin_items().len())
             .and_then(|idx| self.plugin_items.get(idx))
@@ -1980,10 +1982,10 @@ pub struct AppState {
 ///
 /// The overlay hosts a hidden PTY that runs the existing resume-picker TUI
 /// (byte-for-byte). The picker renders to stderr (painted into the popup) and,
-/// on Enter/click, writes the resolved `exec cx …` command to `result_file`
-/// (its stdout, redirected by the overlay wrapper). On the picker's exit the
-/// runtime layer reads `result_file`; a non-empty command is opened in a new
-/// focused tab (`sh -lc <command>`), mirroring the picker's own
+/// on Enter/click, writes the resolved `exec claude --resume …` command to
+/// `result_file` (its stdout, redirected by the overlay wrapper). On the
+/// picker's exit the runtime layer reads `result_file`; a non-empty command is
+/// opened in a new focused tab (`sh -lc <command>`), mirroring the picker's own
 /// `exec sh -c "$CMD"` — never clobbering the pane that was focused.
 #[derive(Debug, Clone)]
 pub(crate) struct ResumePickerOverlay {
@@ -2367,6 +2369,9 @@ impl AppState {
 
     /// Total reserved cells per edge for a pane: `(top, bottom, left, right)`.
     /// Bands from different owners on the same edge sum.
+    // Test-only assertion helper; live code always uses the owner-aware
+    // `pane_carve_totals_excluding`.
+    #[cfg(test)]
     pub(crate) fn pane_carve_totals(&self, pane_id: PaneId) -> (u16, u16, u16, u16) {
         let mut totals = (0_u16, 0_u16, 0_u16, 0_u16);
         let Some(carves) = self.pane_carves.get(&pane_id) else {

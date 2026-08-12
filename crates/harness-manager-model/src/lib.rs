@@ -41,8 +41,10 @@ pub struct HarnessRow {
     /// Whether a left-click opens this entry (host-resolved `harness:open:`).
     #[serde(default)]
     pub openable: bool,
-    /// Whether a right-click offers the disable menu (session / profile),
+    /// Whether a right-click offers the disable menu (this session / user-global),
     /// host-resolved via `harness:disable_session:` / `harness:disable_profile:`.
+    /// `disable_profile` is the wire name of the broader tier: it also edits the
+    /// user-global settings file every project inherits.
     #[serde(default)]
     pub can_disable: bool,
     /// Whether a right-click offers to turn this entry back ON, host-resolved via
@@ -182,6 +184,9 @@ mod tests {
                     tooltip: "runs before every Bash call".to_string(),
                     openable: true,
                     can_disable: true,
+                    can_enable: false,
+                    applies_when: Some("next session".to_string()),
+                    toggle_pending: true,
                     indent: 0,
                     group: Some("PreToolUse".to_string()),
                     tok_loaded: None,
@@ -192,6 +197,7 @@ mod tests {
                     scope: Some("global".to_string()),
                 }],
             }],
+            generated_at: Some(1_770_000_000),
         };
         let json = serde_json::to_string(&model).expect("serialize");
         let back: HarnessRenderModel = serde_json::from_str(&json).expect("deserialize");

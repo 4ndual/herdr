@@ -1,7 +1,7 @@
 //! Harness-manager host glue — mirrors [`crate::historial_host`], the wave-1
 //! host-collector pattern, but with a real collector: it inspects the focused
-//! (or latest-focused) Claude Code pane's session transcript, settings files,
-//! ccp profile, and process, and projects the result into the wasm-safe
+//! (or latest-focused) Claude Code pane's session transcript, settings files
+//! and process, and projects the result into the wasm-safe
 //! [`harness_manager_model::HarnessRenderModel`] republished each ~1 Hz dash
 //! tick via [`App::write_harness_input_file`].
 //!
@@ -24,6 +24,10 @@ use harness_manager_model::{HarnessRenderModel, HarnessRow, HarnessSection, RowS
 use crate::app::state::{HarnessActionKind, PendingHarnessAction};
 use crate::app::App;
 
+/// The agent CLI this collector inspects. The target is only ever adopted from
+/// a focused Claude Code pane, so every label/tooltip that names the agent uses
+/// this one string rather than deriving a kind per tick.
+const AGENT_KIND: &str = "claude";
 /// Full (settings / skills / process) rescan cadence, in dash ticks (~1 Hz).
 const FULL_RESCAN_TICKS: u32 = 5;
 /// A hook that fired within this window renders "active" (red).
@@ -164,7 +168,6 @@ struct HarnessCache {
     mem_files: Vec<PathBuf>,
     /// Resolved memory index path (`MEMORY.md`) for the session, if present.
     mem_index: Option<PathBuf>,
-    profile: Option<String>,
     /// R10: human one-line hook explanations keyed by hook display name, loaded
     /// from `<plugin_state>/hook-descriptions.json`. Empty ⇒ tooltips fall back
     /// to the raw command. Reloaded on the config rescan.
@@ -174,12 +177,6 @@ struct HarnessCache {
     /// config, and every other row comes from scanning config, so without this
     /// a disabled entry has no row and nothing to re-enable from.
     stashed: Vec<serde_json::Value>,
-    /// Which agent CLI drives the focused session: "claude", "cx" (Claude Code
-    /// routed through the CCR gateway), "codex", "pi", or "terminal". Derived on
-    /// the full rescan (cx vs claude comes from which projects root the resolved
-    /// transcript lives under). Empty until first resolved; callers fall back to
-    /// "claude".
-    agent_kind: String,
     session_lines: Vec<(String, String, String, u8)>, // (label, meta, tooltip, indent)
     /// R14: whether the panel was visibly expanded on the previous tick (drives
     /// the refresh-on-open force + the lazy/hidden cadence).
@@ -260,10 +257,10 @@ pub fn tick(app: &mut App) {
         let cache = guard.get_or_insert_with(HarnessCache::default);
         let became_visible = visible && !cache.was_visible;
         cache.was_visible = visible;
-        if visible || became_visible {
-            cache.hidden_skips = 0;
-            true
-        } else if cache.hidden_skips + 1 >= HIDDEN_TICKS {
+        // R14: work on any visible tick (which already subsumes the
+        // hidden→visible transition, since `became_visible` implies `visible`),
+        // or once every HIDDEN_TICKS while the panel stays hidden.
+        if visible || became_visible || cache.hidden_skips + 1 >= HIDDEN_TICKS {
             cache.hidden_skips = 0;
             true
         } else {
@@ -430,14 +427,11 @@ fn refresh(cache: &mut HarnessCache, focus: &herdr_ui_plugin_api::FocusInput, en
     // but rarely changes, so run it on the slow cadence AND only re-parse when a
     // cheap mtime signature moved. The process/RAM rollup is cheap and must
     // update at 1 Hz, so it runs every working tick.
-    if cache.tick % FULL_RESCAN_TICKS == 0 {
+    if cache.tick.is_multiple_of(FULL_RESCAN_TICKS) {
         let sig = config_signature(&cwd);
         if sig != cache.config_sig || cache.ctx_paths.is_empty() {
             cache.config_sig = sig;
             full_rescan(cache, &sid, &cwd);
-        } else {
-            // Config unchanged: still refresh agent_kind cheaply (transcript-derived).
-            refresh_agent_kind(cache);
         }
     }
     refresh_session_lines(cache, &sid, env);
@@ -789,8 +783,7 @@ fn hook_script_path(command: &str) -> Option<PathBuf> {
     command
         .split_whitespace()
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_file())
-        .next_back()
+        .rfind(|p| p.is_absolute() && p.is_file())
 }
 
 /// Read a single scalar field from a markdown file's leading YAML frontmatter
@@ -934,30 +927,11 @@ fn run_capture(cmd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Derive which CLI drives the session from the resolved transcript path: a cx
-/// session (Claude Code via the CCR gateway) writes under
-/// `~/.claude-code-router/profiles/…`, plain Claude under `~/.claude/projects/…`.
-/// Cheap; safe to call every tick without a full config re-parse.
-fn refresh_agent_kind(cache: &mut HarnessCache) {
-    cache.agent_kind = match &cache.transcript {
-        Some(p)
-            if p.to_string_lossy()
-                .contains(".claude-code-router/profiles/") =>
-        {
-            "cx"
-        }
-        _ => "claude",
-    }
-    .to_string();
-}
-
 /// Re-parse the config inputs (settings/hooks/mcps/plugins/skills/agents/ctx/
 /// memory). Expensive but mtime-gated by the caller (R15). Does NOT build the
 /// process/session lines — those run every tick via [`refresh_session_lines`].
 fn full_rescan(cache: &mut HarnessCache, _sid: &str, cwd: &str) {
     let home = home_dir();
-
-    refresh_agent_kind(cache);
 
     // Context file candidates: static harness inputs that exist on disk.
     cache.ctx_paths.clear();
@@ -999,14 +973,6 @@ fn full_rescan(cache: &mut HarnessCache, _sid: &str, cwd: &str) {
             }
         }
     }
-
-    // ccp profile.
-    cache.profile = read_json(&home.join(".claude/settings.json"))
-        .as_ref()
-        .and_then(|s| s.get("_ccp"))
-        .and_then(|c| c.get("profile"))
-        .and_then(|p| p.as_str())
-        .map(str::to_string);
 
     // MCP servers: top-level + this project's entry in ~/.claude.json.
     // Disable stash: what was turned off and is restorable. Read on the same
@@ -1112,14 +1078,11 @@ fn full_rescan(cache: &mut HarnessCache, _sid: &str, cwd: &str) {
 
 /// Rebuild the SESSION section's process/attach lines and the whole-tree RAM/CPU
 /// aggregate. Runs EVERY working tick (cheap: one `ps` snapshot + string work)
-/// so RAM/CPU update at ~1 Hz while the panel is open (R14/R15). Reads the
-/// agent_kind/profile the config scan already cached.
+/// so RAM/CPU update at ~1 Hz while the panel is open (R14/R15).
 fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) {
-    let agent_kind = if cache.agent_kind.is_empty() {
-        "claude".to_string()
-    } else {
-        cache.agent_kind.clone()
-    };
+    // The collector only ever targets a Claude Code pane (see `refresh`), so the
+    // agent is a constant rather than something to derive per tick.
+    let agent_kind = AGENT_KIND;
     cache.session_lines.clear();
     let sid8: String = sid.chars().take(8).collect();
     cache.session_lines.push((
@@ -1131,27 +1094,9 @@ fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) 
     cache.session_lines.push((
         format!("agent {agent_kind}"),
         String::new(),
-        match agent_kind.as_str() {
-            "cx" => "cx: Claude Code driving GPT models through the CCR gateway (transcript under ~/.claude-code-router/profiles)".to_string(),
-            _ => "plain Claude Code (transcript under ~/.claude/projects)".to_string(),
-        },
+        "plain Claude Code (transcript under ~/.claude/projects)".to_string(),
         0,
     ));
-    if let Some(profile) = &cache.profile {
-        cache.session_lines.push((
-            format!("ccp profile {profile}"),
-            String::new(),
-            format!("managed by ccp (~/claude-hub); profile settings: ~/claude-hub/profiles/{profile}/settings.json"),
-            0,
-        ));
-    } else {
-        cache.session_lines.push((
-            "ccp: not detected".to_string(),
-            String::new(),
-            "no _ccp marker in ~/.claude/settings.json".to_string(),
-            0,
-        ));
-    }
     // Claude process tree: resolve the root pid, then walk the FULL descendant
     // tree (recursive ppid descent over one `ps` snapshot) so the SESSION
     // aggregate reflects every worker/tool subprocess, not just depth-1 children.
@@ -1218,7 +1163,7 @@ fn refresh_session_lines(cache: &mut HarnessCache, sid: &str, env: &SessionEnv) 
                         format!("└ {base}"),
                         format!("{pid} {:.0}% {}", p.cpu, fmt_mb(p.rss_kb)),
                         format!("cmd: {cmd_trunc}"),
-                        (*depth as u8).min(4).max(1),
+                        (*depth as u8).clamp(1, 4),
                     ));
                 }
             }
@@ -1302,12 +1247,7 @@ fn render_json(cache: &HarnessCache) -> Option<String> {
         Some((sid, cwd)) => {
             let sid8: String = sid.chars().take(8).collect();
             let folder = basename(Path::new(cwd));
-            let kind = if cache.agent_kind.is_empty() {
-                "claude"
-            } else {
-                cache.agent_kind.as_str()
-            };
-            format!("{kind} · {sid8} · {folder}")
+            format!("{AGENT_KIND} · {sid8} · {folder}")
         }
         None => String::new(),
     };
@@ -1439,7 +1379,7 @@ fn context_section(cache: &HarnessCache) -> HarnessSection {
     // R11 loaded_at; R12 eviction after a compaction boundary).
     let compacted = cache.stats.last_compaction_seq > 0;
     let mut seen: Vec<(&String, &CtxRead)> = cache.stats.ctx_reads.iter().collect();
-    seen.sort_by(|a, b| b.1.seq.cmp(&a.1.seq)); // most-recent first
+    seen.sort_by_key(|b| std::cmp::Reverse(b.1.seq)); // most-recent first
     for (name, read) in seen.into_iter().take(MAX_ROWS.saturating_sub(rows.len())) {
         // Real byte count: recorded content length wins; else stat the path.
         let disk = std::fs::metadata(Path::new(name))
@@ -1581,8 +1521,7 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
         // makes this correct by design: the number belongs to the group header,
         // not to a single hook's row. `agg_event_stat` sums the event's stats.
         let ev = agg_event_stat(&cache.stats, &entry.event);
-        let meta = if ev.count > 0 {
-            let avg = ev.total_ms / ev.count;
+        let meta = if let Some(avg) = ev.total_ms.checked_div(ev.count) {
             let mut m = format!("x{} {avg}ms/{}ms", ev.count, ev.last_ms);
             if ev.err_count > 0 {
                 m.push_str(&format!(" !{}", ev.err_count));
@@ -1606,7 +1545,7 @@ fn hooks_section(cache: &HarnessCache) -> HarnessSection {
         let mut tooltip = format!(
             "{} ({})\n{}\nevent {} · matcher \"{}\"\nevent fired x{} this session · avg {}ms · last {}ms · errors {} ({}ms lost)\ncounts are per-event group (transcript gives event-level granularity)\ntoken cost: not determinable\nright-click to disable",
             entry.name, scope, human, entry.event, entry.matcher,
-            ev.count, if ev.count>0 {ev.total_ms/ev.count} else {0}, ev.last_ms, ev.err_count, ev.err_ms
+            ev.count, ev.total_ms.checked_div(ev.count).unwrap_or(0), ev.last_ms, ev.err_count, ev.err_ms
         );
         // #31: surface the script PATH. Every other row type puts its path on
         // tooltip line 1, but a hook's line 1 is `name (scope)` — the guest
@@ -2025,6 +1964,9 @@ fn agents_section(cache: &HarnessCache) -> HarnessSection {
 enum ResolvedAction {
     Open(PathBuf),
     CopyPath(PathBuf),
+    /// `(entry, user_global)`: with `user_global` the hook is also removed from
+    /// `~/.claude/settings.json`, so a hook inherited from the user-global scope
+    /// cannot survive a session-scoped disable.
     DisableHook(HookEntry, bool),
     DisableMcp(McpEntry),
     DisablePlugin(String),
@@ -2063,7 +2005,9 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
     let guard = CACHE.lock().ok()?;
     let cache = guard.as_ref()?;
     let (kind, idx) = action.key.split_once(':')?;
-    let profile_wide = action.kind == HarnessActionKind::DisableProfile;
+    // `DisableProfile` is the wire name of the broader of the two disable tiers;
+    // what it means here is "also edit the user-global settings file".
+    let user_global = action.kind == HarnessActionKind::DisableProfile;
     match (action.kind, kind) {
         // Open and CopyPath answer the same question — "which file is this row?"
         // — and differ only in what the host then does with the answer, so they
@@ -2093,7 +2037,7 @@ fn resolve_action(action: &PendingHarnessAction) -> Option<ResolvedAction> {
                 .hooks
                 .get(i)
                 .cloned()
-                .map(|h| ResolvedAction::DisableHook(h, profile_wide))
+                .map(|h| ResolvedAction::DisableHook(h, user_global))
         }
         (_, "mcp") => {
             let i: usize = idx.parse().ok()?;
@@ -2606,8 +2550,8 @@ impl App {
                 self.harness_toast(format!("copied {text}"));
                 return true;
             }
-            ResolvedAction::DisableHook(entry, profile_wide) => {
-                self.disable_hook(&entry, profile_wide)
+            ResolvedAction::DisableHook(entry, user_global) => {
+                self.disable_hook(&entry, user_global)
             }
             ResolvedAction::DisableMcp(entry) => self.disable_mcp(&entry),
             ResolvedAction::Enable(kind, name) => self.enable_stashed(&kind, &name),
@@ -2781,24 +2725,20 @@ impl App {
         true
     }
 
-    fn disable_hook(&mut self, entry: &HookEntry, profile_wide: bool) -> bool {
+    /// Disable a hook by removing it from the settings file its row came from,
+    /// stashing the removed record so it can be restored. With `user_global`,
+    /// also remove it from `~/.claude/settings.json` — the scope every project
+    /// inherits — so a hook that lives there does not immediately reappear from
+    /// the user-global scope after a session-scoped disable.
+    fn disable_hook(&mut self, entry: &HookEntry, user_global: bool) -> bool {
         let stash = harness_stash_path();
         let mut changed = remove_hook_from_file(entry, &stash);
-        if profile_wide {
-            // Also remove from the ccp profile source so a profile rebuild
-            // doesn't resurrect it.
-            let profile = CACHE
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().and_then(|c| c.profile.clone()));
-            if let Some(profile) = profile {
-                let profile_file =
-                    home_dir().join(format!("claude-hub/profiles/{profile}/settings.json"));
-                if profile_file.is_file() && profile_file != entry.file {
-                    let mut profile_entry = entry.clone();
-                    profile_entry.file = profile_file;
-                    changed |= remove_hook_from_file(&profile_entry, &stash);
-                }
+        if user_global {
+            let settings = home_dir().join(".claude/settings.json");
+            if settings.is_file() && settings != entry.file {
+                let mut global_entry = entry.clone();
+                global_entry.file = settings;
+                changed |= remove_hook_from_file(&global_entry, &stash);
             }
         }
         if changed {

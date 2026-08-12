@@ -47,7 +47,7 @@ const COLLAPSE_BTN: &str = "[<]";
 const EXPAND_HANDLE: &str = ">";
 const EMPTY_HINT: &str = "focus a claude pane to inspect it";
 const MENU_SESSION: &str = "| disable: this session   |";
-const MENU_PROFILE: &str = "| disable: profile-global |";
+const MENU_PROFILE: &str = "| disable: user-global    |";
 const MENU_COPY: &str = "| copy path               |";
 const MENU_CANCEL: &str = "| cancel                  |";
 
@@ -750,6 +750,7 @@ mod tests {
                     ],
                 },
             ],
+            generated_at: None,
         }
     }
 

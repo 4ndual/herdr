@@ -564,6 +564,7 @@ mod tests {
                     ..Default::default()
                 }],
             }],
+            generated_at: None,
         }
     }
 
