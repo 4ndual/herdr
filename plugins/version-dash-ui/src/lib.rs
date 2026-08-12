@@ -61,12 +61,37 @@ pub extern "C" fn herdr_ui_api_version() -> i32 {
 
 // ── Allocator (host writes event JSON here) ────────────────────────────────
 
+/// Reused input buffer — deliberately NOT a fresh allocation per call.
+///
+/// The obvious implementation (`Vec::with_capacity` + `mem::forget`) leaks the
+/// buffer on every single event: the v3 guest ABI has no `dealloc` export, so
+/// nothing ever gives it back, and a wasm linear memory only ever grows. The
+/// host calls `herdr_ui_alloc` before every `herdr_ui_on_event`, so the guest
+/// ratchets up by one payload per event forever and the host process RSS climbs
+/// with it. Measured on hr before this fix: 3.1 MB/min across the still-leaking
+/// modules, 5.8 GB of linear memory over a 1d20h uptime.
+///
+/// Reuse is safe because the host's sequence is strictly alloc-then-deliver on
+/// one thread: the payload is written here, `herdr_ui_on_event` parses it, and
+/// nothing in the event path calls `herdr_ui_alloc` again before the next event.
+/// The response buffer is separate, so the outbound update cannot be clobbered
+/// by the next inbound payload.
+static HERDR_UI_INPUT: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_alloc(len: i32) -> i32 {
-    let mut bytes = Vec::<u8>::with_capacity(len.max(0) as usize);
-    let ptr = bytes.as_mut_ptr();
-    std::mem::forget(bytes);
-    ptr as i32
+    let wanted = len.max(0) as usize;
+    match HERDR_UI_INPUT.lock() {
+        Ok(mut buf) => {
+            // Resize before taking the pointer: growing may move the allocation.
+            buf.clear();
+            buf.resize(wanted, 0);
+            buf.as_mut_ptr() as i32
+        }
+        // A poisoned lock must not hand back a dangling pointer; 0 tells the
+        // host this guest cannot take the payload.
+        Err(_) => 0,
+    }
 }
 
 // ── Static update (nothing to declare statically) ──────────────────────────
