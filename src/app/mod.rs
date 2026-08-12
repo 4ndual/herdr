@@ -21,12 +21,12 @@ mod resume_picker;
 mod runtime;
 mod runtime_mutations;
 // fork(host-actions): exclusive keyboard routing for plugin modals.
-mod ui_capture;
 mod session;
 pub mod state;
 mod terminal_targets;
 mod terminal_titles;
 mod theme_sync;
+mod ui_capture;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};

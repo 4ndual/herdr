@@ -2335,7 +2335,14 @@ mod tests {
         // assertions below (Rename < Fork < Close) are upstream's real contract.
         assert_eq!(
             menu.items(),
-            &["New tab", "Rename", "Fork", "Archive", "Make invisible", "Close"]
+            &[
+                "New tab",
+                "Rename",
+                "Fork",
+                "Archive",
+                "Make invisible",
+                "Close"
+            ]
         );
         let rename = menu.items().iter().position(|item| *item == "Rename");
         let fork = menu.items().iter().position(|item| *item == "Fork");
@@ -2384,7 +2391,10 @@ mod tests {
         let ws = &state.workspaces[0];
         assert!(ws.tabs[second].hidden, "the tab must be marked hidden");
         assert_ne!(ws.active_tab, second, "focus must move off the hidden tab");
-        assert!(!ws.tabs[ws.active_tab].hidden, "focus must land on a visible tab");
+        assert!(
+            !ws.tabs[ws.active_tab].hidden,
+            "focus must land on a visible tab"
+        );
         assert_eq!(ws.tabs.len(), 2, "hiding must not close the tab");
         assert_eq!(
             ws.tabs[second].root_pane, kept_pane,

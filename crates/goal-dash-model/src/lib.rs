@@ -240,7 +240,6 @@ pub struct GoalRenderModel {
     pub hover: Option<(u16, u16)>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Hit-rect transport (serde-friendly Rect + all of App's rect caches)
 // ---------------------------------------------------------------------------

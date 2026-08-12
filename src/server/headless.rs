@@ -53,8 +53,8 @@ use crate::server::client_accept::{
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
     events_include_active_input, events_include_focus_gained, events_include_pointer_input,
-    latest_app_client, render_targets,
-    terminal_stream_client_ids, ClientConnection, ClientConnectionMode, DeferredRender,
+    latest_app_client, render_targets, terminal_stream_client_ids, ClientConnection,
+    ClientConnectionMode, DeferredRender,
 };
 use crate::server::foreground_policy;
 use crate::server::keybindings::{app_keybindings, apply_keybindings};

@@ -89,7 +89,11 @@ impl App {
             self.refresh_ui_plugin_state_from_manager();
             self.apply_ui_plugin_effects();
             self.request_render();
-        } else if self.ui_plugins.last_error_for(&plugin_id, &module_id).is_some() {
+        } else if self
+            .ui_plugins
+            .last_error_for(&plugin_id, &module_id)
+            .is_some()
+        {
             // Failsafe 3: the guest trapped on this key. Its instance is being
             // rebuilt by crash isolation; do not hold the keyboard for it.
             self.state.ui_keyboard_capture = None;
@@ -131,10 +135,9 @@ mod tests {
     fn ctrl_escape_always_releases_capture() {
         let mut app = test_app();
         app.state.ui_keyboard_capture = Some(("p".into(), "m".into()));
-        assert!(app.dispatch_key_to_captured_module(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::CONTROL
-        )));
+        assert!(
+            app.dispatch_key_to_captured_module(KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL))
+        );
         assert_eq!(app.state.ui_keyboard_capture, None);
     }
 

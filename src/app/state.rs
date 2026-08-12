@@ -2284,7 +2284,6 @@ impl AppState {
         removed
     }
 
-
     /// fork(+131): drop every carve owned by `owner` and report how many went.
     ///
     /// This is the function that makes carve safe to hand to a plugin. A plugin
