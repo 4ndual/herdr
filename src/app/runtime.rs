@@ -62,12 +62,6 @@ impl App {
             let (first, last) = crate::pane_close_history::extract_prompts(record);
             record.first_prompt = first;
             record.last_prompt = last;
-            // Relabel cx sessions (Claude Code routed through the CCR gateway)
-            // as "cx" — the runtime reports them as "claude" since cx *is* Claude
-            // Code, but their transcript location distinguishes the two.
-            if let Some(agent) = crate::pane_close_history::resolve_display_agent(record) {
-                record.agent = Some(agent);
-            }
         }
         crate::pane_close_history::append_records(&records);
     }

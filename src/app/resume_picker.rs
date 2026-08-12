@@ -3,8 +3,8 @@
 //! The overlay hosts a hidden PTY that runs the existing resume-picker TUI
 //! byte-for-byte. The picker renders its screen to stderr (painted into the
 //! popup by [`crate::ui::resume_picker`]) and, on Enter/click, writes the
-//! resolved `exec cx …` command to a result file (its stdout, redirected by the
-//! overlay wrapper script). This module owns the lifecycle:
+//! resolved `exec claude --resume …` command to a result file (its stdout,
+//! redirected by the overlay wrapper script). This module owns the lifecycle:
 //!
 //! - [`App::open_resume_picker_overlay`] spawns the hidden PTY and enters the mode.
 //! - Keys/mouse are forwarded into the PTY while the mode is active
@@ -141,8 +141,9 @@ impl App {
     }
 
     /// Open a picker-resolved command in a new focused tab. The command is a
-    /// shell command line (e.g. `exec cx-resume …`), run via `sh -lc` exactly as
-    /// the picker's own `exec sh -c "$CMD"` would, so `exec` replaces the shell.
+    /// shell command line (e.g. `exec claude --resume …`), run via `sh -lc`
+    /// exactly as the picker's own `exec sh -c "$CMD"` would, so `exec` replaces
+    /// the shell.
     fn open_resume_command_tab(&mut self, command: String) {
         let Some(ws_idx) = self.state.active else {
             return;

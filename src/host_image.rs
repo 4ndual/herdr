@@ -143,9 +143,7 @@ pub(crate) fn resolve_pane_placeholders(
         .collect()
 }
 
-/// The default Claude image-cache root, `~/.claude/image-cache`. cx / CCR
-/// sessions share the same directory (CCR routes the API, not the config dir),
-/// so no per-profile branching is needed.
+/// The default Claude image-cache root, `~/.claude/image-cache`.
 pub(crate) fn default_image_cache_root() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".claude").join("image-cache"))

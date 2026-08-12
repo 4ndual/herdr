@@ -120,11 +120,11 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
 
     let argv = match (source, agent, session_ref.kind) {
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
-            // cmix(cx-resume-lineage): route claude resumes through the cx-resume
-            // dispatcher so cx-origin sessions come back UP as cx (gateway + GPT
-            // models, correct CLAUDE_CONFIG_DIR); daily sessions fall through to
-            // plain claude untouched. See cmix/scripts/patch-herdr-cx-resume.mjs.
-            vec!["cx-resume".into(), session_ref.value.clone()]
+            vec![
+                "claude".into(),
+                "--resume".into(),
+                session_ref.value.clone(),
+            ]
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
@@ -149,6 +149,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
             ]
         }
         ("herdr:pi", "pi", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
+            // pi addresses a stored session with `--session <path|id>`. Its
+            // `-r, --resume` takes no value — it opens an interactive picker —
+            // so the session ref must never be handed to it.
             vec!["pi".into(), "--session".into(), session_ref.value.clone()]
         }
         ("herdr:omp", "omp", AgentSessionRefKind::Path | AgentSessionRefKind::Id) => {
@@ -197,6 +200,12 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:grok", "grok", AgentSessionRefKind::Id) => {
             vec!["grok".into(), "--resume".into(), session_ref.value.clone()]
         }
+        ("herdr:jcode", "jcode", AgentSessionRefKind::Id) => {
+            // Resume only: jcode has no fork flag we can verify, so
+            // [`crate::pane_close_history::PaneCloseRecord::fork_argv`] reports
+            // it as non-forkable rather than guessing one.
+            vec!["jcode".into(), "--resume".into(), session_ref.value.clone()]
+        }
         _ => return None,
     };
 
@@ -233,6 +242,7 @@ pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
             | ("herdr:cursor", "cursor")
             | ("herdr:antigravity_cli", "agy")
             | ("herdr:grok", "grok")
+            | ("herdr:jcode", "jcode")
     )
 }
 
@@ -283,7 +293,7 @@ mod tests {
             )
             .unwrap()
             .argv,
-            vec!["cx-resume", "claude-session"]
+            vec!["claude", "--resume", "claude-session"]
         );
         assert_eq!(
             plan(
@@ -434,6 +444,16 @@ mod tests {
             .unwrap()
             .argv,
             vec!["grok", "--resume", "grok-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:jcode",
+                "jcode",
+                &AgentSessionRef::id("jcode-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["jcode", "--resume", "jcode-session"]
         );
     }
 

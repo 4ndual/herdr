@@ -309,8 +309,8 @@ impl App {
 }
 
 /// Whether a resume plan should arm restart auto-continue: it must be a claude
-/// (or cx, reported as claude) `id`-kind session whose transcript's last turn was
-/// interrupted. The session ref is recovered from the plan's dedupe key
+/// `id`-kind session whose transcript's last turn was interrupted. The session
+/// ref is recovered from the plan's dedupe key
 /// (`source\0agent\0kind\0value`).
 fn auto_continue_should_arm(
     plan: &crate::agent_resume::AgentResumePlan,
@@ -327,7 +327,7 @@ fn auto_continue_should_arm(
         return false;
     }
     let cwd = cwd.to_string_lossy();
-    let Some((path, _is_cx)) = crate::pane_close_history::session_transcript_path(
+    let Some(path) = crate::pane_close_history::session_transcript_path(
         Some("claude"),
         Some("id"),
         Some(value),
@@ -408,8 +408,8 @@ impl App {
             }
 
             // A resumed claude can also boot straight to its idle prompt without a
-            // detectable non-idle blip (fast, clean resume through cx). In that
-            // case fall back to a settle delay: once the agent has had time to come
+            // detectable non-idle blip (a fast, clean resume). In that case fall
+            // back to a settle delay: once the agent has had time to come
             // up and is sitting at an idle claude screen, treat it as ready. Slow
             // or visible boots take the saw_activity path well before this fires.
             let settled = now.saturating_duration_since(ac.armed_at) >= AUTO_CONTINUE_READY_SETTLE;
@@ -417,17 +417,15 @@ impl App {
 
             match ac.nudged_at {
                 None => {
-                    if ready {
-                        if self.send_auto_continue_nudge(&terminal_id, false) {
-                            self.mutate_auto_continue(&terminal_id, |ac| ac.nudged_at = Some(now));
-                            changed = true;
-                            tracing::info!(
-                                terminal = %terminal_id,
-                                saw_activity,
-                                settled,
-                                "auto-continue nudge sent"
-                            );
-                        }
+                    if ready && self.send_auto_continue_nudge(&terminal_id, false) {
+                        self.mutate_auto_continue(&terminal_id, |ac| ac.nudged_at = Some(now));
+                        changed = true;
+                        tracing::info!(
+                            terminal = %terminal_id,
+                            saw_activity,
+                            settled,
+                            "auto-continue nudge sent"
+                        );
                     }
                 }
                 Some(nudged_at) => {

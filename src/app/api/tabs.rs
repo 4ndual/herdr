@@ -23,7 +23,7 @@ impl App {
             for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
                 for tab_idx in 0..ws.tabs.len() {
                     if let Some(tab) = self.tab_info(ws_idx, tab_idx) {
-                        if params.hidden.map_or(true, |hidden| tab.hidden == hidden) {
+                        if params.hidden.is_none_or(|hidden| tab.hidden == hidden) {
                             tabs.push(tab);
                         }
                     }
@@ -222,7 +222,8 @@ impl App {
                 self.terminal_runtimes.insert(terminal.id.clone(), runtime);
                 // Carry the closed pane's human name onto the restored pane.
                 // Without this the pane has no manual label and its border falls
-                // back to the display agent (e.g. "cx"), losing the name it had.
+                // back to the display agent (e.g. "claude"), losing the name it
+                // had.
                 if let Some(pane_label) = record
                     .label
                     .clone()
@@ -685,7 +686,7 @@ mod tests {
             ts_unix_ms: 1,
             pane_id: "w1p1".into(),
             label: Some("codeword".into()),
-            agent: Some("cx".into()),
+            agent: Some("claude".into()),
             session_source: None,
             session_kind: None,
             session_value: None,
@@ -704,7 +705,7 @@ mod tests {
         let terminal_id = restored.terminal_id(restored.root_pane).unwrap();
         let terminal = app.state.terminals.get(terminal_id).unwrap();
         // Without the manual label the border would fall back to the display
-        // agent ("cx"), which is what the restore used to show.
+        // agent ("claude"), which is what the restore used to show.
         assert_eq!(terminal.border_label(true).as_deref(), Some("codeword"));
         shutdown_test_runtimes(&mut app);
     }

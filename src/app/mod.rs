@@ -120,7 +120,7 @@ fn build_historial_rows(
         // Subagent runs (TaskCreate / Agent-tool workers, `agent-*.jsonl`) are
         // pure noise in the historial — excluded at the source, no toggle.
         .filter(|record| !crate::pane_close_history::is_subagent_record(record))
-        // Drop non-resumable *agent* rows: a claude/cx/codex/pi pane whose
+        // Drop non-resumable *agent* rows: a claude/codex/pi/jcode pane whose
         // session ref could not be captured can't be resumed or forked, so it is
         // dead weight. Plain terminals (agent = None) are kept — the `[t]` toggle
         // governs their visibility in the guest.
@@ -2564,7 +2564,7 @@ impl App {
                 .state
                 .installed_plugins
                 .values()
-                .filter(|plugin| std::path::PathBuf::from(&plugin.manifest_path) == manifest_path)
+                .filter(|plugin| std::path::Path::new(&plugin.manifest_path) == manifest_path)
                 .map(|plugin| {
                     (
                         plugin.plugin_id.clone(),
@@ -3754,7 +3754,7 @@ mod tests {
             // A subagent run (agent-* session value) — excluded entirely.
             historial_record(90, "p2", Some("claude"), Some("agent-deadbeef"), true),
             // A non-restorable agent row (no session ref) — excluded as noise.
-            historial_record(80, "p3", Some("cx"), None, false),
+            historial_record(80, "p3", Some("claude"), None, false),
             // A plain terminal (no agent) — kept (guest `[t]` toggle governs it).
             historial_record(70, "p4", None, None, false),
         ];

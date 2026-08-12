@@ -59,7 +59,7 @@ pub struct PaneCloseRecord {
     /// time the panel renders). Absent on records written before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_name: Option<String>,
-    /// First user prompt from the agent transcript (claude/cx sessions), cut
+    /// First user prompt from the agent transcript (claude sessions), cut
     /// char-safe host-side. Extracted once when the record is flushed; absent
     /// for shells/codex/pi and on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -77,14 +77,12 @@ impl PaneCloseRecord {
     pub fn resume_plan(&self) -> Option<crate::agent_resume::AgentResumePlan> {
         use crate::agent_resume::{AgentSessionRef, AgentSessionRefKind};
         let source = self.session_source.as_deref()?;
-        // A cx session is Claude Code launched through the gateway: it is
-        // *persisted* with the display agent "cx" (so the row and the [x] filter
-        // read cx), but it resumes through the same `herdr:claude` source —
-        // cx-resume re-dispatches it back up as cx. Normalize cx -> claude here so
-        // the plan lookup (and therefore `restorable()`, which gates whether the
-        // row survives projection at all) treats it as the claude session it is.
-        // Without this, every cx row is judged non-restorable and dropped from the
-        // historial entirely.
+        // Legacy-record compat: rows written by older builds persisted the
+        // display agent "cx" (Claude Code driven through the retired CCR
+        // gateway) against source "herdr:claude". Nothing writes "cx" any more,
+        // but an existing pane-history.jsonl still carries such rows, and
+        // without this they would be judged non-restorable and silently dropped
+        // from the historial. Read-side only.
         let agent = match self.agent.as_deref()? {
             "cx" => "claude",
             other => other,
@@ -111,7 +109,7 @@ impl PaneCloseRecord {
         let plan = self.resume_plan()?;
         let mut argv = plan.argv;
         match plan.agent.as_str() {
-            // cx-resume <id> --fork-session
+            // claude --resume <id> --fork-session
             "claude" => argv.push("--fork-session".to_string()),
             // codex resume <id> -> codex fork <id>
             "codex" => {
@@ -125,6 +123,10 @@ impl PaneCloseRecord {
                     argv[pos] = "--fork".to_string();
                 }
             }
+            // jcode has no fork flag we can verify, and guessing one would make
+            // the launch fail on an unknown argument rather than degrade. Report
+            // "not forkable" so the caller hides the affordance instead.
+            "jcode" => return None,
             _ => {}
         }
         Some(argv)
@@ -314,25 +316,11 @@ fn truncate_chars(s: &str, max: usize) -> String {
     trimmed.chars().take(max).collect()
 }
 
-/// Base dirs that may hold a claude/cx session transcript, newest-preferred at
-/// call sites. `~/.claude` plus every `~/.claude-code-router/profiles/*/claude`
-/// (the cx router writes per-profile claude homes). Best-effort: unreadable dirs
-/// are skipped.
-fn claude_transcript_bases() -> Vec<PathBuf> {
-    let mut bases = Vec::new();
-    if let Some(home) = dirs_home() {
-        bases.push(home.join(".claude"));
-        let profiles = home.join(".claude-code-router").join("profiles");
-        if let Ok(entries) = std::fs::read_dir(&profiles) {
-            for entry in entries.flatten() {
-                let claude = entry.path().join("claude");
-                if claude.is_dir() {
-                    bases.push(claude);
-                }
-            }
-        }
-    }
-    bases
+/// The Claude Code config dir that holds session transcripts, `~/.claude`.
+/// Stock Claude Code has exactly one such root, matching the root
+/// `usage_dash_core::sources::claude` scans.
+fn claude_transcript_base() -> Option<PathBuf> {
+    dirs_home().map(|home| home.join(".claude"))
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -348,24 +336,21 @@ fn encode_cwd(cwd: &str) -> String {
 }
 
 /// Extract the first and last user prompt (char-safe, capped at
-/// [`PROMPT_MAX_CHARS`]) from a claude/cx session transcript for `record`, if it
+/// [`PROMPT_MAX_CHARS`]) from a claude session transcript for `record`, if it
 /// names an `id`-kind session whose jsonl can be located. Returns
 /// `(first, last)`; either/both `None` when unavailable. Best-effort and
 /// filesystem-only — never panics. Codex/pi/terminal records return `(None,
 /// None)` (no claude transcript to read).
 pub fn extract_prompts(record: &PaneCloseRecord) -> (Option<String>, Option<String>) {
-    let Some((path, _is_cx)) = find_transcript(record) else {
+    let Some(path) = find_transcript(record) else {
         return (None, None);
     };
     read_user_prompts(&path).unwrap_or((None, None))
 }
 
-/// Locate the claude/cx session transcript jsonl for `record`, returning its
-/// path and whether it is a cx (CCR router) transcript (found under
-/// `~/.claude-code-router/profiles/*`). `None` for non-`id`/non-claude sessions
-/// or when no file exists. A cx session is still reported by the runtime as
-/// `agent = "claude"` (cx *is* Claude Code), so both agent labels are accepted.
-fn find_transcript(record: &PaneCloseRecord) -> Option<(PathBuf, bool)> {
+/// Locate the Claude Code session transcript jsonl for `record`. `None` for
+/// non-`id`/non-claude sessions or when no file exists.
+fn find_transcript(record: &PaneCloseRecord) -> Option<PathBuf> {
     session_transcript_path(
         record.agent.as_deref(),
         record.session_kind.as_deref(),
@@ -374,9 +359,8 @@ fn find_transcript(record: &PaneCloseRecord) -> Option<(PathBuf, bool)> {
     )
 }
 
-/// Locate the claude/cx session transcript jsonl for an `id`-kind claude/cx
-/// session identified by `session_value` running in `cwd`. Returns the jsonl
-/// path and whether it is a cx (CCR router) transcript. `None` for
+/// Locate the Claude Code session transcript jsonl for an `id`-kind claude
+/// session identified by `session_value` running in `cwd`. `None` for
 /// non-`id`/non-claude sessions or when no file exists. Shared by the historial
 /// close path and by restart auto-continue, which needs to inspect a live
 /// resumed pane's transcript by its session ref.
@@ -385,31 +369,26 @@ pub fn session_transcript_path(
     session_kind: Option<&str>,
     session_value: Option<&str>,
     cwd: &str,
-) -> Option<(PathBuf, bool)> {
+) -> Option<PathBuf> {
     if session_kind != Some("id") {
         return None;
     }
+    // `Some("cx")` is legacy-record compat, matching the normalization in
+    // [`PaneCloseRecord::resume_plan`]: old rows persisted that display agent
+    // for what was always a Claude Code session.
     if !matches!(agent, Some("claude") | Some("cx")) {
         return None;
     }
     let value = session_value?;
     let enc = encode_cwd(cwd);
-    for base in claude_transcript_bases() {
-        let path = base
-            .join("projects")
-            .join(&enc)
-            .join(format!("{value}.jsonl"));
-        if path.is_file() {
-            let is_cx = base
-                .to_string_lossy()
-                .contains(".claude-code-router/profiles/");
-            return Some((path, is_cx));
-        }
-    }
-    None
+    let path = claude_transcript_base()?
+        .join("projects")
+        .join(&enc)
+        .join(format!("{value}.jsonl"));
+    path.is_file().then_some(path)
 }
 
-/// Whether a claude/cx transcript's last turn was left in flight (interrupted)
+/// Whether a claude transcript's last turn was left in flight (interrupted)
 /// rather than finished. Scans for the last user/assistant record and returns:
 /// a `user` record last (a prompt or tool result awaiting a response) → `true`;
 /// an `assistant` record whose `stop_reason` is not a clean turn end
@@ -473,16 +452,6 @@ fn record_role(value: &serde_json::Value) -> Option<&str> {
         Some(t @ ("user" | "assistant")) => Some(t),
         _ => None,
     }
-}
-
-/// Resolve the display agent kind for a claude/cx `record` from its transcript
-/// location: `"cx"` when the transcript lives under the CCR router profiles,
-/// `"claude"` when under `~/.claude`, `None` when neither applies (leave the
-/// record's existing agent untouched — codex/pi/terminal). Filesystem-only,
-/// best-effort; called once at flush time.
-pub fn resolve_display_agent(record: &PaneCloseRecord) -> Option<String> {
-    let (_, is_cx) = find_transcript(record)?;
-    Some(if is_cx { "cx" } else { "claude" }.to_string())
 }
 
 /// Whether `record`'s session is a subagent run: its transcript jsonl is an
@@ -728,24 +697,25 @@ mod tests {
     fn resume_plan_rebuilds_for_official_agent_session() {
         let record = sample(1, "p");
         let plan = record.resume_plan().expect("claude session is restorable");
-        assert_eq!(plan.argv, vec!["cx-resume", "abc-123"]);
+        assert_eq!(plan.argv, vec!["claude", "--resume", "abc-123"]);
         assert!(record.restorable());
     }
 
     #[test]
-    fn resume_plan_treats_cx_display_agent_as_restorable_claude() {
-        // Regression: a cx session persists with display agent "cx" but source
-        // "herdr:claude". It must stay restorable (else it is dropped from the
-        // historial) and resume through cx-resume, exactly like a claude row.
+    fn resume_plan_accepts_legacy_cx_display_agent() {
+        // Nothing writes "cx" any more, but rows persisted by older builds carry
+        // it as the display agent against source "herdr:claude". They must stay
+        // restorable (else they are dropped from the historial entirely) and
+        // resume as the plain Claude Code sessions they always were.
         let mut record = sample(1, "p");
         record.agent = Some("cx".to_string());
         record.session_source = Some("herdr:claude".to_string());
-        assert!(record.restorable(), "cx rows must be restorable");
-        let plan = record.resume_plan().expect("cx session resolves a plan");
-        assert_eq!(plan.argv, vec!["cx-resume", "abc-123"]);
+        assert!(record.restorable(), "legacy cx rows must stay restorable");
+        let plan = record.resume_plan().expect("legacy cx row resolves a plan");
+        assert_eq!(plan.argv, vec!["claude", "--resume", "abc-123"]);
         assert_eq!(
-            record.fork_argv().expect("cx forkable"),
-            vec!["cx-resume", "abc-123", "--fork-session"]
+            record.fork_argv().expect("legacy cx row is forkable"),
+            vec!["claude", "--resume", "abc-123", "--fork-session"]
         );
     }
 
@@ -764,7 +734,7 @@ mod tests {
         let record = sample(1, "p");
         assert_eq!(
             record.fork_argv().expect("forkable"),
-            vec!["cx-resume", "abc-123", "--fork-session"]
+            vec!["claude", "--resume", "abc-123", "--fork-session"]
         );
     }
 
@@ -773,10 +743,14 @@ mod tests {
         let mut codex = sample(1, "p");
         codex.session_source = Some("herdr:codex".to_string());
         codex.agent = Some("codex".to_string());
-        codex.session_value = Some("cx-1".to_string());
+        codex.session_value = Some("codex-1".to_string());
+        assert_eq!(
+            codex.resume_plan().expect("restorable").argv,
+            vec!["codex", "resume", "codex-1"]
+        );
         assert_eq!(
             codex.fork_argv().expect("forkable"),
-            vec!["codex", "fork", "cx-1"]
+            vec!["codex", "fork", "codex-1"]
         );
 
         let mut pi = sample(1, "p");
@@ -784,10 +758,30 @@ mod tests {
         pi.agent = Some("pi".to_string());
         pi.session_kind = Some("path".to_string());
         pi.session_value = Some("/tmp/pi-session.jsonl".to_string());
+        // pi's `--resume` is an interactive picker that takes no value; the
+        // session is addressed with `--session`, and branched with `--fork`.
+        assert_eq!(
+            pi.resume_plan().expect("restorable").argv,
+            vec!["pi", "--session", "/tmp/pi-session.jsonl"]
+        );
         assert_eq!(
             pi.fork_argv().expect("forkable"),
             vec!["pi", "--fork", "/tmp/pi-session.jsonl"]
         );
+    }
+
+    #[test]
+    fn jcode_resumes_but_does_not_fork() {
+        let mut jcode = sample(1, "p");
+        jcode.session_source = Some("herdr:jcode".to_string());
+        jcode.agent = Some("jcode".to_string());
+        assert_eq!(
+            jcode.resume_plan().expect("restorable").argv,
+            vec!["jcode", "--resume", "abc-123"]
+        );
+        // No verified fork flag: the affordance must resolve to nothing rather
+        // than launch jcode with an argument it would reject.
+        assert!(jcode.fork_argv().is_none());
     }
 
     #[test]
