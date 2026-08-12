@@ -57,7 +57,9 @@ fn agent_infer(
     timeout: Duration,
 ) -> Option<String> {
     match agent {
-        AgentKind::Claude | AgentKind::None => {
+        // jcode has no verified headless/`-p` interface, so it falls in with the
+        // unmodelled-agent arm and is asked through claude, as `None` is.
+        AgentKind::Claude | AgentKind::None | AgentKind::Jcode => {
             let mut command = Command::new("claude");
             command
                 .arg("-p")
@@ -450,7 +452,9 @@ fn agent_observe(
     timeout: Duration,
 ) -> Option<String> {
     match agent {
-        AgentKind::Claude | AgentKind::None => {
+        // jcode has no verified headless/`-p` interface, so it falls in with the
+        // unmodelled-agent arm and is asked through claude, as `None` is.
+        AgentKind::Claude | AgentKind::None | AgentKind::Jcode => {
             let mut command = Command::new("claude");
             command
                 .arg("-p")
@@ -643,15 +647,15 @@ pub fn has_new_user_prompt(path: &Path, since: usize) -> bool {
         }
         match e.get("message").and_then(|m| m.get("content")) {
             Some(Value::String(s)) if !s.trim().is_empty() => return true,
-            Some(Value::Array(blocks)) => {
+            Some(Value::Array(blocks))
                 if blocks.iter().any(|b| {
                     b.get("type").and_then(|t| t.as_str()) == Some("text")
                         && b.get("text")
                             .and_then(|t| t.as_str())
                             .is_some_and(|t| !t.trim().is_empty())
-                }) {
-                    return true;
-                }
+                }) =>
+            {
+                return true;
             }
             _ => {}
         }

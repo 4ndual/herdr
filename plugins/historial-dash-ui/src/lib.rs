@@ -54,7 +54,7 @@ static SHOW_TERMINALS: AtomicBool = AtomicBool::new(false);
 /// `render::ACTION_TOGGLE_LEGEND`. Guest-persistent in memory.
 static SHOW_LEGEND: AtomicBool = AtomicBool::new(false);
 /// Monotonic per-agent filter click counter; `AgentFilter::from_index` maps it to
-/// the current selection (all/claude/cx/codex/pi). Advanced by clicks on
+/// the current selection (all/claude/codex/pi/jcode). Advanced by clicks on
 /// `render::ACTION_CYCLE_AGENT`.
 static AGENT_FILTER_INDEX: AtomicUsize = AtomicUsize::new(0);
 
@@ -353,7 +353,7 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         return render_from_cache().unwrap_or_default();
     }
     if action_id == render::ACTION_CYCLE_AGENT {
-        // Advance the per-agent filter one step (all -> claude -> cx -> ... -> all).
+        // Advance the per-agent filter one step (all -> claude -> ... -> all).
         AGENT_FILTER_INDEX.fetch_add(1, Ordering::SeqCst);
         *HOVERED.lock().expect("hover mutex poisoned") = None;
         return render_from_cache().unwrap_or_default();

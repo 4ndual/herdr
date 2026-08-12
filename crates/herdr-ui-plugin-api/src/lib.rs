@@ -12,6 +12,7 @@ pub enum AgentKind {
     Claude,
     Codex,
     Pi,
+    Jcode,
     /// Focused pane is a plain shell / non-agent (or nothing focused).
     #[default]
     None,

@@ -17,8 +17,8 @@ pub struct HistorialRow {
     /// Stable routing key `"<ts_unix_ms>:<pane_id>"`. The host parses this back
     /// out of a clicked hit-rect's `action_id` to find the source record.
     pub key: String,
-    /// Display agent name: `cx`, `claude`, `codex`, `pi`, or `terminal` (the
-    /// fallback when no agent was detected).
+    /// Display agent name: `claude`, `codex`, `pi`, `jcode`, or `terminal`
+    /// (the fallback when no agent was detected).
     pub agent: String,
     /// Pane label / title, already trimmed for display. Empty when the pane had
     /// no label (the row then omits it).

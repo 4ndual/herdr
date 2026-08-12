@@ -1,0 +1,35 @@
+# jcode — placeholder screen-state manifest (no screen evidence yet).
+#
+# Screen detection in this repo is evidence-based: every rule in the other
+# manifests was written against captured terminal output. There is no jcode
+# binary on the machine this was added from, so there is nothing to capture and
+# no honest rule to write. Copying Claude Code's regexes over would produce
+# confidently-wrong idle/working states instead of no state at all.
+#
+# The file still ships, because the manifest loader resolves the bundled
+# manifest FIRST (`load_manifest_uncached` bails at `bundled_manifest(agent)?`):
+# an agent with no bundled manifest can never be given a local or remote
+# override either. With this file present, a machine that actually runs jcode
+# can drop `~/.config/herdr/agent-detection/jcode.toml` and have it take effect.
+#
+# Until then every jcode screen falls through to `Unknown`, which is the honest
+# answer — PTY activity drives working/idle exactly as it does for any
+# unrecognised program. The rule below exists only because the parser requires
+# at least one; it is deliberately inert.
+#
+# To finish this: run jcode, capture the prompt / working / permission screens
+# with `herdr agent read <pane> --source detection --format text` (and
+# `--format ansi` when styling matters), then replace the rule below with a
+# live-prompt idle rule, a working rule and a real blocker rule the way
+# claude.toml does.
+id = "jcode"
+version = "2026.08.12.1"
+min_engine_version = 1
+updated_at = "2026-08-12T00:00:00Z"
+
+[[rules]]
+id = "placeholder_no_observed_screens"
+state = "unknown"
+priority = 1
+region = "whole_recent"
+contains = ["herdr:jcode-manifest-placeholder"]

@@ -54,6 +54,7 @@ fn map_agent(agent: Agent) -> AgentKind {
         Agent::Claude => AgentKind::Claude,
         Agent::Codex => AgentKind::Codex,
         Agent::Pi => AgentKind::Pi,
+        Agent::Jcode => AgentKind::Jcode,
         _ => AgentKind::None,
     }
 }

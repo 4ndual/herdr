@@ -20,14 +20,15 @@ use unicode_width::UnicodeWidthStr;
 
 /// Accent color for an agent kind. Shared by the row identity and the tooltip
 /// agent value so the same agent always reads as the same color (color =
-/// meaning): a glance down the list distinguishes claude/cx/codex/pi rows even
-/// when several are unnamed and therefore share the agent name as their title.
+/// meaning): a glance down the list distinguishes claude/codex/pi/jcode rows
+/// even when several are unnamed and therefore share the agent name as their
+/// title.
 fn agent_color(agent: &str) -> Color {
     match agent {
         "claude" => Color::Magenta,
-        "cx" => Color::Blue,
         "codex" => Color::Green,
         "pi" => Color::Yellow,
+        "jcode" => Color::Blue,
         "terminal" => Color::DarkGray,
         _ => Color::White,
     }
@@ -43,7 +44,7 @@ pub const ACTION_TOGGLE_PANEL: &str = "historial:toggle_panel";
 pub const ACTION_TOGGLE_TERMINALS: &str = "historial:toggle_terminals";
 
 /// Per-agent filter cycle button in the header. Guest-owned: each `left_down`
-/// advances the filter all -> claude -> cx -> codex -> pi -> all.
+/// advances the filter all -> claude -> codex -> pi -> jcode -> all.
 pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
 
 /// Legend/help toggle in the header (`[?]`). Guest-owned: each `left_down` flips
@@ -57,9 +58,9 @@ pub enum AgentFilter {
     #[default]
     All,
     Claude,
-    Cx,
     Codex,
     Pi,
+    Jcode,
 }
 
 impl AgentFilter {
@@ -69,9 +70,9 @@ impl AgentFilter {
         match i % 5 {
             0 => AgentFilter::All,
             1 => AgentFilter::Claude,
-            2 => AgentFilter::Cx,
-            3 => AgentFilter::Codex,
-            _ => AgentFilter::Pi,
+            2 => AgentFilter::Codex,
+            3 => AgentFilter::Pi,
+            _ => AgentFilter::Jcode,
         }
     }
 
@@ -80,9 +81,9 @@ impl AgentFilter {
         match self {
             AgentFilter::All => "[*]",
             AgentFilter::Claude => "[c]",
-            AgentFilter::Cx => "[x]",
             AgentFilter::Codex => "[o]",
             AgentFilter::Pi => "[p]",
+            AgentFilter::Jcode => "[j]",
         }
     }
 
@@ -91,9 +92,9 @@ impl AgentFilter {
         match self {
             AgentFilter::All => "all",
             AgentFilter::Claude => "claude",
-            AgentFilter::Cx => "cx",
             AgentFilter::Codex => "codex",
             AgentFilter::Pi => "pi",
+            AgentFilter::Jcode => "jcode",
         }
     }
 
@@ -103,9 +104,9 @@ impl AgentFilter {
         match self {
             AgentFilter::All => true,
             AgentFilter::Claude => agent == "claude",
-            AgentFilter::Cx => agent == "cx",
             AgentFilter::Codex => agent == "codex",
             AgentFilter::Pi => agent == "pi",
+            AgentFilter::Jcode => agent == "jcode",
         }
     }
 }
@@ -147,7 +148,10 @@ impl HeaderButton {
     pub fn describe(self, filters: RowFilters) -> String {
         match self {
             HeaderButton::Agent => {
-                format!("[*] filter: {}  (all>claude>cx>codex>pi)", filters.agent.label())
+                format!(
+                    "[*] filter: {}  (all>claude>codex>pi>jcode)",
+                    filters.agent.label()
+                )
             }
             HeaderButton::Terminals => {
                 if filters.show_terminals {
@@ -481,7 +485,7 @@ fn render_full(
 ///   2. the pane's TAB display name (`tab_name`) — herdr always assigns one at
 ///      tab creation (a user rename, "new"/"test", or a number), so this is the
 ///      name the user scans by and is effectively never empty for a live pane;
-///   3. the agent name (`claude`/`cx`/…) — a last-resort safety net only for
+///   3. the agent name (`claude`/`codex`/…) — a last-resort safety net only for
 ///      legacy records written before `tab_name` was captured.
 /// We deliberately never substitute the first user prompt (noisy) nor the
 /// cwd/folder name (rejected). All other metadata lives in the hover tooltip.
@@ -510,7 +514,7 @@ fn render_legend(
     let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<String> = vec![
         format!("[*] agent filter (now: {})", agent.label()),
-        "    all/claude/cx/codex/pi".to_string(),
+        "    all/claude/codex/pi/jcode".to_string(),
         "[t] show terminal panes".to_string(),
         "[<] collapse panel".to_string(),
         "[?] toggle this help".to_string(),
@@ -938,24 +942,47 @@ mod tests {
         assert!(ids.contains(&"historial:cycle_agent"));
     }
 
+    /// The cycle covers every supported agent runtime and returns to `all`, so
+    /// no kind of pane can be filtered out with no way to get it back.
+    #[test]
+    fn the_agent_filter_cycles_through_all_supported_runtimes() {
+        let cycle: Vec<AgentFilter> = (0..6).map(AgentFilter::from_index).collect();
+        assert_eq!(
+            cycle,
+            vec![
+                AgentFilter::All,
+                AgentFilter::Claude,
+                AgentFilter::Codex,
+                AgentFilter::Pi,
+                AgentFilter::Jcode,
+                AgentFilter::All,
+            ]
+        );
+        // Every glyph is the same width, so the header layout cannot shift as
+        // the selection advances.
+        for f in &cycle {
+            assert_eq!(f.glyph().chars().count(), HEADER_BTN_W as usize);
+        }
+    }
+
     #[test]
     fn per_agent_filter_selects_matching_rows() {
         let claude = row("1:w_1_p_1", true);
-        let cx = {
+        let jcode = {
             let mut r = row("2:w_1_p_2", true);
-            r.agent = "cx".to_string();
+            r.agent = "jcode".to_string();
             r
         };
         let model = HistorialRenderModel {
-            rows: vec![claude, cx],
+            rows: vec![claude, jcode],
         };
         let f = RowFilters {
-            agent: AgentFilter::Cx,
+            agent: AgentFilter::Jcode,
             ..RowFilters::default()
         };
         let visible = visible_rows(&model, f);
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].agent, "cx");
+        assert_eq!(visible[0].agent, "jcode");
 
         let f = RowFilters {
             agent: AgentFilter::Claude,
