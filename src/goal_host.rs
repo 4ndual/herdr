@@ -26,6 +26,7 @@
 //!   2. a plugin-side collector: a goal-dash helper process subscribes to the
 //!      socket API (`events.subscribe`) and writes `goal_input.json` itself,
 //!      instead of the host tick writing it.
+//!
 //! When both land, DELETE: this entire file (`src/goal_host.rs`) AND, in
 //! `src/app/mod.rs`, the writer `write_goal_input_file` + `goal_render_input_json`,
 //! the `goal_dash` field, and the `GOAL_DASH_*` consts. At that point the core

@@ -45,7 +45,7 @@ fn newest_jsonl_in(dir: &std::path::Path) -> Option<PathBuf> {
         })
         .filter(|(_, p)| p.extension().map(|x| x == "jsonl").unwrap_or(false))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|e| std::cmp::Reverse(e.0));
     files.into_iter().next().map(|(_, p)| p)
 }
 

@@ -1035,6 +1035,9 @@ pub(super) fn apply_context_menu_action(
     }
 }
 
+// Only reachable from the `#[cfg(test)]` `apply_context_menu_action` mirror; the
+// live path parses the same `plugin:<id>:<action>` form in `input/mouse.rs`.
+#[cfg(test)]
 fn plugin_action_parts(id: &str) -> Option<(&str, &str)> {
     let rest = id.strip_prefix("plugin:")?;
     let (plugin_id, action_id) = rest.split_once(':')?;

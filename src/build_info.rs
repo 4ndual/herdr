@@ -73,6 +73,10 @@ static FORK_VARIANT_MARKER: &[u8] = FORK_VARIANT.as_bytes();
 
 /// Which variant of the fork this binary is, e.g. `noimages`. `None` for a
 /// plain build, which is the overwhelmingly common case.
+// Reader for the scrapeable `HERDR_FORK_VARIANT` marker baked by
+// `build.rs::emit_fork_variant` and `.cargo/config.toml`; kept as the in-process
+// accessor for that provenance mechanism even while no runtime surface reads it.
+#[allow(dead_code)]
 pub fn fork_variant() -> Option<&'static str> {
     // `black_box` for the same reason as in `fork_provenance`: without it the
     // const chain folds away and the literal never reaches the binary.
@@ -102,6 +106,10 @@ pub fn fork_provenance() -> Option<&'static str> {
 }
 
 /// Commits since the nearest tag — the `+N` the version strip renders.
+// Kept as the canonical parser of the `HERDR_FORK_PROVENANCE` marker: its
+// right-to-left `g<sha>`-last contract is what `.cargo/config.toml` and
+// `build.rs` are written against, and the tests mirror this parser.
+#[allow(dead_code)]
 pub fn fork_commit_count() -> Option<u32> {
     // `<tag>-<ahead>-g<sha>[-dirty]`; take the field before the `g<sha>`.
     let desc = fork_provenance()?;

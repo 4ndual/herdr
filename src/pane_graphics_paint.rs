@@ -170,7 +170,7 @@ fn clip_start(start: i32, extent: u32) -> Option<(u32, u32)> {
     if start >= 0 {
         return Some((u32::try_from(start).ok()?, extent));
     }
-    let hidden = u32::try_from(start.unsigned_abs()).ok()?;
+    let hidden = start.unsigned_abs();
     if hidden >= extent {
         return None;
     }

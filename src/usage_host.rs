@@ -18,6 +18,7 @@
 //!   2. a plugin-side collector: a usage-dash helper process subscribes to the
 //!      socket API (`events.subscribe`) and writes `usage_input.json` itself,
 //!      instead of the host tick writing it.
+//!
 //! When both land, DELETE: this entire file (`src/usage_host.rs`) AND, in
 //! `src/app/mod.rs`, the writer `write_usage_input_file` + `usage_render_input_json`,
 //! the `sync_usage_view_hits_from_layers` toggle-mirror shim, the

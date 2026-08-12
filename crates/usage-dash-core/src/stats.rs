@@ -190,14 +190,12 @@ pub fn fold_stats(mut acc: StatsAcc, text: &str) -> StatsAcc {
                     }
                 }
             }
-            "system" => {
-                if v.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") {
-                    acc.autocompacts += 1;
-                    if let Some(cm) = v.get("compactMetadata") {
-                        let pre = cm.get("preTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                        let post = cm.get("postTokens").and_then(|x| x.as_u64()).unwrap_or(0);
-                        acc.freed_tokens += pre.saturating_sub(post);
-                    }
+            "system" if v.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") => {
+                acc.autocompacts += 1;
+                if let Some(cm) = v.get("compactMetadata") {
+                    let pre = cm.get("preTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let post = cm.get("postTokens").and_then(|x| x.as_u64()).unwrap_or(0);
+                    acc.freed_tokens += pre.saturating_sub(post);
                 }
             }
             _ => {}

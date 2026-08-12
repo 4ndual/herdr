@@ -600,6 +600,12 @@
           "description": "Automatically copy text selected by mouse drag or double-click. When disabled, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection."
         },
         {
+          "key": "ui.usage_strip",
+          "type": "boolean",
+          "default": "true",
+          "description": "Show the persistent native usage strip along the bottom of the terminal area."
+        },
+        {
           "key": "ui.host_cursor",
           "type": "enum",
           "default": "auto",
@@ -1026,6 +1032,17 @@
             "on",
             "off"
           ]
+        },
+        {
+          "key": "ui.sound.agents.jcode",
+          "type": "enum",
+          "default": "\"default\"",
+          "description": "Sound override for detected jcode agents.",
+          "values": [
+            "default",
+            "on",
+            "off"
+          ]
         }
       ]
     },
@@ -1038,6 +1055,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Resume supported AI-agent panes into their native conversation sessions when restoring a Herdr session."
+        },
+        {
+          "key": "session.auto_continue_on_restore",
+          "type": "boolean",
+          "default": "true",
+          "description": "After a Herdr server restart re-resumes an agent pane whose previous turn was interrupted by the restart, nudge the resumed agent to continue where it left off. Only fires on restart-triggered restores and only for panes whose transcript shows an in-flight turn."
         }
       ]
     },

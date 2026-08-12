@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Mirror of `goal_dash_core::view::View`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum View {
+    #[default]
     Tree,
     History,
     Proposals,
@@ -55,8 +56,9 @@ pub enum Node {
 }
 
 /// Mirror of `goal_dash_core::view::EditTarget` (what an in-progress edit writes).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum EditTarget {
+    #[default]
     Main,
     Current,
     Sub(u64),
@@ -238,17 +240,6 @@ pub struct GoalRenderModel {
     pub hover: Option<(u16, u16)>,
 }
 
-impl Default for View {
-    fn default() -> Self {
-        View::Tree
-    }
-}
-
-impl Default for EditTarget {
-    fn default() -> Self {
-        EditTarget::Main
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Hit-rect transport (serde-friendly Rect + all of App's rect caches)
@@ -298,28 +289,30 @@ mod tests {
 
     #[test]
     fn model_json_round_trips() {
-        let mut m = GoalRenderModel::default();
-        m.view = View::Tree;
-        m.has_session = true;
-        m.current = GoalNodeData {
-            text: "ship it".into(),
-            source: "user".into(),
-            approved: true,
-            est_label: "2h".into(),
-            due_label: "06-21 18:00".into(),
-            minutes_until: Some(45),
+        let m = GoalRenderModel {
+            view: View::Tree,
+            has_session: true,
+            current: GoalNodeData {
+                text: "ship it".into(),
+                source: "user".into(),
+                approved: true,
+                est_label: "2h".into(),
+                due_label: "06-21 18:00".into(),
+                minutes_until: Some(45),
+                ..Default::default()
+            },
+            nodes: vec![
+                Node::Main,
+                Node::Section(Par::Current, St::Active),
+                Node::Sub(3),
+            ],
+            sel_chips: vec![ChipData {
+                act: ActTag::Edit,
+                glyph: "✎".into(),
+                tip: "edit".into(),
+            }],
             ..Default::default()
         };
-        m.nodes = vec![
-            Node::Main,
-            Node::Section(Par::Current, St::Active),
-            Node::Sub(3),
-        ];
-        m.sel_chips = vec![ChipData {
-            act: ActTag::Edit,
-            glyph: "✎".into(),
-            tip: "edit".into(),
-        }];
         let json = serde_json::to_string(&m).unwrap();
         let back: GoalRenderModel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.current.text, "ship it");

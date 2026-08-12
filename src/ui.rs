@@ -662,13 +662,13 @@ fn layout_plugin_panels(
         let rect = match placement.region {
             PluginPanelRegion::BottomBand => {
                 if usage.width == 0 {
-                    skips.push(skip(&entry, "usage_band_zero_width", content_w, content_h));
+                    skips.push(skip(entry, "usage_band_zero_width", content_w, content_h));
                     continue;
                 }
                 let max_slot = usage.width.saturating_sub(min_peer);
                 let slot_w = resolve_extent(size, content_w, usage.width).min(max_slot);
                 if slot_w == 0 {
-                    skips.push(skip(&entry, "no_room_in_usage_band", content_w, content_h));
+                    skips.push(skip(entry, "no_room_in_usage_band", content_w, content_h));
                     continue;
                 }
                 let (peer, panel) = carve_band_horizontal(usage, slot_w, placement.align);
@@ -677,13 +677,13 @@ fn layout_plugin_panels(
             }
             PluginPanelRegion::Left | PluginPanelRegion::Right => {
                 if terminal.height == 0 {
-                    skips.push(skip(&entry, "pane_area_zero_height", content_w, content_h));
+                    skips.push(skip(entry, "pane_area_zero_height", content_w, content_h));
                     continue;
                 }
                 let max_slot = terminal.width.saturating_sub(min_peer);
                 let w = resolve_extent(size, content_w, terminal.width).min(max_slot);
                 if w == 0 {
-                    skips.push(skip(&entry, "no_room_for_side_band", content_w, content_h));
+                    skips.push(skip(entry, "no_room_for_side_band", content_w, content_h));
                     continue;
                 }
                 let start = matches!(placement.region, PluginPanelRegion::Left);
@@ -701,14 +701,14 @@ fn layout_plugin_panels(
             }
             PluginPanelRegion::Top | PluginPanelRegion::Bottom => {
                 if terminal.width == 0 {
-                    skips.push(skip(&entry, "pane_area_zero_width", content_w, content_h));
+                    skips.push(skip(entry, "pane_area_zero_width", content_w, content_h));
                     continue;
                 }
                 let max_slot = terminal.height.saturating_sub(min_peer);
                 let h = resolve_extent(size, content_h, terminal.height).min(max_slot);
                 if h == 0 {
                     skips.push(skip(
-                        &entry,
+                        entry,
                         "no_room_for_top_bottom_band",
                         content_w,
                         content_h,
@@ -728,7 +728,7 @@ fn layout_plugin_panels(
                 let h = content_h.min(terminal.height);
                 if w == 0 || h == 0 {
                     skips.push(skip(
-                        &entry,
+                        entry,
                         "no_room_for_free_overlay",
                         content_w,
                         content_h,
@@ -1032,11 +1032,9 @@ pub(crate) fn ui_plugin_surface_rect(app: &AppState, frame_area: Rect, surface: 
             }
         }
         UiSurface::Footer => {
-            let area = if app.view.layout == ViewLayout::Mobile {
-                app.view.terminal_area
-            } else {
-                app.view.terminal_area
-            };
+            // Unlike the header, there is no distinct mobile footer rect: both
+            // layouts put the footer on the last row of the terminal area.
+            let area = app.view.terminal_area;
             if area.height > 0 {
                 Rect::new(
                     area.x,

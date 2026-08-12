@@ -9222,6 +9222,11 @@
               "type": "string"
             },
             {
+              "const": "keyboard_capture",
+              "description": "fork(host-actions): exclusive keyboard routing while a plugin modal is\nopen (`HostEffect::SetKeyboardCapture`). Separate from `keyboard_input`\n(a broadcast copy) because capture REDIRECTS keys away from the pane —\na strictly larger power that must be its own visible grant.",
+              "type": "string"
+            },
+            {
               "const": "plugin_admin",
               "description": "fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Kept out of\n`ApiWrite` for the same reason as the two above: a module holding this\ncan switch OTHER modules off, so it has to be declared and visible in\n`plugin list` rather than arriving as a side effect of ordinary writes.\n`plugin.link`/`plugin.unlink` remain host-reserved — installing code from\na path is a strictly larger power than flipping an installed plugin's\nenabled bit, and nothing in-guest needs it.",
               "type": "string"

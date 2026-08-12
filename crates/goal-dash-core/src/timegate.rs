@@ -280,7 +280,7 @@ pub fn list_project_plans_in(dir: &Path, key: &str) -> Vec<PlanMeta> {
             mtime_ms,
         });
     }
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.mtime_ms));
     out
 }
 

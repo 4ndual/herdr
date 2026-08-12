@@ -979,12 +979,10 @@ fn draw_proposals(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         sel_line.min(max_off)
     };
 
-    let mut y = body.y;
-    for (line, idx, _) in lines.into_iter().skip(off).take(height) {
+    for (y, (line, idx, _)) in (body.y..).zip(lines.into_iter().skip(off).take(height)) {
         let rect = Rect::new(body.x, y, body.width, 1);
         f.render_widget(Paragraph::new(line), rect);
         app.prop_rects.push((rect, idx));
-        y += 1;
     }
 
     f.render_widget(dim_rule(area.width), rows[3]);
