@@ -246,7 +246,7 @@ pub enum PipelinePhase {
     Verified,
     /// Finished and failed, with no agent handoff (yet).
     Failed,
-    /// Failed and handed to an agent via cx.
+    /// Failed and handed off to an agent to take over.
     Escalated,
     /// Finished the work but is waiting on the user — the only phase that
     /// blocks on a human. Used for the hr restart, which is never taken without

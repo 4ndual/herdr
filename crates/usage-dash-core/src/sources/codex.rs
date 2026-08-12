@@ -43,7 +43,7 @@ fn rollouts_by_mtime(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.sort_by_key(|e| std::cmp::Reverse(e.0));
     out.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -209,46 +209,6 @@ pub(crate) fn assign_windows(
         }
     }
     (five_hour, weekly)
-}
-
-fn model_catalog_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".codex/ccr-model-catalog.json")
-}
-
-/// Context window for a CCR/Codex model id from `~/.codex/ccr-model-catalog.json`.
-/// `None` when the catalog is missing or has no matching model.
-pub fn ctx_window_from_catalog(model_id: &str) -> Option<u64> {
-    let raw = std::fs::read_to_string(model_catalog_path()).ok()?;
-    ctx_window_from_catalog_str(&raw, model_id)
-}
-
-/// Pure catalog lookup. Each entry's `slug` looks like `"Codex Plan/gpt-5.6-sol"`;
-/// we strip the optional `"Codex Plan/"` prefix from BOTH the catalog slug and
-/// the requested id, then compare, so a bare `gpt-5.6-sol` matches its entry.
-pub fn ctx_window_from_catalog_str(raw: &str, model_id: &str) -> Option<u64> {
-    let want = strip_codex_plan_prefix(model_id);
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let models = v.get("models")?.as_array()?;
-    for m in models {
-        let slug = match m
-            .get("slug")
-            .or_else(|| m.get("display_name"))
-            .and_then(|x| x.as_str())
-        {
-            Some(s) => s,
-            None => continue,
-        };
-        if strip_codex_plan_prefix(slug) == want {
-            return m.get("context_window").and_then(|x| x.as_u64());
-        }
-    }
-    None
-}
-
-/// Drop the CCR `"Codex Plan/"` catalog namespace prefix if present.
-pub fn strip_codex_plan_prefix(id: &str) -> &str {
-    id.strip_prefix("Codex Plan/").unwrap_or(id)
 }
 
 /// Build a snapshot for the focused Codex session (matched by cwd).
@@ -435,26 +395,6 @@ mod tests {
         let (h5, wk) = assign_windows(a, b);
         assert_eq!(h5.used_pct, Some(3.0));
         assert_eq!(wk.used_pct, Some(4.0));
-    }
-
-    #[test]
-    fn catalog_lookup_strips_codex_plan_prefix() {
-        let raw = r#"{"models":[
-            {"slug":"Codex Plan/gpt-5.6-sol","context_window":128000},
-            {"slug":"Codex Plan/gpt-5.5","context_window":1050000},
-            {"slug":"Claude Plan/claude-opus-4-8","context_window":1000000}]}"#;
-        // Bare session id matches the "Codex Plan/"-prefixed slug.
-        assert_eq!(
-            ctx_window_from_catalog_str(raw, "gpt-5.6-sol"),
-            Some(128000)
-        );
-        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-5.5"), Some(1050000));
-        // A prefixed id also matches.
-        assert_eq!(
-            ctx_window_from_catalog_str(raw, "Codex Plan/gpt-5.6-sol"),
-            Some(128000)
-        );
-        assert_eq!(ctx_window_from_catalog_str(raw, "gpt-9.9-none"), None);
     }
 
     #[test]

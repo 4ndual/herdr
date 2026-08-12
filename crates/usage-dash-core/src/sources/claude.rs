@@ -22,80 +22,23 @@ fn projects_root() -> PathBuf {
     PathBuf::from(home).join(".claude/projects")
 }
 
-/// Every `.../claude/projects` dir to scan for a session transcript: the native
-/// Claude Code root plus each CCR profile's mirrored root. "cx" sessions (Claude
-/// Code driving GPT models through the CCR gateway) write their transcripts under
-/// `~/.claude-code-router/profiles/<profile>/claude/projects/…`, not `~/.claude`.
-fn projects_roots() -> Vec<PathBuf> {
-    let mut roots = vec![projects_root()];
-    let home = std::env::var("HOME").unwrap_or_default();
-    let ccr = PathBuf::from(home).join(".claude-code-router/profiles");
-    if let Ok(profiles) = std::fs::read_dir(&ccr) {
-        for prof in profiles.flatten() {
-            let p = prof.path().join("claude/projects");
-            if p.is_dir() {
-                roots.push(p);
-            }
-        }
-    }
-    roots
-}
-
-/// Is this transcript from a **cx** session — Claude Code driving models through
-/// the CCR gateway?
-///
-/// Answered by WHERE the transcript lives, not by which model it names. cx
-/// writes under `~/.claude-code-router/profiles/<profile>/claude/projects/…`
-/// while native Claude Code writes under `~/.claude/projects/…`, so the path is
-/// a direct, model-independent witness of how the pane was launched.
-///
-/// This distinction used to be keyed on the model family (gpt-* ⇒ cx), which was
-/// wrong in both directions: cx routes the Claude plan through the gateway too,
-/// so a cx pane on `claude-opus-5` reported itself as a plain Claude session and
-/// showed no `cx` tag at all. Runtime (which gateway) and plan (whose quota) are
-/// two independent axes; only the plan axis belongs to the model family.
-fn is_cx_transcript(path: &Path) -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return false;
-    }
-    let ccr = PathBuf::from(home).join(".claude-code-router/profiles");
-    path.starts_with(&ccr)
-}
-
-/// Locate the transcript `<sid>.jsonl` under any project dir across every root
-/// (native + CCR profiles); newest mtime wins.
+/// Locate the transcript `<sid>.jsonl` under any project dir of the Claude Code
+/// projects root; newest mtime wins.
 pub fn transcript_for_sid(sid: &str) -> Option<PathBuf> {
     let want = format!("{sid}.jsonl");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for root in projects_roots() {
-        if let Ok(projects) = std::fs::read_dir(&root) {
-            for proj in projects.flatten() {
-                let cand = proj.path().join(&want);
-                if let Ok(meta) = std::fs::metadata(&cand) {
-                    let mt = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
-                        best = Some((mt, cand));
-                    }
+    if let Ok(projects) = std::fs::read_dir(projects_root()) {
+        for proj in projects.flatten() {
+            let cand = proj.path().join(&want);
+            if let Ok(meta) = std::fs::metadata(&cand) {
+                let mt = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
+                    best = Some((mt, cand));
                 }
             }
         }
     }
     best.map(|(_, p)| p)
-}
-
-/// True when a transcript's last assistant model is a GPT/Codex model routed
-/// through CCR, meaning the session must be attributed to the Codex plan (its
-/// identity, colors, and quota) — never Anthropic. The rule: after stripping an
-/// optional `"Codex Plan/"` prefix, the id contains "codex", starts with "gpt-",
-/// or is an `o<digit>` reasoning model (o3, o4-mini, …). Case-insensitive.
-pub fn is_gpt_model(model: &str) -> bool {
-    let m = crate::sources::codex::strip_codex_plan_prefix(model).to_ascii_lowercase();
-    if m.contains("codex") || m.starts_with("gpt-") {
-        return true;
-    }
-    let mut chars = m.chars();
-    chars.next() == Some('o') && chars.next().map(|c| c.is_ascii_digit()).unwrap_or(false)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -149,8 +92,7 @@ fn abbrev_effort(level: &str) -> String {
     }
 }
 
-/// fork: the `<version>` / `<version> cx` prefix carried INSIDE the model
-/// string.
+/// fork: the `<version>` prefix carried INSIDE the model string.
 ///
 /// It belongs on its own snapshot field, and was written that way first — but
 /// the running host deserializes the collector's JSON into its own compiled-in
@@ -158,14 +100,13 @@ fn abbrev_effort(level: &str) -> String {
 /// reach the screen without a host rebuild and a restart. The model string is
 /// passed through untouched, so the data rides there instead. Unwind this in
 /// favour of real fields at the next host promote.
-fn version_prefix(version: Option<&str>, cx: bool) -> String {
-    match (version.map(str::trim).filter(|v| !v.is_empty()), cx) {
-        (Some(v), true) => format!("{v} cx · "),
-        (Some(v), false) => format!("{v} · "),
-        // No version (old transcript): the `cx` tag still matters on its own —
-        // it is the one bit that says this pane is not talking to Anthropic.
-        (None, true) => "cx · ".to_string(),
-        (None, false) => String::new(),
+///
+/// Empty when the transcript carries no version (pre-`version` records), so
+/// callers can prepend it unconditionally.
+fn version_prefix(version: Option<&str>) -> String {
+    match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => format!("{v} · "),
+        None => String::new(),
     }
 }
 
@@ -261,7 +202,7 @@ pub fn parse_transcript(content: &str) -> Transcript {
 /// fork(wave-2): a real model id — anything not empty and not a Claude Code
 /// synthetic placeholder (`<synthetic>` and any other `<…>`-wrapped sentinel).
 fn is_real_model(m: &str) -> bool {
-    !m.is_empty() && !(m.starts_with('<') && m.ends_with('>'))
+    !(m.is_empty() || m.starts_with('<') && m.ends_with('>'))
 }
 
 /// Friendly model name from the raw API id. Unknown ids pass through.
@@ -341,32 +282,29 @@ pub fn snapshot_for_sid_with_subagent(sid: &str, subagent: Option<&str>) -> Opti
     snapshot_from_transcript(&path, subagent)
 }
 
-/// fork(wave-2): the newest transcript for `cwd`'s Claude project dir across
-/// EVERY root (native `~/.claude/projects` + each CCR profile mirror), by mtime.
-/// Claude Code names a project dir by mapping each non-alphanumeric char of the
-/// cwd to `-` (no run collapsing, no wrapping), e.g. `/Users/andual` ->
-/// `-Users-andual` — distinct from pi's `--…--` scheme, so it is computed here.
+/// fork(wave-2): the newest transcript for `cwd`'s Claude project dir under
+/// `~/.claude/projects`, by mtime. Claude Code names a project dir by mapping
+/// each non-alphanumeric char of the cwd to `-` (no run collapsing, no
+/// wrapping), e.g. `/home/andres` -> `-home-andres` — distinct from pi's
+/// `--…--` scheme, so it is computed here.
 fn latest_transcript_for_cwd(cwd: &str) -> Option<PathBuf> {
     let slug: String = cwd
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for root in projects_roots() {
-        let dir = root.join(&slug);
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let mt = e
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
-                if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
-                    best = Some((mt, p));
-                }
+    if let Ok(entries) = std::fs::read_dir(projects_root().join(&slug)) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mt = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if best.as_ref().map(|(b, _)| mt > *b).unwrap_or(true) {
+                best = Some((mt, p));
             }
         }
     }
@@ -375,12 +313,10 @@ fn latest_transcript_for_cwd(cwd: &str) -> Option<PathBuf> {
 
 /// fork(wave-2): resolve the focused Claude pane's transcript, then build its
 /// snapshot. The reported session id is authoritative when its `<sid>.jsonl`
-/// exists (scanned across both roots by [`transcript_for_sid`]); on a sid MISS —
-/// herdr can report a session id that never got a transcript on disk — fall back
-/// to the newest transcript for the focused `cwd` across BOTH roots. The chosen
-/// transcript then flows through the normal gpt-vs-claude attribution below, so a
-/// cx (router) transcript correctly resolves to Codex rather than sticking on a
-/// stale Anthropic snapshot.
+/// exists (located by [`transcript_for_sid`]); on a sid MISS — herdr can report
+/// a session id that never got a transcript on disk — fall back to the newest
+/// transcript for the focused `cwd`, so the pane shows the session it is really
+/// in rather than sticking on a stale snapshot.
 pub fn snapshot_for_focus(
     sid: Option<&str>,
     cwd: Option<&str>,
@@ -392,25 +328,11 @@ pub fn snapshot_for_focus(
     snapshot_from_transcript(&path, subagent)
 }
 
-/// Build a Claude/cx snapshot from an already-resolved transcript path.
+/// Build a Claude snapshot from an already-resolved transcript path.
 fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<UsageSnapshot> {
     let content = std::fs::read_to_string(path).ok()?;
     let t = parse_transcript(&content);
     let model_id = t.model.clone().unwrap_or_default();
-    // Runtime axis: where the transcript lives. Independent of the plan axis
-    // (model family) resolved just below.
-    let cx = is_cx_transcript(path);
-
-    // A cx session (Claude Code driving a GPT model via CCR) is attributed to
-    // the Codex plan — never Anthropic. The LAST assistant model decides: if the
-    // user flipped back to a claude-* model, the session stays Claude.
-    if t.model.as_deref().map(is_gpt_model).unwrap_or(false) {
-        let mut s = gpt_snapshot_for_sid(&content, path, &t, cx)?;
-        if let Some(name) = subagent {
-            apply_subagent_override(&mut s, path, name);
-        }
-        return Some(s);
-    }
 
     let mut s = UsageSnapshot::empty(Cli::Claude);
     let window = window_for(&model_id, t.max_ctx_tokens);
@@ -424,20 +346,16 @@ fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<Usage
             name
         };
         // fork: version · model · mode (e.g. `2.1.220 · Opus 5 1M · high`).
-        // Plain Claude Code carries no runtime tag: `cx` is the notable case,
-        // and tagging the common one would just widen every pane's strip. A cx
-        // pane on a CLAUDE model still gets the tag — it is gateway-routed, and
-        // that is exactly the case the old model-family test missed.
         format!(
             "{}{base}{}",
-            version_prefix(t.version.as_deref(), cx),
+            version_prefix(t.version.as_deref()),
             thinking_suffix(t.thinking, t.effort.as_deref())
         )
     });
     // Version freshness for the caption's clickable tokens. `t.version` is what
     // this pane is RUNNING, which is the number the user can act on — not
     // whatever happens to be installed on disk.
-    s.versions = crate::sources::cliver::versions_for(t.version.as_deref(), cx, false);
+    s.versions = crate::sources::cliver::versions_for(t.version.as_deref(), false);
     s.ctx_used_tokens = t.ctx_tokens;
     s.ctx_window = Some(window);
     s.fill_ctx_pct();
@@ -572,8 +490,7 @@ fn resolve_subagent(main_transcript: &Path, name: &str) -> Option<SubagentResolv
 
 /// fork(wave-1): override a main-session snapshot's model + context in place with
 /// the viewed subagent's, appending ` · @<name>` to the model display. Quota rows,
-/// state, and stats are left untouched (same plan account). A subagent running a
-/// GPT model via CCR gets the same catalog-based window as [`gpt_snapshot_for_sid`].
+/// state, and stats are left untouched (same plan account).
 fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: &str) {
     let Some(r) = resolve_subagent(main_transcript, name) else {
         return; // no matching subagent files -> silent fallback to main session
@@ -591,105 +508,24 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
         return;
     }
 
-    if is_gpt_model(&display_id) {
-        let stripped = crate::sources::codex::strip_codex_plan_prefix(&display_id).to_string();
-        match crate::sources::codex::ctx_window_from_catalog(&stripped) {
-            Some(w) => {
-                s.ctx_window = Some(w);
-                s.ctx_approx = false;
-            }
-            None => s.ctx_approx = true,
-        }
-        s.model = Some(format!(
-            "{stripped}{} · @{name}",
-            thinking_suffix(r.thinking, r.effort.as_deref())
-        ));
+    let window = window_for(&display_id, r.max_ctx_tokens);
+    s.ctx_window = Some(window);
+    s.ctx_approx = false;
+    let name_disp = model_display(&display_id);
+    let with_win = if window == WINDOW_1M {
+        format!("{name_disp} 1M")
     } else {
-        let window = window_for(&display_id, r.max_ctx_tokens);
-        s.ctx_window = Some(window);
-        s.ctx_approx = false;
-        let name_disp = model_display(&display_id);
-        let with_win = if window == WINDOW_1M {
-            format!("{name_disp} 1M")
-        } else {
-            name_disp
-        };
-        // fork(wave-2): model · mode · @subagent.
-        s.model = Some(format!(
-            "{with_win}{} · @{name}",
-            thinking_suffix(r.thinking, r.effort.as_deref())
-        ));
-    }
+        name_disp
+    };
+    // fork(wave-2): model · mode · @subagent.
+    s.model = Some(format!(
+        "{with_win}{} · @{name}",
+        thinking_suffix(r.thinking, r.effort.as_deref())
+    ));
     if r.ctx_tokens.is_some() {
         s.ctx_used_tokens = r.ctx_tokens;
     }
     s.fill_ctx_pct();
-}
-
-/// Build a Codex-attributed snapshot for a cx session. Context/model/stats/state
-/// come from the same Claude Code transcript (cx *is* Claude Code), but quota is
-/// the Codex plan's and the context window comes from the CCR model catalog.
-/// Crucially, this path NEVER calls the Anthropic usage API.
-fn gpt_snapshot_for_sid(
-    content: &str,
-    path: &Path,
-    t: &Transcript,
-    cx: bool,
-) -> Option<UsageSnapshot> {
-    let mut s = UsageSnapshot::empty(Cli::Codex);
-    let raw_model = t.model.clone().unwrap_or_default();
-    let model_id = crate::sources::codex::strip_codex_plan_prefix(&raw_model).to_string();
-
-    match crate::sources::codex::ctx_window_from_catalog(&model_id) {
-        Some(w) => s.ctx_window = Some(w),
-        None => s.ctx_approx = true, // catalog missing/unmatched → % is approximate
-    }
-    // GPT turns report input/output tokens with cache_* always 0, so the existing
-    // context sum (input + cache_read + cache_creation) is exactly the input size.
-    s.ctx_used_tokens = t.ctx_tokens;
-    // fork: mode suffix. The older comment here claimed this was a no-op for cx
-    // because cx-routed GPT transcripts carry no thinking blocks — true of the
-    // BLOCK, but cx is Claude Code and stamps the same top-level `effort` field
-    // as any other session, so the SELECTED level is available and shown.
-    //
-    // Caveat worth knowing when reading this number: it is the level selected
-    // CLIENT-side. Whether the CCR gateway forwards it to the Codex model is a
-    // separate question and not something this transcript can answer.
-    s.model = Some(format!(
-        "{}{model_id}{}",
-        version_prefix(t.version.as_deref(), cx),
-        thinking_suffix(t.thinking, t.effort.as_deref())
-    ));
-    s.versions = crate::sources::cliver::versions_for(t.version.as_deref(), cx, false);
-    s.fill_ctx_pct();
-    s.source_age_secs = util::file_age_secs(path);
-
-    // Main-thread state + full last message: cx is Claude Code, so the same
-    // transcript-based inference applies unchanged.
-    let (st, note) = crate::state::infer_claude(content, s.source_age_secs);
-    s.state = st;
-    s.state_note = note;
-    s.state_full = match st {
-        crate::model::ThreadState::Waiting
-        | crate::model::ThreadState::AwaitingReview
-        | crate::model::ThreadState::Done
-        | crate::model::ThreadState::Degraded => crate::state::full_claude(content),
-        _ => None,
-    };
-    s.stats = crate::stats::session_stats(&path.to_string_lossy(), path);
-
-    // Codex plan quota (separate account from Claude) — window-length mapped.
-    if let Some((h5, wk, plan)) =
-        crate::sources::codex::fresh_rate_limits_for_model(Some(&model_id))
-    {
-        s.five_hour = h5;
-        s.weekly = wk;
-        s.plan = plan;
-        if let Some(wkp) = s.weekly.used_pct {
-            s.daily_used_pct = Some(budget::daily_delta("codex", &util::today_local(), wkp));
-        }
-    }
-    Some(s)
 }
 
 #[cfg(test)]
@@ -758,16 +594,11 @@ mod tests {
     }
 
     #[test]
-    fn version_prefix_tags_cx_only() {
-        // Plain Claude Code gets no runtime tag — tagging the common case would
-        // widen every pane's strip to say nothing.
-        assert_eq!(version_prefix(Some("2.1.220"), false), "2.1.220 · ");
-        assert_eq!(version_prefix(Some("2.1.220"), true), "2.1.220 cx · ");
-        // A missing version must not swallow the cx tag: which gateway a pane
-        // talks to is the part that changes what the user does next.
-        assert_eq!(version_prefix(None, true), "cx · ");
-        assert_eq!(version_prefix(None, false), "");
-        assert_eq!(version_prefix(Some("  "), false), "");
+    fn version_prefix_renders_running_version() {
+        assert_eq!(version_prefix(Some("2.1.220")), "2.1.220 · ");
+        // Pre-`version` transcripts get no separator to lead the caption with.
+        assert_eq!(version_prefix(None), "");
+        assert_eq!(version_prefix(Some("  ")), "");
     }
 
     #[test]
@@ -883,20 +714,7 @@ mod tests {
         assert!(t.ctx_tokens.is_none());
     }
 
-    #[test]
-    fn gpt_model_detection() {
-        assert!(is_gpt_model("gpt-5.6-sol"));
-        assert!(is_gpt_model("gpt-5.5"));
-        assert!(is_gpt_model("Codex Plan/gpt-5.6-luna"));
-        assert!(is_gpt_model("o3"));
-        assert!(is_gpt_model("o4-mini"));
-        assert!(is_gpt_model("some-codex-thing"));
-        assert!(!is_gpt_model("claude-opus-4-8"));
-        assert!(!is_gpt_model("claude-fable-5"));
-        assert!(!is_gpt_model("opus")); // 'o' then 'p', not a digit
-    }
-
-    // ---- cx (CCR-tree) integration fixtures ----
+    // ---- transcript-tree integration fixtures ----
 
     // Each test gets its own temp HOME; cargo nextest isolates tests in separate
     // processes, so mutating the HOME env var here is safe.
@@ -910,7 +728,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let dir = std::env::temp_dir().join(format!("herdr-cx-{tag}-{uniq}"));
+            let dir = std::env::temp_dir().join(format!("herdr-usage-{tag}-{uniq}"));
             std::fs::create_dir_all(&dir).unwrap();
             std::env::set_var("HOME", &dir);
             TempHome { dir }
@@ -930,9 +748,6 @@ mod tests {
         }
     }
 
-    const GPT_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
-{"type":"assistant","message":{"model":"gpt-5.6-sol","usage":{"input_tokens":12000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":300}}}"#;
-
     /// A Claude-model transcript carrying the envelope fields the caption reads
     /// (`version`, `effort`) plus a 1M context window. Distinct from the older
     /// `CLAUDE_TRANSCRIPT` fixture below, which predates those fields. The
@@ -942,121 +757,22 @@ mod tests {
     const CLAUDE_V_TRANSCRIPT: &str = r#"{"type":"user","message":{"role":"user"}}
 {"type":"assistant","version":"2.1.220","effort":"high","message":{"model":"claude-opus-5","usage":{"input_tokens":250000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":300}}}"#;
 
-    const CATALOG: &str = r#"{"models":[
-        {"slug":"Codex Plan/gpt-5.6-sol","context_window":128000},
-        {"slug":"Codex Plan/gpt-5.5","context_window":1050000}]}"#;
-
-    // prolite: single weekly window reported as `primary`.
-    const RATELIMITS: &str = r#"{"rateLimits":{"limitId":"codex","limitName":null,
-        "primary":{"usedPercent":11,"windowDurationMins":10080,"resetsAt":1784489140},
-        "secondary":null,"planType":"prolite"}}"#;
-
+    /// The caption a pane's snapshot renders end to end: the RUNNING Claude Code
+    /// version, the model (with its window), then the selected reasoning level.
     #[test]
-    fn cx_transcript_found_in_ccr_root() {
-        let h = TempHome::new("found");
-        let sid = "abc-123";
-        let want = h.write(
-            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
-            GPT_TRANSCRIPT,
-        );
-        let got = transcript_for_sid(sid).expect("transcript located in CCR tree");
-        assert_eq!(got, want);
-    }
-
-    /// A cx pane running a CLAUDE model. This is the case the old model-family
-    /// test got wrong: cx routes the Anthropic plan through the gateway too, so
-    /// the session is legitimately `Cli::Claude` on Anthropic quota — but it is
-    /// still gateway-routed and must say so. Runtime and plan are independent.
-    #[test]
-    fn cx_pane_on_a_claude_model_still_reports_the_cx_runtime() {
-        let h = TempHome::new("cxclaude");
-        let sid = "sid-cx-claude";
-        h.write(
-            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
-            CLAUDE_V_TRANSCRIPT,
-        );
-
-        let s = snapshot_for_sid(sid).expect("snapshot");
-        // Plan axis: a Claude model on the Claude plan, not Codex.
-        assert_eq!(s.cli, Cli::Claude);
-        // Runtime axis: tagged cx purely because of where the transcript lives.
-        assert_eq!(s.model.as_deref(), Some("2.1.220 cx · Opus 5 1M · high"));
-    }
-
-    /// The mirror of the case above: the very same transcript under the NATIVE
-    /// Claude Code root must carry no cx tag. Without this, "always tags cx"
-    /// would pass the test above just as well.
-    #[test]
-    fn native_claude_pane_carries_no_cx_tag() {
-        let h = TempHome::new("nativeclaude");
-        let sid = "sid-native";
+    fn claude_pane_caption_is_version_model_mode() {
+        let h = TempHome::new("caption");
+        let sid = "sid-caption";
         h.write(
             &format!(".claude/projects/-tmp-proj/{sid}.jsonl"),
             CLAUDE_V_TRANSCRIPT,
         );
+        // Fresh anthropic cache so the Claude path never hits the network.
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
 
         let s = snapshot_for_sid(sid).expect("snapshot");
         assert_eq!(s.cli, Cli::Claude);
         assert_eq!(s.model.as_deref(), Some("2.1.220 · Opus 5 1M · high"));
-    }
-
-    #[test]
-    fn cx_gpt_session_is_codex_with_codex_quota() {
-        let h = TempHome::new("gpt");
-        let sid = "sid-gpt";
-        h.write(
-            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
-            GPT_TRANSCRIPT,
-        );
-        h.write(".codex/ccr-model-catalog.json", CATALOG);
-        // Fresh cache (age < 60s) so no `codex app-server` process is spawned.
-        h.write(".codex/dash2_ratelimits.json", RATELIMITS);
-
-        let s = snapshot_for_sid(sid).expect("snapshot");
-        assert_eq!(s.cli, Cli::Codex); // Codex identity, never Anthropic
-                                       // "cx · " marks the gateway-routed runtime; no version in this fixture.
-        assert_eq!(s.model.as_deref(), Some("cx · gpt-5.6-sol"));
-        assert_eq!(s.ctx_window, Some(128000)); // from CCR catalog
-        assert_eq!(s.ctx_used_tokens, Some(12000));
-        assert_eq!(s.plan.as_deref(), Some("prolite"));
-        // Window-length mapping: the 10080-min window is weekly, 5h stays empty.
-        assert!(s.five_hour.used_pct.is_none());
-        assert_eq!(s.weekly.used_pct, Some(11.0));
-    }
-
-    #[test]
-    fn cx_missing_catalog_marks_ctx_approx() {
-        let h = TempHome::new("nocatalog");
-        let sid = "sid-noc";
-        h.write(
-            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
-            GPT_TRANSCRIPT,
-        );
-        h.write(".codex/dash2_ratelimits.json", RATELIMITS);
-        let s = snapshot_for_sid(sid).expect("snapshot");
-        assert_eq!(s.cli, Cli::Codex);
-        assert!(s.ctx_window.is_none());
-        assert!(s.ctx_approx);
-    }
-
-    #[test]
-    fn ccr_tree_claude_turn_stays_claude() {
-        let h = TempHome::new("claude");
-        let sid = "sid-claude";
-        // Last assistant turn is a claude model (user flipped back) inside the CCR tree.
-        let transcript = r#"{"type":"assistant","message":{"model":"gpt-5.6-sol","usage":{"input_tokens":10,"output_tokens":1}}}
-{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":5000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
-        h.write(
-            &format!(".claude-code-router/profiles/default/claude/projects/-tmp-proj/{sid}.jsonl"),
-            transcript,
-        );
-        // Fresh anthropic cache so the Claude path never hits the network.
-        h.write(
-            ".claude/dash2/anthropic_usage.json",
-            r#"{"five_hour":{"utilization":10.0,"resets_at":"2026-07-15T12:00:00+00:00"},"seven_day":{"utilization":20.0,"resets_at":"2026-07-20T00:00:00+00:00"}}"#,
-        );
-        let s = snapshot_for_sid(sid).expect("snapshot");
-        assert_eq!(s.cli, Cli::Claude); // claude last turn → Anthropic identity
     }
 
     // ---- fork(wave-1): subagent-view override fixtures ----
@@ -1070,7 +786,7 @@ mod tests {
 
     // filename slug ('aprobe1') deliberately differs from the meta `name` ('probe1').
     fn write_subagent_session(h: &TempHome, sid: &str, meta: &str, jsonl: &str) {
-        let proj = "-Users-andual-Projects-herdr";
+        let proj = PROJ_SLUG;
         h.write(
             &format!(".claude/projects/{proj}/{sid}.jsonl"),
             MAIN_TRANSCRIPT,
@@ -1159,7 +875,7 @@ mod tests {
     fn newest_meta_wins_on_duplicate_names() {
         let h = TempHome::new("sub-dup");
         let sid = "sid-dup";
-        let proj = "-Users-andual-Projects-herdr";
+        let proj = PROJ_SLUG;
         h.write(
             &format!(".claude/projects/{proj}/{sid}.jsonl"),
             MAIN_TRANSCRIPT,
@@ -1278,50 +994,27 @@ mod tests {
     const PROJ_CWD: &str = "/tmp/herdrproj";
     const PROJ_SLUG: &str = "-tmp-herdrproj";
 
+    /// An OLDER transcript for the same cwd, with a model the assertions can
+    /// tell apart from `CLAUDE_TRANSCRIPT`'s, so "newest wins" is really tested.
+    const OLDER_CWD_TRANSCRIPT: &str = r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
+
     #[test]
-    fn sid_miss_falls_back_to_newest_cwd_transcript_router_wins() {
-        let h = TempHome::new("fallback-router");
-        // Older native ~/.claude transcript (claude model) …
-        let native = h.write(
-            &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-native.jsonl"),
+    fn sid_miss_falls_back_to_newest_cwd_transcript() {
+        let h = TempHome::new("fallback-cwd");
+        let older = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-older.jsonl"),
+            OLDER_CWD_TRANSCRIPT,
+        );
+        let newer = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/bbbbbbbb-newer.jsonl"),
             CLAUDE_TRANSCRIPT,
         );
-        // … and a NEWER router-tree transcript (gpt model) for the same cwd.
-        let router = h.write(
-            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
-            GPT_TRANSCRIPT,
-        );
-        h.write(".codex/ccr-model-catalog.json", CATALOG);
-        h.write(".codex/dash2_ratelimits.json", RATELIMITS);
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
         let now = std::time::SystemTime::now();
-        set_mtime(&native, now - std::time::Duration::from_secs(600));
-        set_mtime(&router, now);
+        set_mtime(&older, now - std::time::Duration::from_secs(600));
+        set_mtime(&newer, now);
 
         // Reported sid has no transcript on disk -> cwd fallback picks newest.
-        let s = snapshot_for_focus(Some("00000000-missing"), Some(PROJ_CWD), None)
-            .expect("fallback snapshot");
-        assert_eq!(s.cli, Cli::Codex); // router transcript -> Codex attribution
-        assert_eq!(s.model.as_deref(), Some("cx · gpt-5.6-sol"));
-    }
-
-    #[test]
-    fn sid_miss_falls_back_to_newest_cwd_transcript_native_wins() {
-        let h = TempHome::new("fallback-native");
-        let native = h.write(
-            &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-native.jsonl"),
-            CLAUDE_TRANSCRIPT,
-        );
-        let router = h.write(
-            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
-            GPT_TRANSCRIPT,
-        );
-        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
-        let now = std::time::SystemTime::now();
-        // This time the native transcript is the newest.
-        set_mtime(&router, now - std::time::Duration::from_secs(600));
-        set_mtime(&native, now);
-
         let s = snapshot_for_focus(Some("00000000-missing"), Some(PROJ_CWD), None)
             .expect("fallback snapshot");
         assert_eq!(s.cli, Cli::Claude);
@@ -1332,19 +1025,19 @@ mod tests {
     fn exact_sid_match_beats_cwd_fallback() {
         let h = TempHome::new("sid-priority");
         let sid = "12345678-real";
-        // The real sid transcript is a claude model in the native root …
+        // The real sid transcript …
         h.write(
             &format!(".claude/projects/{PROJ_SLUG}/{sid}.jsonl"),
             CLAUDE_TRANSCRIPT,
         );
-        // … while a NEWER router transcript for the same cwd exists but must be
-        // ignored because the sid resolves.
-        let router = h.write(
-            &format!(".claude-code-router/profiles/default-claude-code/claude/projects/{PROJ_SLUG}/bbbbbbbb-router.jsonl"),
-            GPT_TRANSCRIPT,
+        // … while a NEWER transcript for the same cwd exists but must be ignored
+        // because the sid resolves.
+        let newer = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/bbbbbbbb-newer.jsonl"),
+            OLDER_CWD_TRANSCRIPT,
         );
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
-        set_mtime(&router, std::time::SystemTime::now());
+        set_mtime(&newer, std::time::SystemTime::now());
 
         let s = snapshot_for_focus(Some(sid), Some(PROJ_CWD), None).expect("snapshot");
         assert_eq!(s.cli, Cli::Claude); // exact sid wins over newer cwd candidate

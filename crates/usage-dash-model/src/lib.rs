@@ -159,8 +159,6 @@ fn parse_semver(v: &str) -> Option<Vec<u64>> {
 pub enum VersionToken {
     /// The Claude Code version this pane is running.
     Claude,
-    /// The installed codex CLI version (cx panes only).
-    Codex,
 }
 
 /// Versions shown in the usage caption.
@@ -169,11 +167,6 @@ pub struct CliVersions {
     /// Claude Code — always present, since every pane the usage dash tracks runs it.
     #[serde(default)]
     pub claude: CliVersion,
-    /// The machine's installed `codex` CLI. Populated only for cx panes: in a
-    /// native Claude pane the codex binary is not in the loop and showing its
-    /// version would just be noise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex: Option<CliVersion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

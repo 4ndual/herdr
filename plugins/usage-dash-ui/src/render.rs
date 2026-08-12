@@ -26,9 +26,8 @@ const DIM: Color = Color::DarkGray;
 /// reclaimed rows back to panes (a collapsed strip keeps a single row).
 pub const ACTION_TOGGLE_COLLAPSE: &str = "usage:toggle_collapse";
 /// The clickable collapse button drawn on the box's top border.
-/// Action ids for the clickable version tokens on the caption border.
+/// Action id for the clickable version token on the caption border.
 pub const ACTION_VERSION_CLAUDE: &str = "usage:version_claude";
-pub const ACTION_VERSION_CODEX: &str = "usage:version_codex";
 
 const COLLAPSE_BTN: &str = "[▾]";
 /// Fixed bar width for the left box (keeps the shrink-to-fit measurement stable).
@@ -233,15 +232,14 @@ pub struct VersionUi {
     pub confirming: Option<VersionToken>,
 }
 
-/// Caption spans plus each version token's offset/width within the caption.
+/// Caption spans plus the version token's offset/width within the caption.
 struct Caption {
     line: Line<'static>,
     claude_span: Option<(u16, u16)>,
-    codex_span: Option<(u16, u16)>,
 }
 
-/// The box caption rendered ON the top border, with the version tokens as
-/// separate, individually coloured spans so they can be hit-tested.
+/// The box caption rendered ON the top border, with the version token as a
+/// separate, individually coloured span so it can be hit-tested.
 fn caption_line(snap: &UsageSnapshot, ui: VersionUi) -> Caption {
     let mut spans = vec![Span::styled(
         snap.cli.label().to_string(),
@@ -251,7 +249,6 @@ fn caption_line(snap: &UsageSnapshot, ui: VersionUi) -> Caption {
     )];
     let mut offset: u16 = spans[0].content.chars().count() as u16;
     let mut claude_span = None;
-    let mut codex_span = None;
 
     if let Some(text) = version_token_text(
         &snap.versions.claude,
@@ -266,31 +263,15 @@ fn caption_line(snap: &UsageSnapshot, ui: VersionUi) -> Caption {
             text,
             Style::default().fg(freshness_color(snap.versions.claude.freshness())),
         ));
-        offset += width;
+        // No further offset bookkeeping: the Claude token is the only positioned
+        // one, and the spans after it are not hit-tested.
     }
 
     if let Some(m) = &snap.model {
-        let text = format!(" · {m}");
-        offset += text.chars().count() as u16;
-        spans.push(Span::styled(text, Style::default().fg(Color::White)));
-    }
-
-    if let Some(codex) = snap.versions.codex.as_ref() {
-        if let Some(text) = version_token_text(
-            codex,
-            ui.hovered == Some(VersionToken::Codex),
-            ui.confirming == Some(VersionToken::Codex),
-        ) {
-            let prefix = " · codex ";
-            spans.push(Span::styled(prefix.to_string(), Style::default().fg(DIM)));
-            offset += prefix.chars().count() as u16;
-            let width = text.chars().count() as u16;
-            codex_span = Some((offset, width));
-            spans.push(Span::styled(
-                text,
-                Style::default().fg(freshness_color(codex.freshness())),
-            ));
-        }
+        spans.push(Span::styled(
+            format!(" · {m}"),
+            Style::default().fg(Color::White),
+        ));
     }
 
     if let Some(plan) = &snap.plan {
@@ -302,7 +283,6 @@ fn caption_line(snap: &UsageSnapshot, ui: VersionUi) -> Caption {
     Caption {
         line: Line::from(spans),
         claude_span,
-        codex_span,
     }
 }
 
@@ -702,7 +682,6 @@ pub fn render(
         })
     };
     let claude_rect = token_rect(caption.claude_span);
-    let codex_rect = token_rect(caption.codex_span);
 
     let block = rounded_block().title(caption.line);
     let inner = block.inner(rect);
@@ -774,15 +753,6 @@ pub fn render(
             width: r.width,
             height: r.height,
             action_id: ACTION_VERSION_CLAUDE.into(),
-        });
-    }
-    if let Some(r) = codex_rect {
-        hits.push(UiHitRect {
-            x: r.x,
-            y: r.y,
-            width: r.width,
-            height: r.height,
-            action_id: ACTION_VERSION_CODEX.into(),
         });
     }
     hits

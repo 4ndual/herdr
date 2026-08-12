@@ -1,11 +1,10 @@
 //! CLI version freshness: what this pane is running vs what is published.
 //!
-//! Feeds the clickable version tokens in the usage caption. Two facts per CLI:
+//! Feeds the clickable version token in the usage caption. Two facts:
 //!
-//!   * `current` — Claude Code's comes from the transcript envelope (the version
-//!     the pane is genuinely RUNNING, which may be older than what is installed
-//!     on disk; that gap is the whole point). The codex CLI has no transcript
-//!     here, so its `current` is the installed binary's `--version`.
+//!   * `current` — from the transcript envelope: the version the pane is
+//!     genuinely RUNNING, which may be older than what is installed on disk;
+//!     that gap is the whole point.
 //!   * `latest` — the npm registry's `latest` dist-tag.
 //!
 //! ## Why this is cached
@@ -31,8 +30,6 @@ use crate::model::{CliVersion, CliVersions};
 
 /// npm package that publishes the Claude Code CLI.
 const CLAUDE_PKG: &str = "@anthropic-ai/claude-code";
-/// npm package that publishes the codex CLI.
-const CODEX_PKG: &str = "@openai/codex";
 
 /// How long a fetched `latest` stays authoritative. 30 minutes: releases are not
 /// more frequent than that, and it keeps the registry hit rate negligible even
@@ -73,8 +70,6 @@ struct CachedLatest {
 struct Cache {
     #[serde(default)]
     claude: Option<CachedLatest>,
-    #[serde(default)]
-    codex: Option<CachedLatest>,
 }
 
 fn read_cache() -> Cache {
@@ -163,38 +158,15 @@ fn latest_with_age(
     }
 }
 
-/// The installed codex CLI's version, e.g. `codex-cli 0.145.0` → `0.145.0`.
-///
-/// `None` when codex is not installed or does not answer — rendered as unknown,
-/// never as outdated.
-fn installed_codex_version() -> Option<String> {
-    let out = Command::new("codex").arg("--version").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    // Take the last whitespace-separated token of the first line, which is the
-    // version for both the bare (`0.145.0`) and prefixed (`codex-cli 0.145.0`)
-    // shapes.
-    let token = text.lines().next()?.split_whitespace().last()?.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
-}
-
 /// Build the version block for a snapshot.
 ///
-/// `running_claude` is the version from the transcript envelope. `cx` gates the
-/// codex entry: in a native Claude pane the codex binary is not in the loop, so
-/// reporting its version would be noise.
+/// `running_claude` is the version from the transcript envelope.
 ///
 /// `force` bypasses the TTL — used by the "verify now" click on an
 /// already-current token.
-pub fn versions_for(running_claude: Option<&str>, cx: bool, force: bool) -> CliVersions {
+pub fn versions_for(running_claude: Option<&str>, force: bool) -> CliVersions {
     let mut cache = read_cache();
-    let before = (cache.claude.clone(), cache.codex.clone());
+    let before = cache.claude.clone();
 
     let (claude_latest, claude_age) = latest_with_age(CLAUDE_PKG, &mut cache.claude, force);
     let claude = CliVersion {
@@ -203,28 +175,15 @@ pub fn versions_for(running_claude: Option<&str>, cx: bool, force: bool) -> CliV
         checked_age_secs: claude_age,
     };
 
-    let codex = if cx {
-        let (codex_latest, codex_age) = latest_with_age(CODEX_PKG, &mut cache.codex, force);
-        Some(CliVersion {
-            current: installed_codex_version(),
-            latest: codex_latest,
-            checked_age_secs: codex_age,
-        })
-    } else {
-        None
-    };
-
     // Only rewrite the cache when something actually changed — this runs once
     // per tick and the dash already had a disk-write problem.
-    let changed = before.0.as_ref().map(|c| (&c.version, c.fetched_at))
-        != cache.claude.as_ref().map(|c| (&c.version, c.fetched_at))
-        || before.1.as_ref().map(|c| (&c.version, c.fetched_at))
-            != cache.codex.as_ref().map(|c| (&c.version, c.fetched_at));
+    let changed = before.as_ref().map(|c| (&c.version, c.fetched_at))
+        != cache.claude.as_ref().map(|c| (&c.version, c.fetched_at));
     if changed {
         write_cache(&cache);
     }
 
-    CliVersions { claude, codex }
+    CliVersions { claude }
 }
 
 #[cfg(test)]
@@ -310,21 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_absent_for_a_native_claude_pane() {
-        let dir = temp_state_dir("nocodex");
+    fn a_cached_latest_is_used_without_a_network_call() {
+        let dir = temp_state_dir("cached");
         // Seed a fresh claude entry so this test performs no network call.
         write_cache(&Cache {
             claude: Some(CachedLatest {
                 version: "2.1.220".to_string(),
                 fetched_at: now_secs(),
             }),
-            codex: None,
         });
-        let v = versions_for(Some("2.1.220"), false, false);
-        assert!(
-            v.codex.is_none(),
-            "codex is not in the loop in a native pane"
-        );
+        let v = versions_for(Some("2.1.220"), false);
+        assert_eq!(v.claude.latest.as_deref(), Some("2.1.220"));
         assert_eq!(v.claude.freshness(), Freshness::Current);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -337,11 +292,10 @@ mod tests {
                 version: "2.1.220".to_string(),
                 fetched_at: now_secs(),
             }),
-            codex: None,
         });
         // A pane still running an older build is outdated even though the
         // machine may well have 2.1.220 installed.
-        let v = versions_for(Some("2.1.219"), false, false);
+        let v = versions_for(Some("2.1.219"), false);
         assert_eq!(v.claude.current.as_deref(), Some("2.1.219"));
         assert_eq!(v.claude.freshness(), Freshness::Outdated);
         let _ = std::fs::remove_dir_all(dir);

@@ -44,26 +44,20 @@ ui_input_file = "usage_input.json"
 collector = ["../../target/release/usage-dash-collector"]
 
 # ── CLI version actions ─────────────────────────────────────────────────────
-# Invoked from the caption's version tokens. The update actions RESTART the
-# pane, which is why the guest requires a confirming second click before it
-# emits them (see `handle_version_click` in src/lib.rs).
+# Invoked from the caption's version token. The update action RESTARTS the pane,
+# which is why the guest requires a confirming second click before it emits it
+# (see `handle_version_click` in src/lib.rs).
 #
-# Both CLIs on this machine are standalone native installs, not npm packages
-# (`~/.local/share/claude/versions`, `~/.codex/packages/standalone`), so the
-# updater is each tool's own `update` subcommand — which re-checks against its
-# real release channel rather than trusting the npm number the strip displays.
+# Claude Code is typically a standalone native install rather than an npm package
+# (`~/.local/share/claude/versions`), so the updater is the tool's own `update`
+# subcommand — which re-checks against its real release channel rather than
+# trusting the npm number the strip displays.
 
 [[actions]]
 id = "update-claude-code"
 title = "Update Claude Code and resume this pane"
 description = "Run `claude update`, then relaunch this pane's session with --resume"
 command = ["bash", "scripts/update-claude-code.sh"]
-
-[[actions]]
-id = "update-codex"
-title = "Update the codex CLI"
-description = "Run the codex updater; does not restart the pane (codex is not the pane's own binary)"
-command = ["bash", "scripts/update-codex.sh"]
 
 [[actions]]
 id = "verify-cli-versions"

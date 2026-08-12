@@ -137,9 +137,9 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
             // `focus.subagent` is its name; the source overrides model + context
             // with that subagent's, keeping the account's plan-quota rows.
             // fork(wave-2): resolve by session id first, but fall back to the
-            // newest transcript for the focused cwd across both roots when the
-            // reported sid has no transcript on disk (herdr can report a sid that
-            // never got a file), so a live cx pane isn't stuck on a stale snapshot.
+            // newest transcript for the focused cwd when the reported sid has no
+            // transcript on disk (herdr can report a sid that never got a file),
+            // so a live pane isn't stuck on a stale snapshot.
             let sid = focus.session_id.as_deref().filter(|s| !s.is_empty());
             let cwd = focus
                 .cwd
@@ -168,6 +168,10 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
             },
             None => RefreshOutcome::KeepPrevious,
         },
+        // No usage source reads jcode sessions yet, so keep whatever the panel
+        // already shows rather than blanking it — same sticky rule as a source
+        // that yields nothing.
+        AgentKind::Jcode => RefreshOutcome::KeepPrevious,
     }
 }
 
@@ -222,12 +226,6 @@ pub fn handle_with(
         };
         match token {
             VersionToken::Claude => snap.versions.claude.freshness(),
-            VersionToken::Codex => snap
-                .versions
-                .codex
-                .as_ref()
-                .map(|c| c.freshness())
-                .unwrap_or(Freshness::Unknown),
         }
     };
     match action {
@@ -298,14 +296,6 @@ fn version_token_at(view: &UsageView, col: u16, row: u16) -> Option<VersionToken
         .unwrap_or(false)
     {
         return Some(VersionToken::Claude);
-    }
-    if view
-        .hits
-        .codex_version
-        .map(|r| hit(r, col, row))
-        .unwrap_or(false)
-    {
-        return Some(VersionToken::Codex);
     }
     None
 }
@@ -468,21 +458,14 @@ mod version_click_tests {
         width: 7,
         height: 1,
     };
-    const CODEX_RECT: Rect = Rect {
-        x: 30,
-        y: 5,
-        width: 7,
-        height: 1,
-    };
 
     fn view_with_tokens() -> UsageView {
         let mut v = UsageView::default();
         v.hits.claude_version = Some(CLAUDE_RECT);
-        v.hits.codex_version = Some(CODEX_RECT);
         v
     }
 
-    fn snap_with(claude: (&str, &str), codex: Option<(&str, &str)>) -> UsageSnapshot {
+    fn snap_with(claude: (&str, &str)) -> UsageSnapshot {
         let mut s = UsageSnapshot::empty(Cli::Claude);
         s.versions = CliVersions {
             claude: CliVersion {
@@ -490,11 +473,6 @@ mod version_click_tests {
                 latest: Some(claude.1.into()),
                 checked_age_secs: Some(0),
             },
-            codex: codex.map(|(c, l)| CliVersion {
-                current: Some(c.into()),
-                latest: Some(l.into()),
-                checked_age_secs: Some(0),
-            }),
         };
         s
     }
@@ -504,7 +482,7 @@ mod version_click_tests {
     #[test]
     fn one_click_on_an_outdated_token_only_arms_a_confirmation() {
         let mut v = view_with_tokens();
-        let snap = snap_with(("2.1.219", "2.1.220"), None);
+        let snap = snap_with(("2.1.219", "2.1.220"));
 
         handle_with(Action::Click(12, 5), Some(&snap), &mut v);
         assert_eq!(v.version_confirm, Some(VersionToken::Claude));
@@ -517,7 +495,7 @@ mod version_click_tests {
     #[test]
     fn a_second_click_confirms_and_requests_the_update() {
         let mut v = view_with_tokens();
-        let snap = snap_with(("2.1.219", "2.1.220"), None);
+        let snap = snap_with(("2.1.219", "2.1.220"));
 
         handle_with(Action::Click(12, 5), Some(&snap), &mut v);
         handle_with(Action::Click(12, 5), Some(&snap), &mut v);
@@ -533,7 +511,7 @@ mod version_click_tests {
     #[test]
     fn clicking_away_disarms_the_confirmation() {
         let mut v = view_with_tokens();
-        let snap = snap_with(("2.1.219", "2.1.220"), None);
+        let snap = snap_with(("2.1.219", "2.1.220"));
 
         handle_with(Action::Click(12, 5), Some(&snap), &mut v);
         assert_eq!(v.version_confirm, Some(VersionToken::Claude));
@@ -543,22 +521,10 @@ mod version_click_tests {
         assert_eq!(v.version_action, None);
     }
 
-    /// Arming one token then clicking the other must not fire the first.
-    #[test]
-    fn arming_a_different_token_moves_the_confirmation() {
-        let mut v = view_with_tokens();
-        let snap = snap_with(("2.1.219", "2.1.220"), Some(("0.144.0", "0.145.0")));
-
-        handle_with(Action::Click(12, 5), Some(&snap), &mut v);
-        handle_with(Action::Click(32, 5), Some(&snap), &mut v);
-        assert_eq!(v.version_confirm, Some(VersionToken::Codex));
-        assert_eq!(v.version_action, None);
-    }
-
     #[test]
     fn clicking_a_current_token_asks_for_a_recheck_not_an_update() {
         let mut v = view_with_tokens();
-        let snap = snap_with(("2.1.220", "2.1.220"), None);
+        let snap = snap_with(("2.1.220", "2.1.220"));
 
         handle_with(Action::Click(12, 5), Some(&snap), &mut v);
         assert_eq!(v.version_verify, Some(VersionToken::Claude));

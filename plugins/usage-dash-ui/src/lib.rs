@@ -360,7 +360,6 @@ fn hovered_token(column: u16, row: u16) -> Option<VersionToken> {
         .find(|h| column >= h.x && column < h.x + h.width && row >= h.y && row < h.y + h.height)
         .and_then(|h| match h.action_id.as_str() {
             render::ACTION_VERSION_CLAUDE => Some(VersionToken::Claude),
-            render::ACTION_VERSION_CODEX => Some(VersionToken::Codex),
             _ => None,
         })
 }
@@ -378,12 +377,6 @@ fn token_freshness(token: VersionToken) -> Freshness {
     };
     match token {
         VersionToken::Claude => snap.versions.claude.freshness(),
-        VersionToken::Codex => snap
-            .versions
-            .codex
-            .as_ref()
-            .map(|c| c.freshness())
-            .unwrap_or(Freshness::Unknown),
     }
 }
 
@@ -414,7 +407,6 @@ fn handle_version_click(token: VersionToken) -> UiUpdate {
             }
             let action_id = match token {
                 VersionToken::Claude => "update-claude-code",
-                VersionToken::Codex => "update-codex",
             };
             let mut update = repaint_from_cache();
             update.effects.push(HostEffect::InvokePluginAction {
@@ -515,7 +507,6 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
     }
     match action_id {
         render::ACTION_VERSION_CLAUDE => return handle_version_click(VersionToken::Claude),
-        render::ACTION_VERSION_CODEX => return handle_version_click(VersionToken::Codex),
         _ => {}
     }
     // Any other click abandons a pending confirmation: clicking elsewhere is the

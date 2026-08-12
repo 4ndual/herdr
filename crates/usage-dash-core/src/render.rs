@@ -19,6 +19,7 @@ use crate::model::{
     countdown, fmt_k, Cli, CliVersion, Freshness, ThreadState, UsageSnapshot, DAILY_BUDGET_PCT,
 };
 use crate::{UsageView, VersionToken};
+use chrono::{Local, TimeZone};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -107,15 +108,20 @@ fn pct_color(p: f32) -> Color {
     }
 }
 
-/// Absolute local time of an epoch via `date -r` (std has no local tz).
+/// Absolute LOCAL time of an epoch: weekday for the weekly row, `HH:MM` for the
+/// 5h row (std has no local tz).
+///
+/// Was `date -r <epoch>`, which is the BSD/macOS spelling — GNU `date` reads
+/// `-r` as "reference FILE", so this returned an empty string on Linux and both
+/// reset labels rendered blank. It also spawned a process per row per render
+/// tick; chrono answers in-process. An epoch chrono cannot represent yields the
+/// same empty string as before, so callers keep their existing fallback.
 fn abs_time(epoch: i64, weekly: bool) -> String {
-    let fmt = if weekly { "+%a" } else { "+%H:%M" };
-    std::process::Command::new("date")
-        .args(["-r", &epoch.to_string(), fmt])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+    let fmt = if weekly { "%a" } else { "%H:%M" };
+    Local
+        .timestamp_opt(epoch, 0)
+        .single()
+        .map(|dt| dt.format(fmt).to_string())
         .unwrap_or_default()
 }
 
@@ -241,14 +247,12 @@ struct Caption {
     line: Line<'static>,
     /// `(offset_in_caption, width)` for the Claude token, when drawn.
     claude_span: Option<(u16, u16)>,
-    /// `(offset_in_caption, width)` for the codex token, when drawn.
-    codex_span: Option<(u16, u16)>,
 }
 
 /// The box caption rendered ON the top border:
-/// `Claude · 2.1.220 · cx · Opus 5 1M · low · codex 0.145.0`
+/// `Claude · 2.1.220 · Opus 5 1M · low · prolite`
 ///
-/// Version tokens are separate, individually coloured spans so they can be
+/// The version token is a separate, individually coloured span so it can be
 /// hit-tested; everything else is plain text.
 fn caption_line(snap: &UsageSnapshot, view: &UsageView) -> Caption {
     let mut spans = vec![Span::styled(
@@ -260,7 +264,6 @@ fn caption_line(snap: &UsageSnapshot, view: &UsageView) -> Caption {
     // Running width of the caption so far, used to locate the version tokens.
     let mut offset: u16 = spans[0].content.chars().count() as u16;
     let mut claude_span = None;
-    let mut codex_span = None;
 
     let hovered = hovered_token(view);
 
@@ -278,35 +281,15 @@ fn caption_line(snap: &UsageSnapshot, view: &UsageView) -> Caption {
             text,
             Style::default().fg(freshness_color(snap.versions.claude.freshness())),
         ));
-        offset += width;
+        // No further offset bookkeeping: the Claude token is the only positioned
+        // one, and the spans after it are not hit-tested.
     }
 
     if let Some(m) = &snap.model {
-        let text = format!(" · {m}");
-        offset += text.chars().count() as u16;
-        spans.push(Span::styled(text, Style::default().fg(Color::White)));
-    }
-
-    // codex CLI version — only present for cx panes (the collector omits it
-    // otherwise, since the codex binary is not in a native pane's loop).
-    if let Some(codex) = snap.versions.codex.as_ref() {
-        if let Some(text) = version_token_text(
-            codex,
-            hovered == Some(VersionToken::Codex),
-            view.version_confirm == Some(VersionToken::Codex),
-        ) {
-            let prefix = " · codex ";
-            spans.push(Span::styled(prefix.to_string(), Style::default().fg(DIM)));
-            offset += prefix.chars().count() as u16;
-            let width = text.chars().count() as u16;
-            codex_span = Some((offset, width));
-            spans.push(Span::styled(
-                text,
-                Style::default().fg(freshness_color(codex.freshness())),
-            ));
-            // No further offset bookkeeping: codex is the last positioned token,
-            // and the trailing plan span is not hit-tested.
-        }
+        spans.push(Span::styled(
+            format!(" · {m}"),
+            Style::default().fg(Color::White),
+        ));
     }
 
     if let Some(plan) = &snap.plan {
@@ -318,7 +301,6 @@ fn caption_line(snap: &UsageSnapshot, view: &UsageView) -> Caption {
     Caption {
         line: Line::from(spans),
         claude_span,
-        codex_span,
     }
 }
 
@@ -333,8 +315,6 @@ fn hovered_token(view: &UsageView) -> Option<VersionToken> {
     };
     if inside(view.hits.claude_version) {
         Some(VersionToken::Claude)
-    } else if inside(view.hits.codex_version) {
-        Some(VersionToken::Codex)
     } else {
         None
     }
@@ -521,8 +501,6 @@ pub struct Hits {
     pub stats: Option<Rect>,
     /// The Claude Code version token on the caption border, when drawn.
     pub claude_version: Option<Rect>,
-    /// The codex CLI version token on the caption border (cx panes only).
-    pub codex_version: Option<Rect>,
 }
 
 /// Renders the panel into `area` for the given snapshot and interactive `view`.
@@ -668,7 +646,6 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
         })
     };
     let claude_version = token_rect(caption.claude_span);
-    let codex_version = token_rect(caption.codex_span);
 
     let block = rounded_block().title(caption.line);
     let inner = block.inner(rect);
@@ -893,7 +870,6 @@ pub fn draw(f: &mut Frame, area: Rect, snap: Option<&UsageSnapshot>, view: &Usag
             height: 1,
         }),
         claude_version,
-        codex_version,
     }
 }
 
