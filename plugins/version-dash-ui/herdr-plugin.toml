@@ -29,9 +29,17 @@ surfaces = ["panel"]
 capabilities = ["layout_read", "focused_session", "toasts", "plugin_actions"]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
-# out-of-process `version-dash-collector` writes it on a 10-minute cadence (via a
-# scheduled user job — see scripts/), so there is NO in-host writer and NO `collector`
-# manifest field (that field routes exclusively through the usage-dash tick).
+# out-of-process `version-dash-collector` below writes it.
+#
+# The `collector` field used to run for builtin.usage-dash ONLY — every other
+# plugin declaring it was parsed, echoed by `plugin list`, and never executed.
+# That is why this plugin shipped a scheduled user job instead, and why the
+# strip rendered nothing on any machine where that job was never installed
+# (which was every machine). `App::tick_plugin_collectors` now launches the
+# declared collector of EVERY enabled module that also declares a
+# `ui_input_file`, so the snapshot is produced by the host tick, in the right
+# instance's state dir, with no external scheduling. scripts/install-collector-agent.sh
+# remains only for hosts too old to have the generic tick.
 #
 # v1 +N caveat: the `+N` local-changes count is git-source-derived
 # (`git rev-list --count v<latest>..HEAD` on the fork checkout), so it reflects
@@ -39,6 +47,11 @@ capabilities = ["layout_read", "focused_session", "toasts", "plugin_actions"]
 # instances therefore share the same count until a version bump. Build-baked
 # per-binary accuracy is a later host-code follow-up.
 ui_input_file = "version_input.json"
+# Relative argv[0] resolves against the plugin root (src/plugin_collector.rs
+# ::resolve_program), so this points at the root workspace build of the
+# collector crate in plugins/version-dash-ui/collector — the same shape
+# usage-dash uses.
+collector = ["../../target/release/version-dash-collector"]
 
 [ui_modules.placement]
 # A single full-width line carved from the BOTTOM edge of the pane area. This
@@ -48,6 +61,12 @@ ui_input_file = "version_input.json"
 region = "bottom"
 align = "start"
 size = "1"
+# min_peer is counted in ROWS for a top/bottom band (src/ui.rs: max_slot =
+# height - min_peer). The schema default is 24, which silently drops this
+# one-row strip on any pane area 24 rows or shorter — a short pane, a
+# horizontally split tab, a small window. Five rows is the smallest peer that
+# still leaves a usable pane.
+min_peer = 5
 z = 55
 
 # ── the two-button update pipeline (right-click on an instance token) ──────

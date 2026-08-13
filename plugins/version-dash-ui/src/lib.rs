@@ -464,6 +464,31 @@ mod tests {
         assert!(hits.iter().any(|h| h.action_id == "version:instance:test"));
     }
 
+    /// The contract that actually breaks in the field is collector-output →
+    /// guest-model, and it breaks SILENTLY: a field the guest cannot parse makes
+    /// `handle_event` return early and the host keeps the last good frame, so a
+    /// strip that renders nothing looks identical to one that has no data yet.
+    /// `sample_input()` cannot catch that — it is re-serialized from the guest's
+    /// own model. This is the literal bytes `version-dash-collector` wrote on
+    /// 2026-08-13, so a model change that outruns the collector fails HERE.
+    #[test]
+    fn renders_from_the_shipped_collector_snapshot() {
+        let _guard = test_guard();
+        let raw = r#"{"instances":[{"label":"hr","version":"0.8.0","local_changes":193,"state":"up_to_date","detail":null},{"label":"test","version":"0.8.0","local_changes":193,"state":"up_to_date","detail":null}],"latest":"0.8.0","notes_url":"https://github.com/herdrdev/herdr/releases/tag/v0.8.0","latest_date":null,"age_label":"just now","stale":false,"error":null,"pipeline":null,"staged_build":null}"#;
+        let env = format!(
+            "{{\"HERDR_PLUGIN_UI_INPUT_JSON\":{}}}",
+            serde_json::to_string(raw).unwrap()
+        );
+        let event: UiEvent = serde_json::from_str(&frame_json(&env)).expect("frame parses");
+        let update = handle_event(&event);
+        assert_eq!(
+            update.layers.len(),
+            1,
+            "collector snapshot must render a layer"
+        );
+        assert!(!update.layers[0].nodes.is_empty());
+    }
+
     #[test]
     fn missing_input_env_renders_nothing() {
         let _guard = test_guard();
@@ -688,7 +713,10 @@ mod tests {
         // Rebuilding herdrtest is the recovery path; a broken test must not lock
         // the user out of the button that fixes it.
         seed(input_with_test_state(InstanceState::Broken));
-        assert_eq!(invoked_action(&right_click("test")), Some(ACTION_UPDATE_TEST));
+        assert_eq!(
+            invoked_action(&right_click("test")),
+            Some(ACTION_UPDATE_TEST)
+        );
     }
 
     #[test]

@@ -56,8 +56,11 @@ const NOTES_FILE: &str = "latest_notes.md";
 const ARCHIVE_FILE: &str = "releases_notes.md";
 
 /// Curl wall-clock budget. A short timeout keeps a hung network from stacking
-/// collector runs; on timeout we fall back to the cached snapshot.
-const CURL_MAX_SECS: &str = "8";
+/// collector runs; on timeout we fall back to the cached snapshot. It must stay
+/// well under the host's 5s `COLLECTOR_TIMEOUT` (`src/plugin_collector.rs`),
+/// which kills the run outright — two fetches (stable + preview) plus the
+/// per-instance `--version` probes have to fit inside that budget.
+const CURL_MAX_SECS: &str = "2";
 /// Per-binary `--version` budget so a wedged binary can't stall the run.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Socket connect budget for the herdrtest liveness probe.
@@ -84,11 +87,8 @@ const DEFAULT_TEST_BIN: &str = ".local/bin/herdrtest";
 /// the reported version must come from the actual running process, not an assumed
 /// path. Resolve socket → pid → exe.
 const DEFAULT_HR_SOCK: &str = ".herdr-hr/config/herdr/sessions/hr/herdr.sock";
-// The connectable herdrtest SERVER socket is the top-level `herdr.sock` under the
-// instance's config dir (verified live 2026-07-24). The per-session dir only
-// holds `herdr-client.sock`, which refuses connections, so it is NOT the liveness
-// target despite the session being named `test`.
-const DEFAULT_TEST_SOCK: &str = ".herdr-test/config/herdr/herdr.sock";
+// herdrtest's connectable server socket is resolved at runtime — see
+// `resolve_test_sock`.
 
 /// Minimal view of the release manifest we need.
 #[derive(Debug, Deserialize)]
@@ -229,6 +229,13 @@ fn main() {
                 );
                 std::process::exit(1);
             }
+            // Stdout is the host's generic collector protocol
+            // (`src/plugin_collector.rs::parse_collector_stdout`). This
+            // collector owns its `ui_input_file` outright and has nothing for
+            // the host to apply to its own state, so the honest answer is
+            // `keep`. Printing nothing would make every tick log a parse
+            // failure for a run that actually succeeded.
+            println!("{{\"outcome\":\"keep\"}}");
         }
         Err(err) => {
             eprintln!("version-dash-collector: encode failed: {err}");
@@ -345,6 +352,11 @@ fn guest_vocabulary() -> Option<Vec<String>> {
 /// is env-overridable so a sandbox run can target throwaway clones without
 /// touching the live instances.
 fn instance_configs() -> Vec<InstanceCfg> {
+    // The session name drives BOTH the socket path and the `HERDR_SESSION` the
+    // status probe runs with, so it is resolved once. Default `herdrtest`: that
+    // is the session this machine's throwaway instance actually runs under.
+    let test_session =
+        env_nonempty("HERDR_VERSION_TEST_SESSION").unwrap_or_else(|| "herdrtest".into());
     vec![
         InstanceCfg {
             label: "hr",
@@ -357,13 +369,40 @@ fn instance_configs() -> Vec<InstanceCfg> {
         InstanceCfg {
             label: "test",
             bin: env_path("HERDR_VERSION_TEST_BIN", DEFAULT_TEST_BIN),
-            sock: Some(env_path("HERDR_VERSION_TEST_SOCK", DEFAULT_TEST_SOCK)),
+            sock: Some(resolve_test_sock(&test_session)),
             root: Some(env_path("HERDR_VERSION_TEST_ROOT", DEFAULT_TEST_ROOT)),
-            session: Some(
-                env_nonempty("HERDR_VERSION_TEST_SESSION").unwrap_or_else(|| "test".into()),
-            ),
+            session: Some(test_session),
         },
     ]
+}
+
+/// Resolve herdrtest's connectable SERVER socket.
+///
+/// MEASURED 2026-08-13: the socket lives at
+/// `<root>/config/herdr/sessions/<session>/herdr.sock`, and the top-level
+/// `<root>/config/herdr/herdr.sock` this collector used to assume DOES NOT
+/// EXIST on this layout. That single wrong path made every run classify a
+/// perfectly healthy herdrtest as `server not running` — the surface's loudest
+/// possible lie about the thing it exists to report.
+///
+/// Precedence: explicit override → the session socket → the legacy top-level
+/// socket. The first candidate that exists wins; if none exists the session
+/// socket is returned so the liveness probe fails against the path a human
+/// would actually go looking for.
+fn resolve_test_sock(session: &str) -> PathBuf {
+    if let Some(explicit) = env_nonempty("HERDR_VERSION_TEST_SOCK") {
+        return PathBuf::from(explicit);
+    }
+    let root = env_path("HERDR_VERSION_TEST_ROOT", DEFAULT_TEST_ROOT);
+    let herdr_dir = root.join("config").join("herdr");
+    let session_sock = herdr_dir.join("sessions").join(session).join("herdr.sock");
+    let legacy_sock = herdr_dir.join("herdr.sock");
+    for candidate in [&session_sock, &legacy_sock] {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+    session_sock
 }
 
 /// Resolve hr's binary for the version read. Precedence:
@@ -1045,12 +1084,20 @@ fn rev_list_count(repo: &Path, range: &str) -> Option<u32> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-/// Resolve the file the host reads. `HERDR_VERSION_DASH_OUTPUT` wins (tests /
-/// non-standard layouts); otherwise `<state_dir>/plugins/<id>/version_input.json`
-/// replicating herdr's `plugin_state_dir`.
+/// Resolve the file the host reads, in precedence order:
+///   1. `HERDR_VERSION_DASH_OUTPUT` — tests and non-standard layouts;
+///   2. `HERDR_PLUGIN_STATE_DIR` — set by the host when IT launches this
+///      collector (the generic per-tick runner). This is the module's own state
+///      dir, so the snapshot always lands in the instance that asked for it, no
+///      XDG guessing and no per-instance scheduled job;
+///   3. `<state_dir>/plugins/<id>/version_input.json`, replicating herdr's
+///      `plugin_state_dir` — the standalone/scheduled-job path.
 fn output_path() -> PathBuf {
     if let Some(explicit) = env_nonempty("HERDR_VERSION_DASH_OUTPUT") {
         return PathBuf::from(explicit);
+    }
+    if let Some(state) = env_nonempty("HERDR_PLUGIN_STATE_DIR") {
+        return PathBuf::from(state).join(INPUT_FILE);
     }
     state_dir()
         .join("plugins")
@@ -1302,11 +1349,41 @@ mod tests {
         assert_eq!(age_label(2 * 86_400 + 5), "2d");
     }
 
+    // One test owns both output-path env vars: they are process-global, so
+    // splitting these assertions across threaded tests would race.
     #[test]
-    fn output_path_honors_explicit_override() {
+    fn output_path_precedence_is_explicit_then_host_state_dir() {
         std::env::set_var("HERDR_VERSION_DASH_OUTPUT", "/tmp/version_input.json");
+        std::env::set_var(
+            "HERDR_PLUGIN_STATE_DIR",
+            "/tmp/hr/plugins/builtin.version-dash",
+        );
         assert_eq!(output_path(), PathBuf::from("/tmp/version_input.json"));
         std::env::remove_var("HERDR_VERSION_DASH_OUTPUT");
+        assert_eq!(
+            output_path(),
+            PathBuf::from("/tmp/hr/plugins/builtin.version-dash").join(INPUT_FILE)
+        );
+        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+    }
+
+    #[test]
+    fn test_sock_falls_back_to_the_session_socket_when_nothing_exists() {
+        std::env::remove_var("HERDR_VERSION_TEST_SOCK");
+        std::env::set_var("HERDR_VERSION_TEST_ROOT", "/nonexistent/.herdr-test");
+        // Neither candidate exists, so the session path is what a human is sent
+        // to — never the legacy top-level socket this collector used to assume.
+        assert_eq!(
+            resolve_test_sock("herdrtest"),
+            PathBuf::from("/nonexistent/.herdr-test/config/herdr/sessions/herdrtest/herdr.sock")
+        );
+        std::env::set_var("HERDR_VERSION_TEST_SOCK", "/tmp/explicit.sock");
+        assert_eq!(
+            resolve_test_sock("herdrtest"),
+            PathBuf::from("/tmp/explicit.sock")
+        );
+        std::env::remove_var("HERDR_VERSION_TEST_SOCK");
+        std::env::remove_var("HERDR_VERSION_TEST_ROOT");
     }
 
     #[test]

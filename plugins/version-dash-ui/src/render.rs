@@ -76,14 +76,14 @@ fn state_color(state: InstanceState) -> Color {
 /// is far more legible than a glyph nuance.
 fn state_glyph(state: InstanceState) -> &'static str {
     match state {
-        InstanceState::Verified => "\u{2713}",        // ✓ verified good
-        InstanceState::UpToDate => "\u{2713}",        // ✓ but muted — unverified
-        InstanceState::Behind => "\u{2191}",          // ↑ an update exists
-        InstanceState::Broken => "\u{2717}",          // ✗ broken
-        InstanceState::Working => "\u{27F3}",         // ⟳ running right now
+        InstanceState::Verified => "\u{2713}", // ✓ verified good
+        InstanceState::UpToDate => "\u{2713}", // ✓ but muted — unverified
+        InstanceState::Behind => "\u{2191}",   // ↑ an update exists
+        InstanceState::Broken => "\u{2717}",   // ✗ broken
+        InstanceState::Working => "\u{27F3}",  // ⟳ running right now
         InstanceState::AwaitingRestart => "\u{21BB}", // ↻ restart to finish
-        InstanceState::UnsafeRestart => "\u{2691}",    // ⚑ staged, ungated
-        InstanceState::Escalated => "\u{2691}",       // ⚑ an agent has it
+        InstanceState::UnsafeRestart => "\u{2691}", // ⚑ staged, ungated
+        InstanceState::Escalated => "\u{2691}", // ⚑ an agent has it
         InstanceState::Unknown => "?",
     }
 }
