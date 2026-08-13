@@ -1,0 +1,56 @@
+id = "builtin.harness-indicator"
+name = "Harness Indicator"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "One bottom row naming the fleet harness the focused pane runs inside, its agent, and the folder it was launched from (wasm render)"
+platforms = ["linux", "macos"]
+
+# Two artefacts, one nested workspace (see Cargo.toml): the wasm guest and the
+# native collector. Both land under this plugin's own target dir, so linking
+# this plugin never triggers a herdr build.
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release", "-p", "harness-indicator-ui"]
+
+[[build]]
+command = ["cargo", "build", "--release", "-p", "harness-indicator-collector"]
+
+[[ui_modules]]
+id = "harness"
+title = "Harness Indicator"
+description = "Compact fleet-harness / agent / launch-folder line for the focused pane"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/harness_indicator_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+# layout_read + focused_session: per-frame `frame` events carrying the injected
+# HERDR_PLUGIN_UI_INPUT_JSON, and the focus identity the collector reads from
+# HERDR_FOCUS_JSON. toasts: a left-click reports the full attribution and the
+# evidence behind it. No api_read/api_write: the guest asks the host for
+# nothing — every fact arrives through the collector's snapshot.
+capabilities = ["layout_read", "focused_session", "toasts"]
+ui_input_file = "harness_input.json"
+# Run by App::tick_plugin_collectors on the dash tick. Relative argv[0] resolves
+# against the plugin root (src/plugin_collector.rs::resolve_program).
+#
+# Deliberately NOT throttled, unlike version-dash: this snapshot describes the
+# pane you are looking at right now, so a stale answer after a focus change is
+# the one failure that would make the strip worse than nothing. It stays cheap
+# enough to earn that — two local socket calls, a few /proc reads and one scan
+# of ~/harnesses/*/harness.json, with no network anywhere.
+collector = ["target/release/harness-indicator-collector"]
+
+[ui_modules.placement]
+# One full-width row carved from the BOTTOM edge of the pane area, left-compact
+# so it can share the band with the other bottom strips.
+region = "bottom"
+align = "start"
+size = "1"
+# min_peer is counted in ROWS for a top/bottom band (src/ui.rs: max_slot =
+# height - min_peer). The schema default of 24 silently drops a one-row strip on
+# any pane area 24 rows or shorter — that is exactly what kept version-dash
+# invisible. Five is the smallest peer that still leaves a usable pane.
+min_peer = 5
+# Below version-dash's 55: two bottom panels each carve their own band, and this
+# one belongs closer to the panes it describes.
+z = 54
