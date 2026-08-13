@@ -134,7 +134,7 @@ desktop_notify() {
 }
 
 # ── 3. The per-agent resume/fork matrix ──────────────────────────────────────
-# agent_launch_cmd <resume|fork> <agent> <session-value>
+# agent_launch_cmd <resume|fork> <agent> <session-value> [skip|noskip]
 #
 # On success: prints the exact command line to `exec` in a fresh pane, exit 0.
 # On refusal: prints a human-readable REASON, exit 1. Callers must therefore
@@ -148,14 +148,25 @@ desktop_notify() {
 # `$(…)` runs in a subshell, so the assignment dies with it. That bug shipped
 # once already, and every refusal toasted with an empty body.)
 #
-# Every argv here was verified against the real binaries (2026-08-12):
+# Every argv here was verified against the real binaries (2026-08-12; the skip
+# column re-verified against claude and codex-cli 0.147.0 on 2026-08-13):
 #
-#   agent  | resume                  | fork
-#   -------+-------------------------+-----------------------------
-#   claude | claude --resume <id>    | claude --resume <id> --fork-session
-#   codex  | codex resume <id>       | codex fork <id>        (real subcommand)
-#   pi     | pi --session <id>       | pi --fork <id>
-#   jcode  | jcode --resume <id>     | (none — refused, not guessed)
+#   agent  | resume                  | fork                                | skip flag
+#   -------+-------------------------+-------------------------------------+--------------------------------------------
+#   claude | claude --resume <id>    | claude --resume <id> --fork-session | --dangerously-skip-permissions
+#   codex  | codex resume <id>       | codex fork <id>  (real subcommand)   | --dangerously-bypass-approvals-and-sandbox
+#   pi     | pi --session <id>       | pi --fork <id>                      | (none — `pi --help` has no yolo/bypass flag)
+#   jcode  | jcode --resume <id>     | (none — refused, not guessed)       | (not installed here — nothing verified)
+#
+# The 4th argument selects permission mode and DEFAULTS TO `skip`. That default
+# is deliberate: every one of these launches is a continuation of a conversation
+# the user already trusted enough to run, re-prompting for each tool call in the
+# forked/restored copy is pure friction, and it matches the agent-launcher popup,
+# whose permission dropdown is also bypass-by-default. Pass `noskip` to opt out.
+# `--dangerously-bypass-approvals-and-sandbox` is accepted by `codex resume` and
+# `codex fork` themselves (verified with `codex resume --help`), so it goes AFTER
+# the subcommand, not before it. pi and jcode have no verified equivalent and are
+# emitted unchanged rather than given a guessed flag.
 #
 # Two traps encoded here on purpose:
 #
@@ -170,10 +181,73 @@ desktop_notify() {
 # Agents outside this table (omp, gemini, cursor, a plain terminal…) are refused
 # rather than routed through a neighbour's flags. `omp` in particular used to
 # share pi's branch, which emitted `pi --fork` for an omp pane.
+#
+# ── The harness env prefix ───────────────────────────────────────────────────
+# A session is only resumable from the config root that OWNS its transcript.
+# Fleet harnesses (~/harnesses/<name>/config, runtime declared in
+# ~/harnesses/<name>/harness.json) are exactly such roots: they are a
+# CLAUDE_CONFIG_DIR / CODEX_HOME pointing somewhere other than ~/.claude and
+# ~/.codex. Emitting a bare `claude --resume <id>` for a harness-owned session
+# therefore fails — claude looks in the default root, does not find the
+# transcript, and starts a NEW conversation instead. That silently-wrong fork
+# shipped for as long as this matrix has existed.
+#
+# So: locate the transcript, and when it lives under a harness root, prefix the
+# command with the env var that points the runtime back at it. `env` is used
+# rather than a bare `VAR=x cmd` assignment because the emitted string is also
+# passed to `herdr pane run "exec $CMD"` — `exec VAR=x cmd` is a syntax error in
+# every POSIX shell, while `exec env VAR=x cmd` is not.
+#
+# Lookup is glob-only (no `find`): claude names one file per session id, and a
+# codex rollout filename ends in the uuid, so both are a single glob per root.
+#
+# harness_env_prefix <agent> <session-value> -> "env VAR=/path " or "" (always 0)
+harness_env_prefix() {
+  _h_agent="$1"
+  _h_value="$2"
+  [ -n "$_h_value" ] || return 0
+  case "$_h_agent" in
+    claude | codex) ;;
+    *) return 0 ;;
+  esac
+  [ -d "$HOME/harnesses" ] || return 0
+
+  for _h_dir in "$HOME"/harnesses/*/; do
+    [ -d "$_h_dir/config" ] || continue
+    # harness.json is the authoritative runtime declaration; a harness with a
+    # different runtime cannot own this session, and one with none is skipped
+    # rather than assumed (several exist: main, vanilla, mac-main, …).
+    _h_rt=""
+    if [ -r "$_h_dir/harness.json" ] && command -v jq >/dev/null 2>&1; then
+      _h_rt="$(jq -r '.runtime // empty' <"$_h_dir/harness.json" 2>/dev/null)"
+    fi
+    [ "$_h_rt" = "$_h_agent" ] || continue
+
+    case "$_h_agent" in
+      claude)
+        for _h_f in "$_h_dir"config/projects/*/"$_h_value".jsonl; do
+          [ -f "$_h_f" ] || continue
+          printf 'env CLAUDE_CONFIG_DIR=%q ' "${_h_dir%/}/config"
+          return 0
+        done
+        ;;
+      codex)
+        for _h_f in "$_h_dir"config/sessions/*/*/*/rollout-*-"$_h_value".jsonl; do
+          [ -f "$_h_f" ] || continue
+          printf 'env CODEX_HOME=%q ' "${_h_dir%/}/config"
+          return 0
+        done
+        ;;
+    esac
+  done
+  return 0
+}
+
 agent_launch_cmd() {
   _a_verb="$1"
   _a_agent="$2"
   _a_value="$3"
+  _a_mode="${4:-skip}"
 
   # Legacy archive records and display skins can carry "cx" — a cosmetic label
   # for Claude Code driven through a gateway, never a distinct runtime.
@@ -206,13 +280,28 @@ agent_launch_cmd() {
     return 1
   fi
 
+  # Per-runtime skip flag, empty when the mode is off or the runtime has none.
+  _a_skip=""
+  if [ "$_a_mode" = "skip" ]; then
+    case "$_a_agent" in
+      claude) _a_skip=" --dangerously-skip-permissions" ;;
+      codex) _a_skip=" --dangerously-bypass-approvals-and-sandbox" ;;
+    esac
+  fi
+
+  # Harness-owned sessions need their config root back (see harness_env_prefix).
+  # Captured into a variable rather than printed here: the refusal arm below
+  # prints a human-readable REASON on the same stdout, and a stray `env …`
+  # prefix in front of it would be shown to the user as the toast body.
+  _a_pfx="$(harness_env_prefix "$_a_agent" "$_a_value")"
+
   case "$_a_verb:$_a_agent" in
-    resume:claude) printf '%s --resume %q' "$_a_exe" "$_a_value" ;;
-    resume:codex) printf '%s resume %q' "$_a_exe" "$_a_value" ;;
+    resume:claude) printf '%s%s --resume %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
+    resume:codex) printf '%s%s resume %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
     resume:pi) printf '%s --session %q' "$_a_exe" "$_a_value" ;;
     resume:jcode) printf '%s --resume %q' "$_a_exe" "$_a_value" ;;
-    fork:claude) printf '%s --resume %q --fork-session' "$_a_exe" "$_a_value" ;;
-    fork:codex) printf '%s fork %q' "$_a_exe" "$_a_value" ;;
+    fork:claude) printf '%s%s --resume %q --fork-session%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
+    fork:codex) printf '%s%s fork %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
     fork:pi) printf '%s --fork %q' "$_a_exe" "$_a_value" ;;
     *)
       printf "%s is not supported for '%s'" "$_a_verb" "$_a_agent"
