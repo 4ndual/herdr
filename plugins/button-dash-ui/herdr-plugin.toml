@@ -83,17 +83,34 @@ command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/fork-conversation.sh
 # resume-search: open the resume-search picker as an in-app overlay; on
 # Enter/click it execs the resumed session into a pane.
 #
-# The picker is a SEPARATE standalone bun tool, not part of this repo, so the
-# script only resolves its wrapper path and hands it to `herdr resume-picker
-# open --wrapper`. Resolution is configuration-free ($HERDR_PLUGIN_ROOT-relative,
-# then this script's own dir, then PATH) with $HERDR_RESUME_PICKER_WRAPPER as the
-# override; when it is not installed the button toasts that plainly instead of
-# failing silently. Detached so it outlives the action runner.
+# The picker itself lives at plugins/resume-picker/ (bun; scans claude, codex, pi
+# and every ~/harnesses/<n>/config root, and emits an env-prefixed skip-mode
+# resume command). This script only resolves its wrapper path and hands it to
+# `herdr resume-picker open --wrapper`. Resolution is configuration-free
+# ($HERDR_PLUGIN_ROOT-relative, then this script's own dir, then PATH) with
+# $HERDR_RESUME_PICKER_WRAPPER as the override; when it is missing the button
+# toasts that plainly instead of failing silently. Detached so it outlives the
+# action runner.
 [[actions]]
 id = "resume-search"
 title = "Resume search"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-resume-picker.sh\" >/dev/null 2>&1 &"]
+
+# relaunch-skip: relaunch the CURRENT pane's session IN PLACE in skip/yolo
+# permission mode (claude --dangerously-skip-permissions / codex
+# --dangerously-bypass-approvals-and-sandbox; pi and jcode have no verified
+# equivalent and get a toast). Nothing is forked and no tab appears: the script
+# spawns the resumed session as a sibling pane in the SAME tab via `agent start
+# --tab --split` and then closes the old pane — in that order, because closing
+# first would take a single-pane tab with it. A harness-owned session is handed
+# its CLAUDE_CONFIG_DIR / CODEX_HOME through `--env`. See
+# scripts/relaunch-skip.sh. Detached so it outlives the action runner.
+[[actions]]
+id = "relaunch-skip"
+title = "Relaunch skip"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/relaunch-skip.sh\" >/dev/null 2>&1 &"]
 
 # remote: CLAUDE ONLY. Enable Claude Code Remote Control on the CURRENT pane's
 # LIVE conversation so it can be continued from the phone / claude.ai. For a

@@ -105,8 +105,21 @@ static BUTTONS: &[ButtonDef] = &[
         emoji: "\u{1F50E}", // 🔎
         shortcut: "\u{2303}\u{2325}S", // ⌃⌥S (display only; spec proposed ⌃⌥R but that already binds Remote)
         color: "muted",
-        description: "Search Claude Code transcripts and resume the picked session (needs the resume-picker overlay installed)",
+        description: "Search every claude, codex, pi and fleet-harness transcript and resume the picked session in skip mode",
         action_id: "resume-search",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
+        id: "relaunch-skip",
+        label: "Relaunch skip",
+        emoji: "\u{26A1}",             // ⚡
+        shortcut: "\u{2303}\u{2325}K", // ⌃⌥K
+        // `peach` was the last genuinely distinct role left in the host palette
+        // (see canonical_color in the tests), so this button needs no entry in
+        // ALLOWED_COLOR_COLLISIONS — and the next one added will.
+        color: "peach",
+        description: "Relaunch THIS session in place with permissions bypassed — claude and codex; pi and jcode have no such flag",
+        action_id: "relaunch-skip",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
@@ -1006,6 +1019,14 @@ mod tests {
     fn fork_buttons_are_registered() {
         assert!(BUTTONS.iter().any(|b| b.action_id == "fork"));
         assert!(BUTTONS.iter().any(|b| b.action_id == "fork-workspace"));
+    }
+
+    /// The relaunch button is the only one that CLOSES the pane it was clicked
+    /// from, so a registry entry pointing at a missing action would strand the
+    /// user's session. Pinned like the fork pair.
+    #[test]
+    fn relaunch_skip_button_is_registered() {
+        assert!(BUTTONS.iter().any(|b| b.action_id == "relaunch-skip"));
     }
 
     #[test]
