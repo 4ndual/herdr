@@ -1,0 +1,47 @@
+# runtime-swap: reopen the focused pane's agent session under a different
+# runtime, replacing the pane in place.
+#
+# Two halves, mirroring how the agent launcher builds its "new agent tab" modal:
+#
+# - A `placement = "overlay"` pane running a native ratatui binary (`tui/`).
+#   The overlay owns the keyboard and mouse; herdr paints only the chrome. It
+#   shows the live session and the reopen targets, hiding the current runtime.
+# - `scripts/swap-runtime.ts` (bun) does the conversion and the placement. It
+#   follows jcode's import model — flatten to plain text, drop provider-native
+#   reasoning, summarize tool traffic, keep the tail — with native fast paths
+#   where the target runtime imports foreign sessions itself (codex's
+#   app-server importer for Claude Code, jcode's own `--resume`).
+#
+# Placement uses the pre-0.7.5 `agent start` form (wire `agent.spawn`): spawn
+# the new runtime as a sibling pane in the SAME tab, then close the old pane so
+# the split collapses. Spawn always happens before the close, otherwise closing
+# the tab's only pane would destroy the tab.
+#
+# No herdr core changes are involved.
+
+id = "builtin.runtime-swap"
+name = "Runtime Swap"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Reopen a pane's agent session under a different runtime, replacing the pane in place"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "-lc", "cd tui && cargo build --release"]
+
+[[panes]]
+id = "picker"
+title = "reopen in another runtime"
+description = "Pick a target runtime for the focused pane's live session"
+placement = "overlay"
+command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/tui/target/release/runtime-swap-tui\""]
+
+[[actions]]
+id = "reopen-in-runtime"
+title = "Reopen in another runtime"
+contexts = ["tab", "pane"]
+command = [
+  "sh",
+  "-lc",
+  "nohup \"$HERDR_PLUGIN_ROOT/scripts/open-picker.sh\" >/dev/null 2>&1 &",
+]

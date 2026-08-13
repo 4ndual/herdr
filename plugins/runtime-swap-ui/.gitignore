@@ -1,0 +1,3 @@
+# The overlay binary is built by the manifest's [[build]] step, not committed.
+# The repo's root .gitignore only covers plugins/*/target/, not this nested crate.
+tui/target/
