@@ -3,7 +3,11 @@ name = "Harness Indicator"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "One bottom row naming the fleet harness the focused pane runs inside, its agent, and the folder it was launched from (wasm render)"
-platforms = ["linux", "macos"]
+# Linux only, honestly: the collector resolves a harness from
+# /proc/<pid>/environ and /proc/<pid>/cwd. macOS has no /proc — it needs
+# KERN_PROCARGS2 sysctl work before this can claim to run there, and claiming it
+# early would ship a strip that silently only ever says "no harness".
+platforms = ["linux"]
 
 # Two artefacts, one nested workspace (see Cargo.toml): the wasm guest and the
 # native collector. Both land under this plugin's own target dir, so linking
