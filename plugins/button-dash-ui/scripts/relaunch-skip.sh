@@ -134,7 +134,10 @@ fi
 log "argv: $* ${ENV_ARGS[*]:-}"
 
 # 4. Spawn the replacement pane in the SAME tab, then close the old one.
-LABEL="$AGENT skip"
+# Agent names are unique per session (`agent_name_taken` otherwise), and a
+# previously relaunched pane keeps its name for its whole life — suffix with the
+# session id so two skip-relaunched panes can coexist.
+LABEL="$AGENT skip ${VALUE:0:6}"
 SPAWN_JSON="$(hd agent start "$LABEL" --tab "$TAB_ID" --split right --cwd "$CWD" \
   "${ENV_ARGS[@]}" --focus -- "$@" 2>&1)"
 # agent.spawn answers {"result":{"type":"agent_started","agent":{…,"pane_id":…}}}
