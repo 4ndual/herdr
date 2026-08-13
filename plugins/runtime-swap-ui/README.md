@@ -35,7 +35,7 @@ never format translation. Strategy is picked per source/target pair:
 | pair | strategy | what happens |
 | --- | --- | --- |
 | claude (default root) → codex | `native:codex-import` | codex's own app-server importer (`externalAgentConfig/import`) materializes a real rollout; the pane runs `codex resume <thread>` — a true native resume |
-| anything → jcode | `native:jcode-import` | `jcode --resume <foreign-id>`; jcode probes codex → claude → opencode → cursor → pi and imports it itself |
+| default-root session → jcode | `native:jcode-import` | `jcode --resume <foreign-id>`; jcode probes codex → claude → opencode → cursor → pi and imports it itself |
 | everything else | `import:flattened-handoff` | we parse the transcript ourselves and hand the target a flattened history as its first prompt |
 
 The flattened handoff applies jcode's own normalization rules and caps:
@@ -87,10 +87,19 @@ Target runtimes launch in skip/bypass mode
 
 ## Known limits
 
-- **codex's native importer only detects `~/.claude/projects`.** A claude session
-  living in a harness root (`CLAUDE_CONFIG_DIR=~/harnesses/<h>/config`) is
-  rejected with `session_not_detected`, so those fall back to the flattened
-  handoff. Setting `CLAUDE_CONFIG_DIR` for the importer does not help.
+- **Both native importers only see the DEFAULT config root.** codex's detector
+  scans `~/.claude/projects` and rejects anything else with
+  `session_not_detected`; jcode resolves foreign ids through its own
+  `user_home_path()` and prints "No session found". A session living in a
+  harness root (`CLAUDE_CONFIG_DIR=~/harnesses/<h>/config`) is invisible to
+  both, and pointing `CLAUDE_CONFIG_DIR` at the harness does not help. Those
+  pairs are gated off the native path and take the flattened handoff instead —
+  the gate matters, because jcode *exits* on a miss, which would kill the pane
+  that was just spawned and the single-pane tab with it.
+- **jcode has no positional prompt**, so its handoff is delivered with
+  `herdr agent prompt` once the new pane reports the agent ready. For that path
+  the source pane is closed only after delivery succeeds; if the target never
+  comes up, the original conversation is still there.
 - herdr only reports an `agent_session` when the runtime's integration hook does.
   When it is absent the engine recovers the newest transcript this runtime wrote
   for the pane's cwd, matching on the transcript header, and derives the id from

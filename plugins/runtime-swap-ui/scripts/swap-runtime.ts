@@ -13,7 +13,8 @@
  *                     materializes a real rollout, so `codex resume <id>` is a
  *                     true native resume.
  *   * -> jcode        jcode's `--resume` accepts a raw foreign session id and
- *                     runs its own importer.
+ *                     runs its own importer — but only for sessions under the
+ *                     DEFAULT config root, which both native importers require.
  *   same runtime      never offered; the picker hides the current runtime.
  *
  * Placement uses the pre-0.7.5 `agent start` form (wire `agent.spawn`), which
@@ -663,7 +664,45 @@ function seedCodexTrust(cwd: string, configRoot: string | null) {
   }
 }
 
-type Plan = { argv: string[]; strategy: string; note: string };
+type Plan = {
+  argv: string[];
+  strategy: string;
+  note: string;
+  /** Handoff text to deliver after launch, for runtimes with no argv prompt. */
+  prompt?: string;
+};
+
+/**
+ * Which runtimes accept a first prompt as a positional argument and still open
+ * their interactive UI. claude, codex and pi do; jcode's CLI has `--resume` but
+ * no positional prompt, so its handoff is delivered through
+ * `herdr agent prompt` once the pane reports the agent ready.
+ */
+const TAKES_ARGV_PROMPT: Record<Runtime, boolean> = {
+  claude: true,
+  codex: true,
+  pi: true,
+  jcode: false,
+};
+
+/**
+ * Both native importers discover sessions under the DEFAULT config root only:
+ * codex's detector scans `~/.claude/projects` (a harness-root transcript is
+ * rejected with `session_not_detected`, and pointing `CLAUDE_CONFIG_DIR` at the
+ * harness does not help), and jcode resolves foreign ids through its own
+ * `user_home_path()`. Handing either a harness-root session is not a soft miss:
+ * jcode prints "No session found" and exits, which kills the pane we just
+ * spawned — and a single-pane tab with it. So gate the native paths on
+ * visibility and let the flattened handoff take those pairs.
+ *
+ * pi is exempt: jcode keys pi sessions by path, not by id.
+ */
+function nativelyVisible(runtime: Runtime, transcript: string | null): boolean {
+  if (!transcript) return false;
+  if (runtime === "pi") return true;
+  const defaultRoot = runtime === "codex" ? join(HOME, ".codex") : join(HOME, ".claude");
+  return transcript.startsWith(`${defaultRoot}/`);
+}
 
 async function buildPlan(
   source: Source,
@@ -671,19 +710,27 @@ async function buildPlan(
   transcript: string | null,
   configRoot: string | null,
 ): Promise<Plan> {
-  // jcode imports every supported foreign session itself; `--resume` accepts a
-  // raw foreign id and probes codex -> claude -> opencode -> cursor -> pi path.
-  if (target === "jcode") {
-    // `--resume` takes a jcode id, a raw foreign session id, or a pi session
-    // path; jcode probes codex -> claude -> opencode -> cursor -> pi path.
+  // jcode imports every supported foreign session itself; `--resume` takes a
+  // jcode id, a raw foreign session id, or a pi session path, and probes
+  // codex -> claude -> opencode -> cursor -> pi path.
+  if (target === "jcode" && nativelyVisible(source.runtime, transcript)) {
     return {
-      argv: ["jcode", "--resume", source.sessionKind === "id" ? source.sessionValue : sessionId(source)],
+      argv: [
+        "jcode",
+        "--resume",
+        source.runtime === "pi" && source.sessionKind === "path" ? source.sessionValue : sessionId(source),
+      ],
       strategy: "native:jcode-import",
       note: `jcode imports the ${source.runtime} session natively`,
     };
   }
 
-  if (target === "codex" && source.runtime === "claude" && transcript) {
+  if (
+    target === "codex" &&
+    source.runtime === "claude" &&
+    transcript &&
+    nativelyVisible(source.runtime, transcript)
+  ) {
     const threadId = await codexImportClaudeSession(transcript, source.cwd, configRoot);
     if (threadId) {
       return {
@@ -702,9 +749,11 @@ async function buildPlan(
   const messages = parseTranscript(source.runtime, transcript);
   if (!messages.length) throw new Error(`transcript ${transcript} has no replayable user/assistant turns yet`);
   const handoff = buildHandoff(source, target, messages, transcript);
-  const argv = [target, ...trustFlags(target, source.cwd), ...SKIP_FLAGS[target], handoff.prompt];
+  const launch = [target, ...trustFlags(target, source.cwd), ...SKIP_FLAGS[target]];
+  const viaArgv = TAKES_ARGV_PROMPT[target];
   return {
-    argv,
+    argv: viaArgv ? [...launch, handoff.prompt] : launch,
+    prompt: viaArgv ? undefined : handoff.prompt,
     strategy: "import:flattened-handoff",
     note: `${handoff.kept} messages carried over (${handoff.dropped} older omitted); full history at ${handoff.historyPath}`,
   };
@@ -732,6 +781,7 @@ function replacePane(
   target: Runtime,
   argv: string[],
   configRoot: string | null,
+  prompt: string | undefined,
 ): string {
   // Pin the reopened runtime to the same config root the replaced pane used —
   // otherwise a harness-scoped pane reopens against the default root, and the
@@ -753,8 +803,30 @@ function replacePane(
   );
   const newPane = spawned.agent?.pane_id;
   if (!newPane) throw new Error("agent spawn returned no pane id; leaving the source pane untouched");
+  // With the handoff in argv the pane is already carrying the history, so the
+  // source can go immediately. When it has to be typed, wait for the agent to
+  // become interactive first and only then drop the source — if the target
+  // never comes up, the user still has the conversation they started with.
+  if (prompt) waitForAgentThenPrompt(newPane, prompt);
   herdr("pane", "close", source.paneId);
   return newPane;
+}
+
+function waitForAgentThenPrompt(paneId: string, prompt: string) {
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    try {
+      const pane = herdr("pane", "get", paneId).pane;
+      if (pane.agent && pane.agent_status && pane.agent_status !== "unknown") {
+        herdr("agent", "prompt", paneId, prompt);
+        return;
+      }
+    } catch {
+      /* the pane may not be registered yet */
+    }
+    spawnSync("sleep", ["1"]);
+  }
+  throw new Error(`${paneId} never became an interactive agent; the handoff was not delivered`);
 }
 
 // ── main ───────────────────────────────────────────────────────────────────
@@ -791,7 +863,7 @@ async function main() {
     return;
   }
 
-  const newPane = replacePane(source, target, plan.argv, configRoot);
+  const newPane = replacePane(source, target, plan.argv, configRoot, plan.prompt);
   report(args.json, {
     source_pane: source.paneId,
     new_pane: newPane,
