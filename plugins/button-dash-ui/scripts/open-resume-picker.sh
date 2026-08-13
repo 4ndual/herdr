@@ -25,9 +25,12 @@ if [[ -z "$HERDR" ]]; then
   exit 3
 fi
 
-# Locate the overlay wrapper. resume-picker is NOT a herdr plugin -- it is a
-# standalone bun tool -- so it does not ship in this repo. Resolution order,
-# all configuration-free except the first:
+# Locate the overlay wrapper. The picker now SHIPS IN THIS REPO at
+# plugins/resume-picker/ (bin/resume-picker-overlay.sh + src/picker.ts), which is
+# exactly candidate 2 below: $HERDR_PLUGIN_ROOT/../resume-picker/. It used to be
+# an out-of-tree standalone bun tool, and after 401df7c7 removed the extracted
+# copy it existed on no machine at all — every press of this button toasted
+# "not installed". Resolution order, all configuration-free except the first:
 #   1. $HERDR_RESUME_PICKER_WRAPPER  — explicit override for an odd install
 #   2. beside this plugin ($HERDR_PLUGIN_ROOT/../resume-picker/…), which is
 #      where a checkout that vendors it puts it
