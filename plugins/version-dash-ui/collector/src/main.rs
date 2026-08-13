@@ -155,6 +155,23 @@ fn main() {
     let previous = read_previous(&out_path);
     let now = unix_now();
 
+    // Self-throttle. The host's generic collector runner fires on the DASH TICK
+    // — measured at roughly once per second — while this collector's real
+    // cadence is ten minutes. Without this guard, adopting the host tick would
+    // mean two requests to herdr.dev plus `lsof`, `herdr status` and two
+    // `--version` probes EVERY SECOND, forever. The throttle lives here rather
+    // than in the manifest because it is a property of this collector's cost,
+    // not of the host's scheduling.
+    //
+    // The in-flight update pipeline is the deliberate exception: while
+    // pipeline.json / staged-build.json are moving, the strip is a progress
+    // indicator and ten-minute-old truth is useless, so a snapshot older than
+    // either of those files always refreshes.
+    if !refresh_due(&out_path, now) {
+        println!("{{\"outcome\":\"keep\"}}");
+        return;
+    }
+
     // Latest stable (network). On failure we carry the previous value forward so
     // classification still has a reference point.
     let manifest = fetch_manifest();
@@ -374,6 +391,46 @@ fn instance_configs() -> Vec<InstanceCfg> {
             session: Some(test_session),
         },
     ]
+}
+
+/// Whether this run should do real work, or leave the existing snapshot alone.
+///
+/// `false` when the snapshot is younger than the refresh interval AND no
+/// in-flight update file is newer than it. A missing or unreadable snapshot
+/// always refreshes — the first run must produce one.
+fn refresh_due(out_path: &Path, now: u64) -> bool {
+    let Some(age) = file_age_secs(out_path, now) else {
+        return true;
+    };
+    if age >= refresh_interval() {
+        return true;
+    }
+    // Progress files move faster than the interval; if one is newer than the
+    // snapshot, the snapshot is behind the thing it is reporting.
+    let Some(dir) = out_path.parent() else {
+        return false;
+    };
+    ["pipeline.json", "staged-build.json"]
+        .iter()
+        .filter_map(|name| file_age_secs(&dir.join(name), now))
+        .any(|progress_age| progress_age < age)
+}
+
+/// Seconds since `path` was last written, or `None` when it does not exist.
+fn file_age_secs(path: &Path, now: u64) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(now.saturating_sub(secs))
+}
+
+/// Minimum seconds between real collector runs. Ten minutes matches the cadence
+/// this collector was designed for; `HERDR_VERSION_REFRESH_SECS` overrides it
+/// (`0` disables the throttle entirely, which is what the tests and a manual
+/// one-shot run want).
+fn refresh_interval() -> u64 {
+    env_nonempty("HERDR_VERSION_REFRESH_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600)
 }
 
 /// Resolve herdrtest's connectable SERVER socket.
@@ -1365,6 +1422,32 @@ mod tests {
             PathBuf::from("/tmp/hr/plugins/builtin.version-dash").join(INPUT_FILE)
         );
         std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+    }
+
+    #[test]
+    fn refresh_is_throttled_unless_the_snapshot_is_stale_or_a_pipeline_moved() {
+        let dir = std::env::temp_dir().join(format!("vd-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let snapshot = dir.join(INPUT_FILE);
+        std::fs::write(&snapshot, b"{}").expect("write snapshot");
+
+        // No snapshot at all ⇒ always due (the first run must produce one).
+        assert!(refresh_due(&dir.join("absent.json"), unix_now()));
+
+        // A snapshot written "now" is inside the default 600s interval.
+        let now = unix_now();
+        assert!(!refresh_due(&snapshot, now));
+
+        // Same file, evaluated as if 20 minutes had passed.
+        assert!(refresh_due(&snapshot, now + 1_200));
+
+        // A pipeline file NEWER than the snapshot beats the throttle: while an
+        // update is in flight the strip is a progress indicator.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        std::fs::write(dir.join("pipeline.json"), b"{}").expect("write pipeline");
+        assert!(refresh_due(&snapshot, unix_now()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
