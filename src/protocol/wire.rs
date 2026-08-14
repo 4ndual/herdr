@@ -13,6 +13,29 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
+///
+/// # What has actually been published
+///
+/// The authority is the LIVE endpoints, and only those:
+///
+/// - <https://herdr.dev/latest.json> — the stable channel
+/// - <https://herdr.dev/preview.json> — the preview channel
+///
+/// **Never read `website/latest.json` or `website/preview.json` to answer
+/// "what protocol is published".** Those tracked files are inputs to a deploy,
+/// not a record of one: release CI rewrites them and the working tree can sit
+/// arbitrarily far behind whatever is actually serving. On 2026-08-14 the
+/// tracked copies said stable 17 / preview 18 while both live endpoints served
+/// 19 — a two-version error in the direction that makes an unpublished protocol
+/// look reusable, which is exactly the reasoning this constant governs.
+///
+/// # When to bump
+///
+/// Bump when the current source protocol has already been published on either
+/// live endpoint AND the wire format changes incompatibly. Do not bump again
+/// for further incompatible changes until that new version is itself published.
+/// Additive changes — a new method, a new optional field — are not incompatible
+/// and never require a bump.
 pub const PROTOCOL_VERSION: u32 = 19;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
@@ -2176,5 +2199,90 @@ mod tests {
             self.pos += to_read;
             Ok(to_read)
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_authority_tests {
+    /// Maintenance guard: nothing may cite the tracked `website/*.json` files as
+    /// the authority for what protocol or version is PUBLISHED.
+    ///
+    /// Those files are deploy inputs, not a record of a deploy. Release CI
+    /// rewrites them and a working tree can sit arbitrarily far behind what is
+    /// actually serving — on 2026-08-14 they said stable 17 / preview 18 while
+    /// both live endpoints served 19, and a commit message shipped that error as
+    /// the stated reason for a protocol decision. The live endpoints
+    /// (herdr.dev/latest.json, herdr.dev/preview.json) are the only authority.
+    ///
+    /// Deliberately narrow: mentioning `website/latest.json` is fine (release CI
+    /// genuinely updates it). What fails is mentioning it ON THE SAME LINE as a
+    /// claim about what is published or what the protocol is.
+    #[test]
+    fn nothing_cites_the_tracked_website_json_as_version_authority() {
+        const AUTHORITY_WORDS: &[&str] = &[
+            "protocol",
+            "published",
+            "publishes",
+            "publishing",
+            "authority",
+        ];
+
+        fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "rs" | "md" | "mdx"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect(&root.join("src"), &mut files);
+        collect(&root.join("docs/next"), &mut files);
+
+        let mut offenders = Vec::new();
+        for file in files {
+            // This test names the forbidden pattern in order to forbid it.
+            if file.ends_with("protocol/wire.rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for (number, line) in text.lines().enumerate() {
+                let cites_tracked_file =
+                    line.contains("website/latest.json") || line.contains("website/preview.json");
+                if !cites_tracked_file {
+                    continue;
+                }
+                let lowered = line.to_lowercase();
+                if AUTHORITY_WORDS.iter().any(|word| lowered.contains(word)) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(root).unwrap_or(&file).display(),
+                        number + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "the tracked website/*.json files are deploy inputs, not a record of what is \
+             published — cite https://herdr.dev/latest.json or https://herdr.dev/preview.json \
+             instead:\n{}",
+            offenders.join("\n")
+        );
     }
 }

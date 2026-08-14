@@ -100,6 +100,19 @@ impl TileLayout {
         )
     }
 
+    /// A layout holding exactly one pane with a CHOSEN id.
+    ///
+    /// `new()` allocates from the global counter, which cannot produce the
+    /// same raw id in two workspaces — the state that the cross-workspace
+    /// pane-id tests have to construct deliberately.
+    #[cfg(test)]
+    pub fn test_with_single_pane(pane_id: PaneId) -> Self {
+        Self {
+            root: Node::Pane(pane_id),
+            focus: pane_id,
+        }
+    }
+
     pub fn focused(&self) -> PaneId {
         self.focus
     }

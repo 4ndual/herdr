@@ -1,6 +1,6 @@
 # DONE-BATCH — overnight build batch, 2026-08-14
 
-Branch `feat/host-action-bridge`, 17 commits. Full detail and evidence in
+Branch `feat/host-action-bridge`, 18 commits. Full detail and evidence in
 `BATCH-REPORT.md`; this is the per-task summary.
 
 Read the three "not done" rows first — they are the ones that need you.
@@ -115,3 +115,34 @@ real text while the screen shows the image. That is a z-order question between
 the `pane_graphics` half-block paint and pane text, unrelated to #36, and in the
 same family as the version strip reporting "images: none on screen" while an
 image was in fact painted.
+
+## Review follow-ups
+
+**1. Cross-workspace colour leak — fixed in `3f9318bd`, now pinned by a test.**
+The handler discarded the resolved `ws_idx` and scanned every workspace for the
+raw `PaneId`, so a request for `w2:p1` could colour `w1`'s pane and report
+success. The fix was already in; what was missing was a test for the actual
+cross-workspace case. `set_color_does_not_leak_across_workspaces_sharing_a_raw_pane_id`
+forces the same raw id into two workspaces with different terminals, colours the
+second, and asserts the first is untouched — verified red by restoring the old
+scan.
+
+**2. `e5e1eaea`'s protocol reasoning was wrong; corrected in the record, not by
+rewriting history.** The message says "neither channel has published it (stable
+17, preview 18)". The live endpoints both serve **protocol 19** — I had read the
+tracked `website/*.json` files, which are deploy inputs that release CI
+rewrites, not a record of what is serving. The no-bump decision stands, but for
+the correct reason: adding a method is additive, and only *incompatible* changes
+require a bump.
+
+Landed with it: a `PROTOCOL_VERSION` doc comment naming
+`herdr.dev/latest.json` and `herdr.dev/preview.json` as the only authority and
+citing this exact error, plus a maintenance test
+(`nothing_cites_the_tracked_website_json_as_version_authority`) that walks
+`src/` and `docs/next/` and fails on any line pairing `website/*.json` with an
+authority word. Written in Rust rather than as a `scripts/test_*.py` sibling so
+it runs under `cargo nextest` and `just check` without adding Python. Verified
+red against a probe file.
+
+**Working-tree note:** `plugins/tidus-bar-ui/src/lib.rs` carries an uncommitted
+change that is not mine. I left it alone and staged only my own files.

@@ -343,3 +343,71 @@ one.
 The `hr` restart remains for you. The staged binary is
 `09d791f2…`; the running server still holds the previous inode. I have not restarted it and will not: your orchestrator session
 lives in that instance.
+
+## Two review follow-ups
+
+### 1. The cross-workspace colour leak — confirmed fixed, now pinned
+
+Fixed in **`3f9318bd`**. The handler had parsed `(ws_idx, pane_id)` and then
+discarded `ws_idx`, scanning every workspace for the raw `PaneId` and taking the
+first hit; the fix resolves against `workspaces.get(ws_idx)`.
+
+It had no test proving the cross-workspace case, which is the whole defect, so
+one now exists:
+`set_color_does_not_leak_across_workspaces_sharing_a_raw_pane_id`. It forces the
+SAME raw `PaneId` into two workspaces backed by different terminals, colours the
+second workspace's pane, and asserts the first is untouched. The adversarial
+state is constructed deliberately rather than waited for — `PaneId::alloc` is a
+global counter, so a natural collision needs a restore that reinstates saved raw
+ids, and the defect has to be excluded however the state is reached.
+
+**Verified red without the fix:** restoring the `.iter().find_map(...)` scan
+fails the test; the fix passes it. Adds a `TileLayout::test_with_single_pane`
+test helper for building a layout with a chosen pane id.
+
+### 2. The protocol-version authority, and my error in `e5e1eaea`
+
+The `e5e1eaea` commit message states the no-bump reason as "neither channel has
+published it (stable 17, preview 18)". **That is wrong.** Checked against the
+live endpoints:
+
+```
+https://herdr.dev/latest.json   -> "protocol": 19
+https://herdr.dev/preview.json  -> "protocol": 19
+```
+
+Protocol 19 is published in **both** channels. I had read the tracked
+`website/latest.json` (17) and `website/preview.json` (18), which are deploy
+inputs that release CI rewrites — not a record of what is serving. The working
+tree was two versions behind reality, in the direction that makes an unpublished
+protocol look reusable.
+
+**The no-bump decision stands, for a different reason than the one recorded:**
+adding `pane.set_color` is additive, and the rule requires a bump only for an
+*incompatible* wire change. History is not rewritten; this is the correction of
+record.
+
+Landed alongside it:
+
+- A doc comment on `PROTOCOL_VERSION` (`src/protocol/wire.rs`) naming the live
+  endpoints as the only authority, stating plainly that `website/*.json` must
+  never be read to answer "what is published", and citing this specific
+  two-version error as the reason the rule is written down.
+- A maintenance test,
+  `nothing_cites_the_tracked_website_json_as_version_authority`, which walks
+  `src/` and `docs/next/` and fails on any line that mentions
+  `website/latest.json` or `website/preview.json` together with an authority
+  word (protocol, published, publishes, publishing, authority). Deliberately
+  narrow — mentioning the files is fine, since release CI genuinely updates
+  them; claiming they record what is published is not. Written as a Rust test
+  rather than a `scripts/test_*.py` sibling so it runs under `cargo nextest`
+  (and therefore `just check`) without adding Python.
+  **Verified red:** a probe file asserting "The published protocol is recorded
+  in website/latest.json" fails the test with its exact path and line.
+
+### Note on the working tree
+
+`plugins/tidus-bar-ui/src/lib.rs` carries an uncommitted change that is not
+mine (a hover-safety fix referencing an independent video gate). I left it
+alone and staged only my own files for these commits. Worth knowing if another
+session is live in this checkout.

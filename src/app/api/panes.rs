@@ -2051,6 +2051,94 @@ mod tests {
         );
     }
 
+    /// Two panes sharing one raw `PaneId` in DIFFERENT workspaces must colour
+    /// independently.
+    ///
+    /// The handler used to parse `(ws_idx, pane_id)` and then throw `ws_idx`
+    /// away, scanning every workspace for that raw id and taking the first hit.
+    /// A `PaneId` is unique only WITHIN a workspace, so that reads the colour
+    /// request for `w2:p1` and applies it to `w1`'s pane — reporting success
+    /// while the pane the user asked about is untouched. Fixed in 3f9318bd; this
+    /// pins it.
+    ///
+    /// The colliding ids are constructed directly rather than waited for:
+    /// `PaneId::alloc` is a global counter, so a natural collision needs a
+    /// restore that reinstates saved raw ids, and the defect must be excluded on
+    /// the adversarial state regardless of how the state is reached.
+    #[tokio::test]
+    async fn set_color_does_not_leak_across_workspaces_sharing_a_raw_pane_id() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("first"), Workspace::test_new("second")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        // Force the SAME raw pane id into both workspaces, each with its own
+        // terminal, so "which workspace" is the only thing that distinguishes
+        // them.
+        let shared = crate::layout::PaneId::from_raw(4242);
+        for ws_idx in 0..2 {
+            let ws = &mut app.state.workspaces[ws_idx];
+            let tab = ws.active_tab_mut().expect("an active tab");
+            let old_root = tab.root_pane;
+            let terminal_id = tab
+                .panes
+                .remove(&old_root)
+                .expect("the root pane")
+                .attached_terminal_id;
+            tab.root_pane = shared;
+            tab.panes
+                .insert(shared, crate::pane::PaneState::new(terminal_id));
+            tab.layout = crate::layout::TileLayout::test_with_single_pane(shared);
+            ws.public_pane_numbers.clear();
+            ws.public_pane_numbers.insert(shared, 1);
+        }
+        app.state.ensure_test_terminals();
+
+        let first_terminal = app.state.workspaces[0]
+            .terminal_id(shared)
+            .cloned()
+            .expect("first workspace terminal");
+        let second_terminal = app.state.workspaces[1]
+            .terminal_id(shared)
+            .cloned()
+            .expect("second workspace terminal");
+        assert_ne!(
+            first_terminal, second_terminal,
+            "the two panes must be backed by different terminals for this to mean anything"
+        );
+
+        let second_public_id = app
+            .public_pane_id(1, shared)
+            .expect("the second workspace's public pane id");
+        let response = app.handle_pane_set_color(
+            "req".into(),
+            crate::api::schema::PaneSetColorParams {
+                pane_id: second_public_id,
+                color: Some("danger".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        assert_eq!(
+            crate::ui::pane_border_color(&app.state, Some(&second_terminal), true),
+            app.state.palette.red,
+            "the pane that was asked about must be coloured"
+        );
+        assert_eq!(
+            crate::ui::pane_border_color(&app.state, Some(&first_terminal), true),
+            app.state.palette.accent,
+            "the same-id pane in the OTHER workspace must be untouched"
+        );
+    }
+
     fn app_with_send_key_runtime(
         capacity: usize,
     ) -> (App, String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
