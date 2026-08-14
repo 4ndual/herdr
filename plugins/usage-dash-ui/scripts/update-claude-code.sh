@@ -13,7 +13,7 @@
 # proxy was ahead.
 #
 # Resume mechanism: ~/.zshrc wraps claude in `_claude_loop`, which relaunches
-# `claude --resume <sid>` when `~/.claude/.relocate-next` exists (two lines:
+# `claude --resume <sid>` when `${CLAUDE_CONFIG_DIR:-~/.claude}/.relocate-next` exists (two lines:
 # target dir, then session id) and otherwise exits. Writing that handoff and
 # then asking claude to exit therefore hands the session to the new binary
 # without sending blind keystrokes into a live TUI.
@@ -97,7 +97,13 @@ if [[ -z "$SID" || -z "$CWD" || ! -d "$CWD" ]]; then
 fi
 
 # The handoff the relocate-loop consumes: line 1 target dir, line 2 session id.
-printf '%s\n%s\n' "$CWD" "$SID" >"$HOME/.claude/.relocate-next"
+# Under the ACCOUNT root, not $HOME: a pane running in a fleet harness has its
+# own CLAUDE_CONFIG_DIR, and writing the handoff to the default root means the
+# harness's relocate loop never sees it while the default account picks up a
+# handoff for a session it does not own.
+CLAUDE_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CLAUDE_ROOT"
+printf '%s\n%s\n' "$CWD" "$SID" >"$CLAUDE_ROOT/.relocate-next"
 log "update-claude-code: handoff written (sid=$SID cwd=$CWD); asking pane $PANE to exit"
 
 # `/exit` is Claude Code's own clean shutdown: it finishes writing the
