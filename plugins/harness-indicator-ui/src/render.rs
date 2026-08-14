@@ -41,8 +41,11 @@ const WARN: &str = "\u{26A0}"; // ⚠
 /// to a stronger one.
 const INFERRED: &str = "\u{2248}"; // ≈
 
-/// The strip's single hit target, so a click can show the full attribution.
-pub const DETAIL_ACTION: &str = "harness-indicator:detail";
+// The strip declares no hit target at all any more: detail is revealed by HOVER
+// (see render_hovered), and the host suppresses the raw Move events that needs
+// over a module's own hit-rects. The old "harness-indicator:detail" action id is
+// deliberately not kept as a reserved constant — an id nothing can dispatch is
+// how a dead click target survives a refactor.
 
 /// Build the line. Returns `None` when there is nothing worth a row at all —
 /// the guest then emits no layer and the host carves no band, rather than
@@ -139,6 +142,37 @@ pub fn render(input: &IndicatorInput, area: Rect, buf: &mut Buffer) {
     if let Some(line) = line(input) {
         Paragraph::new(line).render(area, buf);
     }
+}
+
+/// Width of the hovered form of the strip (see [`render_hovered`]).
+pub fn hovered_width(input: &IndicatorInput) -> u16 {
+    hovered_line(input).map(|l| l.width() as u16).unwrap_or(0)
+}
+
+/// The strip as it reads WHILE HOVERED: the full attribution, in place of the
+/// summary, on the plugin's own single row.
+///
+/// The UX canon puts detail on hover and nothing else — but this module's carve
+/// is exactly one row (`[ui_modules.placement].size = "1"`), so there is no
+/// slack row underneath to hold a tooltip, and the guest API has no positioned
+/// node to float one next to the strip either (`UiNode` is a sequence of lines
+/// rendered into the surface rect). Swapping the row's own content is the one
+/// shape that keeps the single hover trigger without covering anything,
+/// resizing anything, or inventing a second surface: the detail replaces the
+/// summary it elaborates, and returns the moment the cursor leaves.
+pub fn render_hovered(input: &IndicatorInput, area: Rect, buf: &mut Buffer) {
+    if let Some(line) = hovered_line(input) {
+        Paragraph::new(line).render(area, buf);
+    }
+}
+
+fn hovered_line(input: &IndicatorInput) -> Option<Line<'static>> {
+    // Nothing to elaborate when the summary itself has nothing to say.
+    line(input)?;
+    Some(Line::from(vec![
+        Span::styled(format!("{ICON} "), Style::default().fg(SUBTEXT)),
+        Span::styled(detail(input), Style::default().fg(MUTED)),
+    ]))
 }
 
 /// The full attribution, for the click toast. Says where every claim came from,

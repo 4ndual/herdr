@@ -14,8 +14,16 @@
 //! tick and writes `harness_input.json` into this module's state dir; the host
 //! reads that file per frame and injects it as `HERDR_PLUGIN_UI_INPUT_JSON`.
 //!
-//! Interaction: LEFT-click the strip → toast the full attribution, including
-//! the config dir and which evidence produced it.
+//! Interaction: HOVER the strip → the row itself swaps to the full attribution
+//! (config dir, and which evidence produced it) and swaps back when the cursor
+//! leaves. Nothing is clickable: this strip only reports.
+//!
+//! It used to LEFT-CLICK to toast that attribution. The UX canon puts detail on
+//! hover and reserves clicks for actions, because "click to find out what this
+//! is" is indistinguishable from "click to do something" on a strip full of
+//! other plugins' clickable chips. A one-row carve has no slack row for a
+//! tooltip and the guest API has no positioned node to float one, so the detail
+//! takes over the row it elaborates — see render::render_hovered.
 //!
 //! Terminology: "harness" here is a **fleet harness** (`~/harnesses/<name>`),
 //! not herdr's unrelated internal use of the word for an agent CLI kind.
@@ -23,9 +31,7 @@
 mod render;
 
 use harness_indicator_model::IndicatorInput;
-use herdr_ui_plugin_api::{
-    HostEffect, UiActionKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate,
-};
+use herdr_ui_plugin_api::{MouseEvent, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::sync::Mutex;
@@ -35,6 +41,14 @@ use std::sync::Mutex;
 static LAST_INPUT: Mutex<Option<IndicatorInput>> = Mutex::new(None);
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// The carved row's absolute rect (x, y, width) from the last frame, and whether
+/// the cursor is currently inside it. Hover is resolved from the RAW mouse
+/// stream (capability `mouse_all`) because the host suppresses raw `Move` over a
+/// module's own declared hit-rects — the same reason button-dash and
+/// archive-dash declare none.
+static STRIP_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
+static HOVERED: Mutex<bool> = Mutex::new(false);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -110,9 +124,7 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &UiEvent) -> UiUpdate {
     let ctx = match event {
         UiEvent::Frame(ctx) => ctx,
-        UiEvent::Action {
-            action_id, kind, ..
-        } => return handle_action(action_id, *kind),
+        UiEvent::Mouse(mouse) => return handle_mouse(mouse),
         _ => return UiUpdate::default(),
     };
 
@@ -141,37 +153,50 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         input
     };
 
+    // Remember where the row landed so the RAW mouse stream can be resolved
+    // against it: mouse coordinates are absolute, and so is this rect.
+    *STRIP_RECT.lock().expect("strip rect mutex poisoned") =
+        if ctx.rect.width == 0 || ctx.rect.height == 0 {
+            None
+        } else {
+            Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
+        };
+
+    render_from(&input)
+}
+
+/// Build the layer for `input` in its current hover state. Shared by the frame
+/// path and the mouse path, so a hover repaint is the same rendering as a frame
+/// repaint rather than a second, drifting copy of it.
+fn render_from(input: &IndicatorInput) -> UiUpdate {
     // Render into a CONTENT-sized buffer, independent of the incoming rect, so
     // the host can measure the natural width and carve the slot on the very
     // first content frame (before which `ctx.rect` is still zero).
-    let width = render::content_width(&input);
+    let width = render::content_width(input);
     if width == 0 {
         return UiUpdate::default();
     }
+    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    // The hovered form is wider than the summary; render it into its own
+    // content-sized buffer so the host measures what it will actually draw.
+    let width = if hovered {
+        render::hovered_width(input).max(width)
+    } else {
+        width
+    };
     let content = Rect::new(0, 0, width, 1);
     let mut buf = Buffer::empty(content);
-    render::render(&input, content, &mut buf);
+    if hovered {
+        render::render_hovered(input, content, &mut buf);
+    } else {
+        render::render(input, content, &mut buf);
+    }
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
-    // One hit rect over the whole carved row: the strip has a single meaning,
-    // so every cell of it should answer the same question.
-    //
-    // UiHitRect is ABSOLUTE (screen cells), not relative to the panel. A
-    // rect at 0,0 silently points at the top-left corner of the terminal, so
-    // clicking the strip does nothing and clicking the tab bar toasts — a
-    // failure with no error anywhere, which is why it is anchored on the
-    // panel's own rect and covered by a test.
-    let hits = if ctx.rect.width == 0 || ctx.rect.height == 0 {
-        Vec::new()
-    } else {
-        vec![UiHitRect {
-            action_id: render::DETAIL_ACTION.to_string(),
-            x: ctx.rect.x,
-            y: ctx.rect.y,
-            width: width.min(ctx.rect.width),
-            height: 1,
-        }]
-    };
+    // NO declarative hit-rects: they would make the host suppress the raw
+    // `Move` events this strip needs to know it is hovered (the F5 dedupe), and
+    // there is nothing here to click anyway.
+    let hits: Vec<UiHitRect> = Vec::new();
 
     UiUpdate {
         layers: vec![UiLayer {
@@ -186,27 +211,27 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     }
 }
 
-/// A click asks "on what evidence?" — answer with the full attribution rather
-/// than repeating the line the user just clicked.
-fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
-    if action_id != render::DETAIL_ACTION {
+/// Hover in, hover out. Clicks are ignored on purpose: this strip reports, and
+/// a reporting surface that also acts is how a glance becomes an accident.
+fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
+    let inside = match *STRIP_RECT.lock().expect("strip rect mutex poisoned") {
+        Some((x, y, width)) => {
+            mouse.row == y && mouse.column >= x && mouse.column < x.saturating_add(width)
+        }
+        None => false,
+    };
+    let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
+    if *hovered == inside {
+        // No change ⇒ no repaint. A strip that re-rendered on every mouse move
+        // would repaint the bottom row continuously while the user works.
         return UiUpdate::default();
     }
-    // Right-click is deliberately inert: this plugin only reports, and a
-    // reporting surface with a destructive second gesture is how a glance
-    // becomes an accident.
-    if !matches!(kind, UiActionKind::LeftDown) {
-        return UiUpdate::default();
-    }
+    *hovered = inside;
+    drop(hovered);
     let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
         return UiUpdate::default();
     };
-    UiUpdate {
-        effects: vec![HostEffect::ShowToast {
-            message: render::detail(&input),
-        }],
-        ..Default::default()
-    }
+    render_from(&input)
 }
 
 #[cfg(test)]
@@ -218,7 +243,14 @@ mod tests {
     /// concurrently.
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Hover state is process-global; a test that left the strip hovered
+        // would otherwise hand the next one the detail row instead of the
+        // summary.
+        *HOVERED.lock().expect("hover mutex poisoned") = false;
+        *STRIP_RECT.lock().expect("strip rect mutex poisoned") = None;
+        *LAST_INPUT.lock().expect("input mutex poisoned") = None;
+        guard
     }
 
     fn frame_json(env: &str) -> String {
@@ -257,6 +289,21 @@ mod tests {
         }
     }
 
+    /// Flatten an update's rendered text, for assertions about what the row says.
+    fn text_of(update: &UiUpdate) -> String {
+        update
+            .layers
+            .iter()
+            .flat_map(|layer| layer.nodes.iter())
+            .filter_map(|node| match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|span| span.text.clone())
+            .collect()
+    }
+
     fn frame_with(input: &IndicatorInput) -> UiUpdate {
         let raw = serde_json::to_string(input).expect("encode");
         let event: UiEvent =
@@ -264,24 +311,23 @@ mod tests {
         handle_event(&event)
     }
 
+    /// No hit-rects, on purpose: declaring one makes the host suppress the raw
+    /// `Move` events this strip needs in order to know it is hovered, and there
+    /// is nothing here to click.
     #[test]
-    fn renders_a_panel_layer_with_one_hit_rect() {
+    fn renders_a_panel_layer_with_no_hit_rects() {
         let _guard = test_guard();
         let update = frame_with(&sample());
         assert_eq!(update.layers.len(), 1);
         assert!(matches!(update.layers[0].surface, UiSurface::Panel));
         assert!(!update.layers[0].nodes.is_empty());
-        assert_eq!(update.layers[0].hits.len(), 1);
-        let hit = &update.layers[0].hits[0];
-        assert_eq!(hit.action_id, render::DETAIL_ACTION);
-        // Absolute, anchored on the panel rect the host handed us — not 0,0.
-        assert_eq!((hit.x, hit.y), (3, 47));
-        assert!(hit.width > 0 && hit.width <= 80);
-        assert_eq!(hit.height, 1);
+        assert!(update.layers[0].hits.is_empty());
     }
 
+    /// A zero-sized carve leaves nothing to hover: the remembered rect is
+    /// cleared so a stray mouse move cannot "hover" a strip that is not drawn.
     #[test]
-    fn a_zero_sized_panel_publishes_no_hit_rect() {
+    fn a_zero_sized_panel_is_not_hoverable() {
         let _guard = test_guard();
         let raw = serde_json::to_string(&sample()).expect("encode");
         let frame = frame_json(&env_with(&raw)).replace(
@@ -332,28 +378,58 @@ mod tests {
         assert_eq!(sticky.layers[0].nodes, first.layers[0].nodes);
     }
 
+    fn mouse(kind: herdr_ui_plugin_api::MouseEventKind, column: u16, row: u16) -> UiEvent {
+        UiEvent::Mouse(MouseEvent { kind, column, row })
+    }
+
+    /// The canon trigger: hovering swaps the row to the full attribution, and
+    /// leaving swaps it back. Nothing is emitted as a toast, and no click acts.
     #[test]
-    fn left_click_toasts_the_evidence_and_right_click_does_nothing() {
+    fn hovering_the_strip_shows_the_evidence_in_place() {
+        use herdr_ui_plugin_api::MouseEventKind;
+        let _guard = test_guard();
+        let summary = frame_with(&sample());
+        let summary_text = text_of(&summary);
+
+        // frame_json() carves the row at x=3, y=47, width=80.
+        let hovered = handle_event(&mouse(MouseEventKind::Move, 10, 47));
+        let hovered_text = text_of(&hovered);
+        assert!(
+            hovered_text.contains("config dir") || hovered_text.contains("evidence"),
+            "hover must reveal the attribution, got: {hovered_text}"
+        );
+        assert_ne!(hovered_text, summary_text, "hover must change the row");
+        assert!(
+            hovered.effects.is_empty(),
+            "detail is rendered, never toasted"
+        );
+
+        // Leaving the row restores the summary.
+        let left = handle_event(&mouse(MouseEventKind::Move, 10, 20));
+        assert_eq!(text_of(&left), summary_text);
+
+        // A click on the strip does nothing at all: this surface only reports.
+        assert!(
+            handle_event(&mouse(MouseEventKind::LeftDown, 10, 47))
+                .effects
+                .is_empty(),
+            "a click on a reporting strip must do nothing"
+        );
+    }
+
+    /// A move that does not cross the boundary must not repaint: the bottom row
+    /// would otherwise re-render on every mouse motion while the user works.
+    #[test]
+    fn moving_inside_the_row_does_not_repaint() {
+        use herdr_ui_plugin_api::MouseEventKind;
         let _guard = test_guard();
         frame_with(&sample());
-        let update = handle_action(render::DETAIL_ACTION, UiActionKind::LeftDown);
-        match update.effects.first() {
-            Some(HostEffect::ShowToast { message }) => {
-                assert!(message.contains("e2e-claude"));
-                assert!(message.contains("config dir"));
-            }
-            other => panic!("expected a toast, got {other:?}"),
-        }
-        assert!(
-            handle_action(render::DETAIL_ACTION, UiActionKind::RightDown)
-                .effects
-                .is_empty()
-        );
-        assert!(
-            handle_action("someone-elses-action", UiActionKind::LeftDown)
-                .effects
-                .is_empty()
-        );
+        assert!(!handle_event(&mouse(MouseEventKind::Move, 10, 47))
+            .layers
+            .is_empty());
+        assert!(handle_event(&mouse(MouseEventKind::Move, 12, 47))
+            .layers
+            .is_empty());
     }
 
     /// The bytes the shipped collector writes must render. `sample()` cannot
