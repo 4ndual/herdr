@@ -96,18 +96,17 @@ function click(x: number, y: number) {
 }
 
 const E2E_HARNESS = "hp-e2e-rec";
-const SPAWN_X = 1465;
-const STOP_X = 1539;
-const REFRESH_X = 1592;
-const ACTION_Y = 257;
+/** The herdr window. Its width drives the panel's width (terminal_cols / 4). */
+const WINDOW = process.env.HERDR_WINDOW ?? "2097155";
+const SPAWN_X = 1267;
+const STOP_X = 1343;
+const REFRESH_X = 1426;
+const ACTION_Y = 276;
 
 /** Change the panel width the only way it can change: manifest + relink. */
-function setWidth(cols: string) {
+function setWindow(px: number) {
   if (args.dryRun) return;
-  const manifest = `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui/herdr-plugin.toml`;
-  sh("sed", ["-i", `s/^size = \"[0-9]*\"/size = \"${cols}\"/`, manifest]);
-  sh(HERDR, ["plugin", "unlink", `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui`]);
-  sh(HERDR, ["plugin", "link", `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui`]);
+  sh("xdotool", ["windowsize", WINDOW, String(px), "1000"]);
 }
 
 /** Drive the collector op directly, for states past the tab wrap. */
@@ -203,38 +202,63 @@ async function main() {
   // Measured against the live panel (host rect x=141 y=1 56x41 on a 1600x1000
   // stage). Pixel values, not derived from an assumed cell size — the earlier
   // derivation was wrong and every click missed silently.
-  const PANEL_X = 1410;
-  const TAB_Y = 49;
-  const TAB_X = [1440, 1520, 1575]; // Fleet, Detail, Orch (the strip wraps)
-  const ROW0 = 70;
-  const ROW_H = 19.6;
+  const PANEL_X = 1235;
+  const RAIL_X = 1574;
+  const RAIL_Y = 28;      // this plugin's rail icon, topmost
+  const CLOSE_X = 1556;   // the header's ✕
+  const TITLE_Y = 29;
+  const TAB_Y = 48;       // tab strip, row under the title
+  const TAB_X = [1266, 1341, 1410, 1470]; // Fleet, Detail, Orch, Tmpl
+  const TAB2_Y = 67;      // the strip wraps at this width
+  const TAB2_X = [1270, 1331];            // Models, Mem
+  const ROW0 = 86;
+  /** Stacked rows are TWO lines tall, so one harness is ~38px, not one line. */
+  const ROW_H = 38;
   const rowY = (i: number) => Math.round(ROW0 + ROW_H * i);
 
   // Pin the geometry the coordinates below were measured against, and start
   // from a known view. Without this the recording inherits whatever width and
   // view the last run left behind, and every click silently misses.
-  setWidth("56");
   op(["-action", "view", "-view", "fleet"]);
-  await sleep(6000);
+  await sleep(4000);
+  mark("start: panel closed, only the rail icon");
+  await sleep(HOLD);
 
-  mark("panel visible, fleet list");
+  click(RAIL_X, RAIL_Y);
+  mark("clicked the plugin's own rail icon — panel opens in the right panel");
+  await sleep(HOLD);
+
+  mark("panel open, fleet list");
   await sleep(HOLD);
 
   // The visible tabs are clicked for real. The remaining views (Tmpl, Models,
   // Mem) sit past the wrap point at this width, so they are driven through the
   // same op the click produces — the effect on screen is identical and the
   // recording still shows each view rendering live.
-  const clickTabs = ["Fleet", "Detail", "Orch"];
+  /** Tab label -> the view id the collector reports. Not a lowercase of the label. */
+  const VIEW_ID: Record<string, string> = {
+    Fleet: "fleet",
+    Detail: "detail",
+    Orch: "orchestrator",
+    Tmpl: "templates",
+  };
+  const clickTabs = ["Fleet", "Detail", "Orch", "Tmpl"];
   for (let i = 0; i < clickTabs.length; i++) {
     click(TAB_X[i], TAB_Y);
-    await expect(
-      `tab ${clickTabs[i]} became active`,
-      (s) => s.view === clickTabs[i].toLowerCase().replace("orch", "orchestrator"),
-    );
+    await expect(`tab ${clickTabs[i]} became active`, (s) => s.view === VIEW_ID[clickTabs[i]]);
     mark(`clicked tab ${clickTabs[i]}`);
     await sleep(HOLD);
   }
-  for (const v of ["templates", "models", "memory"]) {
+  click(TAB2_X[0], TAB2_Y);
+  await expect("Models tab became active", (s) => s.view === "models");
+  mark("clicked tab Models (second tab row)");
+  await sleep(HOLD);
+  click(TAB2_X[1], TAB2_Y);
+  await expect("Mem tab became active", (s) => s.view === "memory");
+  mark("clicked tab Mem (second tab row)");
+  await sleep(HOLD);
+
+  for (const v of []) {
     op(["-action", "view", "-view", v]);
     mark(`view ${v}`);
     await sleep(HOLD);
@@ -264,7 +288,7 @@ async function main() {
   // Stay at the width every click coordinate was measured against. The width
   // demonstration happens AFTER the last click, at the end of the run — moving
   // it earlier shifts the panel and every later click misses silently.
-  mark("width A (56 cols) held");
+  mark("width A (wide window) held");
   await sleep(HOLD);
 
   // Mutations, clicked for real on the detail action row. A throwaway harness
@@ -302,11 +326,15 @@ async function main() {
   // recording shows the layout actually re-flowing rather than a cropped view.
   op(["-action", "view", "-view", "fleet"]);
   await sleep(HOLD);
-  setWidth("40");
+  setWindow(1180);
   mark("width B (narrow, 40 cols) — fleet rows stack onto two lines");
   await sleep(HOLD * 3);
-  setWidth("96");
-  mark("back to width A (96 cols) — rows go columnar again");
+  setWindow(1600);
+  mark("back to the wide window — rows go columnar again");
+  await sleep(HOLD * 2);
+
+  click(CLOSE_X, TITLE_Y);
+  mark("clicked ✕ — panel collapses back to the rail");
   await sleep(HOLD * 2);
 
   sh("curl", ["-s", "-X", "DELETE", `http://127.0.0.1:7877/api/harness/${E2E_HARNESS}`]);

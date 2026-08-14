@@ -24,14 +24,15 @@ use herdr_ui_plugin_api::{UiHitRect, UiNode, UiTextSpan};
 /// The panel-width breakpoint, in columns. Below this the panel stacks; at or
 /// above it, rows go columnar.
 ///
-/// 36, not 44, because of the host's own geometry: the right panel is
+/// 33, not 44, because of the host's own geometry: the right panel is
 /// `terminal_cols / 4` clamped to `[28, 56]` (herdr `src/ui.rs`), so on a
 /// 1600px screen it is 40 columns and only reaches 44 on a display wider than
 /// ~1760px. A 44 breakpoint would leave the columnar layout unreachable — dead
 /// code in the only mount that exists. 36 straddles the achievable range: a
-/// narrow window stacks, a full-width one goes columnar, and
-/// `○ codex-gp 0s 0p` still fits on one line at 36.
-pub const WIDE_COLS: u16 = 36;
+/// narrow window stacks, a full-width one goes columnar. Verified on the live
+/// panel: a 1250px window stacks each harness onto two lines, a 1600px one puts
+/// it on one — `○ codex-gp 0s 0p`.
+pub const WIDE_COLS: u16 = 33;
 
 pub struct Ctx {
     pub width: u16,
