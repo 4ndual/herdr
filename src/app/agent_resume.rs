@@ -388,7 +388,9 @@ impl App {
             let Some(ac) = terminal.auto_continue_after_restart else {
                 continue;
             };
-            let is_claude = terminal.effective_known_agent() == Some(crate::detect::Agent::Claude);
+            let nudgeable = terminal
+                .effective_known_agent()
+                .is_some_and(crate::detect::Agent::accepts_auto_continue_nudge);
             let idle = terminal.state == crate::detect::AgentState::Idle;
             let has_runtime = self.terminal_runtimes.get(&terminal_id).is_some();
 
@@ -407,13 +409,13 @@ impl App {
                 self.mutate_auto_continue(&terminal_id, |ac| ac.saw_activity = true);
             }
 
-            // A resumed claude can also boot straight to its idle prompt without a
-            // detectable non-idle blip (a fast, clean resume). In that case fall
-            // back to a settle delay: once the agent has had time to come
-            // up and is sitting at an idle claude screen, treat it as ready. Slow
+            // A resumed agent can also boot straight to its idle prompt without
+            // a detectable non-idle blip (a fast, clean resume). In that case
+            // fall back to a settle delay: once the agent has had time to come
+            // up and is sitting at an idle agent screen, treat it as ready. Slow
             // or visible boots take the saw_activity path well before this fires.
             let settled = now.saturating_duration_since(ac.armed_at) >= AUTO_CONTINUE_READY_SETTLE;
-            let ready = is_claude && idle && has_runtime && (saw_activity || settled);
+            let ready = nudgeable && idle && has_runtime && (saw_activity || settled);
 
             match ac.nudged_at {
                 None => {
@@ -1053,6 +1055,59 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Restart auto-continue was hardcoded to Claude, so a resumed codex/pi/jcode
+    /// pane came back and then sat at its prompt with the work abandoned. The
+    /// gate is now the runtime capability.
+    #[tokio::test]
+    async fn auto_continue_nudges_every_runtime_that_accepts_a_typed_continue() {
+        for agent in [
+            crate::detect::Agent::Codex,
+            crate::detect::Agent::Pi,
+            crate::detect::Agent::Jcode,
+        ] {
+            let (mut app, terminal_id, mut rx) = armed_auto_continue_app();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state(Some(agent), crate::detect::AgentState::Working);
+            app.tick_auto_continue_after_restart(std::time::Instant::now());
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state(Some(agent), crate::detect::AgentState::Idle);
+            app.tick_auto_continue_after_restart(std::time::Instant::now());
+
+            let sent = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("{agent:?} must be nudged"));
+            let mut expected = AUTO_CONTINUE_NUDGE_TEXT.as_bytes().to_vec();
+            expected.push(b'\r');
+            assert_eq!(sent, Bytes::from(expected), "{agent:?}");
+        }
+    }
+
+    /// A runtime herdr does not launch, resume and detection-test end to end is
+    /// resumed without a nudge rather than typed into blind.
+    #[tokio::test]
+    async fn auto_continue_does_not_type_into_an_unsupported_runtime() {
+        let (mut app, terminal_id, mut rx) = armed_auto_continue_app();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Gemini),
+                crate::detect::AgentState::Idle,
+            );
+        app.tick_auto_continue_after_restart(std::time::Instant::now());
+        assert!(
+            rx.try_recv().is_err(),
+            "no nudge for a runtime without a verified idle prompt"
+        );
+    }
+
     #[tokio::test]
     async fn auto_continue_nudges_once_resumed_claude_is_ready() {
         let (mut app, terminal_id, mut rx) = armed_auto_continue_app();

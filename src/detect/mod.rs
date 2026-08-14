@@ -66,6 +66,22 @@ pub enum Agent {
 }
 
 impl Agent {
+    /// Whether this runtime can be nudged to continue after a restart by typing
+    /// one line into its idle prompt.
+    ///
+    /// Restart auto-continue used to be hardcoded to Claude, so every other
+    /// runtime was resumed and then left sitting at its prompt with the work
+    /// abandoned. The gate is not "is it Claude" but two capabilities herdr must
+    /// actually have for the nudge to land: a manifest whose idle state is
+    /// verified (so `AgentState::Idle` means the prompt is really accepting
+    /// input) and a prompt that takes a typed line plus Enter. These four
+    /// runtimes are the ones herdr launches, resumes and detection-tests
+    /// end to end; anything else is resumed without a nudge rather than typed
+    /// into blind.
+    pub fn accepts_auto_continue_nudge(self) -> bool {
+        matches!(self, Self::Claude | Self::Codex | Self::Pi | Self::Jcode)
+    }
+
     pub const ALL: [Self; 22] = [
         Self::Pi,
         Self::Claude,
