@@ -367,26 +367,29 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
     };
 
-    put(
+    // Close control at the START of the title row.
+    //
+    // Third position tried, and the only one that survives contact with the
+    // real overlay. The host hands this program a PTY LARGER than the box it
+    // paints — measured: the TUI renders its footer on row 35 and its [x] at
+    // the title row right edge, and neither is inside the visible box. So
+    // anything anchored to the PTY right or bottom edge is invisible by
+    // construction. The top-LEFT corner is the one place both agree on.
+    let close_rect = Rect::new(x, y, CLOSE.len() as u16, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(CLOSE, accent()))),
+        close_rect,
+    );
+    app.clicks.push((close_rect, Click::Cancel));
+    put_at(
         frame,
+        x + CLOSE.len() as u16 + 1,
         y,
         Line::from(Span::styled(
             "reopen in another runtime",
             Style::default().add_modifier(Modifier::BOLD),
         )),
     );
-    // Mouse-clickable close control, top right (UX canon §3.1.7). herdr is a
-    // mouse-first TUI, so an overlay whose only exit is Esc has no exit for the
-    // way the app is actually driven. It registers a real click rect rather
-    // than being painted decoration — the canon gates it under the REAL-CLICK
-    // rule, so it has to *work*, not merely appear.
-    let close_x = x + width.saturating_sub(CLOSE.len() as u16);
-    let close_rect = Rect::new(close_x, y, CLOSE.len() as u16, 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(CLOSE, dim()))),
-        close_rect,
-    );
-    app.clicks.push((close_rect, Click::Cancel));
     y += 2;
 
     for (label, value) in [
