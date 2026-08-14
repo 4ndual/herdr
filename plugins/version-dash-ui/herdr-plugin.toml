@@ -107,8 +107,28 @@ title = "Update hr from the verified herdrtest build"
 description = "Promote the EXACT build herdrtest was verified on into hr, then wait for you to restart with ⌃⌥X"
 command = ["bash", "scripts/update-hr.sh"]
 
+# show-latest-notes: open the cached patch notes as a floating OVERLAY.
+#
+# It used to `pane split` a real pane and run a pager in it — the wrong surface
+# for a transient read: it took over half the workspace, had no Esc contract,
+# needed manual closing, and left a stray pane the next layout restore would
+# faithfully bring back. The canon puts every secondary surface in an overlay.
 [[actions]]
 id = "show-latest-notes"
 title = "Show release notes for the latest version"
-description = "Open the cached patch notes for the newest release in a pane (offline — no network at click time)"
-command = ["bash", "scripts/show-latest-notes.sh"]
+description = "Open the cached patch notes for the newest release in an overlay (offline — no network at click time)"
+command = [
+  "sh",
+  "-lc",
+  "nohup \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin builtin.version-dash --entrypoint notes --placement overlay --focus >/dev/null 2>&1 &",
+]
+
+# The overlay surface itself: a bun viewer over the collector's cached markdown.
+# The host paints the border and the title; the viewer owns the inside and the
+# keys, and its footer names every one of them (canon §3).
+[[panes]]
+id = "notes"
+title = "release notes"
+description = "Cached patch notes for the newest release"
+placement = "overlay"
+command = ["sh", "-lc", "exec bun run \"$HERDR_PLUGIN_ROOT/scripts/notes-overlay.ts\""]
