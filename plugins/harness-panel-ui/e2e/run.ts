@@ -326,7 +326,7 @@ async function main() {
   // recording shows the layout actually re-flowing rather than a cropped view.
   op(["-action", "view", "-view", "fleet"]);
   await sleep(HOLD);
-  setWindow(1180);
+  setWindow(1250);
   mark("width B (narrow, 40 cols) — fleet rows stack onto two lines");
   await sleep(HOLD * 3);
   setWindow(1600);
