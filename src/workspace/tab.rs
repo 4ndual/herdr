@@ -171,12 +171,17 @@ impl Tab {
         };
 
         let terminal_id = TerminalId::alloc();
+        // Record what this pane was launched WITH — the env extras and the
+        // launch directory — so a restart can reproduce it. Without this a
+        // harness pane resumes against the default config root, where its
+        // session has never existed (DONE-E defect B).
         let terminal = match argv {
-            Some(argv) => {
-                TerminalState::new(terminal_id.clone(), initial_cwd).with_launch_argv(argv.to_vec())
-            }
-            None => TerminalState::new(terminal_id.clone(), initial_cwd),
-        };
+            Some(argv) => TerminalState::new(terminal_id.clone(), initial_cwd.clone())
+                .with_launch_argv(argv.to_vec()),
+            None => TerminalState::new(terminal_id.clone(), initial_cwd.clone()),
+        }
+        .with_launch_env(launch_env.extra_env())
+        .with_launch_cwd(initial_cwd);
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(terminal_id));
 
@@ -434,12 +439,15 @@ impl Tab {
             }
         };
         let terminal_id = TerminalId::alloc();
+        // Same record as the tab constructors: what this split was launched with.
         let terminal = match launch_argv {
             Some(argv) => {
-                TerminalState::new(terminal_id.clone(), actual_cwd).with_launch_argv(argv)
+                TerminalState::new(terminal_id.clone(), actual_cwd.clone()).with_launch_argv(argv)
             }
-            None => TerminalState::new(terminal_id.clone(), actual_cwd),
-        };
+            None => TerminalState::new(terminal_id.clone(), actual_cwd.clone()),
+        }
+        .with_launch_env(launch_env.extra_env())
+        .with_launch_cwd(actual_cwd);
         self.panes.insert(new_id, PaneState::new(terminal_id));
         self.zoomed = false;
         Ok(NewPane {

@@ -323,10 +323,37 @@ fn truncate_chars(s: &str, max: usize) -> String {
     trimmed.chars().take(max).collect()
 }
 
-/// The Claude Code config dir that holds session transcripts, `~/.claude`.
-/// Stock Claude Code has exactly one such root, matching the root
-/// `usage_dash_core::sources::claude` scans.
+/// The Claude Code config dir that holds session transcripts.
+///
+/// `CLAUDE_CONFIG_DIR` first, `~/.claude` second. Stock Claude Code has exactly
+/// one root, but a fleet harness gives each agent its own
+/// (`~/harnesses/<name>/config`) — and that is the environment the pane was
+/// LAUNCHED with, which herdr now persists (`PaneSnapshot::env`).
+///
+/// Before this, every harness pane silently lost its transcript-derived facts:
+/// the prompt previews in the close history, interrupted-turn detection, and
+/// the resume plan all looked under `~/.claude`, where a harness session has
+/// never existed. Same single-root assumption as DONE-E defect B, one layer up.
+///
+/// The per-pane launch env is the more precise source and is threaded in by
+/// [`claude_transcript_base_for`]; this no-argument form is the process-level
+/// fallback for callers that have no pane in hand.
 fn claude_transcript_base() -> Option<PathBuf> {
+    claude_transcript_base_for(None)
+}
+
+/// As [`claude_transcript_base`], but preferring a pane's own recorded
+/// `CLAUDE_CONFIG_DIR` over the server process's.
+fn claude_transcript_base_for(pane_config_dir: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = pane_config_dir.filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+    {
+        return Some(dir);
+    }
     dirs_home().map(|home| home.join(".claude"))
 }
 
@@ -974,5 +1001,23 @@ mod tests {
 
         let missing = std::env::temp_dir().join("herdr-transcript-test-does-not-exist.jsonl");
         assert!(!transcript_last_turn_interrupted(&missing));
+    }
+
+    /// A harness pane keeps its transcripts under its own CLAUDE_CONFIG_DIR, not
+    /// under ~/.claude. Before this every harness pane silently lost its prompt
+    /// previews and interrupted-turn detection — the same single-root assumption
+    /// as the launch-env bug, one layer up.
+    #[test]
+    fn transcript_base_prefers_the_panes_own_config_dir() {
+        let pane_root = "/home/tester/harnesses/e2e-claude/config";
+        assert_eq!(
+            super::claude_transcript_base_for(Some(pane_root)),
+            Some(std::path::PathBuf::from(pane_root)),
+        );
+        // An empty value is not a root: fall through rather than resolving to "".
+        assert_ne!(
+            super::claude_transcript_base_for(Some("")),
+            Some(std::path::PathBuf::from("")),
+        );
     }
 }

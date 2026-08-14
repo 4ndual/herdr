@@ -507,6 +507,18 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        // The launch env is what makes a harness pane resumable at all: without
+        // it the resume runs against the default config root, where the session
+        // has never existed. Persisted per pane by capture (PaneSnapshot::env).
+        let saved_launch_env: Vec<(String, String)> = saved_pane
+            .map(|p| {
+                p.env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let saved_launch_cwd = saved_pane.and_then(|p| p.launch_cwd.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -530,7 +542,7 @@ fn restore_tab(
             .map(String::as_str);
         let launch_env = public_pane_id
             .map(|pane_id| {
-                PaneLaunchEnv::from_extra(Vec::new()).with_identity(
+                PaneLaunchEnv::from_extra(saved_launch_env.clone()).with_identity(
                     workspace_id.to_string(),
                     crate::workspace::public_tab_id_for_number(workspace_id, number),
                     pane_id.to_string(),
@@ -639,7 +651,13 @@ fn restore_tab(
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                // Re-stamp both facts so the NEXT restart reproduces them too —
+                // a pane that only survives one restart is not fixed.
+                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_launch_env(saved_launch_env.clone());
+                if let Some(launch_cwd) = saved_launch_cwd.clone() {
+                    terminal = terminal.with_launch_cwd(launch_cwd);
+                }
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1211,6 +1229,8 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            env: Default::default(),
+                            launch_cwd: None,
                         },
                     )]),
                     zoomed: false,
@@ -1293,6 +1313,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                env: Default::default(),
+                                launch_cwd: None,
                             },
                         ),
                         (
@@ -1304,6 +1326,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                env: Default::default(),
+                                launch_cwd: None,
                             },
                         ),
                     ]),
@@ -1357,6 +1381,8 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    env: Default::default(),
+                    launch_cwd: None,
                 },
             )
         };
@@ -1372,6 +1398,8 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            env: Default::default(),
+            launch_cwd: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1529,6 +1557,8 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            env: Default::default(),
+                            launch_cwd: None,
                         },
                     )]),
                     zoomed: false,
@@ -1690,6 +1720,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                env: Default::default(),
+                launch_cwd: None,
             },
         );
         let history = SessionHistorySnapshot {

@@ -103,6 +103,14 @@ impl PaneLaunchEnv {
         self
     }
 
+    /// The launch-relevant extras only — never the identity vars, which the
+    /// host regenerates on every start, and never the inherited environment.
+    /// This is what gets persisted so a restart can reproduce the launch (see
+    /// PaneSnapshot::env).
+    pub(crate) fn extra_env(&self) -> Vec<(String, String)> {
+        self.extra.clone()
+    }
+
     pub(crate) fn without_pane_identity(mut self) -> Self {
         self.identity = PaneLaunchIdentity::OmitPane;
         self
