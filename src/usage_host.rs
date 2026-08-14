@@ -45,7 +45,7 @@ pub fn tick(app: &mut App) {
     // agent detector consumes (`herdr agent read <pane> --source detection`) — and
     // parse the `Message @<name>…` / `Viewing @<name>` marker. Only meaningful for
     // Claude; other agents have no subagent view.
-    if focus.agent == herdr_ui_plugin_api::AgentKind::Claude {
+    if agent_supports_subagent_view(focus.agent) {
         focus.subagent = focused_subagent(app);
     }
 
@@ -64,12 +64,22 @@ pub fn tick(app: &mut App) {
             &focus,
         );
     } else {
-        match usage_dash_core::refresh(focus) {
-            RefreshOutcome::Replace(snap) => app.usage_snapshot = Some(*snap),
-            RefreshOutcome::Clear => app.usage_snapshot = None,
-            RefreshOutcome::KeepPrevious => {}
+        // Keyed by the pane this refresh was FOR. `KeepPrevious` now genuinely
+        // means "previous for this pane" instead of "whatever was last stored".
+        let key = focus.pane_id.clone();
+        match (usage_dash_core::refresh(focus), key) {
+            (RefreshOutcome::Replace(snap), Some(key)) => {
+                app.usage_snapshots.insert(key, *snap);
+            }
+            (RefreshOutcome::Clear, Some(key)) => {
+                app.usage_snapshots.remove(&key);
+            }
+            // Nothing focused: there is no pane to attribute a snapshot to, and
+            // guessing is what this whole change removes.
+            (_, None) | (RefreshOutcome::KeepPrevious, _) => {}
         }
     }
+    app.evict_stale_usage_snapshots();
 
     // Interim data path: publish the fresh render input to the usage-dash
     // plugin's state dir, where item B's generic `ui_input_file` reader surfaces
@@ -105,20 +115,45 @@ fn declared_collector_module(app: &App) -> Option<PluginManifestUiModule> {
 /// treated as a failure (previous snapshot kept) so a malformed collector can
 /// never blank or corrupt the strip. Returns the reason on failure so the caller
 /// can warn once per distinct message.
-pub fn apply_collector_outcome(app: &mut App, outcome: &CollectorOutcome) -> Result<(), String> {
+/// `pane_key` is the pane the run was launched FOR, not the focused one: a
+/// collector takes real time, and a result that lands after the user moved on
+/// used to be stored as the NEW pane's numbers. `None` means the launch had no
+/// focused pane, in which case there is nothing to attribute the result to.
+pub fn apply_collector_outcome(
+    app: &mut App,
+    pane_key: Option<&str>,
+    outcome: &CollectorOutcome,
+) -> Result<(), String> {
     match outcome {
         CollectorOutcome::Replace(value) => {
             let snapshot = serde_json::from_value::<UsageSnapshot>(value.clone())
                 .map_err(|err| format!("collector snapshot did not deserialize: {err}"))?;
-            app.usage_snapshot = Some(snapshot);
+            if let Some(key) = pane_key {
+                app.usage_snapshots.insert(key.to_string(), snapshot);
+            }
             Ok(())
         }
         CollectorOutcome::Keep => Ok(()),
         CollectorOutcome::Clear => {
-            app.usage_snapshot = None;
+            if let Some(key) = pane_key {
+                app.usage_snapshots.remove(key);
+            }
             Ok(())
         }
     }
+}
+
+/// Whether an agent has a subagent view worth reading off the screen at all.
+///
+/// Only Claude Code has one. Reading the bottom-buffer chrome of every other
+/// runtime looking for a marker it cannot produce is pure cost on every tick,
+/// and a documented predicate says WHY the check is narrow — the bare
+/// `== AgentKind::Claude` it replaces read like an oversight. Deliberately not
+/// a manifest field: the detection manifest structs are
+/// `#[serde(deny_unknown_fields)]`, so a new key forces a `min_engine_version`
+/// bump on every manifest in the wild.
+fn agent_supports_subagent_view(agent: herdr_ui_plugin_api::AgentKind) -> bool {
+    matches!(agent, herdr_ui_plugin_api::AgentKind::Claude)
 }
 
 /// fork(wave-1): resolve the subagent the focused pane is currently viewing by
@@ -267,6 +302,142 @@ mod tests {
         assert!(declared_collector_module(&app).is_none());
     }
 
+    /// The public pane id of whatever the test app has focused.
+    /// Give the app a real workspace so focus resolves to a public pane id.
+    fn seed_workspace(app: &mut App) {
+        if app.state.workspaces.is_empty() {
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        }
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        // focus_input resolves pane -> terminal -> state.terminals; without the
+        // terminal entries it returns the "nothing focused" default.
+        app.state.ensure_test_terminals();
+    }
+
+    fn focused_pane_key(app: &App) -> String {
+        crate::plugin_focus::focus_input(&app.state)
+            .pane_id
+            .expect("the test app has a focused pane")
+    }
+
+    /// Split the test app's focused tab and return both panes' public ids,
+    /// (first, second), with focus left on the first.
+    fn two_panes(app: &mut App) -> (String, String) {
+        seed_workspace(app);
+        let first = focused_pane_key(app);
+        let ws = &mut app.state.workspaces[0];
+        let new_pane = {
+            let tab = ws.active_tab_mut().expect("an active tab");
+            let new_pane = tab
+                .layout
+                .split_focused(ratatui::layout::Direction::Vertical);
+            tab.panes.insert(
+                new_pane,
+                crate::pane::PaneState::new(crate::terminal::TerminalId::alloc()),
+            );
+            new_pane
+        };
+        let number = ws.next_public_pane_number;
+        ws.next_public_pane_number += 1;
+        ws.public_pane_numbers.insert(new_pane, number);
+        let second = crate::workspace::public_pane_id_for_number(&ws.id, number);
+        let root = app.state.workspaces[0]
+            .active_tab()
+            .expect("an active tab")
+            .layout
+            .pane_ids()[0];
+        app.state.workspaces[0]
+            .active_tab_mut()
+            .expect("an active tab")
+            .layout
+            .focus_pane(root);
+        (first, second)
+    }
+
+    /// The strip used to show the WRONG pane's numbers after a focus switch:
+    /// one snapshot for the whole app meant "the last thing collected", not
+    /// "this pane's usage".
+    #[test]
+    fn snapshot_is_keyed_per_pane() {
+        let mut app = test_app();
+        let (first, second) = two_panes(&mut app);
+        app.usage_snapshots
+            .insert(first.clone(), UsageSnapshot::empty(Cli::Claude));
+
+        assert!(
+            app.focused_usage_snapshot().is_some(),
+            "the pane with a snapshot shows it"
+        );
+
+        focus_pane_by_public_id(&mut app, &second);
+        assert!(
+            app.focused_usage_snapshot().is_none(),
+            "a pane with no snapshot of its own renders null, not its neighbour's"
+        );
+    }
+
+    /// The actual race: a collector launched for pane A takes real time, and its
+    /// result used to be stored as whatever was focused when it landed.
+    #[test]
+    fn late_collector_result_lands_on_its_requesting_pane_not_the_focused_one() {
+        let mut app = test_app();
+        let (first, second) = two_panes(&mut app);
+        let value = serde_json::to_value(UsageSnapshot::empty(Cli::Codex)).unwrap();
+
+        // The run was launched for `first`; focus moved to `second` meanwhile.
+        focus_pane_by_public_id(&mut app, &second);
+        apply_collector_outcome(&mut app, Some(&first), &CollectorOutcome::Replace(value)).unwrap();
+
+        assert!(
+            app.usage_snapshots.contains_key(&first),
+            "the result belongs to the pane it was requested for"
+        );
+        assert!(
+            app.focused_usage_snapshot().is_none(),
+            "and must not be attributed to the pane that happens to be focused"
+        );
+    }
+
+    fn focus_pane_by_public_id(app: &mut App, public_id: &str) {
+        let ws = &mut app.state.workspaces[0];
+        let target = ws
+            .active_tab()
+            .expect("an active tab")
+            .layout
+            .pane_ids()
+            .into_iter()
+            .find(|pane_id| {
+                ws.public_pane_number(*pane_id)
+                    .map(|n| crate::workspace::public_pane_id_for_number(&ws.id, n))
+                    .as_deref()
+                    == Some(public_id)
+            })
+            .expect("a pane with that public id");
+        ws.active_tab_mut()
+            .expect("an active tab")
+            .layout
+            .focus_pane(target);
+    }
+
+    /// A closed pane must not leave its snapshot behind: the map is keyed by a
+    /// string the user can create at will.
+    #[test]
+    fn stale_pane_snapshots_are_evicted() {
+        let mut app = test_app();
+        seed_workspace(&mut app);
+        let live = focused_pane_key(&app);
+        app.usage_snapshots
+            .insert(live.clone(), UsageSnapshot::empty(Cli::Claude));
+        app.usage_snapshots
+            .insert("w9:p9".to_string(), UsageSnapshot::empty(Cli::Claude));
+
+        app.evict_stale_usage_snapshots();
+
+        assert!(app.usage_snapshots.contains_key(&live));
+        assert!(!app.usage_snapshots.contains_key("w9:p9"));
+    }
+
     #[test]
     fn tick_with_collector_skips_builtin_refresh() {
         let mut app = test_app();
@@ -278,22 +449,29 @@ mod tests {
                 Some(vec!["/nonexistent/collector".into()]),
             ),
         );
-        // Sentinel snapshot the built-in refresh (agent=None -> Clear) would wipe.
-        app.usage_snapshot = Some(UsageSnapshot::empty(Cli::Claude));
+        // Sentinel snapshot the built-in refresh (agent=None -> Clear) would wipe,
+        // keyed to the pane the test app actually has focused so eviction keeps it.
+        seed_workspace(&mut app);
+        let pane = focused_pane_key(&app);
+        app.usage_snapshots
+            .insert(pane.clone(), UsageSnapshot::empty(Cli::Claude));
         tick(&mut app);
         // Collector declared -> refresh skipped -> sentinel survives (the async
         // collector's real result arrives later via AppEvent, not on this tick).
-        assert!(app.usage_snapshot.is_some());
+        assert!(app.usage_snapshots.contains_key(&pane));
     }
 
     #[test]
     fn tick_without_collector_runs_builtin_refresh() {
         let mut app = test_app();
         install_usage_plugin(&mut app, true, usage_module(Some("usage_input.json"), None));
-        app.usage_snapshot = Some(UsageSnapshot::empty(Cli::Claude));
+        seed_workspace(&mut app);
+        let pane = focused_pane_key(&app);
+        app.usage_snapshots
+            .insert(pane.clone(), UsageSnapshot::empty(Cli::Claude));
         tick(&mut app);
         // No collector -> legacy refresh runs; default focus has no agent -> Clear.
-        assert!(app.usage_snapshot.is_none());
+        assert!(!app.usage_snapshots.contains_key(&pane));
     }
 
     #[test]
@@ -303,28 +481,31 @@ mod tests {
         // Replace with a valid serialized snapshot.
         let snapshot = UsageSnapshot::empty(Cli::Codex);
         let value = serde_json::to_value(&snapshot).unwrap();
-        apply_collector_outcome(&mut app, &CollectorOutcome::Replace(value)).unwrap();
+        let pane = "w1:p1";
+        apply_collector_outcome(&mut app, Some(pane), &CollectorOutcome::Replace(value)).unwrap();
         assert!(matches!(
-            app.usage_snapshot.as_ref().map(|s| s.cli),
+            app.usage_snapshots.get(pane).map(|s| s.cli),
             Some(Cli::Codex)
         ));
 
         // Keep leaves it untouched.
-        apply_collector_outcome(&mut app, &CollectorOutcome::Keep).unwrap();
-        assert!(app.usage_snapshot.is_some());
+        apply_collector_outcome(&mut app, Some(pane), &CollectorOutcome::Keep).unwrap();
+        assert!(app.usage_snapshots.contains_key(pane));
 
         // Clear removes it.
-        apply_collector_outcome(&mut app, &CollectorOutcome::Clear).unwrap();
-        assert!(app.usage_snapshot.is_none());
+        apply_collector_outcome(&mut app, Some(pane), &CollectorOutcome::Clear).unwrap();
+        assert!(!app.usage_snapshots.contains_key(pane));
 
         // A malformed replace value is a failure and keeps the previous snapshot.
-        app.usage_snapshot = Some(UsageSnapshot::empty(Cli::Claude));
+        app.usage_snapshots
+            .insert(pane.to_string(), UsageSnapshot::empty(Cli::Claude));
         let err = apply_collector_outcome(
             &mut app,
+            Some(pane),
             &CollectorOutcome::Replace(serde_json::json!({"not":"a snapshot"})),
         )
         .unwrap_err();
         assert!(err.contains("did not deserialize"), "{err}");
-        assert!(app.usage_snapshot.is_some());
+        assert!(app.usage_snapshots.contains_key(pane));
     }
 }

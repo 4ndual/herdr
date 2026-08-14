@@ -368,13 +368,35 @@ impl PaneClickState {
     }
 }
 
+/// Backstop cap on the per-pane usage snapshot map. The live-pane retain in
+/// [`App::evict_stale_usage_snapshots`] is the real bound; this only catches a
+/// future caller inserting keys that are not live panes.
+const MAX_USAGE_SNAPSHOTS: usize = 256;
+
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     /// Native usage dashboard interaction state (expand/collapse/scroll/hover +
     /// last frame's hit-rects) and the latest resolved snapshot.
     pub(crate) usage_view: usage_dash_core::UsageView,
-    pub(crate) usage_snapshot: Option<usage_dash_core::UsageSnapshot>,
+    /// Usage snapshots keyed by PUBLIC pane id (`"w1:p1"`).
+    ///
+    /// One `Option<UsageSnapshot>` for the whole app showed the WRONG pane's
+    /// numbers after a focus switch, and the collector made it worse: a run
+    /// launched for pane A landed after focus moved to pane B and was stored as
+    /// B's. Keyed per pane, a late result lands on the pane it was requested
+    /// for, and a pane with no snapshot renders `null` rather than borrowing
+    /// its neighbour's.
+    ///
+    /// The key is the public pane id, not `PaneId`: `PaneId` is unique only
+    /// within a workspace, and the `(usize, PaneId)` idiom is workspace-INDEX
+    /// based, which silently rebinds under `workspace.move_block`. The public
+    /// id is already what crosses the plugin boundary.
+    pub(crate) usage_snapshots: std::collections::HashMap<String, usage_dash_core::UsageSnapshot>,
+    /// The pane each in-flight collector run was launched FOR, keyed by module
+    /// key. Read when the run finishes so its result cannot be attributed to
+    /// whatever happens to be focused by then. This is the actual race.
+    pub(crate) collector_request_pane: std::collections::HashMap<String, String>,
     /// fork(wave-2): module keys (see [`crate::plugin_collector::module_key`])
     /// whose out-of-process collector run is currently in flight, so the host
     /// launches at most one process per module per tick.
@@ -1116,7 +1138,8 @@ impl App {
             state,
             terminal_runtimes: restored_terminal_runtimes,
             usage_view: usage_dash_core::UsageView::default(),
-            usage_snapshot: None,
+            usage_snapshots: std::collections::HashMap::new(),
+            collector_request_pane: std::collections::HashMap::new(),
             collectors_in_flight: std::collections::HashSet::new(),
             collector_last_error: std::collections::HashMap::new(),
             goal_dash: goal_dash_core::App::new(None),
@@ -2640,8 +2663,14 @@ impl App {
 
     pub(crate) fn sync_ui_plugin_focus_event(&mut self) {
         let focus = crate::plugin_focus::focus_input(&self.state);
+        // `pane_id` is part of the comparison. Without it, moving focus between
+        // two panes running the same agent in the same directory emitted NO
+        // focus event at all, so every per-pane surface kept painting the pane
+        // the user just left — the strip showing the wrong pane's numbers was
+        // half this and half the unkeyed snapshot.
         if self.last_ui_plugin_focus.as_ref().is_some_and(|last| {
-            last.session_id == focus.session_id
+            last.pane_id == focus.pane_id
+                && last.session_id == focus.session_id
                 && last.session_ref == focus.session_ref
                 && last.cwd == focus.cwd
                 && last.agent == focus.agent
@@ -2650,6 +2679,10 @@ impl App {
             return;
         }
         self.last_ui_plugin_focus = Some(focus.clone());
+        // Focus is an EVENT. Waiting out the remainder of the ~1 Hz dash tick
+        // before the strip re-reads its source is exactly the perceptible lag
+        // the instant-update rule forbids, so the next tick is due now.
+        self.next_dash_tick = std::time::Instant::now();
         if self.ui_plugins.dispatch_focus_changed(focus) {
             self.refresh_ui_plugin_state_from_manager();
             self.apply_ui_plugin_notifications();
@@ -2732,7 +2765,7 @@ impl App {
                     tracing::info!(
                         ?rect,
                         usage_area = ?self.state.view.usage_strip_rect,
-                        has_snapshot = self.usage_snapshot.is_some(),
+                        has_snapshot = self.focused_usage_snapshot().is_some(),
                         "usage frame dispatch"
                     );
                 }
@@ -3041,6 +3074,55 @@ impl App {
         read_ui_input_blob(&state_dir, ui_input_file, key, &mut self.ui_input_cache)
     }
 
+    /// The focused pane's usage snapshot, or `None`.
+    ///
+    /// `None` is a real answer here and must render as `null`: a pane whose
+    /// collector has not reported yet shows nothing rather than the previously
+    /// focused pane's numbers.
+    pub(crate) fn focused_usage_snapshot(&self) -> Option<&usage_dash_core::UsageSnapshot> {
+        let key = crate::plugin_focus::focus_input(&self.state).pane_id?;
+        self.usage_snapshots.get(&key)
+    }
+
+    /// Drop snapshots for panes that no longer exist, and bound the map.
+    ///
+    /// Per-pane keying turns one snapshot into an unbounded map keyed by a
+    /// string the user can create at will; without this a long session leaks one
+    /// entry per closed pane.
+    pub(crate) fn evict_stale_usage_snapshots(&mut self) {
+        if self.usage_snapshots.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<String> = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(_, ws)| {
+                ws.tabs.iter().flat_map(move |tab| {
+                    tab.layout
+                        .pane_ids()
+                        .into_iter()
+                        .filter_map(move |pane_id| {
+                            ws.public_pane_number(pane_id).map(|number| {
+                                crate::workspace::public_pane_id_for_number(&ws.id, number)
+                            })
+                        })
+                })
+            })
+            .collect();
+        self.usage_snapshots.retain(|key, _| live.contains(key));
+        // Backstop only: `live` above already bounds the map by the pane roster.
+        // This catches a future caller inserting a key that is not a live pane.
+        if self.usage_snapshots.len() > MAX_USAGE_SNAPSHOTS {
+            tracing::warn!(
+                snapshots = self.usage_snapshots.len(),
+                "usage snapshot map exceeded its cap; clearing"
+            );
+            self.usage_snapshots.clear();
+        }
+    }
+
     /// Serialize the live [`usage_dash_core::model::UsageRenderInput`] for the
     /// usage WASM plugin: the current snapshot plus the host-owned view toggles
     /// and the absolute reset-time strings (the guest can't run `date`).
@@ -3049,7 +3131,8 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let (five_hour_abs, weekly_abs) = match self.usage_snapshot.as_ref() {
+        let snapshot = self.focused_usage_snapshot().cloned();
+        let (five_hour_abs, weekly_abs) = match snapshot.as_ref() {
             Some(snap) => (
                 snap.five_hour
                     .resets_at
@@ -3063,7 +3146,9 @@ impl App {
             None => (String::new(), String::new()),
         };
         let input = usage_dash_core::model::UsageRenderInput {
-            snapshot: self.usage_snapshot.clone(),
+            // Explicitly this pane's snapshot or none at all. Falling back to
+            // another pane's numbers is the defect, not a nicety.
+            snapshot,
             expanded: self.usage_view.expanded,
             collapsed: self.usage_view.collapsed,
             stats_shown: self.usage_view.stats_shown,
@@ -4197,6 +4282,63 @@ mod tests {
         assert_eq!(
             env.get("HERDR_PLUGIN_UI_INPUT_JSON").map(String::as_str),
             Some("{\"snapshot\":null}")
+        );
+    }
+
+    /// Moving focus between two panes running the same agent in the same
+    /// directory used to emit no focus event at all: the dedupe compared
+    /// everything about the session EXCEPT which pane it was, so every per-pane
+    /// plugin surface kept painting the pane the user had just left.
+    #[test]
+    fn focus_event_fires_when_only_the_pane_changes() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+        let ws = &mut app.state.workspaces[0];
+        let new_pane = {
+            let tab = ws.active_tab_mut().expect("an active tab");
+            let pane = tab
+                .layout
+                .split_focused(ratatui::layout::Direction::Vertical);
+            tab.panes.insert(
+                pane,
+                crate::pane::PaneState::new(crate::terminal::TerminalId::alloc()),
+            );
+            pane
+        };
+        let number = ws.next_public_pane_number;
+        ws.next_public_pane_number += 1;
+        ws.public_pane_numbers.insert(new_pane, number);
+        app.state.ensure_test_terminals();
+
+        app.sync_ui_plugin_focus_event();
+        let first = app
+            .last_ui_plugin_focus
+            .clone()
+            .expect("the first sync records a focus");
+
+        // Same agent (none), same cwd, same session: only the pane differs.
+        let root = app.state.workspaces[0]
+            .active_tab()
+            .expect("an active tab")
+            .layout
+            .pane_ids()[0];
+        app.state.workspaces[0]
+            .active_tab_mut()
+            .expect("an active tab")
+            .layout
+            .focus_pane(root);
+        app.sync_ui_plugin_focus_event();
+
+        let second = app
+            .last_ui_plugin_focus
+            .clone()
+            .expect("the second sync records a focus");
+        assert_ne!(
+            first.pane_id, second.pane_id,
+            "a pane-only focus move must still be observed"
         );
     }
 

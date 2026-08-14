@@ -176,9 +176,14 @@ impl App {
             // snapshot and warn only once per distinct reason.
             let key = crate::plugin_collector::module_key(&plugin_id, &module_id);
             self.collectors_in_flight.remove(&key);
+            let request_pane = self.collector_request_pane.remove(&key);
             let apply_result = match &result {
                 Ok(outcome) if plugin_id == super::USAGE_DASH_PLUGIN_ID => {
-                    crate::usage_host::apply_collector_outcome(self, outcome)
+                    crate::usage_host::apply_collector_outcome(
+                        self,
+                        request_pane.as_deref(),
+                        outcome,
+                    )
                 }
                 Ok(_) => Ok(()),
                 Err(message) => Err(message.clone()),

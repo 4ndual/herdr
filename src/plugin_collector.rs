@@ -105,11 +105,23 @@ pub fn launch_if_idle(
         // A previous run is still going; skip this tick (1 Hz cadence).
         return;
     }
+    // Remember which pane this run is FOR. A collector takes real time, and the
+    // user can move focus while it runs; without this the result is applied to
+    // whatever is focused when it lands.
+    match focus.pane_id.clone() {
+        Some(pane_id) => {
+            app.collector_request_pane.insert(key.clone(), pane_id);
+        }
+        None => {
+            app.collector_request_pane.remove(&key);
+        }
+    }
 
     let plugin_root = match app.state.installed_plugins.get(plugin_id) {
         Some(plugin) => PathBuf::from(&plugin.plugin_root),
         None => {
             app.collectors_in_flight.remove(&key);
+            app.collector_request_pane.remove(&key);
             return;
         }
     };
@@ -118,6 +130,7 @@ pub fn launch_if_idle(
         Ok(json) => json,
         Err(err) => {
             app.collectors_in_flight.remove(&key);
+            app.collector_request_pane.remove(&key);
             tracing::warn!(error = %err, plugin_id, "failed to serialize collector FocusInput");
             return;
         }
