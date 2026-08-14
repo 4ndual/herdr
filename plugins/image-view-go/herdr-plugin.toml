@@ -1,0 +1,46 @@
+id = "builtin.image-view-go"
+name = "Image View (Go collector)"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Image View with its collector ported to Go — same guest, same snapshot, byte-for-byte identical output"
+# Wider than the Rust twin's platform list only in the sense that nothing here
+# reads /proc: the Go collector is pure stdlib, CGO_ENABLED=0, and cross-compiles
+# to darwin and windows (verified, all three GOOS values build).
+platforms = ["linux", "macos", "windows"]
+
+# The GUEST is not converted — this is a collector-only port, queue item 1 of
+# the Rust→Go pipeline. It deliberately reuses the Rust twin's wasm rather than
+# copying it: a copy would silently drift the moment either side is rebuilt, and
+# the point of this plugin is that ONLY the collector differs.
+[[build]]
+command = ["sh", "-lc", "cd ../image-view-ui && cargo build --target wasm32-unknown-unknown --release"]
+
+[[build]]
+command = ["sh", "-lc", "cd collector && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o ../target/image-view-collector ."]
+
+[[ui_modules]]
+id = "image"
+title = "Image View (Go collector)"
+description = "Renders an image into a pane via pane.graphics.set, chosen per frame by the guest"
+kind = "wasm"
+api_version = 3
+module = "../image-view-ui/target/wasm32-unknown-unknown/release/image_view_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+# Identical to the Rust twin's, deliberately: a capability difference would make
+# any behavioural difference impossible to attribute to the collector.
+capabilities = ["layout_read", "focused_session", "api_read", "pane_graphics"]
+ui_input_file = "image_input.json"
+# The Go collector. Same argv shape as the Rust twin (root as argv[1]), same
+# stdout line, same exit codes, byte-identical JSON — verified with `cmp` against
+# the Rust output on a 40-image corpus.
+collector = ["target/image-view-collector", "~/.claude/image-cache"]
+graphics_roots = ["~/.claude/image-cache"]
+
+[ui_modules.placement]
+region = "bottom"
+align = "start"
+size = "1"
+# One below the Rust twin's 54, so that if both are ever enabled at once the two
+# strips are distinguishable on screen instead of fighting for one row.
+z = 53
