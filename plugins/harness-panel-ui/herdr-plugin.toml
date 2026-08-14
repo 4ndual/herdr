@@ -51,6 +51,10 @@ capabilities = ["layout_read", "api_read", "api_write", "mouse_all", "toasts"]
 # plugin: the contract itself is verified byte-level in tests/contract.rs against
 # real collector output, so the feed is correct the moment the host can paint.
 ui_input_file = "harness_panel_input.json"
+# Runs once per dash tick. It does NOT collect — it only ensures the long-lived
+# event-loop collector is alive and exits (see collector/tick.go). Declaring it
+# is also what wires the host's ui_input_file transport.
+collector = ["target/release/harness-panel-collector", "tick"]
 # Declared for #32: dead today (the host ignores it and would draw the generic
 # marker), correct the moment the rail lands.
 rail_icon = "🎛"

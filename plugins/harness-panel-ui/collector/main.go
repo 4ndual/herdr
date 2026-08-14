@@ -59,6 +59,8 @@ func run(mode string, args []string) error {
 		return runCollect(args)
 	case "op":
 		return runOp(args)
+	case "tick":
+		return runTick(args)
 	case "-h", "--help", "help":
 		usage()
 		return nil
