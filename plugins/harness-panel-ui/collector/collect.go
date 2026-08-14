@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -113,6 +114,17 @@ func (c *Collector) runEvents(ctx context.Context) {
 		for ctx.Err() == nil {
 			payload, err := conn.ReadMessage(wsReadDeadline)
 			if err != nil {
+				// A read timeout means the daemon has simply been quiet, which
+				// is the NORMAL state of a settled fleet — not a broken socket.
+				// Tearing the connection down here drops into reconnect backoff
+				// and freezes the panel on stale data for as long as the fleet
+				// is calm, which is exactly when it looks most broken. Treat it
+				// as a keepalive: re-read the fleet once, then keep listening.
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() && ctx.Err() == nil {
+					c.refreshAll(ctx, "keepalive")
+					continue
+				}
 				if !errors.Is(err, io.EOF) && ctx.Err() == nil {
 					log.Printf("harness-panel: websocket read: %v", err)
 				}

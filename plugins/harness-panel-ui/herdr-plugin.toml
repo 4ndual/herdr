@@ -54,7 +54,7 @@ ui_input_file = "harness_panel_input.json"
 # Runs once per dash tick. It does NOT collect — it only ensures the long-lived
 # event-loop collector is alive and exits (see collector/tick.go). Declaring it
 # is also what wires the host's ui_input_file transport.
-collector = ["target/release/harness-panel-collector", "tick"]
+collector = ["../../target/release/harness-panel-collector", "tick"]
 # Declared for #32: dead today (the host ignores it and would draw the generic
 # marker), correct the moment the rail lands.
 rail_icon = "🎛"

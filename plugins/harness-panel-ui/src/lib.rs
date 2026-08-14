@@ -180,7 +180,21 @@ fn on_frame(ctx: &UiFrameContext) -> UiUpdate {
             z_index: 0,
             consumes_mouse: true,
             nodes: painted.nodes,
-            hits: painted.hits,
+            // `UiHitRect` coordinates are ABSOLUTE-FRAME (host: app/input/mouse.rs
+            // §4), while `render` lays hits out in panel-local space because that
+            // is the only space it knows. Translate by the rect origin here, at
+            // the one point where the real geometry is in hand. Without this the
+            // panel paints perfectly and every click misses — the hit rects sit
+            // wherever the panel would be if it were at the screen origin.
+            hits: painted
+                .hits
+                .into_iter()
+                .map(|hit| herdr_ui_plugin_api::UiHitRect {
+                    x: hit.x.saturating_add(ctx.rect.x),
+                    y: hit.y.saturating_add(ctx.rect.y),
+                    ..hit
+                })
+                .collect(),
             data: None,
         }],
         effects: Vec::new(),

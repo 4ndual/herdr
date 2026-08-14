@@ -34,8 +34,8 @@ func runTick(_ []string) error {
 	defer func() { _ = lock.Close() }()
 
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// Held: the event loop is already running. Nothing to do.
-		return nil
+		// Held: the event loop is already running. Just relay its output.
+		return emitSnapshot(dir)
 	}
 	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 
@@ -52,5 +52,34 @@ func runTick(_ []string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	return cmd.Process.Release()
+	if err := cmd.Process.Release(); err != nil {
+		return err
+	}
+	return emitSnapshot(dir)
+}
+
+// emitSnapshot relays the event loop's latest snapshot on stdout, which is how
+// the host actually transports a collector's output: it runs the binary each
+// tick and parses stdout as
+//
+//	{"outcome":"replace","snapshot":{…}} | {"outcome":"keep"} | {"outcome":"clear"}
+//
+// (src/plugin_collector.rs). The event loop stays the source of truth; this only
+// forwards what it last published. When the loop has not published yet, `keep`
+// is the honest answer — it tells the host to hold whatever it already has
+// instead of replacing live data with an empty snapshot.
+func emitSnapshot(dir string) error {
+	raw, err := os.ReadFile(filepath.Join(dir, "harness_panel_input.json"))
+	if err != nil || len(raw) == 0 {
+		_, err := os.Stdout.WriteString(`{"outcome":"keep"}`)
+		return err
+	}
+	if _, err := os.Stdout.WriteString(`{"outcome":"replace","snapshot":`); err != nil {
+		return err
+	}
+	if _, err := os.Stdout.Write(raw); err != nil {
+		return err
+	}
+	_, err = os.Stdout.WriteString(`}`)
+	return err
 }
