@@ -53,14 +53,19 @@ collector = ["../../target/release/usage-dash-collector"]
 # subcommand — which re-checks against its real release channel rather than
 # trusting the npm number the strip displays.
 
+# The strip itself is a wasm guest plus a Rust collector and runs anywhere, so
+# the PLUGIN stays on all three platforms; only these two shell actions are
+# POSIX-only, and they are gated per action rather than by narrowing the plugin.
 [[actions]]
 id = "update-claude-code"
 title = "Update Claude Code and resume this pane"
 description = "Run `claude update`, then relaunch this pane's session with --resume"
+platforms = ["linux", "macos"]
 command = ["bash", "scripts/update-claude-code.sh"]
 
 [[actions]]
 id = "verify-cli-versions"
 title = "Re-check CLI versions now"
 description = "Force a fresh latest-version fetch, bypassing the 30-minute cache"
+platforms = ["linux", "macos"]
 command = ["bash", "scripts/verify-cli-versions.sh"]

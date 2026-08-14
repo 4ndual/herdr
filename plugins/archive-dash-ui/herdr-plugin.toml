@@ -3,7 +3,9 @@ name = "Archive Dash"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Archive a pane's session and restore/fork/delete it from a compact chip widget (wasm render)"
-platforms = ["linux", "macos", "windows"]
+# Not windows: every action is a POSIX shell script run through `sh -lc`. Advertising a platform the actions cannot run on
+# just moves the failure from install time to click time.
+platforms = ["linux", "macos"]
 
 # Build the guest wasm module in this plugin dir; the wasm lands at the module
 # path below (honoring CARGO_TARGET_DIR when the environment sets one).

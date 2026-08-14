@@ -3,7 +3,10 @@ name = "Button Dash"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "Clickable quick-reference of keyboard-shortcut actions in the bottom dash (wasm render)"
-platforms = ["linux", "macos", "windows"]
+# Not windows: every action is a POSIX shell script run through `sh -lc`, and those
+# scripts drive `ps`, `tmux` and `readlink /proc`. Advertising a platform the actions cannot run on
+# just moves the failure from install time to click time.
+platforms = ["linux", "macos"]
 
 # Build the guest module in this plugin dir; the wasm lands at the module path
 # below (honoring CARGO_TARGET_DIR when the environment sets one).

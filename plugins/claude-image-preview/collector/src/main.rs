@@ -209,9 +209,31 @@ fn write_atomic(out: &Path, input: &ImageInput) -> std::io::Result<()> {
 }
 
 fn default_cache_root() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".claude").join("image-cache"),
-        None => PathBuf::from(".claude/image-cache"),
+    claude_config_root().join("image-cache")
+}
+
+/// Claude Code's config root: `$CLAUDE_CONFIG_DIR` when set, else `$HOME/.claude`.
+///
+/// A pane under a fleet harness gets its own account root through this variable,
+/// and Claude Code keeps that account's pasted images under it — so reading
+/// `$HOME/.claude/image-cache` unconditionally showed nothing, or another
+/// account's images, for every harness pane.
+///
+/// NOTE: the host also gates image reads against the manifest's `graphics_roots`,
+/// which is a static `~/.claude/image-cache` string it expands with HOME only.
+/// Until that gate understands the config root (parked to the #42 src/ sweep), a
+/// harness-root image resolves here and is then refused by the host. Fixing this
+/// half alone changes nothing for the default root, and is what lets the other
+/// half be a one-line manifest change once the host supports it.
+fn claude_config_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    match std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        Some(home) => PathBuf::from(home).join(".claude"),
+        // An empty HOME used to yield a RELATIVE ".claude/image-cache" rooted at
+        // whatever the CWD happened to be; missing cleanly is the honest answer.
+        None => PathBuf::from("/nonexistent/.claude"),
     }
 }
 
@@ -334,13 +356,82 @@ mod tests {
         assert_eq!(png_dimensions(&png_head(0, 0)), None);
     }
 
+    // HOME and CLAUDE_CONFIG_DIR are process-wide, and `cargo test` runs these
+    // as threads of one process, so the env-mutating tests take a lock and put
+    // the environment back.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<std::ffi::OsString>,
+        config_dir: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            EnvGuard {
+                home: std::env::var_os("HOME"),
+                config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.config_dir.take() {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+    }
+
     #[test]
     fn tilde_expands_against_home() {
+        let _env = EnvGuard::new();
         std::env::set_var("HOME", "/home/tester");
         assert_eq!(
             expand_tilde("~/.claude/image-cache"),
             PathBuf::from("/home/tester/.claude/image-cache")
         );
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn cache_root_defaults_under_home() {
+        let _env = EnvGuard::new();
+        std::env::set_var("HOME", "/home/tester");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(
+            default_cache_root(),
+            PathBuf::from("/home/tester/.claude/image-cache")
+        );
+    }
+
+    #[test]
+    fn cache_root_follows_the_harness_config_root() {
+        let _env = EnvGuard::new();
+        std::env::set_var("HOME", "/home/tester");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/home/tester/harnesses/h1/config");
+        assert_eq!(
+            default_cache_root(),
+            PathBuf::from("/home/tester/harnesses/h1/config/image-cache")
+        );
+    }
+
+    #[test]
+    fn cache_root_without_a_home_does_not_go_relative() {
+        let _env = EnvGuard::new();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("HOME");
+        assert!(
+            default_cache_root().is_absolute(),
+            "an empty HOME must not produce a CWD-relative cache root"
+        );
     }
 }

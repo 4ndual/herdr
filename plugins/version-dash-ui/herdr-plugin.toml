@@ -3,7 +3,10 @@ name = "Version Dash"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
 description = "At-a-glance running herdr versions (hr + herdrtest) vs latest stable release, with right-click staged updates (wasm render)"
-platforms = ["linux", "macos", "windows"]
+# Not windows: the collector resolves instances through `/proc` (and `lsof`/`ps` on macOS)
+# and the update scripts drive `tmux`. Advertising a platform the actions cannot run on
+# just moves the failure from install time to click time.
+platforms = ["linux", "macos"]
 
 # Build the guest module in this plugin dir; the wasm lands at the module path
 # below (honoring CARGO_TARGET_DIR when the environment sets one).
