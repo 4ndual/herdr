@@ -1,6 +1,6 @@
 # DONE-BATCH — overnight build batch, 2026-08-14
 
-Branch `feat/host-action-bridge`, 12 commits. Full detail and evidence in
+Branch `feat/host-action-bridge`, 15 commits. Full detail and evidence in
 `BATCH-REPORT.md`; this is the per-task summary.
 
 Read the three "not done" rows first — they are the ones that need you.
@@ -17,9 +17,9 @@ Read the three "not done" rows first — they are the ones that need you.
 | Observability fix | done | `dd791e10` | live: `rendered_surfaces`/`nodes`/`hit_rects`/`wasm_memory_bytes` all reporting from the test instance |
 | Rail control rig | done | `dd791e10` | caught a 2005x971 window on a 1600x1000 screen on its first real run |
 | #32 `rail_icon` | done | `844b8537` | two bundled manifests had already declared the field against a host that ignored it |
-| #25 usage strip | done | `2f75d11d` | per-pane keying + in-flight correlation; focus dedupe now includes `pane_id` (verified red without the fix) |
+| #25 usage strip | done | `2f75d11d`, `41dbfef0` | per-pane keying + in-flight correlation; the focus event was then found never to fire on the server+client path at all — fixing that took harness-indicator from 562 ms to 74 ms |
 | #34 colors phase 1 | done | `183c4a2c` | strict parser, handler-side validation, one border resolver |
-| #34 phase 2 | **done** | `PENDING` | persisted `color` in `PaneSnapshot` + `pane.set_color` behind the new `Metadata` capability |
+| #34 phase 2 | **done** | `e5e1eaea` | persisted `color` in `PaneSnapshot` + `pane.set_color` behind the new `Metadata` capability |
 | #37 invisible API | done | `183c4a2c` | `tab.hide`, `tab.create --hidden`, `tab list --hidden`, sidebar filtered, cycling fixed |
 | #19 roster scope | done | `183c4a2c` | composes with a plugin `agent_view` instead of being disabled by one |
 | #18 code half | done | `183c4a2c`, `4bdabb1d` | B1/B2 closed; carve-release-on-disable finally has a test |
@@ -55,6 +55,15 @@ Read the three "not done" rows first — they are the ones that need you.
 
 ## Corrections to earlier claims in this batch
 
+- **I skipped #34 phase 2 on a false premise.** I read §7's open questions
+  (default "no") and missed the `USER ANSWERS (2026-08-13 ~18:00)` section ~45
+  lines later in the same file, which explicitly overrides those defaults and
+  answers both "yes". You caught it; phase 2 is now shipped in `e5e1eaea`.
+- **The focus event never fired on the path that renders `hr`.**
+  `sync_ui_plugin_focus_event` was wired only into the direct-TUI render loop,
+  which a server+client herdr never runs — so #25's per-pane keying was correct
+  but could not help. Found by re-measuring rather than assuming the fix worked.
+
 - **"#36 done" was wrong until `80bfae97`.** It was committed in its own
   worktree and never merged into this branch. The E2E caught it — a pane
   launched through the promoted binary produced a snapshot with no `env` at all.
@@ -72,7 +81,7 @@ Read the three "not done" rows first — they are the ones that need you.
 ## Validation
 
 `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean after
-every task. Final suite: **3540 tests, 3529 passed, 11 failed** — all 11 in the
+every task. Final suite: **3544 tests, 3533 passed, 11 failed** — all 11 in the
 pre-existing set verified against the base commit (`api_ping` ×4 and
 `auto_detect` ×3 are socket-contention flakes under parallel load and pass when
 run alone; plus `cli::sessions` legacy restore, `client_mode` cwd fallback,
