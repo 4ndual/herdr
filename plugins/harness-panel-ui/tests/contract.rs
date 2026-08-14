@@ -207,3 +207,24 @@ fn corrupt_input_degrades_instead_of_trapping() {
         },
     );
 }
+
+/// The models view against the daemon's real shape: `/api/models` returns
+/// objects per runtime (`{"id":"fable","enabled":true,…}`), not strings. Reading
+/// them as strings yields a runtime header followed by blank lines — a view that
+/// looks broken while the data is fine.
+#[test]
+fn the_models_view_lists_real_model_ids() {
+    let text = render_text(
+        &fixture("models.json"),
+        RenderSize {
+            width: 56,
+            height: 40,
+        },
+    );
+    assert!(
+        text.lines().any(|l| l.trim_start().starts_with("opus")
+            || l.trim_start().starts_with("fable")
+            || l.trim_start().starts_with("sonnet")),
+        "no model id rendered — entries decoded as empty strings again:\n{text}"
+    );
+}

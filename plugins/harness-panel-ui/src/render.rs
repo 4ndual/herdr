@@ -441,10 +441,35 @@ pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
                     out.nodes
                         .push(line(vec![span(fit(runtime, w), Some("blue"), true)]));
                     y += 1;
+                    // /api/models returns OBJECTS per runtime, not strings:
+                    //   {"claude":[{"id":"fable","enabled":true,"verified":true,…}]}
+                    // Reading these with `as_str` yields "" for every entry, which
+                    // renders as a runtime header followed by blank lines — the
+                    // view looks broken while the data is perfectly fine. Accept a
+                    // bare string too, so a runtime that reports the simpler shape
+                    // still lists.
                     let items: Vec<String> = match v {
                         serde_json::Value::Array(a) => a
                             .iter()
-                            .map(|x| x.as_str().unwrap_or_default().to_string())
+                            .filter_map(|x| match x {
+                                serde_json::Value::String(s) => Some(s.clone()),
+                                serde_json::Value::Object(o) => {
+                                    let id = o.get("id")?.as_str()?;
+                                    // A disabled or unverified model is worth
+                                    // seeing as such rather than silently listed
+                                    // alongside working ones.
+                                    let mark = match (
+                                        o.get("enabled").and_then(serde_json::Value::as_bool),
+                                        o.get("verified").and_then(serde_json::Value::as_bool),
+                                    ) {
+                                        (Some(false), _) => " off",
+                                        (_, Some(false)) => " ?",
+                                        _ => "",
+                                    };
+                                    Some(format!("{id}{mark}"))
+                                }
+                                _ => None,
+                            })
                             .collect(),
                         serde_json::Value::Object(o) => o.keys().cloned().collect(),
                         _ => Vec::new(),
