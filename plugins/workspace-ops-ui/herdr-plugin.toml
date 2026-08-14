@@ -53,12 +53,12 @@ placement = "overlay"
 # shell-free form the host supports.
 command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/target/picker\""]
 
-# `contexts` is declared for intent and forward-compatibility: the host parses
-# it (app/api/plugins/manifest.rs:60) but does not yet use it to filter menu
-# items, so all three entries currently appear in the workspace, tab AND pane
-# menus alike. Each action resolves its own target and degrades gracefully
-# rather than assuming which menu invoked it. Spec for honouring `contexts` is
-# filed in .local/prd/overnight-execution-plan-2026-08-13.md.
+# `contexts` is honoured by the host: a menu only shows the actions that declare
+# its own context (input/mouse.rs::plugin_context_menu_items), so these three
+# appear in the tab and pane menus and NOT in the workspace-row menu. An action
+# that declares no contexts is unscoped and still appears everywhere. Each
+# action still resolves its own target and degrades gracefully rather than
+# assuming which menu invoked it.
 [[actions]]
 id = "convert-to-workspace"
 title = "Convert to workspace"

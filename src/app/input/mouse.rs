@@ -1,5 +1,7 @@
 use bytes::Bytes;
+// Used by `plugin_context_menu_items` below.
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use herdr_ui_plugin_api::UiActionRef;
 use ratatui::layout::{Direction, Rect};
 use tracing::warn;
 
@@ -1215,12 +1217,15 @@ impl AppState {
                             })
                         })
                         .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
+                    let plugin_items = self.plugin_context_menu_items(
+                        crate::api::schema::PluginActionContext::Workspace,
+                    );
                     self.context_menu = Some(ContextMenuState {
                         kind,
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
-                        plugin_items: self.ui_context_menu_items.clone(),
+                        plugin_items,
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -1234,6 +1239,8 @@ impl AppState {
                     (self.active, self.tab_at(mouse.column, mouse.row))
                 {
                     let forkable = self.tab_focused_pane_is_forkable(ws_idx, tab_idx);
+                    let plugin_items = self
+                        .plugin_context_menu_items(crate::api::schema::PluginActionContext::Tab);
                     self.context_menu = Some(ContextMenuState {
                         kind: ContextMenuKind::Tab {
                             ws_idx,
@@ -1243,7 +1250,7 @@ impl AppState {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
-                        plugin_items: self.ui_context_menu_items.clone(),
+                        plugin_items,
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -1269,6 +1276,8 @@ impl AppState {
                         .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
                         .and_then(|terminal| terminal.manual_label.as_ref())
                         .is_some();
+                    let plugin_items = self
+                        .plugin_context_menu_items(crate::api::schema::PluginActionContext::Pane);
                     self.context_menu = Some(ContextMenuState {
                         kind: ContextMenuKind::Pane {
                             ws_idx,
@@ -1280,7 +1289,7 @@ impl AppState {
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
-                        plugin_items: self.ui_context_menu_items.clone(),
+                        plugin_items,
                     });
                     self.mode = Mode::ContextMenu;
                 }
@@ -1385,6 +1394,49 @@ impl AppState {
         let right = (sidebar.x + sidebar.width).max(terminal.x + terminal.width);
         let bottom = (sidebar.y + sidebar.height).max(terminal.y + terminal.height);
         Rect::new(x, y, right.saturating_sub(x), bottom.saturating_sub(y))
+    }
+
+    /// The plugin context-menu items that belong in a menu opened on `context`.
+    ///
+    /// `[[actions]] contexts` was parsed and then ignored, so every declared
+    /// action showed up in the workspace, tab AND pane menus alike — a
+    /// workspace row offered "Convert to workspace" for a tab it does not have.
+    /// An action that declares no contexts is unscoped and still appears
+    /// everywhere: that is what every plugin written before this filter existed
+    /// relies on, and silently hiding those entries would be the worse bug.
+    pub(crate) fn plugin_context_menu_items(
+        &self,
+        context: crate::api::schema::PluginActionContext,
+    ) -> Vec<UiActionRef> {
+        self.ui_context_menu_items
+            .iter()
+            .filter(|item| self.plugin_action_allows_context(&item.id, context))
+            .cloned()
+            .collect()
+    }
+
+    fn plugin_action_allows_context(
+        &self,
+        item_id: &str,
+        context: crate::api::schema::PluginActionContext,
+    ) -> bool {
+        // A menu entry a module drew itself, rather than a manifest-backed
+        // `plugin:<plugin-id>:<action-id>`: there is no declaration to filter
+        // on, so it stays.
+        let Some((plugin_id, action_id)) = item_id
+            .strip_prefix("plugin:")
+            .and_then(|rest| rest.split_once(':'))
+        else {
+            return true;
+        };
+        let Some(action) = self
+            .installed_plugins
+            .get(plugin_id)
+            .and_then(|plugin| plugin.actions.iter().find(|action| action.id == action_id))
+        else {
+            return true;
+        };
+        action.contexts.is_empty() || action.contexts.contains(&context)
     }
 
     pub(crate) fn context_menu_rect(&self) -> Option<Rect> {
@@ -2101,6 +2153,120 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    /// A plugin action declaring `contexts = ["tab", "pane"]` must not show up
+    /// in the workspace-row menu. Reported from a screenshot: right-clicking a
+    /// WORKSPACE row offered workspace-ops' "Convert to workspace" / "Move to
+    /// workspace..." / "Copy metadata", all three declared tab+pane only,
+    /// because the host parsed `contexts` and then never consulted it.
+    ///
+    /// The back-compat half is asserted in the same test: an action that
+    /// declares nothing is unscoped and still appears in all three menus.
+    #[test]
+    fn context_menu_plugin_items_honour_declared_contexts() {
+        use crate::api::schema::{PluginActionContext, PluginManifestAction};
+
+        fn action(id: &str, contexts: Vec<PluginActionContext>) -> PluginManifestAction {
+            PluginManifestAction {
+                id: id.into(),
+                title: id.into(),
+                description: None,
+                contexts,
+                platforms: None,
+                command: vec!["sh".into(), "-c".into(), ":".into()],
+            }
+        }
+
+        let mut state = AppState::test_new();
+        state.installed_plugins = std::collections::HashMap::from([(
+            "builtin.workspace-ops".to_string(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "builtin.workspace-ops".into(),
+                name: "Workspace Ops".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.7.0".into(),
+                description: None,
+                manifest_path: "/tmp/herdr-plugin.toml".into(),
+                plugin_root: "/tmp".into(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                startup: Vec::new(),
+                actions: vec![
+                    action(
+                        "convert-to-workspace",
+                        vec![PluginActionContext::Tab, PluginActionContext::Pane],
+                    ),
+                    action("copy-metadata", vec![PluginActionContext::Pane]),
+                    action("audit", vec![PluginActionContext::Workspace]),
+                    action("legacy", Vec::new()),
+                ],
+                events: Vec::new(),
+                panes: Vec::new(),
+                ui_modules: Vec::new(),
+                link_handlers: Vec::new(),
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        )]);
+        state.ui_context_menu_items = ["convert-to-workspace", "copy-metadata", "audit", "legacy"]
+            .into_iter()
+            .map(|action_id| UiActionRef {
+                id: format!("plugin:builtin.workspace-ops:{action_id}"),
+                label: action_id.to_string(),
+            })
+            .chain(std::iter::once(UiActionRef {
+                // A module's own menu entry, not a manifest action: nothing to
+                // filter on, so it must survive every menu.
+                id: "example.goal-ui:fork".into(),
+                label: "Fork".into(),
+            }))
+            .collect();
+
+        let labels = |context| {
+            state
+                .plugin_context_menu_items(context)
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            labels(PluginActionContext::Workspace),
+            vec!["audit", "legacy", "Fork"],
+            "a workspace row must not offer tab/pane-scoped actions"
+        );
+        assert_eq!(
+            labels(PluginActionContext::Tab),
+            vec!["convert-to-workspace", "legacy", "Fork"]
+        );
+        assert_eq!(
+            labels(PluginActionContext::Pane),
+            vec!["convert-to-workspace", "copy-metadata", "legacy", "Fork"]
+        );
+    }
+
+    /// An item whose plugin or action the host cannot resolve stays visible.
+    /// Hiding it would turn a registry that is momentarily out of sync — a
+    /// reload in flight, a manifest that failed to parse — into silently
+    /// missing menu entries, which is harder to diagnose than an extra one.
+    #[test]
+    fn unresolvable_plugin_items_are_not_filtered_out() {
+        use crate::api::schema::PluginActionContext;
+
+        let mut state = AppState::test_new();
+        state.ui_context_menu_items = vec![UiActionRef {
+            id: "plugin:not.installed:whatever".into(),
+            label: "Whatever".into(),
+        }];
+
+        assert_eq!(
+            state
+                .plugin_context_menu_items(PluginActionContext::Workspace)
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn parse_historial_action_routes_verbs_and_ignores_toggle() {
