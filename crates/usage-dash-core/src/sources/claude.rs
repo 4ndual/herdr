@@ -5,8 +5,19 @@
 //!   • 5h / weekly limit %      ← Anthropic usage API (see anthropic_usage.rs)
 //!   • daily 12% tracker        ← weekly% delta since midnight (budget.rs)
 //!
-//! The context window (1M vs 200k) isn't in the transcript, so it's inferred
-//! from the opus 1M setting and self-corrected if observed usage exceeds 200k.
+//! Everything shown for a pane comes from THAT pane's own session. The model,
+//! the reasoning effort and the CLI version are stamped per turn in the
+//! transcript, so they are read from its tail; the focused transcript is
+//! resolved from the session reference herdr reports, never from "newest file in
+//! this cwd", which is a sibling pane's conversation as often as it is this
+//! one's.
+//!
+//! The 1M context window is the one fact no transcript records. Session evidence
+//! still comes first — a session that has already exceeded 200k is on the 1M
+//! window whatever any setting says — and only then does the pane's OWN account
+//! root (`CLAUDE_CONFIG_DIR`) `settings.json` decide. Same rule for a model or
+//! effort the transcript never stamped: the root's configured default is a last
+//! resort, not the source of truth.
 
 use crate::budget;
 use crate::model::{Cli, UsageSnapshot};
@@ -69,13 +80,22 @@ pub struct Transcript {
 /// Code stamped `effort`, so old sessions keep the previous behaviour instead
 /// of silently losing their mode. Empty when there is nothing to say, so
 /// callers can append it unconditionally.
-fn thinking_suffix(thinking: bool, effort: Option<&str>) -> String {
-    match effort.map(str::trim).filter(|e| !e.is_empty()) {
+///
+/// `default_effort` is the pane's own root `settings.json` `effortLevel`, used
+/// only when the session says nothing at all — a transcript that predates the
+/// `effort` stamp and never emitted a thinking block. Session evidence, explicit
+/// or observed, always wins over a setting.
+fn thinking_suffix(thinking: bool, effort: Option<&str>, default_effort: Option<&str>) -> String {
+    let session_level = effort.map(str::trim).filter(|e| !e.is_empty());
+    match session_level {
         Some(level) => format!(" · {}", abbrev_effort(level)),
         // `think` rather than `thinking` — same meaning, 3 columns cheaper, and
         // this is the fallback for pre-`effort` transcripts only.
         None if thinking => " · think".to_string(),
-        None => String::new(),
+        None => match default_effort.map(str::trim).filter(|e| !e.is_empty()) {
+            Some(level) => format!(" · {}", abbrev_effort(level)),
+            None => String::new(),
+        },
     }
 }
 
@@ -231,38 +251,89 @@ pub fn model_display(id: &str) -> String {
     }
 }
 
-/// Is opus 1M context enabled? Reads `~/.claude/settings.json` `.model` for a
-/// `[1m]` variant (and honors CLAUDE_CODE_DISABLE_1M_CONTEXT). Best-effort.
-fn one_m_enabled() -> bool {
-    if std::env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        return false;
-    }
-    let p = util::claude_config_root().join("settings.json");
-    if let Ok(raw) = std::fs::read_to_string(p) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
-                return m.contains("1m");
-            }
-        }
-    }
-    false
+/// The CONFIGURED defaults from the focused pane's own account root, used only
+/// where the session itself gives no answer.
+///
+/// These are settings, not facts about a session: `settings.json` says what a
+/// NEW session would start as, while a running pane can be on any model and any
+/// effort level. So every field here is a last resort behind the transcript, and
+/// the root is the pane's own (`CLAUDE_CONFIG_DIR`), never a global one.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct RootDefaults {
+    /// `.model` with any `[1m]` marker stripped, e.g. `claude-fable-5`.
+    model: Option<String>,
+    /// `.effortLevel`, e.g. `low`.
+    effort: Option<String>,
+    /// `.model` carried a `[1m]` marker and 1M is not disabled by env.
+    one_m: bool,
 }
 
-/// Pick the context window for a model, self-correcting if usage exceeds 200k.
-fn window_for(model_id: &str, observed_max: u64) -> u64 {
-    let mut w = if model_id.contains("opus") && one_m_enabled() {
-        WINDOW_1M
-    } else {
-        WINDOW_200K
+fn root_defaults() -> RootDefaults {
+    let mut out = RootDefaults::default();
+    let raw = match std::fs::read_to_string(util::claude_config_root().join("settings.json")) {
+        Ok(raw) => raw,
+        Err(_) => return out,
     };
-    if observed_max > w {
-        w = WINDOW_1M;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return out;
+    };
+    if let Some(model) = v.get("model").and_then(|x| x.as_str()) {
+        let disabled = std::env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        out.one_m = !disabled && model.contains("1m");
+        let bare = model.split('[').next().unwrap_or(model).trim();
+        if !bare.is_empty() {
+            out.model = Some(bare.to_string());
+        }
     }
-    w
+    out.effort = v
+        .get("effortLevel")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string);
+    out
+}
+
+/// Pick the context window for a model.
+///
+/// Session evidence first: a session that has ALREADY exceeded 200k is on the 1M
+/// window, whatever any setting says. Absent that, the pane's own root setting
+/// decides — and only for opus, which is the family the 1M beta applies to.
+fn window_for(model_id: &str, observed_max: u64, defaults: &RootDefaults) -> u64 {
+    if observed_max > WINDOW_200K {
+        return WINDOW_1M;
+    }
+    if defaults.one_m && one_m_applies_to(model_id, defaults.model.as_deref()) {
+        return WINDOW_1M;
+    }
+    WINDOW_200K
+}
+
+/// Does the root's `[1m]` marker describe THIS session's model?
+///
+/// The marker is attached to one configured model (`claude-fable-5[1m]`), so it
+/// says nothing about a pane running something else. Matching is containment in
+/// either direction because the two spellings differ by design: settings hold a
+/// user-facing alias (`opus`), transcripts hold the API id (`claude-opus-4-8`).
+///
+/// This used to be a bare `model_id.contains("opus")`, from when 1M was an
+/// opus-only beta — which both missed a 1M-enabled non-opus model and claimed
+/// 1M for any opus pane on an account whose 1M model was something else.
+fn one_m_applies_to(session_model: &str, configured: Option<&str>) -> bool {
+    let session = session_model.to_ascii_lowercase();
+    match configured {
+        Some(configured) => {
+            let configured = configured.to_ascii_lowercase();
+            !configured.is_empty()
+                && (session.contains(&configured) || configured.contains(&session))
+        }
+        // Settings that name no model at all: fall back to the historical
+        // opus-only assumption rather than granting 1M to everything.
+        None => session.contains("opus"),
+    }
 }
 
 pub fn snapshot_for_sid(sid: &str) -> Option<UsageSnapshot> {
@@ -315,14 +386,37 @@ fn latest_transcript_for_cwd(cwd: &str) -> Option<PathBuf> {
 /// a session id that never got a transcript on disk — fall back to the newest
 /// transcript for the focused `cwd`, so the pane shows the session it is really
 /// in rather than sticking on a stale snapshot.
+/// Resolve the FOCUSED pane's own transcript.
+///
+/// `refs` are the session references herdr reported for that pane, most
+/// authoritative first (`session_id`, then the native `session_ref` — for Claude
+/// both are the session uuid, but herdr fills them from different places and
+/// either can be the one that is populated).
+///
+/// The cwd fallback is deliberately reachable ONLY when the pane has no session
+/// reference at all. Several panes routinely share one cwd, so "newest
+/// transcript in this project dir" is another pane's conversation as often as it
+/// is this one's — using it to paper over a reference that simply has no file
+/// yet is what made every pane in a repo report the same model and effort.
+/// With a reference in hand and no transcript for it, the honest answer is none:
+/// a brand-new session has nothing to show for a tick or two, and the panel is
+/// sticky, so it keeps the previous frame rather than borrowing a sibling's.
 pub fn snapshot_for_focus(
-    sid: Option<&str>,
+    refs: &[Option<&str>],
     cwd: Option<&str>,
     subagent: Option<&str>,
 ) -> Option<UsageSnapshot> {
-    let path = sid
-        .and_then(transcript_for_sid)
-        .or_else(|| cwd.and_then(latest_transcript_for_cwd))?;
+    let mut named = false;
+    for candidate in refs.iter().flatten().filter(|r| !r.is_empty()) {
+        named = true;
+        if let Some(path) = transcript_for_sid(candidate) {
+            return snapshot_from_transcript(&path, subagent);
+        }
+    }
+    if named {
+        return None;
+    }
+    let path = cwd.and_then(latest_transcript_for_cwd)?;
     snapshot_from_transcript(&path, subagent)
 }
 
@@ -333,23 +427,34 @@ fn snapshot_from_transcript(path: &Path, subagent: Option<&str>) -> Option<Usage
     let model_id = t.model.clone().unwrap_or_default();
 
     let mut s = UsageSnapshot::empty(Cli::Claude);
-    let window = window_for(&model_id, t.max_ctx_tokens);
-    s.model = t.model.as_deref().map(|id| {
-        let name = model_display(id);
-        // fork: `1M` not `(1M context)` — 9 columns saved on the line that sets
-        // the box width, with the meaning intact next to a model name.
-        let base = if window == WINDOW_1M {
-            format!("{name} 1M")
-        } else {
-            name
-        };
-        // fork: version · model · mode (e.g. `2.1.220 · Opus 5 1M · high`).
-        format!(
-            "{}{base}{}",
-            version_prefix(t.version.as_deref()),
-            thinking_suffix(t.thinking, t.effort.as_deref())
-        )
-    });
+    let defaults = root_defaults();
+    // The session's own model, or — only when this transcript has produced no
+    // real assistant record yet — the model a new session in this root starts
+    // as. Never another pane's session.
+    let model_id = if model_id.is_empty() {
+        defaults.model.clone().unwrap_or_default()
+    } else {
+        model_id
+    };
+    let window = window_for(&model_id, t.max_ctx_tokens, &defaults);
+    s.model = Some(model_id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            let name = model_display(id);
+            // fork: `1M` not `(1M context)` — 9 columns saved on the line that
+            // sets the box width, with the meaning intact next to a model name.
+            let base = if window == WINDOW_1M {
+                format!("{name} 1M")
+            } else {
+                name
+            };
+            // fork: version · model · mode (e.g. `2.1.220 · Opus 5 1M · high`).
+            format!(
+                "{}{base}{}",
+                version_prefix(t.version.as_deref()),
+                thinking_suffix(t.thinking, t.effort.as_deref(), defaults.effort.as_deref())
+            )
+        });
     // Version freshness for the caption's clickable tokens. `t.version` is what
     // this pane is RUNNING, which is the number the user can act on — not
     // whatever happens to be installed on disk.
@@ -506,7 +611,10 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
         return;
     }
 
-    let window = window_for(&display_id, r.max_ctx_tokens);
+    // The subagent runs under the same account root as its parent, so the same
+    // defaults apply where its own tail is silent.
+    let defaults = root_defaults();
+    let window = window_for(&display_id, r.max_ctx_tokens, &defaults);
     s.ctx_window = Some(window);
     s.ctx_approx = false;
     let name_disp = model_display(&display_id);
@@ -518,7 +626,7 @@ fn apply_subagent_override(s: &mut UsageSnapshot, main_transcript: &Path, name: 
     // fork(wave-2): model · mode · @subagent.
     s.model = Some(format!(
         "{with_win}{} · @{name}",
-        thinking_suffix(r.thinking, r.effort.as_deref())
+        thinking_suffix(r.thinking, r.effort.as_deref(), defaults.effort.as_deref())
     ));
     if r.ctx_tokens.is_some() {
         s.ctx_used_tokens = r.ctx_tokens;
@@ -562,20 +670,35 @@ mod tests {
         // The whole point of preferring `effort`: a turn that emitted no
         // thinking block still reports the SELECTED level, instead of
         // silently reading as "thinking off".
-        assert_eq!(thinking_suffix(false, Some("high")), " · high");
+        assert_eq!(thinking_suffix(false, Some("high"), None), " · high");
         // Long levels are abbreviated so the caption stays narrow; see abbrev_effort.
-        assert_eq!(thinking_suffix(true, Some("Medium")), " · med");
+        assert_eq!(thinking_suffix(true, Some("Medium"), None), " · med");
         // "none" is a real selected level and must be shown as such, never
         // collapsed into "no suffix" — off and unknown must stay distinct.
-        assert_eq!(thinking_suffix(false, Some("none")), " · none");
+        assert_eq!(thinking_suffix(false, Some("none"), None), " · none");
     }
 
     #[test]
     fn thinking_flag_is_the_fallback_for_old_transcripts() {
-        assert_eq!(thinking_suffix(true, None), " · think");
-        assert_eq!(thinking_suffix(false, None), "");
+        assert_eq!(thinking_suffix(true, None, None), " · think");
+        assert_eq!(thinking_suffix(false, None, None), "");
         // Whitespace-only is treated as absent, not as a level.
-        assert_eq!(thinking_suffix(true, Some("  ")), " · think");
+        assert_eq!(thinking_suffix(true, Some("  "), None), " · think");
+    }
+
+    #[test]
+    fn the_root_default_effort_is_the_last_resort_only() {
+        // A session that stamped its own level ignores the root setting even
+        // when they disagree — the pane is running what the transcript says.
+        assert_eq!(thinking_suffix(false, Some("high"), Some("low")), " · high");
+        // An observed thinking block is still session evidence, so it also
+        // outranks the setting.
+        assert_eq!(thinking_suffix(true, None, Some("low")), " · think");
+        // Only with nothing at all from the session does the root answer.
+        assert_eq!(thinking_suffix(false, None, Some("low")), " · low");
+        assert_eq!(thinking_suffix(false, None, Some("Medium")), " · med");
+        // A blank setting is not an answer.
+        assert_eq!(thinking_suffix(false, None, Some("  ")), "");
     }
 
     #[test]
@@ -701,8 +824,54 @@ mod tests {
     #[test]
     fn window_self_corrects_above_200k() {
         // sonnet has no 1M, but observed usage > 200k forces the 1M window
-        assert_eq!(window_for("claude-sonnet-4-6", 50_000), WINDOW_200K);
-        assert_eq!(window_for("claude-sonnet-4-6", 250_000), WINDOW_1M);
+        let off = RootDefaults::default();
+        assert_eq!(window_for("claude-sonnet-4-6", 50_000, &off), WINDOW_200K);
+        assert_eq!(window_for("claude-sonnet-4-6", 250_000, &off), WINDOW_1M);
+    }
+
+    #[test]
+    fn the_1m_window_prefers_session_evidence_over_the_root_setting() {
+        // Settings that name no model keep the historical opus-only rule.
+        let bare = RootDefaults {
+            one_m: true,
+            ..RootDefaults::default()
+        };
+        let off = RootDefaults::default();
+        assert_eq!(window_for("claude-opus-5", 10_000, &bare), WINDOW_1M);
+        assert_eq!(window_for("claude-sonnet-5", 10_000, &bare), WINDOW_200K);
+        // Root says nothing, but this session has ALREADY passed 200k, so it
+        // demonstrably has the bigger window whatever the setting claims.
+        assert_eq!(window_for("claude-sonnet-5", 250_000, &off), WINDOW_1M);
+    }
+
+    #[test]
+    fn the_1m_marker_applies_only_to_the_model_it_was_configured_for() {
+        let fable_1m = RootDefaults {
+            model: Some("claude-fable-5".into()),
+            one_m: true,
+            ..RootDefaults::default()
+        };
+        // The configured model gets the window it was configured with, even
+        // though it is not opus.
+        assert_eq!(window_for("claude-fable-5", 10_000, &fable_1m), WINDOW_1M);
+        // A pane on a different model does not inherit that account setting.
+        assert_eq!(window_for("claude-opus-5", 10_000, &fable_1m), WINDOW_200K);
+
+        // Settings hold a user-facing alias, transcripts hold the API id; the
+        // two must still be recognised as the same model.
+        let opus_alias = RootDefaults {
+            model: Some("opus".into()),
+            one_m: true,
+            ..RootDefaults::default()
+        };
+        assert_eq!(
+            window_for("claude-opus-4-8", 10_000, &opus_alias),
+            WINDOW_1M
+        );
+        assert_eq!(
+            window_for("claude-sonnet-5", 10_000, &opus_alias),
+            WINDOW_200K
+        );
     }
 
     #[test]
@@ -1019,7 +1188,7 @@ mod tests {
     const OLDER_CWD_TRANSCRIPT: &str = r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":10,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0,"output_tokens":50}}}"#;
 
     #[test]
-    fn sid_miss_falls_back_to_newest_cwd_transcript() {
+    fn a_named_session_never_borrows_a_siblings_transcript() {
         let h = TempHome::new("fallback-cwd");
         let older = h.write(
             &format!(".claude/projects/{PROJ_SLUG}/aaaaaaaa-older.jsonl"),
@@ -1034,11 +1203,24 @@ mod tests {
         set_mtime(&older, now - std::time::Duration::from_secs(600));
         set_mtime(&newer, now);
 
-        // Reported sid has no transcript on disk -> cwd fallback picks newest.
-        let s = snapshot_for_focus(Some("00000000-missing"), Some(PROJ_CWD), None)
-            .expect("fallback snapshot");
+        // A pane that HAS a session reference whose transcript does not exist
+        // yet reports nothing. Falling back to "newest in this cwd" here is what
+        // made every pane in one repo show the same model: several panes share a
+        // cwd, so the newest transcript is a sibling pane as often as it is this
+        // one. The panel is sticky, so nothing shown beats something wrong.
+        assert!(
+            snapshot_for_focus(&[Some("00000000-missing")], Some(PROJ_CWD), None).is_none(),
+            "a named-but-missing session must not resolve to another pane"
+        );
+
+        // With NO reference at all, the cwd fallback is still the best guess
+        // available and stays: newest wins.
+        let s = snapshot_for_focus(&[None, Some("")], Some(PROJ_CWD), None)
+            .expect("unnamed focus still falls back to the cwd");
         assert_eq!(s.cli, Cli::Claude);
         assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+        let _ = &older;
+        let _ = &newer;
     }
 
     #[test]
@@ -1059,8 +1241,56 @@ mod tests {
         h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
         set_mtime(&newer, std::time::SystemTime::now());
 
-        let s = snapshot_for_focus(Some(sid), Some(PROJ_CWD), None).expect("snapshot");
+        let s = snapshot_for_focus(&[Some(sid)], Some(PROJ_CWD), None).expect("snapshot");
         assert_eq!(s.cli, Cli::Claude); // exact sid wins over newer cwd candidate
+        assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
+    }
+
+    #[test]
+    fn the_root_default_model_fills_in_only_when_the_session_has_none() {
+        let h = TempHome::new("root-default-model");
+        let sid = "12345678-synthetic";
+        // A transcript whose only assistant record is a synthetic placeholder:
+        // a real session, but no model evidence in it yet.
+        h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/{sid}.jsonl"),
+            r#"{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":0,"output_tokens":1}}}"#,
+        );
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        h.write(
+            ".claude/settings.json",
+            r#"{"model":"claude-fable-5[1m]","effortLevel":"high"}"#,
+        );
+
+        let s = snapshot_for_focus(&[Some(sid)], Some(PROJ_CWD), None).expect("snapshot");
+        // Model and effort come from the ROOT settings, since the session has
+        // neither, and the `[1m]` marker is stripped from the display NAME while
+        // still selecting the window — the marker was configured for exactly the
+        // model this session fell back to.
+        assert_eq!(s.model.as_deref(), Some("Fable 5 1M · high"));
+        assert_eq!(s.ctx_window, Some(WINDOW_1M));
+    }
+
+    #[test]
+    fn the_native_session_ref_resolves_when_herdr_reports_no_session_id() {
+        let h = TempHome::new("session-ref");
+        let sid = "12345678-native";
+        h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/{sid}.jsonl"),
+            CLAUDE_TRANSCRIPT,
+        );
+        // A NEWER sibling in the same cwd that must not be picked.
+        let newer = h.write(
+            &format!(".claude/projects/{PROJ_SLUG}/bbbbbbbb-newer.jsonl"),
+            OLDER_CWD_TRANSCRIPT,
+        );
+        h.write(".claude/dash2/anthropic_usage.json", ANTHROPIC_CACHE);
+        set_mtime(&newer, std::time::SystemTime::now());
+
+        // session_id empty, session_ref populated — the shape herdr reports for
+        // a pane it adopted rather than spawned.
+        let s = snapshot_for_focus(&[None, Some(sid)], Some(PROJ_CWD), None)
+            .expect("session_ref must resolve");
         assert_eq!(s.model.as_deref(), Some("Opus 4.8"));
     }
 }

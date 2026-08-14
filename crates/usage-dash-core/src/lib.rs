@@ -140,13 +140,20 @@ pub fn refresh(focus: FocusInput) -> RefreshOutcome {
             // newest transcript for the focused cwd when the reported sid has no
             // transcript on disk (herdr can report a sid that never got a file),
             // so a live pane isn't stuck on a stale snapshot.
+            // Both references are passed: herdr populates `session_id` from its
+            // own usage keying and `session_ref` from the agent's native resume
+            // reference, and which one is filled depends on how the pane was
+            // adopted. Reading only `session_id` meant a pane that reported just
+            // the native ref fell through to the cwd fallback and rendered a
+            // SIBLING pane's session.
             let sid = focus.session_id.as_deref().filter(|s| !s.is_empty());
+            let session_ref = focus.session_ref.as_deref().filter(|s| !s.is_empty());
             let cwd = focus
                 .cwd
                 .as_deref()
                 .map(|c| c.to_string_lossy().into_owned());
             match sources::claude::snapshot_for_focus(
-                sid,
+                &[sid, session_ref],
                 cwd.as_deref(),
                 focus.subagent.as_deref(),
             ) {
