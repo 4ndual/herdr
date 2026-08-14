@@ -107,8 +107,24 @@ next tick.
 No throttle, on purpose: the bar describes the tree you are looking at right
 now, so staleness after a focus change is the one failure that would make it
 worse than nothing. It earns that by being cheap — one scan of `~/harnesses/*`,
-a few `/proc` reads and three local socket calls, **5–20 ms measured**, written
-into every snapshot as `collect_us` so the claim is checkable from the artefact.
+a few `/proc` reads and three local socket calls — and every snapshot carries
+its own wall time as `collect_us`, so the claim is checkable from the artefact
+rather than asserted.
+
+Measured on this machine, 24 harnesses on disk:
+
+| condition | p50 | p90 | max |
+| --- | --- | --- | --- |
+| run directly, quiet machine (n=12) | 9.6 ms | 10.5 ms | 25.1 ms |
+| host tick, load average 14 (n=20) | 38.2 ms | 132.6 ms | 193.8 ms |
+
+The brief's 50 ms budget holds comfortably at the median and is **exceeded in
+the tail under heavy machine load**. The cost is dominated by the three socket
+round trips and the `/proc` reads, which stretch with system load rather than
+with fleet size, so this is a latency tail on a once-per-second tick, not a
+budget the bar blows every frame. If the tail ever matters, the fix is the
+event-driven collector in the phase-2 plan, not a throttle — a throttled bar is
+a stale bar.
 
 Linux only, honestly: attribution reads `/proc/<pid>/environ`. macOS needs
 `KERN_PROCARGS2` first, and claiming support early would ship a permanently
