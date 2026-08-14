@@ -1391,6 +1391,11 @@ pub enum ContextMenuKind {
     Tab {
         ws_idx: usize,
         tab_idx: usize,
+        /// Whether this tab's focused pane runs an agent herdr can actually
+        /// fork. Decided when the menu opens, so the row is offered only where
+        /// it can work — jcode has no fork flag at all, and an unverified
+        /// runtime is not forkable either (see `PaneCloseRecord::fork_argv`).
+        forkable: bool,
     },
     Pane {
         ws_idx: usize,
@@ -1533,7 +1538,7 @@ impl ContextMenuState {
                 "Open worktree...",
                 "Collapse",
             ],
-            ContextMenuKind::Tab { .. } => &[
+            ContextMenuKind::Tab { forkable: true, .. } => &[
                 "New tab",
                 "Rename",
                 "Fork",
@@ -1541,6 +1546,11 @@ impl ContextMenuState {
                 "Make invisible",
                 "Close",
             ],
+            // No Fork row where forking is impossible. Offering it anyway and
+            // failing later is how a menu teaches users not to trust it.
+            ContextMenuKind::Tab {
+                forkable: false, ..
+            } => &["New tab", "Rename", "Archive", "Make invisible", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 source_pane_id: Some(_),
@@ -1999,6 +2009,42 @@ pub(crate) struct ResumePickerOverlay {
 }
 
 impl AppState {
+    /// Whether the tab's focused pane runs an agent herdr can fork.
+    ///
+    /// The Fork row used to be listed unconditionally and dispatched a generic
+    /// action with no agent knowledge, so it appeared on jcode panes — which
+    /// have no fork flag at all — and on panes running no agent. The authority
+    /// here is the same one [`crate::pane_close_history::PaneCloseRecord::fork_argv`]
+    /// uses: a runtime is forkable only where its argv transform is verified.
+    pub(crate) fn tab_focused_pane_is_forkable(&self, ws_idx: usize, tab_idx: usize) -> bool {
+        let Some(tab) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.tabs.get(tab_idx))
+        else {
+            return false;
+        };
+        let pane_id = tab.layout.focused();
+        let Some(terminal_id) = tab
+            .panes
+            .get(&pane_id)
+            .map(|pane| &pane.attached_terminal_id)
+        else {
+            return false;
+        };
+        let Some(agent) = self
+            .terminals
+            .get(terminal_id)
+            .and_then(|terminal| terminal.effective_known_agent())
+        else {
+            return false;
+        };
+        matches!(
+            agent,
+            crate::detect::Agent::Claude | crate::detect::Agent::Codex | crate::detect::Agent::Pi
+        )
+    }
+
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
     }
@@ -3202,9 +3248,9 @@ impl AppState {
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
                 }
-                ContextMenuKind::Tab { ws_idx, tab_idx } => {
-                    assert_tab_index(ws_idx, tab_idx, "context menu tab")
-                }
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                } => assert_tab_index(ws_idx, tab_idx, "context menu tab"),
                 ContextMenuKind::Pane {
                     ws_idx,
                     tab_idx,

@@ -820,19 +820,34 @@ pub(super) fn apply_context_menu_action(
                 state.mode = Mode::Navigate;
             }
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("New tab"),
+        ) => {
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
             open_new_tab_dialog(state);
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("Rename"),
+        ) => {
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
             open_rename_active_tab(state, false);
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("Fork"),
+        ) => {
             // Fork the conversation of this tab's focused pane into a new tab
             // via the existing button-dash "fork" plugin action. AppState cannot
             // reach the plugin runtime directly, so record a request the outer
@@ -854,7 +869,12 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Make invisible")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("Make invisible"),
+        ) => {
             if state
                 .workspaces
                 .get_mut(ws_idx)
@@ -867,7 +887,12 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("Archive"),
+        ) => {
             // Archive this tab's focused pane via the archive-dash plugin
             // action; the outer App/event loop dispatches the request.
             if let Some(pane_id) = state
@@ -887,7 +912,12 @@ pub(super) fn apply_context_menu_action(
             }
             leave_modal(state);
         }
-        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
+        (
+            ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            },
+            Some("Close"),
+        ) => {
             state.selected = ws_idx;
             state.active = Some(ws_idx);
             state.switch_tab(tab_idx);
@@ -1330,17 +1360,32 @@ impl App {
                     self.state.mode = Mode::Navigate;
                 }
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("New tab"),
+            ) => {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 open_new_tab_dialog(&mut self.state);
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("Rename"),
+            ) => {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 open_rename_active_tab(&mut self.state, false);
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Fork")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("Fork"),
+            ) => {
                 // Same fork-the-focused-pane request as the TUI apply path
                 // (`apply_context_menu_action`); the outer loop dispatches it.
                 if let Some(pane_id) = self
@@ -1362,7 +1407,12 @@ impl App {
                 }
                 leave_modal(&mut self.state);
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Make invisible")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("Make invisible"),
+            ) => {
                 if self
                     .state
                     .workspaces
@@ -1376,7 +1426,12 @@ impl App {
                 }
                 leave_modal(&mut self.state);
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Archive")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("Archive"),
+            ) => {
                 // Same archive-the-focused-pane request as the TUI apply path.
                 if let Some(pane_id) = self
                     .state
@@ -1397,7 +1452,12 @@ impl App {
                 }
                 leave_modal(&mut self.state);
             }
-            (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
+            (
+                ContextMenuKind::Tab {
+                    ws_idx, tab_idx, ..
+                },
+                Some("Close"),
+            ) => {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 if !self.close_active_tab_via_api_requires_confirmation() {
@@ -2324,6 +2384,7 @@ mod tests {
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
+                forkable: true,
             },
             x: 0,
             y: 0,
@@ -2351,6 +2412,32 @@ mod tests {
         assert!(fork < close, "Fork must come before Close");
     }
 
+    /// Fork is offered only where herdr can actually fork the running agent.
+    /// jcode has no fork flag and a pane with no detected agent has no argv to
+    /// transform, so the row is omitted rather than dispatched into a failure.
+    #[test]
+    fn tab_context_menu_omits_fork_when_the_pane_is_not_forkable() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+                forkable: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: Vec::new(),
+        };
+        assert_eq!(
+            menu.items(),
+            &["New tab", "Rename", "Archive", "Make invisible", "Close"]
+        );
+        assert!(
+            !menu.items().contains(&"Fork"),
+            "no Fork row where forking cannot work"
+        );
+    }
+
     // fork(ADR-001): "Make invisible" mutates core tab state, so it stays
     // host-owned in BOTH dispatch paths and there is no `tab.hide` API method to
     // cover it from outside. The three tests below pin the dispatch itself —
@@ -2359,7 +2446,11 @@ mod tests {
     // dropping the effect.
     fn tab_menu_at(ws_idx: usize, tab_idx: usize) -> ContextMenuState {
         ContextMenuState {
-            kind: ContextMenuKind::Tab { ws_idx, tab_idx },
+            kind: ContextMenuKind::Tab {
+                ws_idx,
+                tab_idx,
+                forkable: true,
+            },
             x: 0,
             y: 0,
             list: MenuListState::new(0),
@@ -2445,6 +2536,7 @@ mod tests {
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
+                forkable: true,
             },
             x: 0,
             y: 0,
@@ -2531,6 +2623,7 @@ mod tests {
             kind: ContextMenuKind::Tab {
                 ws_idx: 0,
                 tab_idx: 0,
+                forkable: true,
             },
             x: 0,
             y: 0,

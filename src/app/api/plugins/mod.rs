@@ -423,7 +423,9 @@ impl App {
             Some(crate::app::state::ContextMenuKind::Pane {
                 ws_idx, pane_id, ..
             }) => self.plugin_context_for_pane(ws_idx, pane_id, "context_menu"),
-            Some(crate::app::state::ContextMenuKind::Tab { ws_idx, tab_idx }) => {
+            Some(crate::app::state::ContextMenuKind::Tab {
+                ws_idx, tab_idx, ..
+            }) => {
                 let mut context = self.plugin_context_for_workspace(ws_idx, "context_menu");
                 context.tab_id = self.public_tab_id(ws_idx, tab_idx);
                 context.tab_label = self

@@ -1225,8 +1225,13 @@ impl AppState {
                 if let (Some(ws_idx), Some(tab_idx)) =
                     (self.active, self.tab_at(mouse.column, mouse.row))
                 {
+                    let forkable = self.tab_focused_pane_is_forkable(ws_idx, tab_idx);
                     self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::Tab { ws_idx, tab_idx },
+                        kind: ContextMenuKind::Tab {
+                            ws_idx,
+                            tab_idx,
+                            forkable,
+                        },
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
@@ -3891,7 +3896,10 @@ mod tests {
             menu.kind,
             ContextMenuKind::Tab {
                 ws_idx: 0,
-                tab_idx: 1
+                tab_idx: 1,
+                // No agent has been detected on this test pane, so there is
+                // nothing to fork and the menu says so.
+                forkable: false,
             }
         );
         assert_eq!(app.state.mode, Mode::ContextMenu);
