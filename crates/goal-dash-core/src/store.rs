@@ -12,7 +12,7 @@ use std::time::SystemTime;
 
 use crate::model::{GoalDoc, GoalState, Links, PromptEntry, Tree, GOAL_FILE};
 use crate::timegate::{
-    cwd_from_jsonl, global_goal_path, home, project_goal_file, project_root, state_dir,
+    cwd_from_jsonl, global_goal_path, project_goal_file, project_root, state_dir,
 };
 
 // ----------------------------- legacy split-file readers -----------------------------
@@ -388,10 +388,10 @@ pub fn move_goal_store(
 // ----------------------------- transcript discovery -----------------------------
 
 fn projects_dir() -> PathBuf {
-    home().join(".claude/projects")
+    crate::timegate::claude_config_root().join("projects")
 }
 fn pi_sessions_dir() -> PathBuf {
-    home().join(".pi/agent/sessions")
+    crate::timegate::pi_sessions_root()
 }
 fn transcript_roots() -> Vec<PathBuf> {
     vec![projects_dir(), pi_sessions_dir()]

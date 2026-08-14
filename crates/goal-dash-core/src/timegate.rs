@@ -33,8 +33,29 @@ pub fn home() -> PathBuf {
 
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
+/// Claude Code's config root: `$CLAUDE_CONFIG_DIR` when set, else `$HOME/.claude`.
+///
+/// Goals, plans and transcripts all live under the ACCOUNT's root, and a fleet
+/// harness gives each harness its own by setting this variable. Reading
+/// `$HOME/.claude` unconditionally means a harness pane reads and writes another
+/// account's goal state.
+pub fn claude_config_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    home().join(".claude")
+}
+
+/// pi's session root: `$PI_SESSION_DIR` when set, else `$HOME/.pi/agent/sessions`.
+pub fn pi_sessions_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PI_SESSION_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    home().join(".pi/agent/sessions")
+}
+
 pub fn state_dir() -> PathBuf {
-    home().join(".claude/goal")
+    claude_config_root().join("goal")
 }
 
 pub fn project_goal_file(dir: &Path) -> PathBuf {
@@ -44,11 +65,7 @@ pub fn project_goal_file(dir: &Path) -> PathBuf {
 /// The project root for a working dir: nearest ancestor holding `.git`, `CLAUDE.md`, or an existing
 /// `.goal.json`. `$HOME` and `~/.claude` are never project roots.
 pub fn project_root(dir: &Path) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let skip: Vec<PathBuf> = home
-        .iter()
-        .flat_map(|h| [h.clone(), h.join(".claude")])
-        .collect();
+    let skip: Vec<PathBuf> = vec![home(), claude_config_root()];
     let mut cur = Some(dir);
     while let Some(d) = cur {
         if !skip.iter().any(|s| s == d)
@@ -67,14 +84,19 @@ pub fn global_goal_path(goal_id: &str) -> PathBuf {
 }
 
 pub fn plans_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    home.join(".claude").join("plans")
+    claude_config_root().join("plans")
 }
 
-/// `~/Projects` — the root holding per-project folders, the candidate set for the sorter.
+/// The root holding per-project folders — the candidate set for the sorter.
+///
+/// `$HERDR_PROJECTS_HOME` when set, else `~/Projects`. The bare default assumed
+/// every user keeps repos in one folder with that exact name; for anyone using
+/// `~/src`, `~/code` or `~/dev` the candidate set came back empty and the sorter
+/// was a silent no-op with no way to point it anywhere.
 pub fn projects_home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("HERDR_PROJECTS_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
     home().join("Projects")
 }
 
