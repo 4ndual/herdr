@@ -1,0 +1,92 @@
+{
+  "buttons": [
+    {
+      "id": "fork",
+      "label": "Fork",
+      "emoji": "🍴",
+      "shortcut": "⌃⌥F",
+      "color": "green",
+      "description": "Fork this conversation into a new TAB — claude, codex and pi; jcode has no fork flag and is refused"
+    },
+    {
+      "id": "fork-workspace",
+      "label": "Fork → workspace",
+      "emoji": "🔱",
+      "shortcut": "⌃⌥⇧F",
+      "color": "mauve",
+      "description": "Fork this conversation into a new WORKSPACE — claude, codex and pi; jcode has no fork flag and is refused"
+    },
+    {
+      "id": "resume-search",
+      "label": "Resume search",
+      "emoji": "🔎",
+      "shortcut": "⌃⌥S",
+      "color": "muted",
+      "description": "Search every claude, codex, pi and fleet-harness transcript and resume the picked session in skip mode"
+    },
+    {
+      "id": "relaunch-skip",
+      "label": "Relaunch skip",
+      "emoji": "⚡",
+      "shortcut": "⌃⌥K",
+      "color": "peach",
+      "description": "Relaunch THIS session in place with permissions bypassed — claude and codex; pi and jcode have no such flag"
+    },
+    {
+      "id": "relocate",
+      "label": "Relocate",
+      "emoji": "📦",
+      "shortcut": "⌃⌥L",
+      "color": "success",
+      "description": "Move this conversation to the project it is actually about and continue it there (claude only)"
+    },
+    {
+      "id": "archive",
+      "label": "Archive pane",
+      "emoji": "🗄️",
+      "shortcut": "⌃⌥A",
+      "color": "teal",
+      "description": "Close the current pane and save it to the archive widget, restorable for claude, codex and pi"
+    },
+    {
+      "id": "bg-dispatch",
+      "label": "Background agent",
+      "emoji": "🚀",
+      "shortcut": "⌃⌥B",
+      "color": "magenta",
+      "description": "Open a pane to type a prompt, then dispatch it as a detached background agent (claude --bg; claude only)"
+    },
+    {
+      "id": "remote",
+      "label": "Remote",
+      "emoji": "📱",
+      "shortcut": "⌃⌥R",
+      "color": "subtext",
+      "description": "Claude only: enable Remote Control (/remote-control) to continue this session from the phone or claude.ai"
+    },
+    {
+      "id": "handoff-hr",
+      "label": "Handoff hr",
+      "emoji": "🤝",
+      "shortcut": "⌃⌥H",
+      "color": "warning",
+      "description": "Swap in the new binary WITHOUT killing panes — agents and subagents keep running"
+    },
+    {
+      "id": "restart-hr",
+      "label": "Restart hr",
+      "emoji": "🔄",
+      "shortcut": "⌃⌥X",
+      "color": "blue",
+      "description": "Fully kill & relaunch this herdr instance, restoring the session"
+    },
+    {
+      "id": "full-restart",
+      "label": "Full restart",
+      "emoji": "♻️",
+      "shortcut": "⌃⌥⇧X",
+      "color": "red",
+      "description": "Hard kill tmux + agents + server (reclaim all RAM), relaunch fresh & resume"
+    }
+  ]
+}

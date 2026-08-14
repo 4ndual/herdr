@@ -23,7 +23,7 @@
 use herdr_ui_plugin_api::{UiFrameContext, UiHitRect, UiLayer, UiNode, UiSurface, UiTextSpan};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
 /// This plugin's manifest id; sent with every `plugin.action.invoke` so the
@@ -209,16 +209,21 @@ static BUTTONS: &[ButtonDef] = &[
     },
 ];
 
-// Action id for the built-in expand/collapse toggle (guest-internal; never
-// reaches plugin.action.invoke).
-const ACTION_TOGGLE_LIST: &str = "button-dash:toggle_list";
-const _: &str = ACTION_TOGGLE_LIST; // reserved id, kept documented
+/// Manifest action opened by the strip's `[?]` cell: the full reference list,
+/// as a floating OVERLAY pane.
+///
+/// It used to be a guest-local expand/collapse that drew one row per button
+/// BELOW the grid, inside the bottom band. The band has ~4 slack rows and the
+/// registry has 11 buttons, so 7 entries were clipped off-screen with no scroll
+/// affordance (defect D4). Per the UX canon a list that does not fit the band is
+/// a secondary surface, and a secondary surface is an overlay — which also gets
+/// the Esc-to-close contract for free. The hover tooltip is unchanged: it is one
+/// row and it always fits.
+const ACTION_REFERENCE_LIST: &str = "reference-list";
 
 // ── Guest-persistent state ────────────────────────────────────────────────────
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-/// Whether the expandable full list (label + shortcut + description) is shown.
-static LIST_EXPANDED: AtomicBool = AtomicBool::new(false);
 /// Index into [`BUTTONS`] the cursor is currently hovering (for the tooltip),
 /// or `None`. [`HOVER_TOGGLE`] is the sentinel for "hovering the list toggle".
 static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
@@ -419,9 +424,9 @@ fn handle_mouse(mouse: &MouseInput) -> UiUpdateV3 {
         }
         "left_down" => match hit {
             Some(HOVER_TOGGLE) => {
-                let expanded = !LIST_EXPANDED.load(Ordering::SeqCst);
-                LIST_EXPANDED.store(expanded, Ordering::SeqCst);
-                render_update(Vec::new())
+                // The reference list is an overlay pane now, not an in-panel
+                // expansion — see ACTION_REFERENCE_LIST.
+                render_update(vec![invoke_effect(PLUGIN_ID, ACTION_REFERENCE_LIST)])
             }
             Some(index) => {
                 let button = &BUTTONS[index];
@@ -490,12 +495,11 @@ fn compact_label(button: &ButtonDef) -> String {
     format!("[{} {}]", button.emoji, button.shortcut)
 }
 
+/// The reference cell. A question mark, not a disclosure triangle: it opens an
+/// OVERLAY rather than expanding this panel, and the canon reserves the
+/// open/close glyph pair for surfaces that really do collapse back in place.
 fn toggle_label() -> &'static str {
-    if LIST_EXPANDED.load(Ordering::SeqCst) {
-        "[\u{25BC}]" // ▼
-    } else {
-        "[\u{25B6}]" // ▶
-    }
+    "[?]"
 }
 
 /// Lay out the compact GRID once (rows of [`BUTTONS_PER_ROW`] cells, the toggle
@@ -627,17 +631,9 @@ fn button_dash_layer() -> UiLayer {
         nodes.push(UiNode::Line { spans });
     }
 
-    let expanded = LIST_EXPANDED.load(Ordering::SeqCst);
     let hovered = *HOVERED.lock().expect("hover mutex poisoned");
 
-    if expanded {
-        // Full reference below the strip: one detail row per button.
-        for button in BUTTONS {
-            nodes.push(UiNode::Line {
-                spans: detail_spans(button),
-            });
-        }
-    } else if let Some(index) = hovered {
+    if let Some(index) = hovered {
         // Hover tooltip below the strip: the hovered button's full label.
         if index != HOVER_TOGGLE {
             if let Some(button) = BUTTONS.get(index) {
@@ -702,8 +698,8 @@ fn push_gap(spans: &mut Vec<UiTextSpan>, col: &mut u16, gap: &str) {
 mod tests {
     use super::*;
 
-    // These tests mutate process-global state (STRIP_ORIGIN / HOVERED /
-    // LIST_EXPANDED). Serialize them so parallel `cargo test` can't race (and so
+    // These tests mutate process-global state (STRIP_ORIGIN / HOVERED).
+    // Serialize them so parallel `cargo test` can't race (and so
     // a panic mid-test can't poison a shared mutex for the others).
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -714,7 +710,6 @@ mod tests {
     fn reset() {
         *STRIP_ORIGIN.lock().unwrap() = None;
         *HOVERED.lock().unwrap() = None;
-        LIST_EXPANDED.store(false, Ordering::SeqCst);
     }
 
     fn mouse(kind: &str, column: u16, row: u16) -> MouseInput {
@@ -1074,8 +1069,10 @@ mod tests {
         *STRIP_ORIGIN.lock().unwrap() = None;
     }
 
+    /// D4: the reference cell opens the OVERLAY action and adds no rows to the
+    /// band. The old behaviour (expand in place) clipped 7 of 11 entries.
     #[test]
-    fn toggle_click_flips_expanded_and_lists_all() {
+    fn reference_cell_opens_the_overlay_and_never_grows_the_panel() {
         let _g = guard();
         reset();
         *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
@@ -1083,12 +1080,63 @@ mod tests {
         let toggle = segments.iter().find(|s| s.target == HOVER_TOGGLE).unwrap();
         let col = toggle.x + toggle.width / 2;
         let update = handle_mouse(&mouse("left_down", col, toggle.row));
-        assert!(LIST_EXPANDED.load(Ordering::SeqCst));
-        assert!(update.effects.is_empty());
-        // expanded → grid rows + one row per button
-        assert_eq!(update.layers[0].nodes.len(), grid_rows() as usize + BUTTONS.len());
-        LIST_EXPANDED.store(false, Ordering::SeqCst);
+        match update.effects.first().expect("one effect") {
+            HostEffectV3::Api { method, params, .. } => {
+                assert_eq!(method, "plugin.action.invoke");
+                assert_eq!(params["plugin_id"], json!(PLUGIN_ID));
+                assert_eq!(params["action_id"], json!(ACTION_REFERENCE_LIST));
+            }
+            other => panic!("expected Api effect, got {other:?}"),
+        }
+        // the grid, and nothing else: no rows were added to the bottom band
+        assert_eq!(update.layers[0].nodes.len(), grid_rows() as usize);
         *STRIP_ORIGIN.lock().unwrap() = None;
+    }
+
+    /// The overlay renders from `reference.json`; the strip renders from
+    /// [`BUTTONS`]. They are two copies of one list, so pin them together —
+    /// otherwise the reference silently documents a strip that has moved on.
+    #[test]
+    fn reference_json_matches_buttons() {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: String,
+            label: String,
+            emoji: String,
+            shortcut: String,
+            color: String,
+            description: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            buttons: Vec<Entry>,
+        }
+        let raw = include_str!("../reference.json");
+        let file: File = serde_json::from_str(raw).expect("reference.json parses");
+        assert_eq!(
+            file.buttons.len(),
+            BUTTONS.len(),
+            "reference.json has {} entries but the strip renders {} buttons — \
+             regenerate it when the registry changes",
+            file.buttons.len(),
+            BUTTONS.len(),
+        );
+        for (entry, button) in file.buttons.iter().zip(BUTTONS) {
+            assert_eq!(entry.id, button.id, "reference.json order must match BUTTONS");
+            assert_eq!(entry.label, button.label, "label drift on '{}'", button.id);
+            assert_eq!(entry.emoji, button.emoji, "emoji drift on '{}'", button.id);
+            assert_eq!(
+                entry.shortcut, button.shortcut,
+                "shortcut drift on '{}'",
+                button.id
+            );
+            assert_eq!(entry.color, button.color, "colour drift on '{}'", button.id);
+            assert_eq!(
+                entry.description, button.description,
+                "description drift on '{}'",
+                button.id
+            );
+        }
     }
 
     #[test]

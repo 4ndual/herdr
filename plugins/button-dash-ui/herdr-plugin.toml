@@ -115,6 +115,37 @@ title = "Relaunch skip"
 contexts = ["tab", "pane"]
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/relaunch-skip.sh\" >/dev/null 2>&1 &"]
 
+# reference-list: the full button reference, as a floating OVERLAY pane.
+#
+# It used to expand inside the bottom-band panel, where ~4 slack rows had to hold
+# 11 entries — 7 were clipped off-screen with no scroll affordance (defect D4).
+# Per the UX canon, a list that does not fit the band is a secondary surface and
+# a secondary surface is an overlay: Esc closes it, it needs no cleanup, and it
+# can be as tall as it likes. The strip's `[?]` cell invokes this action.
+#
+# `plugin pane open` is called directly rather than through a wrapper script —
+# there is nothing to resolve, unlike the resume picker's wrapper hunt.
+[[actions]]
+id = "reference-list"
+title = "Button reference"
+contexts = ["tab", "pane"]
+command = [
+  "sh",
+  "-lc",
+  "nohup \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin builtin.button-dash --entrypoint reference --placement overlay --focus >/dev/null 2>&1 &",
+]
+
+# The overlay's own surface: a bun TUI reading reference.json (the same data the
+# wasm guest renders in the strip; a guest test fails if the two drift).
+[[panes]]
+id = "reference"
+title = "button reference"
+description = "Every button in the dash with its shortcut and what it does"
+placement = "overlay"
+width = 96
+height = 16
+command = ["sh", "-lc", "exec bun run \"$HERDR_PLUGIN_ROOT/scripts/reference-overlay.ts\""]
+
 # remote: CLAUDE ONLY. Enable Claude Code Remote Control on the CURRENT pane's
 # LIVE conversation so it can be continued from the phone / claude.ai. For a
 # claude pane it types the `/remote-control` slash command into the running
