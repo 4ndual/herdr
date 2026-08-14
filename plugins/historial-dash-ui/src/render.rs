@@ -9,8 +9,8 @@
 //! declares them — it never handles those actions itself. The one action the
 //! guest owns is the header collapse toggle, matching goal-dash.
 
-use historial_dash_model::HistorialRenderModel;
 use herdr_ui_plugin_api::UiHitRect;
+use historial_dash_model::HistorialRenderModel;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -170,10 +170,18 @@ impl HeaderButton {
     fn color(self, filters: RowFilters) -> Color {
         match self {
             HeaderButton::Agent => {
-                if filters.agent == AgentFilter::All { Color::Magenta } else { Color::LightMagenta }
+                if filters.agent == AgentFilter::All {
+                    Color::Magenta
+                } else {
+                    Color::LightMagenta
+                }
             }
             HeaderButton::Terminals => {
-                if filters.show_terminals { Color::Green } else { Color::LightGreen }
+                if filters.show_terminals {
+                    Color::Green
+                } else {
+                    Color::LightGreen
+                }
             }
             HeaderButton::Legend => Color::Yellow,
             HeaderButton::Collapse => Color::Cyan,
@@ -221,7 +229,15 @@ fn draw_header_hint(area: Rect, buf: &mut Buffer, y: u16, text: &str, color: Col
         text.to_string(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )))
-    .render(Rect { x: area.x, y, width: area.width, height: 1 }, buf);
+    .render(
+        Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        },
+        buf,
+    );
 }
 
 /// Prefixes for host-resolved row actions. The suffix after the final `:` in the
@@ -343,7 +359,11 @@ fn render_full(
     // as distinct controls; the active state adds BOLD.
     let btn_style = |btn: HeaderButton, active: bool| {
         let s = Style::default().fg(btn.color(filters));
-        if active { s.add_modifier(Modifier::BOLD) } else { s }
+        if active {
+            s.add_modifier(Modifier::BOLD)
+        } else {
+            s
+        }
     };
     header.push(Span::styled(
         agent_glyph,
@@ -504,12 +524,7 @@ fn row_identifier(row: &historial_dash_model::HistorialRow) -> &str {
 /// Render the legend overlay (shown while `[?]` is toggled on), describing the
 /// current header/row glyph semantics. Dense and dim; drawn from `area.y + 1`
 /// down, clipped to the panel bottom.
-fn render_legend(
-    model: &HistorialRenderModel,
-    area: Rect,
-    buf: &mut Buffer,
-    agent: AgentFilter,
-) {
+fn render_legend(model: &HistorialRenderModel, area: Rect, buf: &mut Buffer, agent: AgentFilter) {
     let _ = model;
     let dim = Style::default().fg(Color::DarkGray);
     let lines: Vec<String> = vec![
@@ -607,7 +622,12 @@ fn tip_wrapped(
 /// (relative + absolute), and the first/last user prompts. Drawn just beneath
 /// the hovered row (`start_y`); if it would overflow the panel bottom it shifts
 /// up so it stays fully on-screen. All content lives here, not on the row.
-fn render_tooltip(row: &historial_dash_model::HistorialRow, area: Rect, start_y: u16, buf: &mut Buffer) {
+fn render_tooltip(
+    row: &historial_dash_model::HistorialRow,
+    area: Rect,
+    start_y: u16,
+    buf: &mut Buffer,
+) {
     let bottom = area.y + area.height; // exclusive
     if area.width < 6 || area.height < 4 {
         return; // too small for a boxed tooltip
@@ -632,7 +652,14 @@ fn render_tooltip(row: &historial_dash_model::HistorialRow, area: Rect, start_y:
         status_text.to_string(),
         Style::default().fg(status_color),
     ));
-    tip_wrapped(&mut lines, "id", &row.sid, Style::default().fg(Color::Gray), inner_w, 1);
+    tip_wrapped(
+        &mut lines,
+        "id",
+        &row.sid,
+        Style::default().fg(Color::Gray),
+        inner_w,
+        1,
+    );
 
     // --- location: workspace, tab, cwd (blank-line separated group) ---
     let mut loc: Vec<Line<'static>> = Vec::new();
@@ -644,9 +671,20 @@ fn render_tooltip(row: &historial_dash_model::HistorialRow, area: Rect, start_y:
         ));
     }
     if !row.tab_name.trim().is_empty() {
-        loc.push(tip_field("tab", row.tab_name.clone(), Style::default().fg(Color::Cyan)));
+        loc.push(tip_field(
+            "tab",
+            row.tab_name.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
     }
-    tip_wrapped(&mut loc, "cwd", &row.cwd, Style::default().fg(Color::Blue), inner_w, 2);
+    tip_wrapped(
+        &mut loc,
+        "cwd",
+        &row.cwd,
+        Style::default().fg(Color::Blue),
+        inner_w,
+        2,
+    );
     if !loc.is_empty() {
         lines.push(Line::from(""));
         lines.extend(loc);
@@ -907,7 +945,17 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+        );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.iter().any(|id| *id == "historial:restore:100:w_1_p_1"));
@@ -922,10 +970,26 @@ mod tests {
         };
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
-        assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:restore:")));
-        assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:fork:")));
-        assert!(hits.iter().all(|h| !h.action_id.starts_with("historial:del:")));
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+        );
+        assert!(hits
+            .iter()
+            .all(|h| !h.action_id.starts_with("historial:restore:")));
+        assert!(hits
+            .iter()
+            .all(|h| !h.action_id.starts_with("historial:fork:")));
+        assert!(hits
+            .iter()
+            .all(|h| !h.action_id.starts_with("historial:del:")));
     }
 
     #[test]
@@ -933,7 +997,17 @@ mod tests {
         let model = HistorialRenderModel::default();
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+        );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert_eq!(ids.len(), 4);
         assert!(ids.contains(&"historial:toggle_panel"));
@@ -1055,10 +1129,22 @@ mod tests {
         let legend_x = collapse_x - 1 - 3;
         let term_x = legend_x - 3;
         let agent_x = term_x - 3;
-        assert_eq!(header_button_at(area, collapse_x, 0), Some(HeaderButton::Collapse));
-        assert_eq!(header_button_at(area, legend_x, 0), Some(HeaderButton::Legend));
-        assert_eq!(header_button_at(area, term_x, 0), Some(HeaderButton::Terminals));
-        assert_eq!(header_button_at(area, agent_x, 0), Some(HeaderButton::Agent));
+        assert_eq!(
+            header_button_at(area, collapse_x, 0),
+            Some(HeaderButton::Collapse)
+        );
+        assert_eq!(
+            header_button_at(area, legend_x, 0),
+            Some(HeaderButton::Legend)
+        );
+        assert_eq!(
+            header_button_at(area, term_x, 0),
+            Some(HeaderButton::Terminals)
+        );
+        assert_eq!(
+            header_button_at(area, agent_x, 0),
+            Some(HeaderButton::Agent)
+        );
         // Off the header row -> None.
         assert_eq!(header_button_at(area, collapse_x, 1), None);
         // Left of the button cluster -> None.
@@ -1136,7 +1222,17 @@ mod tests {
         // Shown: the unnamed terminal row appears by its agent-kind identity
         // ("terminal"), still never the folder name.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+        );
         let shown = buffer_text(&buf);
         assert!(shown.contains("terminal"));
         assert!(!shown.contains("scratch"));
@@ -1170,7 +1266,17 @@ mod tests {
     fn collapsed_handle_declares_toggle() {
         let area = Rect::new(0, 0, 3, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&HistorialRenderModel::default(), area, &mut buf, None, RowFilters { show_terminals: true, ..RowFilters::default() }, None);
+        let hits = render(
+            &HistorialRenderModel::default(),
+            area,
+            &mut buf,
+            None,
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+        );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
     }
@@ -1228,7 +1334,10 @@ mod tests {
             area,
             &mut buf,
             Some(0),
-            RowFilters { show_terminals: true, ..RowFilters::default() },
+            RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
             None,
         );
         let text = buffer_text(&buf);
