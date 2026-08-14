@@ -61,12 +61,16 @@ func run() error {
 		return err
 	}
 
-	via, copyErr := Copy(block)
+	via, copyErr := CopyVerified(block)
 	if copyErr != nil {
-		_ = client.Notify(ctx, "copy metadata failed", copyErr.Error())
+		// Loudly: the notification, the stderr and a non-zero exit. A menu
+		// action that fails quietly is indistinguishable from a dead button,
+		// which is the report that started this.
+		herdr.Report(ctx, client, "copy-metadata", "copy metadata failed", copyErr.Error())
 		return copyErr
 	}
-	_ = client.Notify(ctx, "metadata copied", "via "+via)
+	herdr.Report(ctx, client, "copy-metadata", "metadata copied",
+		target.PaneID+" · "+target.WorkspaceID+" · via "+via)
 	fmt.Print(block)
 	return nil
 }

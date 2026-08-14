@@ -64,8 +64,14 @@ func run() error {
 	if dbg := os.Getenv("WSOPS_DEBUG"); dbg != "" {
 		params["env"].(map[string]string)["WSOPS_DEBUG"] = dbg
 	}
+	// The picker is a separate process in an overlay pane, so this action's only
+	// job is to open it — and until now it reported nothing either way. An open
+	// that fails left the menu looking dead, which is exactly the complaint.
 	if err := client.Call(ctx, "plugin.pane.open", params, nil); err != nil {
+		herdr.Report(ctx, client, "move-to-workspace", "move to workspace failed", err.Error())
 		return err
 	}
+	herdr.Report(ctx, client, "move-to-workspace", "pick a workspace",
+		"choose a destination for "+target.TabLabel)
 	return nil
 }

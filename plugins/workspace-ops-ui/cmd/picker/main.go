@@ -207,10 +207,13 @@ func (m *model) commit() tea.Cmd {
 	debugf("commit dest=%s(%s) panes=%d", dest.ID, dest.Display(), len(m.plan.Panes))
 	if _, err := m.plan.Execute(ctx, m.client, dest.ID, true); err != nil {
 		debugf("commit failed: %v", err)
+		// The overlay closes on success, so a failure that only painted its own
+		// status line vanished with it. Report it as well.
+		herdr.Report(ctx, m.client, "move-to-workspace", "move to workspace failed", err.Error())
 		m.status, m.failed = err.Error(), true
 		return nil
 	}
-	_ = m.client.Notify(ctx, "moved to workspace", m.plan.Summary(dest.Display()))
+	herdr.Report(ctx, m.client, "move-to-workspace", "moved to workspace", m.plan.Summary(dest.Display()))
 	m.status, m.done = m.plan.Summary(dest.Display()), true
 	return tea.Quit
 }

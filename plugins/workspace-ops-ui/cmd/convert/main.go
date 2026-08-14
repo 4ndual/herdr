@@ -53,13 +53,13 @@ func run() error {
 	workspace, err := plan.Execute(ctx, client, "", true)
 	if err != nil {
 		if workspace != "" {
-			_ = client.Notify(ctx, "convert to workspace: partial",
+			herdr.Report(ctx, client, "convert-to-workspace", "convert to workspace: partial",
 				fmt.Sprintf("%v — panes already moved are in the new workspace", err))
 		}
 		return err
 	}
 	name := plan.WorkspaceName()
-	_ = client.Notify(ctx, "converted to workspace", plan.Summary(name))
+	herdr.Report(ctx, client, "convert-to-workspace", "converted to workspace", plan.Summary(name))
 	fmt.Printf("%s\n", plan.Summary(name))
 	return nil
 }

@@ -56,11 +56,18 @@ type Target struct {
 // invocation, or a menu kind that carries less context — fall back to the
 // focused pane, which is what the user was looking at.
 func ResolveTarget(ctx context.Context, c *herdr.Client) (Target, error) {
-	t := Target{
-		PaneID:      os.Getenv("HERDR_PANE_ID"),
-		TabID:       os.Getenv("HERDR_TAB_ID"),
-		WorkspaceID: os.Getenv("HERDR_WORKSPACE_ID"),
-	}
+	// Only the PANE comes from the environment. HERDR_TAB_ID and
+	// HERDR_WORKSPACE_ID describe the tab and workspace that were SELECTED when
+	// the menu opened, which is not the same thing as the parentage of the pane
+	// that was clicked — right-click a pane in a workspace that is not the
+	// current one and they disagree.
+	//
+	// Seeding them from the environment and only falling back to the pane made
+	// every field except the pane id describe the wrong place: a pane in w1D
+	// reported "workspace w1C plugfix" because w1C was on screen. Parentage is
+	// therefore taken from the pane record and nowhere else; the environment
+	// values are kept only for the case where the pane cannot be found at all.
+	t := Target{PaneID: os.Getenv("HERDR_PANE_ID")}
 	panes, err := c.Panes(ctx)
 	if err != nil {
 		return t, err
@@ -76,16 +83,8 @@ func ResolveTarget(ctx context.Context, c *herdr.Client) (Target, error) {
 	if t.PaneID == "" {
 		return t, fmt.Errorf("no pane: neither HERDR_PANE_ID nor a focused pane")
 	}
-	for _, p := range panes {
-		if p.ID == t.PaneID {
-			if t.TabID == "" {
-				t.TabID = p.TabID
-			}
-			if t.WorkspaceID == "" {
-				t.WorkspaceID = p.WorkspaceID
-			}
-			break
-		}
+	if err := applyParentage(&t, panes); err != nil {
+		return t, err
 	}
 	tabs, err := c.Tabs(ctx)
 	if err != nil {
@@ -234,4 +233,25 @@ func Tilde(path string) string {
 		return "~" + path[len(home):]
 	}
 	return path
+}
+
+// applyParentage fills a target's tab and workspace from the PANE, which is the
+// only authority on where that pane lives.
+//
+// Kept separate from the socket calls so the rule itself is testable: the bug it
+// fixes is not visible in any state where the selection and the pane agree,
+// which is every state a casual test constructs.
+func applyParentage(t *Target, panes []herdr.Pane) error {
+	for _, p := range panes {
+		if p.ID == t.PaneID {
+			t.TabID = p.TabID
+			t.WorkspaceID = p.WorkspaceID
+			return nil
+		}
+	}
+	// The pane vanished between the click and now. Say so rather than silently
+	// describing whatever happens to be on screen.
+	t.TabID = os.Getenv("HERDR_TAB_ID")
+	t.WorkspaceID = os.Getenv("HERDR_WORKSPACE_ID")
+	return fmt.Errorf("pane %s is not in the pane list (closed since the menu opened?)", t.PaneID)
 }

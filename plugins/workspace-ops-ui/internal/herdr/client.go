@@ -369,3 +369,49 @@ func (c *Client) Notify(ctx context.Context, title, body string) error {
 	}
 	return c.Call(ctx, "notification.show", params, nil)
 }
+
+// NotifyResult shows a notification and reports whether the host actually
+// displayed it.
+//
+// `notification.show` answers a REFUSAL as a success: the transport call
+// returns no error while the body says {"shown":false,"reason":"disabled"} —
+// the same shape that made `pane.move` report refusals as moves. `reason` is
+// one of shown, disabled, rate_limited, no_foreground_client, busy; `disabled`
+// means `ui.toast.delivery = "off"`, which is the DEFAULT, so an action that
+// only checks the transport error believes it told the user something when it
+// told them nothing.
+func (c *Client) NotifyResult(ctx context.Context, title, body string) (shown bool, reason string, err error) {
+	params := map[string]any{"title": title}
+	if body != "" {
+		params["body"] = body
+	}
+	var out struct {
+		Shown  bool   `json:"shown"`
+		Reason string `json:"reason"`
+	}
+	if err := c.Call(ctx, "notification.show", params, &out); err != nil {
+		return false, "", err
+	}
+	return out.Shown, out.Reason, nil
+}
+
+// Report surfaces an action's outcome to the user, and refuses to be silently
+// refused.
+//
+// Every workspace-ops action ends in exactly one of these. The reason it must
+// check `shown` is the report that started this work: all three menu entries
+// read as dead buttons because `ui.toast.delivery` defaults to "off", so every
+// notification was answered {"shown":false,"reason":"disabled"} and dropped.
+// When the host will not show it, the outcome still reaches the command log's
+// stderr, and the reason names the setting that would fix it.
+func Report(ctx context.Context, c *Client, action, title, body string) {
+	shown, reason, err := c.NotifyResult(ctx, title, body)
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "%s: %s: %s (notification failed: %v)\n", action, title, body, err)
+	case !shown:
+		fmt.Fprintf(os.Stderr,
+			"%s: %s: %s (not shown: %s — set [ui.toast] delivery = \"herdr\" in config.toml)\n",
+			action, title, body, reason)
+	}
+}
