@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -167,7 +170,7 @@ func TestRunWritesTheSnapshotAndReportsIt(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "state", "image_input.json")
 
 	var stdout bytes.Buffer
-	code, err := run([]string{dir, out}, &stdout)
+	code, err := run(context.Background(), []string{dir, out}, &stdout)
 	if err != nil || code != 0 {
 		t.Fatalf("run: code=%d err=%v", code, err)
 	}
@@ -191,7 +194,7 @@ func TestRunWritesTheSnapshotAndReportsIt(t *testing.T) {
 
 func TestRunWithoutARootIsAUsageError(t *testing.T) {
 	t.Setenv("IMAGE_VIEW_ROOT", "")
-	code, err := run(nil, &bytes.Buffer{})
+	code, err := run(context.Background(), nil, &bytes.Buffer{})
 	if code != 2 || err == nil {
 		t.Fatalf("got code=%d err=%v, want code=2 and a usage error", code, err)
 	}
@@ -201,7 +204,7 @@ func TestRunWithoutARootIsAUsageError(t *testing.T) {
 // "no png found under <path>" is the whole diagnosis.
 func TestRunWithNoImagesExitsOneNamingThePath(t *testing.T) {
 	dir := tempDir(t, "empty-run")
-	code, err := run([]string{dir, filepath.Join(t.TempDir(), "out.json")}, &bytes.Buffer{})
+	code, err := run(context.Background(), []string{dir, filepath.Join(t.TempDir(), "out.json")}, &bytes.Buffer{})
 	if code != 1 || err == nil {
 		t.Fatalf("got code=%d err=%v, want code=1 with an error", code, err)
 	}
@@ -289,5 +292,119 @@ func TestAnMtimeTieResolvesDeterministically(t *testing.T) {
 	}
 	if got != newer {
 		t.Fatalf("got %q, want the strictly newer %q", got, newer)
+	}
+}
+
+// ── event-loop core ────────────────────────────────────────────────────────
+
+// The whole point of the shim architecture: the tick path and the event path
+// must produce the same bytes, or the "one-line migration" is a rewrite in
+// disguise and the gates only ever tested one of them.
+func TestTickShimAndEventLoopProduceIdenticalSnapshots(t *testing.T) {
+	dir := tempDir(t, "equiv")
+	writePNG(t, filepath.Join(dir, "a.png"), 320, 240)
+
+	tickOut := filepath.Join(t.TempDir(), "tick.json")
+	var tickStdout bytes.Buffer
+	code, err := run(context.Background(), []string{dir, tickOut}, &tickStdout)
+	if err != nil || code != 0 {
+		t.Fatalf("tick shim: code=%d err=%v", code, err)
+	}
+
+	loopOut := filepath.Join(t.TempDir(), "loop.json")
+	var loopStdout bytes.Buffer
+	core := &Core{Root: dir, Out: loopOut, Stdout: &loopStdout}
+	events := make(chan Event, 1)
+	events <- Event{Reason: "test", At: time.Now()}
+	close(events)
+	if err := core.RunLoop(context.Background(), events, nil); err != nil {
+		t.Fatalf("event loop: %v", err)
+	}
+
+	tickBytes, err := os.ReadFile(tickOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopBytes, err := os.ReadFile(loopOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(tickBytes, loopBytes) {
+		t.Fatalf("paths diverge:\n tick: %s\n loop: %s", tickBytes, loopBytes)
+	}
+	if tickStdout.String() == "" || loopStdout.String() == "" {
+		t.Fatal("both paths must report on stdout")
+	}
+}
+
+// A cancelled context must stop the loop immediately, not after one more event.
+// This is what makes shutdown clean in a long-lived process, and goleak in
+// TestMain is what proves nothing survives it.
+func TestRunLoopStopsOnCancellation(t *testing.T) {
+	dir := tempDir(t, "cancel")
+	writePNG(t, filepath.Join(dir, "a.png"), 10, 10)
+	core := &Core{Root: dir, Out: filepath.Join(t.TempDir(), "o.json"), Stdout: &bytes.Buffer{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events := make(chan Event) // unbuffered and never fed: only cancel can end this
+	done := make(chan error, 1)
+	go func() { done <- core.RunLoop(ctx, events, nil) }()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunLoop did not return within 2s of cancellation")
+	}
+}
+
+// A bad event must not kill a long-lived collector: an empty cache is normal,
+// and exiting would freeze the snapshot until someone restarted the process.
+func TestRunLoopSurvivesABadEvent(t *testing.T) {
+	empty := tempDir(t, "survive-empty")
+	core := &Core{Root: empty, Out: filepath.Join(t.TempDir(), "o.json"), Stdout: &bytes.Buffer{}}
+
+	var seen []error
+	events := make(chan Event, 2)
+	events <- Event{Reason: "empty-cache"}
+	events <- Event{Reason: "still-empty"}
+	close(events)
+
+	if err := core.RunLoop(context.Background(), events, func(err error) { seen = append(seen, err) }); err != nil {
+		t.Fatalf("loop returned %v; a bad event must not end it", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("got %d errors, want 2 — every bad event must be reported, not swallowed", len(seen))
+	}
+}
+
+// The handler must hold no state between events: a long-lived process that
+// accumulates is how a bounded job becomes a leak. Same core, many events,
+// byte-identical output every time.
+func TestHandlerIsStatelessAcrossManyEvents(t *testing.T) {
+	dir := tempDir(t, "stateless")
+	writePNG(t, filepath.Join(dir, "a.png"), 64, 48)
+	out := filepath.Join(t.TempDir(), "o.json")
+	core := &Core{Root: dir, Out: out, Stdout: io.Discard}
+
+	var first []byte
+	for n := 0; n < 500; n++ {
+		if err := core.HandleEvent(context.Background(), Event{Reason: "loop"}); err != nil {
+			t.Fatalf("event %d: %v", n, err)
+		}
+		current, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			first = current
+			continue
+		}
+		if !bytes.Equal(first, current) {
+			t.Fatalf("event %d produced different bytes than event 0", n)
+		}
 	}
 }

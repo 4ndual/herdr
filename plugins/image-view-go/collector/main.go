@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -35,7 +36,11 @@ type imageInput struct {
 }
 
 func main() {
-	code, err := run(os.Args[1:], os.Stdout)
+	// A tick run is short, but the context is real: it is the same one the
+	// event loop cancels on shutdown, so both paths stop the same way.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	code, err := run(ctx, os.Args[1:], os.Stdout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
@@ -44,7 +49,7 @@ func main() {
 
 // run is separated from main so the whole flow is testable without a subprocess:
 // it returns the exit code instead of calling os.Exit.
-func run(args []string, stdout io.Writer) (int, error) {
+func run(ctx context.Context, args []string, stdout io.Writer) (int, error) {
 	rootArg := ""
 	if len(args) > 0 {
 		rootArg = args[0]
@@ -66,50 +71,32 @@ func run(args []string, stdout io.Writer) (int, error) {
 		out = filepath.Join(os.Getenv("HERDR_PLUGIN_STATE_DIR"), "image_input.json")
 	}
 
-	newest, err := newestPNG(root)
-	if err != nil {
+	core := &Core{Root: root, Out: out, Stdout: stdout}
+	// THE SHIM: one synthesised event through the same handler the event loop
+	// will use. When the host's event-driven collector mode lands, this call is
+	// replaced by core.RunLoop(ctx, events, onError) and nothing else moves.
+	if err := core.HandleEvent(ctx, Event{Reason: "tick", At: time.Now()}); err != nil {
 		return 1, err
-	}
-	if newest == "" {
-		return 1, fmt.Errorf("no png found under %s", root)
-	}
-
-	width, height, ok, err := pngDimensions(newest)
-	if err != nil {
-		return 1, err
-	}
-	if !ok {
-		return 1, fmt.Errorf("not a png: %s", newest)
-	}
-
-	// Absolute, because the host requires it and because a relative path could
-	// not be checked against graphics_roots in any meaningful way.
-	absolute, err := filepath.Abs(newest)
-	if err != nil {
-		return 1, err
-	}
-	resolved, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return 1, err
-	}
-
-	input := imageInput{Path: resolved, Width: width, Height: height}
-	encoded, err := json.MarshalIndent(input, "", "  ")
-	if err != nil {
-		return 1, err
-	}
-	// serde_json::to_vec_pretty ends without a trailing newline; the Rust twin's
-	// output is byte-compared against this one in the parity gate.
-	if err := writeAtomic(out, encoded); err != nil {
-		return 1, err
-	}
-	// The snapshot is already on disk; a stdout write that fails (closed pipe,
-	// full disk) does not make the run unsuccessful, but it is not swallowed
-	// either — the host captures stderr into the plugin log.
-	if _, err := fmt.Fprintf(stdout, "%s -> %s\n", input.Path, out); err != nil {
-		fmt.Fprintf(os.Stderr, "image-view-collector: report line not written: %v\n", err) //nolint:errcheck // last resort
 	}
 	return 0, nil
+}
+
+// absoluteResolved makes the path absolute and resolves symlinks, because the
+// host requires an absolute path and a relative one could not be checked
+// against graphics_roots in any meaningful way.
+func absoluteResolved(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(absolute)
+}
+
+// marshalSnapshot encodes exactly what the Rust twin's serde_json::to_vec_pretty
+// produces — two-space indent, no trailing newline — because the parity gate
+// compares the two byte for byte.
+func marshalSnapshot(input imageInput) ([]byte, error) {
+	return json.MarshalIndent(input, "", "  ")
 }
 
 func expandTilde(raw string) string {
