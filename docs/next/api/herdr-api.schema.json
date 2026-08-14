@@ -9269,6 +9269,12 @@
               },
               "type": "array"
             },
+            "hit_rects": {
+              "description": "Declared `UiHitRect` count in the current layers. Zero on a module whose\nclicks \"do nothing\" means the module never published a target; non-zero\nmoves the investigation to coordinates.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
             "hot_reload": {
               "type": "string"
             },
@@ -9334,6 +9340,31 @@
             "plugin_id": {
               "type": "string"
             },
+            "rendered_content_h": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rendered_content_w": {
+              "description": "Measured content dims of the module's panel layers this frame,\nindependent of whether the panel was skipped.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rendered_nodes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rendered_surfaces": {
+              "description": "Whether this module produced any layer in the frame most recently laid\nout, and how much it produced.\n\n`panel_content_w/h` above are populated from the panel SKIP record, so a\nmodule that renders perfectly reports 0x0 there — read together with a\n`layer_count` that only covers pane layers, a healthy painting module was\nindistinguishable from a dead one. Four wrong diagnoses of the right rail\nsurvived on exactly that ambiguity. These fields answer the question\ndirectly: what did this module paint, and where.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "surfaces": {
               "items": {
                 "type": "string"
@@ -9343,6 +9374,15 @@
             "ui_input_file": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "wasm_memory_bytes": {
+              "description": "Linear memory held by the loaded guest instance, invisible to the process\nfootprint. `None` when the module is not loaded.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
                 "null"
               ]
             }
@@ -9361,7 +9401,12 @@
             "panel_content_w",
             "panel_content_h",
             "layer_count",
-            "layer_bytes"
+            "layer_bytes",
+            "rendered_surfaces",
+            "rendered_nodes",
+            "hit_rects",
+            "rendered_content_w",
+            "rendered_content_h"
           ],
           "type": "object"
         },

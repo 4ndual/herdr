@@ -843,7 +843,7 @@ fn panel_content_dims(app: &AppState, plugin_id: &str, module_id: &str) -> (u16,
 
 /// Cell width of a single node's line (span text char counts). Only Line/Status
 /// nodes carry inline text in the bottom dash; other node kinds contribute 0.
-fn ui_node_line_width(node: &UiNode) -> u16 {
+pub(crate) fn ui_node_line_width(node: &UiNode) -> u16 {
     let span_w = |spans: &[UiTextSpan]| -> u16 {
         spans
             .iter()

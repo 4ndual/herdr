@@ -154,6 +154,30 @@ impl App {
                         self.state.pane_text_totals_for_plugin(&module.plugin_id);
                     let (layer_count, layer_bytes) =
                         (graphics_layers + text_layers, graphics_bytes + text_bytes);
+                    // Measured from the live layer set, not from the skip record:
+                    // a module that renders fine has no skip record at all.
+                    let mut rendered_surfaces: Vec<String> = Vec::new();
+                    let mut rendered_nodes = 0usize;
+                    let mut hit_rects = 0usize;
+                    let mut rendered_content_w = 0u16;
+                    let mut rendered_content_h = 0u16;
+                    for entry in self.state.ui_surface_layers.iter().filter(|entry| {
+                        entry.plugin_id == module.plugin_id && entry.module_id == module.module_id
+                    }) {
+                        let surface = format!("{:?}", entry.layer.surface);
+                        if !rendered_surfaces.contains(&surface) {
+                            rendered_surfaces.push(surface);
+                        }
+                        rendered_nodes += entry.layer.nodes.len();
+                        hit_rects += entry.layer.hits.len();
+                        if entry.layer.surface == herdr_ui_plugin_api::UiSurface::Panel {
+                            for node in &entry.layer.nodes {
+                                rendered_content_w =
+                                    rendered_content_w.max(crate::ui::ui_node_line_width(node));
+                                rendered_content_h = rendered_content_h.saturating_add(1);
+                            }
+                        }
+                    }
                     crate::api::schema::PluginUiModuleStatus {
                         plugin_id: module.plugin_id.clone(),
                         module_id: module.module_id.clone(),
@@ -202,6 +226,14 @@ impl App {
                         panel_content_h: skip.map(|s| s.content_h).unwrap_or(0),
                         layer_count,
                         layer_bytes,
+                        rendered_surfaces,
+                        rendered_nodes,
+                        hit_rects,
+                        rendered_content_w,
+                        rendered_content_h,
+                        wasm_memory_bytes: self
+                            .ui_plugins
+                            .memory_bytes_for(&module.plugin_id, &module.module_id),
                     }
                 })
                 .collect();
@@ -4234,5 +4266,74 @@ command = ["act.exe"]
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(registry_dir);
+    }
+
+    /// A painting module must be distinguishable from a dead one.
+    ///
+    /// `panel_content_w/h` are filled from the panel SKIP record, so a module
+    /// that rendered fine reported 0x0 and — with a `layer_count` that only
+    /// counts pane layers — looked exactly like a module producing nothing.
+    /// Four wrong diagnoses of the right rail survived on that ambiguity.
+    #[tokio::test]
+    async fn plugin_ui_status_reports_what_a_module_actually_rendered() {
+        let mut app = test_app();
+        let Some(module) = app.ui_plugins.all().first().cloned() else {
+            panic!("test app auto-links the bundled ui dashboards");
+        };
+        app.state.ui_surface_layers = vec![crate::ui_plugins::UiSurfaceLayer {
+            plugin_id: module.plugin_id.clone(),
+            module_id: module.module_id.clone(),
+            negotiated_version: 3,
+            placement: None,
+            layer: herdr_ui_plugin_api::UiLayer {
+                surface: herdr_ui_plugin_api::UiSurface::Panel,
+                z_index: 1,
+                consumes_mouse: false,
+                nodes: vec![herdr_ui_plugin_api::UiNode::Line {
+                    spans: vec![herdr_ui_plugin_api::UiTextSpan {
+                        text: "hello".into(),
+                        role: None,
+                        bold: false,
+                        underline: false,
+                        italic: false,
+                    }],
+                }],
+                hits: vec![herdr_ui_plugin_api::UiHitRect {
+                    x: 0,
+                    y: 0,
+                    width: 5,
+                    height: 1,
+                    action_id: "go".into(),
+                }],
+                data: None,
+            },
+        }];
+
+        let response = app.handle_plugin_ui_status(
+            "1".to_string(),
+            crate::api::schema::PluginUiStatusParams {
+                plugin_id: Some(module.plugin_id.clone()),
+                module_id: Some(module.module_id.clone()),
+            },
+        );
+        let ResponseResult::PluginUiStatus { modules } = response_result(&response) else {
+            panic!("expected a plugin.ui.status result");
+        };
+        let status = modules.first().expect("the filtered module");
+        assert_eq!(status.rendered_surfaces, vec!["Panel".to_string()]);
+        assert_eq!(status.rendered_nodes, 1);
+        assert_eq!(
+            status.hit_rects, 1,
+            "a published click target must be visible"
+        );
+        assert_eq!(
+            (status.rendered_content_w, status.rendered_content_h),
+            (5, 1)
+        );
+        assert_eq!(
+            (status.panel_content_w, status.panel_content_h),
+            (0, 0),
+            "the skip-derived dims stay zero: that is exactly why the rendered dims exist"
+        );
     }
 }

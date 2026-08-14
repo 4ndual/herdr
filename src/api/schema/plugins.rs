@@ -99,6 +99,29 @@ pub struct PluginUiModuleStatus {
     /// the host accounting here is the only way to attribute it.
     pub layer_count: usize,
     pub layer_bytes: usize,
+    /// Whether this module produced any layer in the frame most recently laid
+    /// out, and how much it produced.
+    ///
+    /// `panel_content_w/h` above are populated from the panel SKIP record, so a
+    /// module that renders perfectly reports 0x0 there — read together with a
+    /// `layer_count` that only covers pane layers, a healthy painting module was
+    /// indistinguishable from a dead one. Four wrong diagnoses of the right rail
+    /// survived on exactly that ambiguity. These fields answer the question
+    /// directly: what did this module paint, and where.
+    pub rendered_surfaces: Vec<String>,
+    pub rendered_nodes: usize,
+    /// Declared `UiHitRect` count in the current layers. Zero on a module whose
+    /// clicks "do nothing" means the module never published a target; non-zero
+    /// moves the investigation to coordinates.
+    pub hit_rects: usize,
+    /// Measured content dims of the module's panel layers this frame,
+    /// independent of whether the panel was skipped.
+    pub rendered_content_w: u16,
+    pub rendered_content_h: u16,
+    /// Linear memory held by the loaded guest instance, invisible to the process
+    /// footprint. `None` when the module is not loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_memory_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

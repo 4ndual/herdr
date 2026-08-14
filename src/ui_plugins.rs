@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
-use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 /// Spec §5.4: at most this many `HostEffect::Api` effects are executed from one
 /// `UiUpdate`; any beyond it are refused (never silently dropped — the caller
@@ -222,6 +222,18 @@ impl PluginRuntime {
             .contains_key(&(plugin_id.to_string(), module_id.to_string()))
     }
 
+    /// Bytes of linear memory the guest instance currently holds.
+    ///
+    /// Guest memory lives inside the wasm instance and is invisible to the
+    /// process footprint, so without this a leaking module is indistinguishable
+    /// from an idle one from outside.
+    fn instance_memory_bytes(&self, plugin_id: &str, module_id: &str) -> Option<usize> {
+        let instance = self
+            .instances
+            .get(&(plugin_id.to_string(), module_id.to_string()))?;
+        Some(instance.memory.data_size(&instance.store))
+    }
+
     fn new() -> Result<Self, String> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
@@ -410,6 +422,80 @@ struct ModuleInstance {
     negotiated_version: u32,
 }
 
+/// Give guests a working `fd_write` that lands in the host log.
+///
+/// UI modules run freestanding, with no WASI. Anything a guest printed —
+/// `println!`, a panic message, `dbg!` left in during development — either
+/// failed instantiation with "unknown import" or vanished, so plugin authors
+/// had no way at all to see inside their own module and the host had no record
+/// of a guest that was screaming. Both stdout (fd 1) and stderr (fd 2) are
+/// routed to `tracing` tagged with the module identity; every other fd reports
+/// EBADF rather than pretending the write happened.
+fn define_guest_stdio(
+    linker: &mut Linker<()>,
+    plugin_id: &str,
+    module_id: &str,
+) -> Result<(), String> {
+    let plugin_id = plugin_id.to_string();
+    let module_id = module_id.to_string();
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            move |mut caller: Caller<'_, ()>,
+                  fd: i32,
+                  iovs: i32,
+                  iovs_len: i32,
+                  nwritten: i32|
+                  -> i32 {
+                const ERRNO_SUCCESS: i32 = 0;
+                const ERRNO_BADF: i32 = 8;
+                if fd != 1 && fd != 2 {
+                    return ERRNO_BADF;
+                }
+                let Some(wasmtime::Extern::Memory(memory)) = caller.get_export("memory") else {
+                    return ERRNO_BADF;
+                };
+                let data = memory.data(&caller);
+                let mut text = String::new();
+                let mut written: u32 = 0;
+                for i in 0..iovs_len.max(0) {
+                    let head = iovs as usize + (i as usize * 8);
+                    let Some(iov) = data.get(head..head + 8) else {
+                        break;
+                    };
+                    let ptr = u32::from_le_bytes([iov[0], iov[1], iov[2], iov[3]]) as usize;
+                    let len = u32::from_le_bytes([iov[4], iov[5], iov[6], iov[7]]) as usize;
+                    // A guest cannot be trusted to log a bounded amount, and this
+                    // runs on the render path: take a slice, never the whole heap.
+                    let len = len.min(GUEST_LOG_MAX_BYTES);
+                    let Some(bytes) = data.get(ptr..ptr.saturating_add(len)) else {
+                        break;
+                    };
+                    text.push_str(&String::from_utf8_lossy(bytes));
+                    written = written.saturating_add(len as u32);
+                }
+                let text = text.trim_end();
+                if !text.is_empty() {
+                    tracing::warn!(plugin = %plugin_id, module = %module_id, fd, "{text}");
+                }
+                // Report the byte count back so the guest's writer does not spin
+                // retrying a short write.
+                let nwritten = nwritten as usize;
+                if let Some(slot) = memory.data_mut(&mut caller).get_mut(nwritten..nwritten + 4) {
+                    slot.copy_from_slice(&written.to_le_bytes());
+                }
+                ERRNO_SUCCESS
+            },
+        )
+        .map_err(|err| format!("failed to define guest fd_write: {err}"))?;
+    Ok(())
+}
+
+/// Per-iovec cap on guest log text. A runaway guest gets truncated, not a host
+/// allocation the size of its heap.
+const GUEST_LOG_MAX_BYTES: usize = 4096;
+
 impl ModuleInstance {
     fn build(engine: &Engine, module: &RegisteredUiModule) -> Result<Self, String> {
         let path = module.module_path.display();
@@ -421,7 +507,10 @@ impl ModuleInstance {
         // Arm a finite deadline so instantiation/start code cannot hang either;
         // every subsequent guest call re-arms before running.
         store.set_epoch_deadline(EPOCH_DEADLINE_TICKS);
-        let instance = Instance::new(&mut store, &compiled, &[])
+        let mut linker = Linker::new(engine);
+        define_guest_stdio(&mut linker, &module.plugin_id, &module.module_id)?;
+        let instance = linker
+            .instantiate(&mut store, &compiled)
             .map_err(|err| format!("failed to instantiate wasm ui module {path}: {err}"))?;
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -1402,6 +1491,13 @@ impl UiPluginManager {
 
     /// fork(+127): the module's last load / hot-reload / call error, if the most
     /// recent attempt failed.
+    /// Linear-memory size of the loaded guest, if it is loaded.
+    pub(crate) fn memory_bytes_for(&self, plugin_id: &str, module_id: &str) -> Option<usize> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.instance_memory_bytes(plugin_id, module_id))
+    }
+
     pub(crate) fn last_error_for(&self, plugin_id: &str, module_id: &str) -> Option<&str> {
         self.last_errors
             .get(&(plugin_id.to_string(), module_id.to_string()))
