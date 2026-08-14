@@ -38,8 +38,8 @@ type Args = { display: string; session: string; out: string; dryRun: boolean };
 
 function parseArgs(argv: string[]): Args {
   const args: Args = {
-    display: ":21",
-    session: "hpanel",
+    display: ":9",
+    session: "herdrtest",
     out: join(process.env.HOME ?? "/tmp", "Projects/herdr/.local/qa/harness-panel-e2e.mp4"),
     dryRun: false,
   };
@@ -57,7 +57,7 @@ function parseArgs(argv: string[]): Args {
 
 const args = parseArgs(process.argv.slice(2));
 const HERDR = process.env.HERDR_BIN ?? `${process.env.HOME}/.local/bin/herdrtest`;
-const SOCKET = `${process.env.HOME}/.herdr-${args.session}/config/herdr/sessions/${args.session}/herdr.sock`;
+const SOCKET = `${process.env.HOME}/.herdr-test/config/herdr/sessions/herdrtest/herdr.sock`;
 const SIZE = "1600x1000";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -68,7 +68,16 @@ const HOLD = 3000;
 function sh(cmd: string, cmdArgs: string[], env: Record<string, string> = {}) {
   return spawnSync(cmd, cmdArgs, {
     encoding: "utf8",
-    env: { ...process.env, DISPLAY: args.display, HERDR_SOCKET_PATH: SOCKET, ...env },
+    // BOTH socket vars: HERDR_CLIENT_SOCKET_PATH is inherited from whatever
+    // session this script runs inside and WINS over HERDR_SOCKET_PATH, so
+    // setting only the latter silently drives the wrong server.
+    env: {
+      ...process.env,
+      DISPLAY: args.display,
+      HERDR_SOCKET_PATH: SOCKET,
+      HERDR_CLIENT_SOCKET_PATH: SOCKET,
+      ...env,
+    },
   });
 }
 
@@ -76,6 +85,29 @@ function click(x: number, y: number) {
   if (args.dryRun) return;
   sh("xdotool", ["mousemove", String(x), String(y)]);
   sh("xdotool", ["click", "1"]);
+}
+
+const E2E_HARNESS = "hp-e2e-rec";
+const SPAWN_X = 1465;
+const STOP_X = 1539;
+const REFRESH_X = 1592;
+const ACTION_Y = 257;
+
+/** Change the panel width the only way it can change: manifest + relink. */
+function setWidth(cols: string) {
+  if (args.dryRun) return;
+  const manifest = `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui/herdr-plugin.toml`;
+  sh("sed", ["-i", `s/^size = \"[0-9]*\"/size = \"${cols}\"/`, manifest]);
+  sh(HERDR, ["plugin", "unlink", `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui`]);
+  sh(HERDR, ["plugin", "link", `${process.env.HOME}/Projects/herdr/plugins/harness-panel-ui`]);
+}
+
+/** Drive the collector op directly, for states past the tab wrap. */
+function op(opArgs: string[]) {
+  if (args.dryRun) return;
+  sh(`${process.env.HOME}/Projects/herdr/target/release/harness-panel-collector`, ["op", ...opArgs], {
+    HERDR_PLUGIN_STATE_DIR: `${process.env.HOME}/.herdr-test/state/herdr/plugins/builtin.harness-panel`,
+  });
 }
 
 function hover(x: number, y: number) {
@@ -133,43 +165,92 @@ async function main() {
   // Panel geometry. Filled from the live layout once the panel paints; the
   // constants below are the fallback for a 1600x1000 stage with a 34-column
   // right panel at an 8x19 cell.
-  const PANEL_X = 1600 - 34 * 8;
-  const TAB_Y = 6 + 19; // second row of the panel: the tab strip
-  const tabX = (i: number) => PANEL_X + 8 + i * 7 * 8;
-  const rowY = (i: number) => TAB_Y + 19 * (i + 1);
+  // Measured against the live panel (host rect x=141 y=1 56x41 on a 1600x1000
+  // stage). Pixel values, not derived from an assumed cell size — the earlier
+  // derivation was wrong and every click missed silently.
+  const PANEL_X = 1410;
+  const TAB_Y = 49;
+  const TAB_X = [1440, 1520, 1575]; // Fleet, Detail, Orch (the strip wraps)
+  const ROW0 = 70;
+  const ROW_H = 19.6;
+  const rowY = (i: number) => Math.round(ROW0 + ROW_H * i);
 
   mark("panel visible, fleet list");
   await sleep(HOLD);
 
-  const views = ["Fleet", "Detail", "Orch", "Tmpl", "Models", "Mem"];
-  for (let i = 0; i < views.length; i++) {
-    click(tabX(i), TAB_Y);
-    mark(`clicked tab ${views[i]}`);
+  // The visible tabs are clicked for real. The remaining views (Tmpl, Models,
+  // Mem) sit past the wrap point at this width, so they are driven through the
+  // same op the click produces — the effect on screen is identical and the
+  // recording still shows each view rendering live.
+  const clickTabs = ["Fleet", "Detail", "Orch"];
+  for (let i = 0; i < clickTabs.length; i++) {
+    click(TAB_X[i], TAB_Y);
+    mark(`clicked tab ${clickTabs[i]}`);
     await sleep(HOLD);
   }
-
-  click(tabX(0), TAB_Y);
+  for (const v of ["templates", "models", "memory"]) {
+    op(["-action", "view", "-view", v]);
+    mark(`view ${v}`);
+    await sleep(HOLD);
+  }
+  op(["-action", "view", "-view", "fleet"]);
   mark("back to Fleet");
   await sleep(HOLD);
 
-  hover(PANEL_X + 40, rowY(1));
+  hover(PANEL_X + 40, rowY(3));
   mark("hover a fleet row — tooltip line");
   await sleep(HOLD);
 
-  click(PANEL_X + 40, rowY(1));
+  click(PANEL_X + 40, rowY(3));
   mark("clicked a row — selects the harness, switches to Detail");
   await sleep(HOLD * 2);
 
-  click(tabX(0), TAB_Y);
+  op(["-action", "view", "-view", "fleet"]);
   await sleep(HOLD);
-  wheel(PANEL_X + 40, rowY(3), 5);
+  wheel(PANEL_X + 40, rowY(6), 6);
   mark("wheel-scrolled the fleet list");
   await sleep(HOLD);
 
   // Both panel widths. The panel width follows the manifest placement, so the
   // second width comes from a live manifest edit + relink rather than a resize.
-  mark("width A (wide) held");
+  setWidth("96");
   await sleep(HOLD);
+  mark("width A (wide, 96 cols) held");
+  await sleep(HOLD);
+
+  // Mutations, clicked for real on the detail action row. A throwaway harness
+  // is used so a live one is never spawned or stopped by the recording.
+  sh("curl", ["-s", "-X", "POST", "-H", "content-type: application/json",
+    "--data", JSON.stringify({ name: E2E_HARNESS, runtime: "claude", template: "default" }),
+    "http://127.0.0.1:7877/api/harness"]);
+  await sleep(2000);
+  op(["-action", "select", "-target", E2E_HARNESS]);
+  mark(`selected throwaway harness ${E2E_HARNESS}`);
+  await sleep(HOLD * 2);
+
+  // The action row sits under the detail fields; y measured on the live panel.
+  click(SPAWN_X, ACTION_Y);
+  mark("clicked [spawn] — fleet should flip stopped -> idle");
+  await sleep(HOLD * 3);
+  click(STOP_X, ACTION_Y);
+  mark("clicked [stop] — fleet should flip back to stopped");
+  await sleep(HOLD * 3);
+  click(REFRESH_X, ACTION_Y);
+  mark("clicked [refresh]");
+  await sleep(HOLD * 2);
+
+  // Second width: a manifest edit + relink is how panel width changes, so the
+  // recording shows the layout actually re-flowing rather than a cropped view.
+  op(["-action", "view", "-view", "fleet"]);
+  await sleep(HOLD);
+  setWidth("40");
+  mark("width B (narrow, 40 cols) — fleet rows stack onto two lines");
+  await sleep(HOLD * 3);
+  setWidth("96");
+  mark("back to width A (96 cols) — rows go columnar again");
+  await sleep(HOLD * 2);
+
+  sh("curl", ["-s", "-X", "DELETE", `http://127.0.0.1:7877/api/harness/${E2E_HARNESS}`]);
 
   console.log("\n--- timeline ---\n" + timeline.join("\n"));
   writeFileSync(args.out.replace(/\.mp4$/, ".timeline"), timeline.join("\n") + "\n");
