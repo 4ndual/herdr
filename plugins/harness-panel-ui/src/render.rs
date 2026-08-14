@@ -22,9 +22,16 @@ use crate::model::{Snapshot, VIEWS};
 use herdr_ui_plugin_api::{UiHitRect, UiNode, UiTextSpan};
 
 /// The panel-width breakpoint, in columns. Below this the panel stacks; at or
-/// above it, rows go columnar. 44 is where `name + status + ctx + sessions`
-/// stops fitting on one line without truncating the name to uselessness.
-pub const WIDE_COLS: u16 = 44;
+/// above it, rows go columnar.
+///
+/// 36, not 44, because of the host's own geometry: the right panel is
+/// `terminal_cols / 4` clamped to `[28, 56]` (herdr `src/ui.rs`), so on a
+/// 1600px screen it is 40 columns and only reaches 44 on a display wider than
+/// ~1760px. A 44 breakpoint would leave the columnar layout unreachable — dead
+/// code in the only mount that exists. 36 straddles the achievable range: a
+/// narrow window stacks, a full-width one goes columnar, and
+/// `○ codex-gp 0s 0p` still fits on one line at 36.
+pub const WIDE_COLS: u16 = 36;
 
 pub struct Ctx {
     pub width: u16,
@@ -133,7 +140,7 @@ fn header(snap: &Snapshot, ctx: &Ctx, out: &mut Painted, y: &mut u16) {
         y: *y,
         width: 1,
         height: 1,
-        action_id: "toggle:panel".into(),
+        action_id: "close:panel".into(),
     });
     *y += 1;
 
@@ -310,31 +317,6 @@ pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
         hits: Vec::new(),
         total_rows: 0,
     };
-    // Collapsed: one clickable line, and nothing else. This lives here rather
-    // than in the ABI wrapper because it IS the rendered contract — a caller
-    // that renders a closed snapshot must get the collapsed panel, and a test
-    // that renders one must see it.
-    //
-    // Never an empty layer: a guest that stops emitting one is stranded, because
-    // the host drops its carve and afterwards only ever sends a zero rect, so it
-    // can never claim geometry again and freezes mid-screen.
-    if !snap.open {
-        out.nodes.push(line(vec![span(
-            fit("▦ harness fleet — click to open", ctx.width as usize),
-            Some("muted"),
-            true,
-        )]));
-        out.hits.push(UiHitRect {
-            x: 0,
-            y: 0,
-            width: ctx.width,
-            height: 1,
-            action_id: "toggle:panel".into(),
-        });
-        out.total_rows = 1;
-        return out;
-    }
-
     let mut y: u16 = 0;
     header(snap, ctx, &mut out, &mut y);
 

@@ -229,43 +229,25 @@ fn the_models_view_lists_real_model_ids() {
     );
 }
 
-/// The launcher contract: closed renders ONE clickable line, open renders the
-/// views. Neither state may be empty — a guest that stops emitting a layer is
-/// stranded, because the host drops the carve and then only ever sends a zero
-/// rect, so it can never claim geometry again and freezes mid-screen.
+/// The close control. The rail opens the panel; this is the way back, and the
+/// standing UI rule is that any overlay-like surface carries a mouse-clickable
+/// close. Rendered from a real fixture so it cannot regress to a decoration.
 #[test]
-fn closed_collapses_to_one_clickable_line_and_open_restores_the_views() {
-    let raw = fixture("fleet.json");
-    let size = RenderSize {
-        width: 56,
-        height: 40,
-    };
-
-    // The fixtures predate the flag; an absent `open` must mean visible.
-    let absent = render_text(&raw, size);
-    assert!(
-        absent.lines().count() > 3,
-        "an absent `open` collapsed the panel — old snapshots must still render:\n{absent}"
+fn the_header_carries_a_clickable_close() {
+    let text = render_text(
+        &fixture("fleet.json"),
+        RenderSize {
+            width: 40,
+            height: 30,
+        },
     );
-
-    let closed = raw.replace("\"view\":", "\"open\":false,\"view\":");
-    let text = render_text(&closed, size);
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(
-        lines.len(),
-        1,
-        "closed must render exactly one line, got:\n{text}"
+    let first = text.lines().next().unwrap_or_default();
+    assert!(
+        first.contains('✕'),
+        "the title row must carry a close glyph, got {first:?}"
     );
     assert!(
-        lines[0].contains("harness fleet"),
-        "the collapsed line must name the panel: {:?}",
-        lines[0]
-    );
-
-    let open = raw.replace("\"view\":", "\"open\":true,\"view\":");
-    let opened = render_text(&open, size);
-    assert!(
-        opened.lines().count() > 3 && opened.contains("Fleet"),
-        "open must restore the views:\n{opened}"
+        first.chars().count() <= 40,
+        "the close must sit inside the rect, not past it: {first:?}"
     );
 }

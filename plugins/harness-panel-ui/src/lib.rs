@@ -254,11 +254,26 @@ fn on_action(action_id: &str) -> UiUpdate {
     // 35-row fleet list on a 3-row templates list shows an empty panel.
     *SCROLL.lock().expect("scroll") = 0;
 
+    // Closing is not a data change, so it never reaches the collector: the host
+    // owns right-panel visibility (the rail expands it), and §7.2 lets a module
+    // collapse a surface it declares. Routing this through the collector instead
+    // would fight the rail for the same state.
+    if verb == "close" {
+        return UiUpdate {
+            layers: Vec::new(),
+            effects: vec![HostEffect::SetSurfaceCollapsed {
+                surface: UiSurface::RightPanel,
+                collapsed: true,
+            }],
+            scope: UiUpdateScope::Partial,
+            consumed_action_ids: vec![action_id.to_string()],
+        };
+    }
+
     let payload = match verb {
         "view" => serde_json::json!({ "action": "view", "view": arg }),
         "select" => serde_json::json!({ "action": "select", "target": arg }),
         "spawn" | "stop" | "refresh" => serde_json::json!({ "action": verb, "target": arg }),
-        "toggle" => serde_json::json!({ "action": "toggle" }),
         _ => return UiUpdate::default(),
     };
 
