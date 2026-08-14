@@ -19,6 +19,14 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  CLOSE_LABEL,
+  closeX,
+  disableMouse,
+  enableMouse,
+  isCloseClick,
+  isCloseKey,
+} from "./overlay-chrome";
 
 const STATE_DIR =
   process.env.HERDR_PLUGIN_STATE_DIR ??
@@ -84,14 +92,26 @@ function render() {
   const body: string[] = [];
   for (let i = 0; i < view; i += 1) {
     const line = source[top + i] ?? "";
-    body.push(style(line.slice(0, width - 1)));
+    // Row 0 reserves the top-right cells for the close control (canon §3.1.7):
+    // a mouse-first TUI needs a clickable exit, not only Esc.
+    const room = i === 0 ? closeX(width) - 1 : width - 1;
+    body.push(style(line.slice(0, Math.max(0, room))));
   }
+  body[0] =
+    (body[0] ?? "").padEnd(Math.max(0, closeX(width)) + (body[0] ?? "").length - visibleLength(body[0] ?? "")) +
+    `${ACCENT}${CLOSE_LABEL}${RESET}`;
   const position = source.length > view ? `${top + 1}-${Math.min(top + view, source.length)}/${source.length}  ` : "";
-  const hint = `${DIM} ${position}↑↓ scroll · pgup/pgdn page · esc close${RESET}`;
+  const hint = `${DIM} ${position}↑↓ scroll · pgup/pgdn page · q / esc / [x] close${RESET}`;
   out.write(`\x1b[H\x1b[2J${body.join("\r\n")}\r\n${hint}`);
 }
 
+/** Printable length, ignoring the ANSI escapes `style()` may have inserted. */
+function visibleLength(text: string): number {
+  return text.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
 function close() {
+  disableMouse(out);
   out.write("\x1b[H\x1b[2J");
   try {
     (process.stdin as any).setRawMode?.(false);
@@ -103,6 +123,9 @@ function close() {
 
 function onData(chunk: Buffer) {
   const text = chunk.toString("utf8");
+  // The clickable [x], first: a press on it closes exactly like Esc does.
+  if (isCloseClick(text, cols())) return close();
+  if (isCloseKey(text)) return close();
   const page = Math.max(1, rows() - 2);
   let index = 0;
   let dirty = false;
@@ -127,7 +150,6 @@ function onData(chunk: Buffer) {
       continue;
     }
     index += 1;
-    if (ch === "q" || ch === "\x03" || ch === "\x04") return close();
     if (ch === " ") {
       top += page;
       dirty = true;
@@ -142,6 +164,9 @@ try {
 } catch {
   /* not a tty — render once; the host can still close us */
 }
+enableMouse(out);
+// Any exit path must hand the terminal back the way it found it.
+process.on("exit", () => disableMouse(out));
 process.stdin.resume();
 process.stdin.on("data", onData);
 process.on("SIGWINCH", render);

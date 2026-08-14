@@ -22,6 +22,14 @@
 
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import {
+  CLOSE_LABEL,
+  closeX,
+  disableMouse,
+  enableMouse,
+  isCloseClick,
+  isCloseKey,
+} from "./overlay-chrome";
 
 type Button = {
   id: string;
@@ -83,7 +91,9 @@ const pad = (text: string, to: number) => text + " ".repeat(Math.max(0, to - wid
 function render() {
   const term = cols();
   const lines: string[] = [];
-  lines.push(` \x1b[1mButton dash — every button\x1b[0m  ${DIM}esc to close${RESET}`);
+  // Title row carries the clickable close control at the right (canon §3.1.7).
+  const title = " \x1b[1mButton dash — every button\x1b[0m";
+  lines.push(`${title}${" ".repeat(Math.max(1, closeX(term) - 27))}${ROLE.teal}${CLOSE_LABEL}${RESET}`);
   lines.push("");
   // Column widths from the data, so a longer label never wraps mid-row.
   const labelW = Math.max(...buttons.map((b) => width(b.label)));
@@ -99,10 +109,15 @@ function render() {
     const desc = [...b.description].slice(0, room).join("");
     lines.push(`${color}${head}${RESET}${DIM}${desc}${RESET}`);
   }
+  // Footer names every key that does anything, including the two that are not
+  // keys at all — the canon's rule that an undocumented key does not exist.
+  lines.push("");
+  lines.push(`${DIM} ↵ / q / esc / [x] close${RESET}`);
   out.write(`\x1b[H\x1b[2J${lines.join("\r\n")}`);
 }
 
 function close() {
+  disableMouse(out);
   out.write("\x1b[H\x1b[2J");
   try {
     (process.stdin as any).setRawMode?.(false);
@@ -118,11 +133,13 @@ try {
   /* not a tty — still render once, the host will close us */
 }
 process.stdin.resume();
+enableMouse(out);
+process.on("exit", () => disableMouse(out));
 process.stdin.on("data", (chunk: Buffer) => {
   const text = chunk.toString("utf8");
-  // Esc, q, Enter, ^C, ^D all close. Anything else is ignored rather than
-  // typed into a surface that has no input.
-  if (/[\x1bq\r\n\x03\x04]/.test(text)) close();
+  // A press on the [x], or any of the close keys. Everything else is ignored
+  // rather than typed into a surface that has no input.
+  if (isCloseClick(text, cols()) || isCloseKey(text) || /[\r\n]/.test(text)) close();
 });
 process.on("SIGWINCH", render);
 render();

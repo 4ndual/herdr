@@ -141,9 +141,9 @@ command = [
 id = "reference"
 title = "button reference"
 description = "Every button in the dash with its shortcut and what it does"
+# No width/height here: the host only accepts a size on a "popup" pane
+# (manifest.rs invalid_plugin_pane_size), and an overlay is sized by the host.
 placement = "overlay"
-width = 96
-height = 16
 command = ["sh", "-lc", "exec bun run \"$HERDR_PLUGIN_ROOT/scripts/reference-overlay.ts\""]
 
 # remote: CLAUDE ONLY. Enable Claude Code Remote Control on the CURRENT pane's

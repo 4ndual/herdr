@@ -37,6 +37,7 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import { CLOSE_LABEL, closeX, disableMouse, enableMouse, isCloseClick } from "./overlay-chrome";
 
 type Runtime = "claude" | "codex" | "pi";
 
@@ -405,8 +406,14 @@ function render() {
   if (cursor >= top + listRows) top = cursor - listRows + 1;
 
   const lines: string[] = [];
+  // The clickable [x] rides the header row’s right edge: herdr is mouse-first,
+  // so every overlay ships a close control a mouse can hit, not only Esc
+  // (canon §3.1.7). The pad is computed from the VISIBLE length, since the
+  // header carries SGR escapes that occupy no columns.
+  const head = `\x1b[1m resume\x1b[0m  ${shown.length}/${all.length} sessions   \x1b[2m↑↓ move · enter resume (skip mode) · q / esc / [x] close\x1b[0m`;
+  const headWidth = head.replace(/\x1b\[[0-9;]*m/g, "").length;
   lines.push(
-    `\x1b[1m resume\x1b[0m  ${shown.length}/${all.length} sessions   \x1b[2m↑↓ move · enter resume (skip mode) · esc cancel\x1b[0m`,
+    `${head}${" ".repeat(Math.max(1, closeX(width) - headWidth))}\x1b[36m${CLOSE_LABEL}\x1b[0m`,
   );
   lines.push(` \x1b[36m/\x1b[0m ${query}\x1b[7m \x1b[0m`);
 
@@ -433,6 +440,7 @@ function render() {
 // ── input ───────────────────────────────────────────────────────────────────
 
 function finish(command: string | null) {
+  disableMouse(out as unknown as NodeJS.WriteStream);
   write("\x1b[H\x1b[2J");
   try {
     (process.stdin as any).setRawMode?.(false);
@@ -453,6 +461,8 @@ function finish(command: string | null) {
  */
 function onData(chunk: Buffer) {
   const text = chunk.toString("utf8");
+  // A press on the [x] cancels, exactly like Esc: one exit, three doors.
+  if (isCloseClick(text, cols())) return finish(null);
   let index = 0;
   let dirty = false;
 
@@ -534,6 +544,9 @@ function main() {
     /* not a tty — keys will still arrive line-buffered */
   }
   process.stdin.resume();
+  enableMouse(out as unknown as NodeJS.WriteStream);
+  // Hand the terminal back however we leave.
+  process.on("exit", () => disableMouse(out as unknown as NodeJS.WriteStream));
   process.stdin.on("data", onData);
   process.on("SIGWINCH", render);
   render();
