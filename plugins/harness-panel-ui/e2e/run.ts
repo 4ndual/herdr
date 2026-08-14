@@ -31,7 +31,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 type Args = { display: string; session: string; out: string; dryRun: boolean };
@@ -62,8 +62,16 @@ const SIZE = "1600x1000";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Beat between steps. Deliberately unhurried: the reviewer samples frames. */
-const HOLD = 3000;
+/** Beat between steps.
+ *
+ * Deliberately unhurried, and sized against the RENDER LAG rather than taste:
+ * a view change travels op -> control file -> collector fetch -> input file ->
+ * host tick -> repaint, which takes ~4s. At a 3s hold each state was superseded
+ * before it ever reached the screen, so the orchestrator view never appeared on
+ * camera and the gate rejected the recording for it. The hold must exceed the
+ * lag with margin, because the reviewer samples frames rather than watching.
+ */
+const HOLD = 7000;
 
 function sh(cmd: string, cmdArgs: string[], env: Record<string, string> = {}) {
   return spawnSync(cmd, cmdArgs, {
@@ -108,6 +116,33 @@ function op(opArgs: string[]) {
   sh(`${process.env.HOME}/Projects/herdr/target/release/harness-panel-collector`, ["op", ...opArgs], {
     HERDR_PLUGIN_STATE_DIR: `${process.env.HOME}/.herdr-test/state/herdr/plugins/builtin.harness-panel`,
   });
+}
+
+type Snap = { view: string; selected?: string; fleet?: { name: string; status: string }[] };
+
+function snap(): Snap {
+  const p = `${process.env.HOME}/.herdr-test/state/herdr/plugins/builtin.harness-panel/harness_panel_input.json`;
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as Snap;
+  } catch {
+    return { view: "?" };
+  }
+}
+
+const failures: string[] = [];
+
+/** Wait for a predicate on the emitted snapshot; record a failure if it never holds. */
+async function expect(what: string, pred: (s: Snap) => boolean, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (pred(snap())) return true;
+    await sleep(400);
+  }
+  const s = snap();
+  const msg = `MISMATCH: ${what} (view=${s.view} selected=${s.selected ?? "-"})`;
+  console.error(msg);
+  failures.push(msg);
+  return false;
 }
 
 function hover(x: number, y: number) {
@@ -175,6 +210,13 @@ async function main() {
   const ROW_H = 19.6;
   const rowY = (i: number) => Math.round(ROW0 + ROW_H * i);
 
+  // Pin the geometry the coordinates below were measured against, and start
+  // from a known view. Without this the recording inherits whatever width and
+  // view the last run left behind, and every click silently misses.
+  setWidth("56");
+  op(["-action", "view", "-view", "fleet"]);
+  await sleep(6000);
+
   mark("panel visible, fleet list");
   await sleep(HOLD);
 
@@ -185,6 +227,10 @@ async function main() {
   const clickTabs = ["Fleet", "Detail", "Orch"];
   for (let i = 0; i < clickTabs.length; i++) {
     click(TAB_X[i], TAB_Y);
+    await expect(
+      `tab ${clickTabs[i]} became active`,
+      (s) => s.view === clickTabs[i].toLowerCase().replace("orch", "orchestrator"),
+    );
     mark(`clicked tab ${clickTabs[i]}`);
     await sleep(HOLD);
   }
@@ -202,20 +248,23 @@ async function main() {
   await sleep(HOLD);
 
   click(PANEL_X + 40, rowY(3));
+  await expect("row click selected a harness", (s) => s.view === "detail" && !!s.selected);
   mark("clicked a row — selects the harness, switches to Detail");
   await sleep(HOLD * 2);
 
   op(["-action", "view", "-view", "fleet"]);
+  await expect("back on the fleet list before scrolling", (s) => s.view === "fleet");
   await sleep(HOLD);
-  wheel(PANEL_X + 40, rowY(6), 6);
+  wheel(PANEL_X + 40, rowY(6), 8);
   mark("wheel-scrolled the fleet list");
   await sleep(HOLD);
 
   // Both panel widths. The panel width follows the manifest placement, so the
   // second width comes from a live manifest edit + relink rather than a resize.
-  setWidth("96");
-  await sleep(HOLD);
-  mark("width A (wide, 96 cols) held");
+  // Stay at the width every click coordinate was measured against. The width
+  // demonstration happens AFTER the last click, at the end of the run — moving
+  // it earlier shifts the panel and every later click misses silently.
+  mark("width A (56 cols) held");
   await sleep(HOLD);
 
   // Mutations, clicked for real on the detail action row. A throwaway harness
@@ -230,9 +279,19 @@ async function main() {
 
   // The action row sits under the detail fields; y measured on the live panel.
   click(SPAWN_X, ACTION_Y);
+  await expect(
+    "spawn flipped hp-e2e-rec to idle",
+    (s) => s.fleet?.some((h) => h.name === E2E_HARNESS && h.status === "idle") ?? false,
+    25000,
+  );
   mark("clicked [spawn] — fleet should flip stopped -> idle");
   await sleep(HOLD * 3);
   click(STOP_X, ACTION_Y);
+  await expect(
+    "stop flipped hp-e2e-rec back to stopped",
+    (s) => s.fleet?.some((h) => h.name === E2E_HARNESS && h.status === "stopped") ?? false,
+    25000,
+  );
   mark("clicked [stop] — fleet should flip back to stopped");
   await sleep(HOLD * 3);
   click(REFRESH_X, ACTION_Y);
@@ -267,6 +326,12 @@ async function main() {
     "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", args.out,
   ], { encoding: "utf8" });
   console.log(`\nrecorded ${args.out} (${probe.stdout.trim()}s)`);
+  if (failures.length) {
+    console.error(`\n${failures.length} STEP(S) DID NOT TAKE EFFECT — recording is not gate-ready:`);
+    for (const f of failures) console.error(`  ${f}`);
+    process.exit(2);
+  }
+  console.log("every asserted step took effect");
 }
 
 await main();
