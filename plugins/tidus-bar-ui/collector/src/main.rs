@@ -179,6 +179,10 @@ struct Node {
     dispatch_parent: Option<String>,
     /// Parent of the most recent finished job.
     history_parent: Option<String>,
+    /// Session that DISPATCHED the in-flight job, when the fleet stamped one.
+    dispatch_session: Option<String>,
+    /// Session that dispatched the most recent finished job.
+    history_session: Option<String>,
     /// When that job finished, from `last-result.json → t`. `None` when the
     /// file has no parseable timestamp, which is treated as "too old to hold"
     /// rather than "hold forever": an unreadable clock must not pin a chip to
@@ -216,17 +220,50 @@ impl Node {
     /// `now` is threaded in rather than read here so the whole snapshot is
     /// computed against ONE instant: a tick that read the clock per node could
     /// expire one chip and keep its sibling from the same job.
-    fn edge_to(&self, parent: &str, now: SystemTime) -> Option<EdgeKind> {
-        if self.dispatch_parent.as_deref() == Some(parent) {
+    fn edge_to(
+        &self,
+        parent: &str,
+        now: SystemTime,
+        focus_session: Option<&str>,
+    ) -> Option<EdgeKind> {
+        if self.dispatch_parent.as_deref() == Some(parent)
+            && Self::job_belongs_to_session(self.dispatch_session.as_deref(), focus_session)
+        {
             return Some(EdgeKind::Dispatch);
         }
         if self.team.as_deref() == Some(parent) {
             return Some(EdgeKind::Team);
         }
-        if self.history_parent.as_deref() == Some(parent) && self.within_grace(now) {
+        if self.history_parent.as_deref() == Some(parent)
+            && self.within_grace(now)
+            && Self::job_belongs_to_session(self.history_session.as_deref(), focus_session)
+        {
             return Some(EdgeKind::History);
         }
         None
+    }
+
+    /// Whether a JOB edge belongs to the pane now being looked at.
+    ///
+    /// The fleet stamps `parentSession` — the dispatching session's uuid — on
+    /// every dispatch and job record. A profile has many live sessions at once,
+    /// so "parent = main" identifies the fleet member but not which of its panes
+    /// sent the work; without this every pane of a profile showed every other
+    /// pane's children, i.e. its nephews.
+    ///
+    /// Unowned work (the field absent — a job the fleet stamped before this
+    /// existed) shows EVERYWHERE. There is no session to match it against, and
+    /// hiding it would silently drop legacy jobs from every bar rather than from
+    /// the wrong one.
+    ///
+    /// Team edges never reach here: a team affiliation is profile-level and
+    /// belongs to every session of that profile, which is what makes it
+    /// different from a job in the first place.
+    fn job_belongs_to_session(owner: Option<&str>, focus_session: Option<&str>) -> bool {
+        match owner {
+            None => true,
+            Some(owner) => focus_session == Some(owner),
+        }
     }
 
     /// Whether the last finished job is recent enough to keep its chip.
@@ -290,8 +327,18 @@ fn load_fleet(root: &Path) -> Vec<Node> {
         let config_dir = std::fs::canonicalize(&config_dir).ok();
 
         let state = dir.join("state");
-        let (dispatch_parent, live, task, job_tail_now) = read_dispatch(&state);
+        let dispatch = read_dispatch(&state);
+        let (dispatch_parent, live, task, job_tail_now) = (
+            dispatch.parent,
+            dispatch.live,
+            dispatch.task,
+            dispatch.job_tail,
+        );
         let last = read_last_result(&state);
+        let history_session = last
+            .job_id
+            .as_deref()
+            .and_then(|id| job_parent_session(root, id));
         let (history_parent, last_event, last_task, job_tail_last, history_at) =
             (last.parent, last.event, last.task, last.job_tail, last.at);
 
@@ -303,7 +350,9 @@ fn load_fleet(root: &Path) -> Vec<Node> {
             profile,
             team: string_at(&meta, "team"),
             dispatch_parent,
+            dispatch_session: dispatch.parent_session,
             history_parent,
+            history_session,
             history_at,
             live,
             task: task.or(last_task),
@@ -319,24 +368,58 @@ fn load_fleet(root: &Path) -> Vec<Node> {
 }
 
 /// In-flight dispatch → `(parent, live, task, job_tail)`.
-fn read_dispatch(state: &Path) -> (Option<String>, bool, Option<String>, Option<String>) {
+fn read_dispatch(state: &Path) -> Dispatch {
     let Ok(raw) = std::fs::read(state.join("dispatch.json")) else {
-        return (None, false, None, None);
+        return Dispatch::default();
     };
     let Ok(rec) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return (None, false, None, None);
+        return Dispatch::default();
     };
     // `claimDispatch` creates the file O_EXCL and then writes it; a record with
     // no id is a half-written file, not a job.
     let Some(id) = string_at(&rec, "id") else {
-        return (None, false, None, None);
+        return Dispatch::default();
     };
-    (
-        string_at(&rec, "parent").filter(|p| p != CLI_PARENT),
-        true,
-        string_at(&rec, "task"),
-        job_tail(&id),
-    )
+    Dispatch {
+        parent: string_at(&rec, "parent").filter(|p| p != CLI_PARENT),
+        live: true,
+        task: string_at(&rec, "task"),
+        job_tail: job_tail(&id),
+        parent_session: string_at(&rec, "parentSession").filter(|s| !s.is_empty()),
+    }
+}
+
+/// A routed task in flight, as `dispatch.json` records it.
+#[derive(Debug, Default, Clone)]
+struct Dispatch {
+    parent: Option<String>,
+    live: bool,
+    task: Option<String>,
+    job_tail: Option<String>,
+    /// The dispatching SESSION, not just the dispatching harness.
+    ///
+    /// A profile has many live sessions at once — that is the whole reason the
+    /// per-pane attribution fix exists — so "parent = main" says which fleet
+    /// member sent the job but not which of its panes. With this, a pane can
+    /// show its own children instead of its siblings' (nephews).
+    ///
+    /// `None` for a job the fleet stamped before this field existed.
+    parent_session: Option<String>,
+}
+
+/// The dispatching session recorded for a finished job.
+///
+/// `last-result.json` does not carry `parentSession`; the job record under
+/// `.jobs/<id>.json` does. Looked up by the id `last-result.json` already
+/// carries, so no new bookkeeping is needed and a missing job file simply reads
+/// as unowned.
+fn job_parent_session(root: &Path, job_id: &str) -> Option<String> {
+    if job_id.is_empty() || job_id.contains('/') || job_id.contains("..") {
+        return None;
+    }
+    let raw = std::fs::read(root.join(".jobs").join(format!("{job_id}.json"))).ok()?;
+    let rec = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
+    string_at(&rec, "parentSession").filter(|s| !s.is_empty())
 }
 
 /// The most recent finished job, as `last-result.json` records it.
@@ -346,6 +429,8 @@ struct LastResult {
     event: Option<String>,
     task: Option<String>,
     job_tail: Option<String>,
+    /// Full job id, used to find the job record that carries `parentSession`.
+    job_id: Option<String>,
     /// When it finished. `None` means undatable, which the grace treats as too
     /// old to hold rather than as "hold forever".
     at: Option<SystemTime>,
@@ -375,6 +460,7 @@ fn read_last_result(state: &Path) -> LastResult {
         event: string_at(&ev, "event"),
         task: string_at(&ev, "task"),
         job_tail: string_at(&ev, "id").and_then(|id| job_tail(&id)),
+        job_id: string_at(&ev, "id"),
         at: finished_at,
     }
 }
@@ -552,7 +638,12 @@ fn resolve(focus: &Focus) -> BarInput {
         // has no managed process and nobody spawns it, so it can be an
         // orchestrator but never a child.
         .filter(|n| !n.profile)
-        .filter_map(|n| n.edge_to(&focus_name, now).map(|edge| (n, edge)))
+        // The focused pane's own session decides which JOBS are its own; team
+        // edges are profile-level and unaffected.
+        .filter_map(|n| {
+            n.edge_to(&focus_name, now, focus.session_ref.as_deref())
+                .map(|edge| (n, edge))
+        })
         .collect();
     // Live work first, then declared members, then history; alphabetical inside
     // each band so the bar does not reshuffle under the cursor every tick.
@@ -1149,7 +1240,9 @@ mod tests {
             profile: false,
             team: None,
             dispatch_parent: None,
+            dispatch_session: None,
             history_parent: None,
+            history_session: None,
             // Fresh by default so edge tests exercise edge PRECEDENCE without
             // every one of them also having to opt into the grace window.
             history_at: Some(SystemTime::now()),
@@ -1176,20 +1269,20 @@ mod tests {
         let now = SystemTime::now();
         let mut n = node("kid");
         n.history_parent = Some("old".into());
-        assert_eq!(n.edge_to("old", now), Some(EdgeKind::History));
+        assert_eq!(n.edge_to("old", now, None), Some(EdgeKind::History));
         assert_eq!(n.primary_parent(now), Some("old"));
 
         n.team = Some("boss".into());
-        assert_eq!(n.edge_to("boss", now), Some(EdgeKind::Team));
+        assert_eq!(n.edge_to("boss", now, None), Some(EdgeKind::Team));
         assert_eq!(n.primary_parent(now), Some("boss"));
 
         n.dispatch_parent = Some("now".into());
-        assert_eq!(n.edge_to("now", now), Some(EdgeKind::Dispatch));
+        assert_eq!(n.edge_to("now", now, None), Some(EdgeKind::Dispatch));
         assert_eq!(n.primary_parent(now), Some("now"));
         // The weaker edges still resolve for their own parents — a child can be
         // on one parent's bar by team while serving a dispatch from another.
-        assert_eq!(n.edge_to("boss", now), Some(EdgeKind::Team));
-        assert_eq!(n.edge_to("stranger", now), None);
+        assert_eq!(n.edge_to("boss", now, None), Some(EdgeKind::Team));
+        assert_eq!(n.edge_to("stranger", now, None), None);
     }
 
     // ── #51: per-pane profile resolution ────────────────────────────────────
@@ -1332,21 +1425,21 @@ mod tests {
 
         child.history_at = Some(now - Duration::from_secs(7));
         assert_eq!(
-            child.edge_to("main", now),
+            child.edge_to("main", now, None),
             Some(EdgeKind::History),
             "a job that just finished is still on the bar"
         );
 
         child.history_at = Some(now - DISPATCH_GRACE + Duration::from_secs(30));
         assert_eq!(
-            child.edge_to("main", now),
+            child.edge_to("main", now, None),
             Some(EdgeKind::History),
             "and stays until the window is actually up"
         );
 
         child.history_at = Some(now - DISPATCH_GRACE - Duration::from_secs(1));
         assert_eq!(
-            child.edge_to("main", now),
+            child.edge_to("main", now, None),
             None,
             "past the window it drops off"
         );
@@ -1363,7 +1456,7 @@ mod tests {
         child.history_at = Some(now - DISPATCH_GRACE - Duration::from_secs(3600));
 
         assert_eq!(
-            child.edge_to("main", now),
+            child.edge_to("main", now, None),
             Some(EdgeKind::Team),
             "team keeps the chip long after any job of its own expired"
         );
@@ -1377,7 +1470,7 @@ mod tests {
         let mut child = node("codex-gp");
         child.history_parent = Some("main".into());
         child.history_at = None;
-        assert_eq!(child.edge_to("main", now), None);
+        assert_eq!(child.edge_to("main", now, None), None);
         assert_eq!(child.primary_parent(now), None);
     }
 
@@ -1388,7 +1481,7 @@ mod tests {
         let mut child = node("codex-gp");
         child.history_parent = Some("main".into());
         child.history_at = Some(now + Duration::from_secs(600));
-        assert_eq!(child.edge_to("main", now), Some(EdgeKind::History));
+        assert_eq!(child.edge_to("main", now, None), Some(EdgeKind::History));
     }
 
     #[test]
@@ -1451,6 +1544,118 @@ mod tests {
         assert!(chip_is_worth_a_slot(&slot_chip(None), EdgeKind::History));
     }
 
+    // ── #51 phase 2.5: children, not nephews ────────────────────────────────
+
+    /// A dispatch belongs to the SESSION that sent it, not merely to the
+    /// harness. A profile has many live sessions at once, so without this every
+    /// pane of a profile showed every other pane's children.
+    #[test]
+    fn a_dispatch_shows_only_on_the_pane_that_sent_it() {
+        let now = SystemTime::now();
+        let mine = "9def60d0-8cb5-47d8-a9e0-86b8471e8ebb";
+        let theirs = "e26394d9-3bc6-4a23-b69f-814d3c27214b";
+
+        let mut child = node("codex1");
+        child.dispatch_parent = Some("main".into());
+        child.dispatch_session = Some(mine.into());
+
+        assert_eq!(
+            child.edge_to("main", now, Some(mine)),
+            Some(EdgeKind::Dispatch),
+            "the pane that dispatched it sees it"
+        );
+        assert_eq!(
+            child.edge_to("main", now, Some(theirs)),
+            None,
+            "a sibling pane of the same profile must NOT see it"
+        );
+        assert_eq!(
+            child.edge_to("main", now, None),
+            None,
+            "and neither does a pane with no session of its own"
+        );
+    }
+
+    /// The same rule applies to a finished job held by the grace: it stays on
+    /// the bar of the pane that sent it, and only that one.
+    #[test]
+    fn a_finished_job_is_held_only_on_its_own_pane() {
+        let now = SystemTime::now();
+        let mine = "9def60d0-8cb5-47d8-a9e0-86b8471e8ebb";
+        let theirs = "e26394d9-3bc6-4a23-b69f-814d3c27214b";
+
+        let mut child = node("codex-gp");
+        child.history_parent = Some("main".into());
+        child.history_at = Some(now - Duration::from_secs(7));
+        child.history_session = Some(mine.into());
+
+        assert_eq!(
+            child.edge_to("main", now, Some(mine)),
+            Some(EdgeKind::History)
+        );
+        assert_eq!(child.edge_to("main", now, Some(theirs)), None);
+    }
+
+    /// Work the fleet stamped before `parentSession` existed has no session to
+    /// match, so it shows EVERYWHERE. Hiding it would drop legacy jobs from
+    /// every bar rather than from the wrong one.
+    #[test]
+    fn unowned_legacy_work_shows_on_every_pane() {
+        let now = SystemTime::now();
+        let mut child = node("legacy");
+        child.dispatch_parent = Some("main".into());
+        child.dispatch_session = None;
+
+        for session in [Some("aaaa"), Some("bbbb"), None] {
+            assert_eq!(
+                child.edge_to("main", now, session),
+                Some(EdgeKind::Dispatch),
+                "unowned work is visible from {session:?}"
+            );
+        }
+    }
+
+    /// A TEAM edge is profile-level and belongs to every session of that
+    /// profile — that is what makes it different from a job.
+    #[test]
+    fn team_edges_are_not_filtered_by_session() {
+        let now = SystemTime::now();
+        let mut member = node("member");
+        member.team = Some("main".into());
+
+        for session in [Some("aaaa"), Some("bbbb"), None] {
+            assert_eq!(
+                member.edge_to("main", now, session),
+                Some(EdgeKind::Team),
+                "team membership is visible from {session:?}"
+            );
+        }
+    }
+
+    /// The dispatching session is read off the job record the fleet writes.
+    #[test]
+    fn the_job_record_supplies_the_owning_session() {
+        let root = tempdir("jobs-root");
+        std::fs::create_dir_all(root.join(".jobs")).unwrap();
+        std::fs::write(
+            root.join(".jobs").join("main-1786719179313009317.json"),
+            br#"{"id":"main-1786719179313009317","parent":"main","child":"codex1","parentSession":"9def60d0-8cb5-47d8-a9e0-86b8471e8ebb"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            job_parent_session(&root, "main-1786719179313009317").as_deref(),
+            Some("9def60d0-8cb5-47d8-a9e0-86b8471e8ebb")
+        );
+        // A legacy record without the field, and a missing one, both read as
+        // unowned rather than as an error.
+        std::fs::write(root.join(".jobs").join("old.json"), br#"{"id":"old"}"#).unwrap();
+        assert_eq!(job_parent_session(&root, "old"), None);
+        assert_eq!(job_parent_session(&root, "absent"), None);
+        // A job id is pasted into a path, so it is refused if it could escape.
+        assert_eq!(job_parent_session(&root, "../../etc/passwd"), None);
+    }
+
     #[test]
     fn cli_sentinel_is_not_a_parent() {
         let dir = tempdir("cli");
@@ -1459,11 +1664,15 @@ mod tests {
             br#"{"id":"j1","parent":"(cli)","child":"kid","task":"t"}"#,
         )
         .unwrap();
-        let (parent, live, task, tail) = read_dispatch(&dir);
-        assert_eq!(parent, None, "(cli) is a sentinel, not a harness");
-        assert!(live, "an in-flight dispatch is live even without a parent");
-        assert_eq!(task.as_deref(), Some("t"));
-        assert_eq!(tail.as_deref(), Some("j1"));
+        let d = read_dispatch(&dir);
+        assert_eq!(d.parent, None, "(cli) is a sentinel, not a harness");
+        assert!(
+            d.live,
+            "an in-flight dispatch is live even without a parent"
+        );
+        assert_eq!(d.task.as_deref(), Some("t"));
+        assert_eq!(d.job_tail.as_deref(), Some("j1"));
+        assert_eq!(d.parent_session, None, "an unstamped dispatch is unowned");
     }
 
     #[test]
@@ -1471,9 +1680,9 @@ mod tests {
         let dir = tempdir("half");
         // claimDispatch creates the file O_EXCL and only then writes it.
         std::fs::write(dir.join("dispatch.json"), br#"{"parent":"p"}"#).unwrap();
-        let (parent, live, _, _) = read_dispatch(&dir);
-        assert_eq!(parent, None);
-        assert!(!live);
+        let d = read_dispatch(&dir);
+        assert_eq!(d.parent, None);
+        assert!(!d.live);
     }
 
     #[test]
