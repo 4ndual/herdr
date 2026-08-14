@@ -562,8 +562,20 @@ fn restore_tab(
         };
         if let Some(plan) = pending_native_agent_restore {
             let terminal_id = TerminalId::alloc();
-            let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                .with_pending_agent_resume_plan(plan);
+            // A pane that happens to carry a resumable agent is still the same
+            // pane: it keeps the env it was launched with, the directory it was
+            // launched in and the colour the user gave it. This branch used to
+            // build a bare TerminalState, so #36 and #34 held for every pane
+            // EXCEPT the agent panes they exist for — and the deferred resume
+            // then ran without CLAUDE_CONFIG_DIR/CODEX_HOME and looked for the
+            // conversation under the default root, where it has never existed.
+            let mut terminal = restamp_persisted_pane_facts(
+                TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_pending_agent_resume_plan(plan),
+                saved_launch_env.clone(),
+                saved_launch_cwd.clone(),
+                saved_color.clone(),
+            );
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -655,25 +667,12 @@ fn restore_tab(
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                // Re-stamp both facts so the NEXT restart reproduces them too —
-                // a pane that only survives one restart is not fixed.
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                    .with_launch_env(saved_launch_env.clone());
-                if let Some(launch_cwd) = saved_launch_cwd.clone() {
-                    terminal = terminal.with_launch_cwd(launch_cwd);
-                }
-                if let Some(color) = saved_color.clone() {
-                    // No TTL: a persisted colour that expired minutes after a
-                    // restart would be worse than not persisting it at all.
-                    terminal.metadata_tokens.patch(
-                        std::collections::HashMap::from([(
-                            crate::app::api_helpers::METADATA_COLOR_KEY.to_string(),
-                            Some(color),
-                        )]),
-                        None,
-                        std::time::Instant::now(),
-                    );
-                }
+                let mut terminal = restamp_persisted_pane_facts(
+                    TerminalState::new(terminal_id.clone(), cwd.clone()),
+                    saved_launch_env.clone(),
+                    saved_launch_cwd.clone(),
+                    saved_color.clone(),
+                );
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -780,6 +779,41 @@ fn restore_tab(
         )),
         failed_imports,
     )
+}
+
+/// Re-stamp the pane facts a restart must not consume: the launch env extras,
+/// the launch directory and the pane colour.
+///
+/// Re-stamping (rather than merely applying) is the point — the restored
+/// terminal has to carry these forward so the NEXT capture writes them again. A
+/// pane that only survives one restart is not fixed.
+///
+/// Both restore branches go through this: the plain runtime respawn and the
+/// deferred native agent resume. Keeping it in one place is what stops the two
+/// from drifting apart again.
+fn restamp_persisted_pane_facts(
+    terminal: TerminalState,
+    launch_env: Vec<(String, String)>,
+    launch_cwd: Option<PathBuf>,
+    color: Option<String>,
+) -> TerminalState {
+    let mut terminal = terminal.with_launch_env(launch_env);
+    if let Some(launch_cwd) = launch_cwd {
+        terminal = terminal.with_launch_cwd(launch_cwd);
+    }
+    if let Some(color) = color {
+        // No TTL: a persisted colour that expired minutes after a restart would
+        // be worse than not persisting it at all.
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::app::api_helpers::METADATA_COLOR_KEY.to_string(),
+                Some(color),
+            )]),
+            None,
+            std::time::Instant::now(),
+        );
+    }
+    terminal
 }
 
 fn pane_restore_startup<'a>(
@@ -1295,6 +1329,138 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+    }
+
+    /// Characterization for the defect that made #36 and #34 look done while
+    /// they held for every pane EXCEPT the ones they exist for.
+    ///
+    /// A pane whose agent session can be resumed takes the deferred-resume
+    /// branch of `restore_tab`, which used to build a bare `TerminalState`. The
+    /// launch env, the launch directory and the colour were dropped, so the
+    /// deferred resume ran without CLAUDE_CONFIG_DIR/CODEX_HOME (a harness
+    /// conversation has never existed under the default root, so the agent
+    /// never came back), and the next capture wrote a record carrying `cwd`
+    /// alone. An identical pane with no agent kept all of it.
+    ///
+    /// Both halves are asserted: the restored terminal carries the facts, AND a
+    /// capture of the restored state writes them back — a pane that survives
+    /// one restart and not the next is not fixed.
+    #[tokio::test]
+    async fn restore_keeps_launch_env_colour_and_agent_binding_on_a_resumable_agent_pane() {
+        let cwd = std::env::current_dir().unwrap();
+        let launch_cwd = cwd.join("launch-dir");
+        let env = std::collections::BTreeMap::from([(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/tester/harnesses/e2e/config".to_string(),
+        )]);
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::from([(0, 1)]),
+                next_public_pane_number: 2,
+                public_tab_numbers: vec![1],
+                next_public_tab_number: 2,
+                tabs: vec![TabSnapshot {
+                    hidden: false,
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd: cwd.clone(),
+                            label: Some("fe-proof".into()),
+                            agent_name: Some("fe-proof".into()),
+                            managed_agent_kind: Some("pi".into()),
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:pi".into(),
+                                agent: "pi".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: test_session_path("pi-session.jsonl"),
+                            }),
+                            launch_argv: None,
+                            env: env.clone(),
+                            launch_cwd: Some(launch_cwd.clone()),
+                            color: Some("#ff5f87".into()),
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals
+            .values()
+            .next()
+            .expect("restored terminal should exist");
+        assert!(
+            terminal.pending_agent_resume_plan.is_some(),
+            "the pane must take the deferred native agent resume branch, \
+             otherwise this test no longer covers the defect"
+        );
+        assert_eq!(
+            terminal.launch_env,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/home/tester/harnesses/e2e/config".to_string()
+            )],
+            "the deferred resume reads the terminal's own launch env; without it \
+             the resume runs against the default config root"
+        );
+        assert_eq!(terminal.launch_cwd.as_ref(), Some(&launch_cwd));
+        assert_eq!(
+            terminal.managed_agent_kind(),
+            Some(crate::detect::Agent::Pi)
+        );
+
+        // The re-stamp half: capture the restored state and the record must be
+        // whole again, not `cwd` alone.
+        let recaptured = super::super::snapshot::capture(
+            &workspaces,
+            &terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            Some(0),
+            0,
+            30,
+            0.5,
+            Default::default(),
+        );
+        let pane = recaptured.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .expect("the restored pane should be captured");
+        assert_eq!(pane.env, env, "the launch env must reach the next snapshot");
+        assert_eq!(pane.launch_cwd.as_ref(), Some(&launch_cwd));
+        assert_eq!(pane.color.as_deref(), Some("#ff5f87"));
+        assert_eq!(pane.managed_agent_kind.as_deref(), Some("pi"));
+        assert_eq!(pane.agent_name.as_deref(), Some("fe-proof"));
     }
 
     #[tokio::test]
