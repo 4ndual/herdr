@@ -66,6 +66,12 @@ pub struct WorkspaceSnapshot {
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
+    /// #34 phase 2, workspace half: the colour a user gave the workspace. The
+    /// pane colour has been persisted since the same change; the workspace one
+    /// was not, so setting it was a session-scoped novelty rather than a
+    /// property of the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +203,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             next_public_tab_number: 0,
             tabs: vec![tab],
             active_tab: 0,
+            color: None,
         }
     }
 }
@@ -338,6 +345,10 @@ fn capture_workspace(
             .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
             .collect(),
         active_tab: ws.active_tab,
+        color: ws
+            .metadata_tokens
+            .values()
+            .remove(crate::app::api_helpers::METADATA_COLOR_KEY),
     }
 }
 
@@ -743,6 +754,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1312,6 +1324,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,

@@ -406,6 +406,21 @@ fn restore_workspace(
     let (cached_git_space, cached_auto_label, cached_git_status_key) =
         crate::workspace::discover_workspace_git_identity(&snap.identity_cwd);
 
+    // The workspace half of the pane colour re-stamp, and for the same reason:
+    // no TTL, because a colour that expired minutes after a restart would be
+    // worse than not persisting it at all.
+    let mut metadata_tokens = crate::metadata_tokens::MetadataTokens::default();
+    if let Some(color) = snap.color.clone() {
+        metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::app::api_helpers::METADATA_COLOR_KEY.to_string(),
+                Some(color),
+            )]),
+            None,
+            std::time::Instant::now(),
+        );
+    }
+
     (
         Some(Workspace {
             id: workspace_id,
@@ -418,7 +433,7 @@ fn restore_workspace(
             cached_git_ahead_behind: None,
             cached_git_space,
             worktree_space,
-            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_tokens,
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number,
@@ -1289,6 +1304,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1329,6 +1345,85 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+    }
+
+    /// #34 phase 2, workspace half. The pane colour was persisted and
+    /// re-stamped; the workspace colour was captured nowhere, so a restart
+    /// silently dropped it and "set a workspace colour" was a session-scoped
+    /// novelty. Both directions are asserted — the colour reaches the restored
+    /// workspace, and a snapshot with no colour still restores cleanly.
+    #[tokio::test]
+    async fn restore_keeps_a_workspace_colour() {
+        fn snapshot_with_color(color: Option<&str>) -> SessionSnapshot {
+            let cwd = std::env::current_dir().unwrap();
+            SessionSnapshot {
+                version: super::super::snapshot::SNAPSHOT_VERSION,
+                workspaces: vec![WorkspaceSnapshot {
+                    id: Some("w1".into()),
+                    custom_name: None,
+                    identity_cwd: cwd.clone(),
+                    worktree_space: None,
+                    public_pane_numbers: HashMap::new(),
+                    next_public_pane_number: 0,
+                    public_tab_numbers: Vec::new(),
+                    next_public_tab_number: 0,
+                    tabs: vec![TabSnapshot {
+                        hidden: false,
+                        custom_name: None,
+                        layout: LayoutSnapshot::Pane(0),
+                        panes: HashMap::from([(
+                            0,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd,
+                                label: None,
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: None,
+                                launch_argv: None,
+                                env: Default::default(),
+                                launch_cwd: None,
+                                color: None,
+                            },
+                        )]),
+                        zoomed: false,
+                        focused: Some(0),
+                        root_pane: Some(0),
+                    }],
+                    active_tab: 0,
+                    color: color.map(str::to_string),
+                }],
+                active: Some(0),
+                selected: 0,
+                sidebar_width: None,
+                sidebar_section_split: None,
+                collapsed_space_keys: Default::default(),
+            }
+        }
+
+        let restore_color = |color: Option<&str>| {
+            let snapshot = snapshot_with_color(color);
+            let (events, _event_rx) = mpsc::channel(4);
+            let (workspaces, _terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            );
+            workspaces[0]
+                .metadata_tokens
+                .values()
+                .remove(crate::app::api_helpers::METADATA_COLOR_KEY)
+        };
+
+        assert_eq!(restore_color(Some("#5fafff")).as_deref(), Some("#5fafff"));
+        assert_eq!(restore_color(None), None);
     }
 
     /// Characterization for the defect that made #36 and #34 look done while
@@ -1392,6 +1487,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1521,6 +1617,7 @@ mod tests {
                     root_pane: Some(10),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1638,6 +1735,7 @@ mod tests {
                     },
                 ],
                 active_tab: 3,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1701,6 +1799,7 @@ mod tests {
                 root_pane: Some(10),
             }],
             active_tab: 0,
+            color: None,
         };
         let mut next_public_pane_number = 1;
 
@@ -1754,6 +1853,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
@@ -1952,6 +2052,7 @@ mod tests {
                     root_pane: Some(0),
                 }],
                 active_tab: 0,
+                color: None,
             }],
             active: Some(0),
             selected: 0,
