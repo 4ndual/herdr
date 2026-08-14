@@ -103,8 +103,13 @@ impl PaneCloseRecord {
     }
 
     /// Argv to FORK (branch) this session into a new tab, transforming the plain
-    /// resume argv per agent. Agents without a known fork flag fall back to the
-    /// resume argv (best-effort continue rather than nothing).
+    /// resume argv per agent.
+    ///
+    /// An agent with no known fork transform returns `None`. It used to fall
+    /// through to the plain RESUME argv, which is not a degraded fork — it is a
+    /// different, destructive operation: the user asks to branch a conversation
+    /// and instead gets a second writer on the original. Silently. `None` lets
+    /// the caller hide the affordance, which is what jcode already relies on.
     pub fn fork_argv(&self) -> Option<Vec<String>> {
         let plan = self.resume_plan()?;
         let mut argv = plan.argv;
@@ -127,7 +132,9 @@ impl PaneCloseRecord {
             // the launch fail on an unknown argument rather than degrade. Report
             // "not forkable" so the caller hides the affordance instead.
             "jcode" => return None,
-            _ => {}
+            // Not a fallback: see the doc comment. An unknown runtime is not
+            // forkable until someone verifies its flag against the real binary.
+            _ => return None,
         }
         Some(argv)
     }
@@ -782,6 +789,21 @@ mod tests {
         // No verified fork flag: the affordance must resolve to nothing rather
         // than launch jcode with an argument it would reject.
         assert!(jcode.fork_argv().is_none());
+    }
+
+    /// An unknown runtime must not silently RESUME when the user asked to FORK.
+    /// The catch-all used to fall through to the plain resume argv, so a future
+    /// runtime (or a typo in a record) branched nothing and quietly put a second
+    /// writer on the original conversation.
+    #[test]
+    fn an_unknown_runtime_is_not_forkable() {
+        let mut unknown = sample(1, "p");
+        unknown.session_source = Some("herdr:zeta".to_string());
+        unknown.agent = Some("zeta".to_string());
+        assert!(
+            unknown.resume_plan().is_none() || unknown.fork_argv().is_none(),
+            "an unverified runtime must not be offered a fork"
+        );
     }
 
     #[test]
