@@ -13,8 +13,7 @@ use crate::util;
 use std::path::PathBuf;
 
 fn sessions_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".pi/agent/sessions")
+    util::pi_sessions_root()
 }
 
 /// Context window by pi model id (gpt-5.4 backend). Conservative default.

@@ -21,6 +21,78 @@ pub fn today_local() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
+/// The user's home directory.
+///
+/// `std::env::var("HOME").unwrap_or_default()` — the pattern this replaces —
+/// yields `""` when HOME is unset or empty, and every `PathBuf::from("").join(x)`
+/// downstream then silently becomes a RELATIVE path rooted at the process CWD.
+/// That turns "no home" into "read and write someone else's directory" instead
+/// of a clean miss. HOME is unset on Windows and can be scrubbed from a
+/// systemd/launchd unit environment, so this is not hypothetical.
+///
+/// Mirrors `goal-dash-core::timegate::home()`, the one place in the workspace
+/// that already got this right.
+pub fn home() -> std::path::PathBuf {
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(home);
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return std::path::PathBuf::from(profile);
+        }
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()),
+        ) {
+            let mut home = std::path::PathBuf::from(drive);
+            home.push(path);
+            return home;
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// Root of a config tree: the env override when set and non-empty, else
+/// `<home>/<default>`.
+fn config_root(env_var: &str, default_dir: &str) -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(dir);
+    }
+    home().join(default_dir)
+}
+
+/// Claude Code's config root: `$CLAUDE_CONFIG_DIR` when set, else `$HOME/.claude`.
+///
+/// Every per-account file Claude Code writes — credentials, settings, projects —
+/// moves with this variable, and herdr's harnesses use exactly that to give each
+/// harness its own account root. Reading `$HOME/.claude` unconditionally reads
+/// the wrong account whenever a pane runs under a harness.
+pub fn claude_config_root() -> std::path::PathBuf {
+    config_root("CLAUDE_CONFIG_DIR", ".claude")
+}
+
+/// Codex's config root: `$CODEX_HOME` when set, else `$HOME/.codex`.
+///
+/// Same harness story as [`claude_config_root`]; `harness-indicator-ui`'s
+/// collector already treats `CODEX_HOME` as the authority for this path.
+pub fn codex_config_root() -> std::path::PathBuf {
+    config_root("CODEX_HOME", ".codex")
+}
+
+/// pi's session root: `$PI_SESSION_DIR` when set, else `$HOME/.pi/agent/sessions`.
+///
+/// `pi --session-dir` sets this; `runtime-swap-ui` and the resume picker already
+/// honor it when they look for pi transcripts.
+pub fn pi_sessions_root() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("PI_SESSION_DIR").filter(|value| !value.is_empty()) {
+        return std::path::PathBuf::from(dir);
+    }
+    home().join(".pi/agent/sessions")
+}
+
 /// Age in seconds of a file's last modification, vs now.
 pub fn file_age_secs(path: &std::path::Path) -> u64 {
     let meta = match std::fs::metadata(path) {

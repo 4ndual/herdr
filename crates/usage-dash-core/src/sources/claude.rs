@@ -18,8 +18,7 @@ const WINDOW_200K: u64 = 200_000;
 const WINDOW_1M: u64 = 1_000_000;
 
 fn projects_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/projects")
+    util::claude_config_root().join("projects")
 }
 
 /// Locate the transcript `<sid>.jsonl` under any project dir of the Claude Code
@@ -242,8 +241,7 @@ fn one_m_enabled() -> bool {
     {
         return false;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let p = PathBuf::from(home).join(".claude/settings.json");
+    let p = util::claude_config_root().join("settings.json");
     if let Ok(raw) = std::fs::read_to_string(p) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(m) = v.get("model").and_then(|x| x.as_str()) {
@@ -716,22 +714,40 @@ mod tests {
 
     // ---- transcript-tree integration fixtures ----
 
-    // Each test gets its own temp HOME; cargo nextest isolates tests in separate
-    // processes, so mutating the HOME env var here is safe.
+    // Each test gets its own temp HOME. `cargo nextest` isolates tests in separate
+    // processes, but plain `cargo test` runs them as THREADS of one process, so
+    // HOME is shared state and concurrent `TempHome`s clobber each other — which
+    // is why this file used to fail a dozen tests under `cargo test` while
+    // passing under nextest and under `--test-threads=1`. The lock serializes the
+    // env-mutating tests, and the previous value is restored on drop so a later
+    // test never inherits a HOME pointing at a deleted directory. Same pattern as
+    // `goal-dash-core/src/store.rs`.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct TempHome {
         dir: PathBuf,
+        prev_home: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TempHome {
         fn new(tag: &str) -> Self {
+            // A test that panics while holding the lock poisons it; the data is
+            // just `()`, so recover rather than cascading a second failure.
+            let guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let uniq = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let dir = std::env::temp_dir().join(format!("herdr-usage-{tag}-{uniq}"));
             std::fs::create_dir_all(&dir).unwrap();
+            let prev_home = std::env::var_os("HOME");
             std::env::set_var("HOME", &dir);
-            TempHome { dir }
+            TempHome {
+                dir,
+                prev_home,
+                _guard: guard,
+            }
         }
 
         fn write(&self, rel: &str, content: &str) -> PathBuf {
@@ -744,6 +760,10 @@ mod tests {
 
     impl Drop for TempHome {
         fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }

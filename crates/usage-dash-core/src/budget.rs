@@ -12,8 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn budget_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/dash2/budget")
+    crate::util::claude_config_root().join("dash2/budget")
 }
 
 /// Pure fold: given the stored `(date, weekly_pct)` baseline, today's date, and

@@ -35,8 +35,7 @@ const CACHE_TTL_SECS: u64 = 60;
 const READ_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn cache_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".codex/dash2_ratelimits.json")
+    crate::util::codex_config_root().join("dash2_ratelimits.json")
 }
 
 /// Fresh `(primary=5h, secondary=weekly, plan_type)` from the app-server, cached.

@@ -16,8 +16,7 @@ use crate::util;
 use std::path::{Path, PathBuf};
 
 fn sessions_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".codex/sessions")
+    util::codex_config_root().join("sessions")
 }
 
 /// All rollout files, newest mtime first.
