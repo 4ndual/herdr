@@ -44,7 +44,11 @@ api_version = 3
 module = "target/wasm32-unknown-unknown/release/harness_panel_ui.wasm"
 hot_reload = "on"
 surfaces = ["panel"]
-capabilities = ["layout_read", "api_read", "api_write", "mouse_all", "toasts"]
+# plugin_actions is what lets the guest's InvokePluginAction effect survive
+# the host's capability filter (ui_plugins.rs: filter_effects_for_module).
+# Without it every click is delivered to the guest, the guest emits its op
+# effect, and the host silently drops it — clicks look dead end to end.
+capabilities = ["layout_read", "api_read", "api_write", "mouse_all", "toasts", "plugin_actions"]
 # The collector writes this file; the host hands its bytes to the guest as
 # HERDR_PLUGIN_UI_INPUT_JSON. Declaring it currently coincides with the panel not
 # painting, but that is the known host-side right-panel deadlock (D1), not this
