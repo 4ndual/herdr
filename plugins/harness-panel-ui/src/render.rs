@@ -228,39 +228,53 @@ fn fleet_row(
     }
 }
 
-/// Action buttons for the selected harness. One row of short labels; on a
-/// narrow panel they stay on one row because they are already short, which is
-/// the panel's equivalent of the site's 2-column action grid.
-fn actions(target: &str, y: u16, out: &mut Painted) {
+/// Action buttons for the selected harness.
+///
+/// They WRAP rather than overflow. The site hit this exact problem at ≤700px —
+/// four buttons in one flex row pushed "Open in herdr" onto three lines — and
+/// fixed it with a 2-column grid. The panel has no grid, so it lays the buttons
+/// out left to right and breaks to a new row when the next one would cross the
+/// rect. Returns the number of rows drawn so the caller can advance its cursor.
+fn actions(target: &str, y: u16, width: u16, out: &mut Painted) -> u16 {
+    const BUTTONS: [(&str, &str, &str); 3] = [
+        ("[spawn]", "spawn", "success"),
+        ("[stop]", "stop", "danger"),
+        ("[refresh]", "refresh", "blue"),
+    ];
     let mut x: u16 = 0;
-    for (label, action) in [
-        ("[spawn]", "spawn"),
-        ("[stop]", "stop"),
-        ("[refresh]", "refresh"),
-    ] {
+    let mut row = y;
+    let mut rows: u16 = 1;
+    let mut spans: Vec<UiTextSpan> = Vec::new();
+    for (label, action, role) in BUTTONS {
         let w = label.chars().count() as u16;
+        // +1 for the space this button would be preceded by, when not first.
+        let needed = if spans.is_empty() { w } else { w + 1 };
+        if x + needed > width && !spans.is_empty() {
+            out.nodes.push(line(std::mem::take(&mut spans)));
+            row += 1;
+            rows += 1;
+            x = 0;
+        }
+        if !spans.is_empty() {
+            spans.push(span(" ", None, false));
+            x += 1;
+        }
+        spans.push(span(label, Some(role), true));
         out.hits.push(UiHitRect {
             x,
-            y,
+            y: row,
             width: w,
             height: 1,
             action_id: format!("{action}:{target}"),
         });
-        x += w + 1;
+        x += w;
     }
-    out.nodes.push(line(vec![
-        span("[spawn]", Some("success"), true),
-        span(" ", None, false),
-        span("[stop]", Some("danger"), true),
-        span(" ", None, false),
-        span("[refresh]", Some("blue"), true),
-    ]));
+    if !spans.is_empty() {
+        out.nodes.push(line(spans));
+    }
+    rows
 }
 
-/// `y` is a running row cursor. Several list arms bump it after their last
-/// read in an iteration — the value is consumed by the NEXT iteration's
-/// height check, which the compiler cannot see, so the trailing increments
-/// read as dead. Removing them would silently break the clip bound.
 #[allow(unused_assignments)]
 pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
     let mut out = Painted {
@@ -341,8 +355,7 @@ pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
                         y += 1;
                     }
                 }
-                actions(&d.name, y, &mut out);
-                y += 1;
+                y += actions(&d.name, y, ctx.width, &mut out);
             }
             None => {
                 out.nodes.push(line(vec![span(

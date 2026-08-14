@@ -4,7 +4,23 @@
 //! binaries that hot-reload independently, so a guest that predates a collector
 //! field must render rather than fail to parse.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Accept an explicit `null` where a value is expected, yielding the default.
+///
+/// Go marshals a nil slice as `null`, not `[]`, and a collector that has not
+/// fetched a view yet holds nil slices for it. serde's `default` only covers a
+/// MISSING field, so without this the whole snapshot failed to parse the moment
+/// any list was empty — and the guest, which falls back to an empty snapshot on
+/// a parse error, rendered a permanently disconnected panel. Caught by the
+/// byte-level contract test over real collector output.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -69,11 +85,13 @@ pub struct Detail {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub pending: i64,
+    #[serde(deserialize_with = "null_to_default")]
     pub sessions: Vec<Session>,
     #[serde(rename = "liveRules")]
     pub live_rules: String,
     #[serde(rename = "memoryDir")]
     pub memory_dir: String,
+    #[serde(deserialize_with = "null_to_default")]
     pub memories: Vec<Memory>,
 }
 
@@ -97,8 +115,11 @@ pub struct Snapshot {
     pub selected: String,
     pub detail_tab: String,
     pub scroll: i64,
+    #[serde(deserialize_with = "null_to_default")]
     pub fleet: Vec<Harness>,
+    #[serde(deserialize_with = "null_to_default")]
     pub tree: Vec<TreeNode>,
+    #[serde(deserialize_with = "null_to_default")]
     pub templates: Vec<Template>,
     pub models: serde_json::Value,
     pub exposure: serde_json::Value,

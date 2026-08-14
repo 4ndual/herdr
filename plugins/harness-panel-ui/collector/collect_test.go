@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -245,3 +246,26 @@ func TestHeapStaysFlatUnderSustainedEvents(t *testing.T) {
 }
 
 func floatPtr(f float64) *float64 { return &f }
+
+// The wire format the guest reads: empty lists must serialize as [] rather than
+// null. A nil slice marshals as `null`, which is a different type to any strict
+// reader — and the Rust guest failed the entire snapshot on exactly that.
+func TestEmptyListsSerializeAsListsNotNull(t *testing.T) {
+	c, _, _ := newTestCollector(t)
+	c.publish("test")
+
+	raw, err := os.ReadFile(c.inputPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"fleet":null`, `"tree":null`, `"templates":null`} {
+		if bytes.Contains(raw, []byte(field)) {
+			t.Fatalf("wire format regression: %s — must be an empty list", field)
+		}
+	}
+	for _, field := range []string{`"fleet":[`, `"tree":[`, `"templates":[`} {
+		if !bytes.Contains(raw, []byte(field)) {
+			t.Fatalf("expected %s in the published snapshot: %s", field, raw)
+		}
+	}
+}

@@ -47,6 +47,13 @@ func NewCollector(client *Client, stateDir string) *Collector {
 			Daemon: client.base,
 			View:   ViewFleet,
 			Reason: "startup",
+			// Empty, not nil: Go marshals a nil slice as `null`, and a consumer
+			// that expects a list then has to special-case it. The guest is
+			// hardened against null anyway, but emitting a well-formed empty
+			// list is the collector's job, not the reader's problem.
+			Fleet:     []Harness{},
+			Tree:      []TreeNode{},
+			Templates: []Template{},
 		},
 	}
 }

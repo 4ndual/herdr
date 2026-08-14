@@ -13,8 +13,8 @@
 //! renders; when #32 lands, the right-panel rect becomes non-zero and the same
 //! code moves to the real slot with no edit and without ever drawing twice.
 
-mod model;
-mod render;
+pub mod model;
+pub mod render;
 
 use herdr_ui_plugin_api::{
     HostEffect, UiEvent, UiFrameContext, UiLayer, UiSurface, UiUpdate, UiUpdateScope,
@@ -317,23 +317,38 @@ mod frame_tests {
         }
         UiFrameContext {
             surface,
-            rect: UiLayoutRect { x: 0, y: 0, width: w, height: h },
+            rect: UiLayoutRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
             focused: false,
-            host: HostSnapshot { focus: Default::default(), env },
+            host: HostSnapshot {
+                focus: Default::default(),
+                env,
+            },
         }
     }
 
     #[test]
     fn a_zero_rect_panel_frame_claims_the_carve() {
         let u = on_frame(&ctx(UiSurface::Panel, 0, 0, None));
-        assert_eq!(u.layers.len(), 1, "must emit a placeholder to claim the carve");
+        assert_eq!(
+            u.layers.len(),
+            1,
+            "must emit a placeholder to claim the carve"
+        );
         assert!(!u.layers[0].nodes.is_empty());
     }
 
     #[test]
     fn a_zero_rect_right_panel_frame_stays_silent() {
         let u = on_frame(&ctx(UiSurface::RightPanel, 0, 0, None));
-        assert!(u.layers.is_empty(), "claiming both slots would double-render post-#32");
+        assert!(
+            u.layers.is_empty(),
+            "claiming both slots would double-render post-#32"
+        );
     }
 
     #[test]
@@ -355,5 +370,49 @@ mod frame_tests {
         assert!(text.contains("alpha"), "fleet not rendered: {text}");
         assert!(text.contains("live"), "connection state missing: {text}");
         assert!(!u.layers[0].hits.is_empty(), "no clickable hit rects");
+    }
+}
+
+/// Test-only seam so the byte-level contract tests in `tests/contract.rs` can
+/// drive the exact parse and render path the guest uses, on the exact bytes the
+/// Go collector writes. Not part of the wasm ABI — the host never calls it.
+pub mod testing {
+    use crate::model::Snapshot;
+    use crate::render::{self, Ctx};
+
+    #[derive(Clone, Copy)]
+    pub struct RenderSize {
+        pub width: u16,
+        pub height: u16,
+    }
+
+    /// Parse collector output exactly as `on_frame` does.
+    pub fn parse_snapshot(raw: &str) -> Option<Snapshot> {
+        serde_json::from_str::<Snapshot>(raw).ok()
+    }
+
+    /// Render to plain text, the way the terminal would flatten the layer.
+    pub fn render_text(raw: &str, size: RenderSize) -> String {
+        let snap = parse_snapshot(raw).unwrap_or_default();
+        let painted = render::paint(
+            &snap,
+            &Ctx {
+                width: size.width,
+                height: size.height,
+                hover: None,
+                scroll: 0,
+            },
+        );
+        painted
+            .nodes
+            .iter()
+            .map(|node| match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => {
+                    spans.iter().map(|s| s.text.clone()).collect::<String>()
+                }
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
