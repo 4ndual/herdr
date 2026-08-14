@@ -97,14 +97,22 @@ fi
 #    names the projects root the migration must write into, which the picker
 #    passes through to migrate-session.sh as CLAUDE_PROJECTS_DIR.
 # ---------------------------------------------------------------------------
-CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Every claude root, not just the default: a harness-owned session's transcript
+# is under ~/harnesses/<name>/config/projects, and the single-root search this
+# replaces refused the relocate with "no transcript on disk" for those panes.
+# The root that OWNS the transcript is also the root the migration must write
+# into, which is why PROJECTS_DIR is derived from the hit rather than assumed.
 PROJECTS_DIR=""
 TRANSCRIPT=""
-found="$(find "$CLAUDE_DIR/projects" -maxdepth 2 -type f -name "$SID.jsonl" 2>/dev/null | head -1)"
-if [[ -n "$found" ]]; then
-  PROJECTS_DIR="$CLAUDE_DIR/projects"
-  TRANSCRIPT="$found"
-fi
+while IFS= read -r CLAUDE_DIR; do
+  [[ -n "$CLAUDE_DIR" ]] || continue
+  found="$(find "$CLAUDE_DIR/projects" -maxdepth 2 -type f -name "$SID.jsonl" 2>/dev/null | head -1)"
+  if [[ -n "$found" ]]; then
+    PROJECTS_DIR="$CLAUDE_DIR/projects"
+    TRANSCRIPT="$found"
+    break
+  fi
+done < <(claude_roots)
 if [[ -z "$TRANSCRIPT" ]]; then
   toast "Relocate failed" "no transcript on disk for session $SID"
   exit 6

@@ -243,6 +243,35 @@ harness_env_prefix() {
   return 0
 }
 
+# claude_roots -> every Claude Code config root on this machine, one per line.
+#
+# The default root FIRST, then each fleet harness root (~/harnesses/<name>/config
+# whose harness.json declares runtime "claude"). Callers that look up a
+# transcript must walk all of them: a harness pane's transcript has never lived
+# under ~/.claude, so a single-root lookup silently reports "no session" for
+# exactly the panes that most need recovering. Same defect the host carried in
+# `claude_transcript_base` until #36.
+#
+# Emits absolute paths; roots that do not exist are skipped, so the output can be
+# consumed directly without existence checks.
+claude_roots() {
+  _cr_default="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  [ -d "$_cr_default" ] && printf '%s\n' "$_cr_default"
+
+  [ -d "$HOME/harnesses" ] || return 0
+  for _cr_dir in "$HOME"/harnesses/*/; do
+    [ -d "$_cr_dir/config" ] || continue
+    [ "$_cr_dir/config" = "$_cr_default" ] && continue
+    _cr_rt=""
+    if [ -r "$_cr_dir/harness.json" ] && command -v jq >/dev/null 2>&1; then
+      _cr_rt="$(jq -r '.runtime // empty' <"$_cr_dir/harness.json" 2>/dev/null)"
+    fi
+    [ "$_cr_rt" = "claude" ] || continue
+    printf '%s\n' "${_cr_dir%/}/config"
+  done
+  return 0
+}
+
 agent_launch_cmd() {
   _a_verb="$1"
   _a_agent="$2"

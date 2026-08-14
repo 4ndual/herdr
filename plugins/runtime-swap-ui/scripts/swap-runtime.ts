@@ -122,15 +122,35 @@ function paneProcessEnv(paneId: string): Record<string, string> {
   }
   if (!pid) return {};
   const env: Record<string, string> = {};
+  const keep = (key: string, value: string) => {
+    if (Object.values(CONFIG_ROOT_VAR).includes(key)) env[key] = value;
+  };
   try {
     for (const entry of readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")) {
       const split = entry.indexOf("=");
       if (split <= 0) continue;
-      const key = entry.slice(0, split);
-      if (Object.values(CONFIG_ROOT_VAR).includes(key)) env[key] = entry.slice(split + 1);
+      keep(entry.slice(0, split), entry.slice(split + 1));
+    }
+    return env;
+  } catch {
+    /* the process may have exited, or there is no /proc — macOS. */
+  }
+  // macOS has no /proc. Without this the swap silently dropped the pane's
+  // config root on every Mac: the catch above returned {}, the new runtime
+  // launched against the DEFAULT root, and the session it was supposed to carry
+  // over simply was not there. `ps -Eww` prints the environment after the
+  // command, space separated.
+  try {
+    const out = Bun.spawnSync(["ps", "-Eww", "-o", "command=", "-p", String(pid)]);
+    if (out.exitCode === 0) {
+      for (const token of new TextDecoder().decode(out.stdout).split(/\s+/)) {
+        const split = token.indexOf("=");
+        if (split <= 0) continue;
+        keep(token.slice(0, split), token.slice(split + 1));
+      }
     }
   } catch {
-    /* the process may have exited, or /proc may be restricted */
+    /* ps is unavailable or refused; the caller falls back to the default root */
   }
   return env;
 }

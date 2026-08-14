@@ -89,9 +89,22 @@ if [[ -z "$VALUE" ]]; then
   case "$AGENT" in
     claude)
       # Claude Code names a project dir by mapping every non-alphanumeric char
-      # of the cwd to '-'. One root only: ~/.claude/projects.
+      # of the cwd to '-'. Searched across EVERY claude root, not just the
+      # default one: a harness pane's transcript has never been under ~/.claude,
+      # so the single-root lookup this replaces reported "no session id" for
+      # precisely the panes a fork was most wanted on.
       ENC="$(printf '%s' "$CWD" | LC_ALL=C sed 's/[^A-Za-z0-9]/-/g')"
-      newest="$(ls -t "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
+      newest=""
+      while IFS= read -r _root; do
+        [ -n "$_root" ] || continue
+        _cand="$(ls -t "$_root/projects/$ENC/"*.jsonl 2>/dev/null | head -1)"
+        [ -n "$_cand" ] || continue
+        if [ -z "$newest" ] || [ "$_cand" -nt "$newest" ]; then
+          newest="$_cand"
+        fi
+      done <<EOF
+$(claude_roots)
+EOF
       if [[ -n "$newest" ]]; then
         VALUE="$(basename "$newest" .jsonl)"
         KIND="id"

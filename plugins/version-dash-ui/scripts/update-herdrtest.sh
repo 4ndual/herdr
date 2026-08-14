@@ -60,7 +60,11 @@ VD_DO_RESTART="${VD_DO_RESTART:-0}"
 # zig lives anywhere else (the Windows VM uses a different path entirely) the
 # build failed against a dead path. 57ecd926 did this everywhere else.
 export ZIG="${ZIG:-$(command -v zig 2>/dev/null || echo "$HOME/.local/zig/0.15.2/zig")}"
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
+# macOS only. Exporting a Darwin toolchain path on Linux is at best inert and at
+# worst confusing in a build log that is already hard to read.
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+  export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
+fi
 
 log() { printf '» %s\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
