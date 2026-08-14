@@ -293,6 +293,31 @@ pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
         hits: Vec::new(),
         total_rows: 0,
     };
+    // Collapsed: one clickable line, and nothing else. This lives here rather
+    // than in the ABI wrapper because it IS the rendered contract — a caller
+    // that renders a closed snapshot must get the collapsed panel, and a test
+    // that renders one must see it.
+    //
+    // Never an empty layer: a guest that stops emitting one is stranded, because
+    // the host drops its carve and afterwards only ever sends a zero rect, so it
+    // can never claim geometry again and freezes mid-screen.
+    if !snap.open {
+        out.nodes.push(line(vec![span(
+            fit("▦ harness fleet — click to open", ctx.width as usize),
+            Some("muted"),
+            true,
+        )]));
+        out.hits.push(UiHitRect {
+            x: 0,
+            y: 0,
+            width: ctx.width,
+            height: 1,
+            action_id: "toggle:panel".into(),
+        });
+        out.total_rows = 1;
+        return out;
+    }
+
     let mut y: u16 = 0;
     header(snap, ctx, &mut out, &mut y);
 

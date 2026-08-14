@@ -14,6 +14,10 @@ use serde::{Deserialize, Deserializer};
 /// any list was empty — and the guest, which falls back to an empty snapshot on
 /// a parse error, rendered a permanently disconnected panel. Caught by the
 /// byte-level contract test over real collector output.
+fn default_true() -> bool {
+    true
+}
+
 fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -104,7 +108,7 @@ pub struct LastOp {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
     pub connected: bool,
@@ -122,6 +126,15 @@ pub struct Snapshot {
     #[serde(deserialize_with = "null_to_default")]
     pub templates: Vec<Template>,
     pub models: serde_json::Value,
+    /// Panel body open.
+    ///
+    /// Defaults to TRUE when the field is absent: an older snapshot, or any
+    /// producer that does not know about this flag, must not silently collapse
+    /// the panel. The collector always emits it explicitly, and ITS zero value
+    /// is closed — so a fresh install shows just the launcher icon and the
+    /// panel is something the user opens.
+    #[serde(default = "default_true")]
+    pub open: bool,
     pub exposure: serde_json::Value,
     pub detail: Option<Detail>,
     pub last_op: Option<LastOp>,
@@ -147,3 +160,30 @@ pub const VIEWS: [(&str, &str); 6] = [
     ("models", "Models"),
     ("memory", "Mem"),
 ];
+
+impl Default for Snapshot {
+    /// Mirrors the serde defaults. `open` must be true here as well: a derived
+    /// `Default` would make it false, and then any code path that builds a
+    /// snapshot without deserialising one — including tests — would silently
+    /// render the collapsed panel instead of the views.
+    fn default() -> Self {
+        Self {
+            open: true,
+            connected: false,
+            daemon: String::new(),
+            updated_unix: 0,
+            reason: String::new(),
+            view: String::new(),
+            selected: String::new(),
+            detail_tab: String::new(),
+            scroll: 0,
+            fleet: Vec::new(),
+            tree: Vec::new(),
+            templates: Vec::new(),
+            detail: None,
+            exposure: serde_json::Value::Null,
+            models: serde_json::Value::Null,
+            last_op: None,
+        }
+    }
+}

@@ -92,3 +92,27 @@ command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/../../target/release/harness-
 [[event_hooks]]
 on = "startup"
 command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/../../target/release/harness-panel-collector\" collect >/dev/null 2>&1 &"]
+
+# The launcher icon: its own one-row band, always visible, and what opens the
+# panel. The right-panel RAIL is not carved in this host build, so the
+# `rail_icon` above renders nothing today; this gives the plugin a real icon of
+# its own now, and costs nothing when the rail lands.
+[[ui_modules]]
+id = "launcher"
+title = "Harness Panel launcher"
+description = "One-row icon that opens and closes the harness panel"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/harness_panel_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+capabilities = ["layout_read", "mouse_all", "plugin_actions"]
+ui_input_file = "harness_panel_input.json"
+collector = ["../../target/release/harness-panel-collector", "tick"]
+
+[ui_modules.placement]
+region = "bottom"
+align = "start"
+size = "1"
+min_peer = 8
+z = 70

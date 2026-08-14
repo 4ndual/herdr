@@ -163,6 +163,11 @@ func runOp(args []string) error {
 	case "tab":
 		ctl.DetailTab = *tab
 		ctl.Scroll = 0
+	case "toggle":
+		// What the launcher icon drives.
+		ctl.Open = !ctl.Open
+	case "open":
+		ctl.Open = true
 	case "scroll":
 		if *scroll >= 0 {
 			ctl.Scroll = *scroll

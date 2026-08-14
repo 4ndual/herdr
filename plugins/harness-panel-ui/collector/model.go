@@ -111,6 +111,11 @@ type Snapshot struct {
 	// Tab within the detail view.
 	DetailTab string `json:"detail_tab"`
 	Scroll    int    `json:"scroll"`
+	// Open drives the panel body: closed renders a single line, open renders the
+	// views. The panel never relinquishes its carve — a guest that stops
+	// emitting a layer is stranded, because the host then only ever sends it a
+	// zero rect and it can never claim geometry again.
+	Open bool `json:"open"`
 
 	Fleet     []Harness       `json:"fleet"`
 	Tree      []TreeNode      `json:"tree"`
@@ -140,6 +145,10 @@ type Control struct {
 	Selected  string `json:"selected"`
 	DetailTab string `json:"detail_tab"`
 	Scroll    int    `json:"scroll"`
+	// Open, not Closed: the zero value must mean the panel is CLOSED, so a fresh
+	// install shows only the launcher icon and the panel is something the user
+	// opens — the same shape as Plugin Manager's rail icon.
+	Open bool `json:"open"`
 	// Nonce changes on every write so the collector can detect a repeat request
 	// (e.g. refresh pressed twice) that would otherwise look identical.
 	Nonce int64 `json:"nonce"`
