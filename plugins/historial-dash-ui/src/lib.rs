@@ -57,6 +57,18 @@ static SHOW_LEGEND: AtomicBool = AtomicBool::new(false);
 /// Whether subagent rows are hidden. Defaults to SHOWN so the panel's contents
 /// do not change under anyone who has been using it; the control is opt-in.
 static HIDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
+
+/// The live search query, as typed. Empty means no search and is the fast path
+/// through `RowFilters::keep`.
+static SEARCH_QUERY: Mutex<String> = Mutex::new(String::new());
+
+/// Whether the search box is open and holding the keyboard.
+///
+/// Capture matters: `keyboard_input` is a BROADCAST copy, so without
+/// `HostEffect::SetKeyboardCapture` every character typed into the box would
+/// ALSO reach the focused agent pane — searching your history would type into
+/// your conversation. The capture is released the moment the box closes.
+static SEARCH_OPEN: AtomicBool = AtomicBool::new(false);
 /// Monotonic per-agent filter click counter; `AgentFilter::from_index` maps it to
 /// the current selection (all/claude/codex/pi/jcode). Advanced by clicks on
 /// `render::ACTION_CYCLE_AGENT`.
@@ -65,6 +77,10 @@ static AGENT_FILTER_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// The composed header filter state read from the guest's static flags.
 fn current_filters() -> RowFilters {
     RowFilters {
+        // Already lowercased at write time — see handle_key. Lowercasing here
+        // instead would allocate a String on every frame to answer a question
+        // that only changes when someone types.
+        query: SEARCH_QUERY.lock().expect("search mutex poisoned").clone(),
         hide_subagents: HIDE_SUBAGENTS.load(Ordering::SeqCst),
         show_terminals: SHOW_TERMINALS.load(Ordering::SeqCst),
         agent: AgentFilter::from_index(AGENT_FILTER_INDEX.load(Ordering::SeqCst)),
@@ -157,6 +173,7 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     match event {
         UiEvent::Frame(ctx) => handle_frame(ctx),
         UiEvent::Mouse(mouse) => handle_mouse(mouse),
+        UiEvent::Key(key) => handle_key(key),
         UiEvent::Action {
             action_id, kind, ..
         } => handle_action(action_id, *kind),
@@ -199,7 +216,7 @@ fn render_from_cache() -> Option<UiUpdate> {
     let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, filters, header_hover);
+    let hits = render::render(model, area, &mut buf, hovered, &filters, header_hover);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -207,6 +224,58 @@ fn render_from_cache() -> Option<UiUpdate> {
         scope: UiUpdateScope::Partial,
         consumed_action_ids: Vec::new(),
     })
+}
+
+/// Search-box typing. Only runs while the box is open, because that is the only
+/// time this module holds the keyboard.
+///
+/// Keys arrive as a BROADCAST (`keyboard_input`) — the pane sees them too — so
+/// the box must ALSO hold `SetKeyboardCapture` while open, or typing a search
+/// would type into the focused agent. Capture is taken when the box opens and
+/// released on Esc/Enter, never left dangling: a plugin that keeps the keyboard
+/// after its modal closes is indistinguishable, to the user, from a frozen
+/// terminal.
+fn handle_key(key: &herdr_ui_plugin_api::KeyEvent) -> UiUpdate {
+    if !SEARCH_OPEN.load(Ordering::SeqCst) {
+        return UiUpdate::default();
+    }
+    let mut query = SEARCH_QUERY.lock().expect("search mutex poisoned");
+    match key.key.as_str() {
+        "Escape" => {
+            query.clear();
+            drop(query);
+            return close_search();
+        }
+        // Enter keeps the query and gives the keyboard back, so the filtered
+        // list stays on screen and the pane becomes typable again.
+        "Enter" => {
+            drop(query);
+            return close_search();
+        }
+        "Backspace" => {
+            query.pop();
+        }
+        text if text.chars().count() == 1 && !key.ctrl && !key.alt && !key.meta => {
+            // Stored lowercased so the per-frame filter never has to convert.
+            query.extend(text.chars().flat_map(char::to_lowercase));
+        }
+        _ => return UiUpdate::default(),
+    }
+    drop(query);
+    // The visible row set just changed; a stale hover index may point past it.
+    *HOVERED.lock().expect("hover mutex poisoned") = None;
+    render_from_cache().unwrap_or_default()
+}
+
+/// Close the box and hand the keyboard back in the same update.
+fn close_search() -> UiUpdate {
+    SEARCH_OPEN.store(false, Ordering::SeqCst);
+    *HOVERED.lock().expect("hover mutex poisoned") = None;
+    let mut update = render_from_cache().unwrap_or_default();
+    update
+        .effects
+        .push(HostEffect::SetKeyboardCapture { captured: false });
+    update
 }
 
 /// Raw mouse handling (requires the `mouse_all` capability, which delivers every
@@ -236,7 +305,7 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
                 .lock()
                 .expect("model mutex poisoned")
                 .as_ref()
-                .map(|m| render::visible_rows(m, filters).len())
+                .map(|m| render::visible_rows(m, &filters).len())
                 .unwrap_or(0);
             let next = area.and_then(|a| hovered_row_at(a, rows, mouse.column, mouse.row));
             *HOVERED.lock().expect("hover mutex poisoned") = next;
@@ -289,7 +358,16 @@ fn ensure_model(ctx: &UiFrameContext) -> bool {
         .get("HERDR_PLUGIN_UI_INPUT_JSON")
         .filter(|json| !json.is_empty())
     else {
-        return MODEL.lock().expect("model mutex poisoned").is_some();
+        // NO payload is a different case from a BROKEN one. The host not
+        // delivering the input means there is nothing to show — the documented
+        // behaviour, and what the empty-input test pins — whereas a malformed
+        // payload below keeps the last good model rather than blanking a panel
+        // over one bad write.
+        *MODEL.lock().expect("model mutex poisoned") = None;
+        *LAST_INPUT_FINGERPRINT
+            .lock()
+            .expect("fingerprint mutex poisoned") = None;
+        return false;
     };
 
     let current = fingerprint(json);
@@ -342,7 +420,7 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
         if let Some(i) = *hov {
             let filters = current_filters();
             let max_rows = area.height.saturating_sub(1) as usize;
-            let visible = render::visible_rows(model, filters).len().min(max_rows);
+            let visible = render::visible_rows(model, &filters).len().min(max_rows);
             if i >= visible {
                 *hov = None;
             }
@@ -380,7 +458,7 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, filters, header_hover);
+    let hits = render::render(model, area, &mut buf, hovered, &filters, header_hover);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     UiUpdate {
@@ -408,6 +486,18 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         // Re-render immediately with the new filter (falls back to empty only when
         // there is no carved panel, which never happens on a header click).
         return render_from_cache().unwrap_or_default();
+    }
+    if action_id == render::ACTION_TOGGLE_SEARCH {
+        if SEARCH_OPEN.load(Ordering::SeqCst) {
+            return close_search();
+        }
+        SEARCH_OPEN.store(true, Ordering::SeqCst);
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        let mut update = render_from_cache().unwrap_or_default();
+        update
+            .effects
+            .push(HostEffect::SetKeyboardCapture { captured: true });
+        return update;
     }
     if action_id == render::ACTION_TOGGLE_SUBAGENTS {
         let hide = !HIDE_SUBAGENTS.load(Ordering::SeqCst);

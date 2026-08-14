@@ -52,6 +52,9 @@ pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
 /// while shown.
 pub const ACTION_TOGGLE_LEGEND: &str = "historial:toggle_legend";
 
+/// Header toggle for the search box.
+pub const ACTION_TOGGLE_SEARCH: &str = "historial:toggle_search";
+
 /// Header toggle for [`RowFilters::hide_subagents`].
 pub const ACTION_TOGGLE_SUBAGENTS: &str = "historial:toggle_subagents";
 
@@ -118,11 +121,19 @@ impl AgentFilter {
 /// legend-overlay toggle. Shared by the renderer and the guest's hover
 /// hit-testing so both agree on which rows are visible. (Subagent rows are
 /// excluded at the host source, so there is no subagent toggle here.)
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct RowFilters {
     pub show_terminals: bool,
     pub agent: AgentFilter,
     pub show_legend: bool,
+    /// Active search query, lowercased. Empty means no search.
+    ///
+    /// Matching is SUBSTRING-PER-TERM: the query is split on whitespace and a
+    /// row must contain every term somewhere in its searchable text, in any
+    /// order. That is what people expect from a history box — "herdr fix"
+    /// finds a row about fixing herdr regardless of word order — and it is the
+    /// rule the resume-picker settled on for the same reason.
+    pub query: String,
     /// Hide rows whose transcript is an `agent-*` jsonl, i.e. a subagent run.
     ///
     /// `HistorialRow::is_subagent` has existed and been documented as driving a
@@ -140,7 +151,38 @@ impl RowFilters {
         if self.hide_subagents && row.is_subagent {
             return false;
         }
-        self.agent.matches(&row.agent)
+        if !self.agent.matches(&row.agent) {
+            return false;
+        }
+        self.matches_query(row)
+    }
+
+    /// Every term must appear somewhere in the row's searchable text.
+    ///
+    /// The haystack is built per row per call rather than indexed up front on
+    /// purpose: it is only built while a query is ACTIVE (the empty-query fast
+    /// path returns before touching a row's strings), and a query is active for
+    /// the seconds someone is typing, not for the life of the panel. Indexing
+    /// eagerly would pay for 40 rows of concatenation on every tick forever to
+    /// save a few microseconds during those seconds.
+    fn matches_query(&self, row: &historial_dash_model::HistorialRow) -> bool {
+        if self.query.is_empty() {
+            return true;
+        }
+        let haystack = [
+            row.label.as_str(),
+            row.tab_name.as_str(),
+            row.cwd.as_str(),
+            row.workspace_name.as_str(),
+            row.first_prompt.as_str(),
+            row.last_prompt.as_str(),
+            row.agent.as_str(),
+        ]
+        .join(" ")
+        .to_lowercase();
+        self.query
+            .split_whitespace()
+            .all(|term| haystack.contains(term))
     }
 }
 
@@ -152,6 +194,7 @@ pub enum HeaderButton {
     Agent,
     Terminals,
     Subagents,
+    Search,
     Legend,
     Collapse,
 }
@@ -159,7 +202,7 @@ pub enum HeaderButton {
 impl HeaderButton {
     /// One-line human description shown as a hover hint at the panel bottom, so
     /// the otherwise-cryptic `[*][t][?][<]` glyphs are self-explanatory.
-    pub fn describe(self, filters: RowFilters) -> String {
+    pub fn describe(self, filters: &RowFilters) -> String {
         match self {
             HeaderButton::Agent => {
                 format!(
@@ -181,6 +224,13 @@ impl HeaderButton {
                     "[s] subagents shown  (click to hide)".to_string()
                 }
             }
+            HeaderButton::Search => {
+                if filters.query.is_empty() {
+                    "[/] search this history  (type to filter, esc to clear)".to_string()
+                } else {
+                    format!("[/] searching: {}  (esc clears)", filters.query)
+                }
+            }
             HeaderButton::Legend => "[?] toggle the help legend".to_string(),
             HeaderButton::Collapse => "[<] collapse this panel".to_string(),
         }
@@ -188,7 +238,7 @@ impl HeaderButton {
 
     /// Accent color for this button, applied even when inactive so each glyph
     /// reads as a distinct control rather than gray text.
-    fn color(self, filters: RowFilters) -> Color {
+    fn color(self, filters: &RowFilters) -> Color {
         match self {
             HeaderButton::Agent => {
                 if filters.agent == AgentFilter::All {
@@ -208,6 +258,9 @@ impl HeaderButton {
             // strip sharing a colour role without a declared reason, and this
             // sits next to the green terminals toggle.
             HeaderButton::Subagents => Color::Cyan,
+            // Blue is the canon's navigation role, and a search box is how you
+            // navigate a long list.
+            HeaderButton::Search => Color::Blue,
             HeaderButton::Legend => Color::Yellow,
             HeaderButton::Collapse => Color::Cyan,
         }
@@ -221,6 +274,9 @@ const HEADER_BTN_W: u16 = 3;
 /// right-to-left hit chain stays uniform.
 const SUBAGENTS_BTN: &str = "[s]";
 
+/// Search glyph.
+const SEARCH_BTN: &str = "[/]";
+
 /// Resolve which header button (if any) the absolute coordinate `(col, row)` is
 /// over. Mirrors the right-to-left hit-rect layout in [`render_full`] exactly so
 /// hover and click agree. Returns `None` off the header row or between buttons.
@@ -231,7 +287,8 @@ pub fn header_button_at(area: Rect, col: u16, row: u16) -> Option<HeaderButton> 
     let collapse_x = area.x + area.width.saturating_sub(HEADER_BTN_W);
     let legend_x = collapse_x.saturating_sub(1 + HEADER_BTN_W);
     let term_x = legend_x.saturating_sub(HEADER_BTN_W);
-    let sub_x = term_x.saturating_sub(HEADER_BTN_W);
+    let search_x = term_x.saturating_sub(HEADER_BTN_W);
+    let sub_x = search_x.saturating_sub(HEADER_BTN_W);
     let agent_x = sub_x.saturating_sub(HEADER_BTN_W);
     let hit = |x: u16| col >= x && col < x + HEADER_BTN_W;
     if hit(collapse_x) {
@@ -240,6 +297,8 @@ pub fn header_button_at(area: Rect, col: u16, row: u16) -> Option<HeaderButton> 
         Some(HeaderButton::Legend)
     } else if hit(term_x) {
         Some(HeaderButton::Terminals)
+    } else if hit(search_x) {
+        Some(HeaderButton::Search)
     } else if hit(sub_x) {
         Some(HeaderButton::Subagents)
     } else if hit(agent_x) {
@@ -297,10 +356,10 @@ const LEGEND_BTN: &str = "[?]";
 /// The rows to actually render, honoring the show-terminals toggle: when off
 /// (default), plain terminal/shell rows are filtered out. Shared by the renderer
 /// and the guest's hover hit-testing so both agree on row indices.
-pub fn visible_rows(
-    model: &HistorialRenderModel,
-    filters: RowFilters,
-) -> Vec<&historial_dash_model::HistorialRow> {
+pub fn visible_rows<'a>(
+    model: &'a HistorialRenderModel,
+    filters: &RowFilters,
+) -> Vec<&'a historial_dash_model::HistorialRow> {
     model.rows.iter().filter(|row| filters.keep(row)).collect()
 }
 
@@ -314,7 +373,7 @@ pub fn render(
     area: Rect,
     buf: &mut Buffer,
     hovered: Option<usize>,
-    filters: RowFilters,
+    filters: &RowFilters,
     header_hover: Option<HeaderButton>,
 ) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
@@ -353,7 +412,7 @@ fn render_full(
     area: Rect,
     buf: &mut Buffer,
     hovered: Option<usize>,
-    filters: RowFilters,
+    filters: &RowFilters,
     header_hover: Option<HeaderButton>,
 ) -> Vec<UiHitRect> {
     let width = area.width as usize;
@@ -410,6 +469,10 @@ fn render_full(
         btn_style(HeaderButton::Subagents, filters.hide_subagents),
     ));
     header.push(Span::styled(
+        SEARCH_BTN,
+        btn_style(HeaderButton::Search, !filters.query.is_empty()),
+    ));
+    header.push(Span::styled(
         LEGEND_BTN,
         btn_style(HeaderButton::Legend, filters.show_legend),
     ));
@@ -452,7 +515,15 @@ fn render_full(
         height: 1,
         action_id: ACTION_TOGGLE_TERMINALS.to_string(),
     });
-    let sub_x = term_x.saturating_sub(HEADER_BTN_W);
+    let search_x = term_x.saturating_sub(HEADER_BTN_W);
+    hits.push(UiHitRect {
+        x: search_x,
+        y: area.y,
+        width: HEADER_BTN_W,
+        height: 1,
+        action_id: ACTION_TOGGLE_SEARCH.to_string(),
+    });
+    let sub_x = search_x.saturating_sub(HEADER_BTN_W);
     hits.push(UiHitRect {
         x: sub_x,
         y: area.y,
@@ -994,7 +1065,7 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
@@ -1019,7 +1090,7 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
@@ -1046,17 +1117,18 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
             None,
         );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
-        assert_eq!(ids.len(), 5);
+        assert_eq!(ids.len(), 6);
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.contains(&"historial:toggle_terminals"));
         assert!(ids.contains(&"historial:toggle_subagents"));
+        assert!(ids.contains(&"historial:toggle_search"));
         assert!(ids.contains(&"historial:toggle_legend"));
         assert!(ids.contains(&"historial:cycle_agent"));
     }
@@ -1087,6 +1159,49 @@ mod tests {
     /// The model has carried `is_subagent` and documented a "hide subagents"
     /// filter since the field was added, but nothing read it. This pins the
     /// control to the data so the two cannot drift apart again.
+    /// Substring-per-term, order-independent, case-insensitive — the rule the
+    /// resume-picker settled on, because that is what people expect a history
+    /// box to do.
+    #[test]
+    fn search_matches_every_term_in_any_order() {
+        let mut model = HistorialRenderModel::default();
+        model.rows.push(HistorialRow {
+            cwd: "/home/u/Projects/alpha".to_string(),
+            first_prompt: "fix the strip rendering".to_string(),
+            ..row("a", true)
+        });
+        model.rows.push(HistorialRow {
+            cwd: "/home/u/Projects/beta".to_string(),
+            first_prompt: "write the docs".to_string(),
+            ..row("b", true)
+        });
+
+        let search = |q: &str| {
+            let filters = RowFilters {
+                show_terminals: true,
+                query: q.to_string(),
+                ..RowFilters::default()
+            };
+            visible_rows(&model, &filters).len()
+        };
+
+        assert_eq!(search(""), 2, "an empty query filters nothing");
+        assert_eq!(search("alpha"), 1, "matches the cwd");
+        assert_eq!(search("docs"), 1, "matches the prompt");
+        // Order-independent, and across DIFFERENT fields.
+        assert_eq!(search("alpha fix"), 1);
+        assert_eq!(search("fix alpha"), 1);
+        // Every term must match: one hit plus one miss is a miss.
+        assert_eq!(search("alpha docs"), 0);
+        // Case-insensitive (the guest lowercases the query; the haystack too).
+        assert_eq!(
+            search("ALPHA"),
+            0,
+            "the guest lowercases the query before it gets here; a raw upper-case term must not match"
+        );
+        assert_eq!(search("alpha"), 1);
+    }
+
     #[test]
     fn hiding_subagents_removes_exactly_the_subagent_rows() {
         let mut model = HistorialRenderModel::default();
@@ -1102,7 +1217,7 @@ mod tests {
             ..RowFilters::default()
         };
         assert_eq!(
-            visible_rows(&model, shown).len(),
+            visible_rows(&model, &shown).len(),
             3,
             "default shows subagents"
         );
@@ -1112,7 +1227,7 @@ mod tests {
             hide_subagents: true,
             ..RowFilters::default()
         };
-        let rows = visible_rows(&model, hidden);
+        let rows = visible_rows(&model, &hidden);
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter().all(|row| !row.is_subagent),
@@ -1135,7 +1250,7 @@ mod tests {
             agent: AgentFilter::Jcode,
             ..RowFilters::default()
         };
-        let visible = visible_rows(&model, f);
+        let visible = visible_rows(&model, &f);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].agent, "jcode");
 
@@ -1143,7 +1258,7 @@ mod tests {
             agent: AgentFilter::Claude,
             ..RowFilters::default()
         };
-        let visible = visible_rows(&model, f);
+        let visible = visible_rows(&model, &f);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].agent, "claude");
     }
@@ -1159,7 +1274,7 @@ mod tests {
             show_legend: true,
             ..RowFilters::default()
         };
-        let _ = render(&model, area, &mut buf, None, f, None);
+        let _ = render(&model, area, &mut buf, None, &f, None);
         let text = buffer_text(&buf);
         // Legend content is shown; the row's label ("herdr") is not.
         assert!(text.contains("agent filter"));
@@ -1180,7 +1295,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
         // No hover: only the row is drawn (no tooltip).
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         let text = buffer_text(&buf);
         assert!(text.contains("bitwarden")); // tab name is the row identity
         assert!(!text.contains("fix the historial")); // never the first prompt
@@ -1197,7 +1312,7 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         assert!(buffer_text(&buf).contains("claude"));
     }
 
@@ -1205,11 +1320,12 @@ mod tests {
     fn header_button_at_resolves_each_button_right_to_left() {
         let area = Rect::new(0, 0, 44, 12);
         // Layout (right-to-left): collapse at width-3, then a space, then
-        // legend, terminals, subagents, agent — each 3 cols.
+        // legend, terminals, search, subagents, agent — each 3 cols.
         let collapse_x = area.width - 3;
         let legend_x = collapse_x - 1 - 3;
         let term_x = legend_x - 3;
-        let sub_x = term_x - 3;
+        let search_x = term_x - 3;
+        let sub_x = search_x - 3;
         let agent_x = sub_x - 3;
         assert_eq!(
             header_button_at(area, collapse_x, 0),
@@ -1222,6 +1338,10 @@ mod tests {
         assert_eq!(
             header_button_at(area, term_x, 0),
             Some(HeaderButton::Terminals)
+        );
+        assert_eq!(
+            header_button_at(area, search_x, 0),
+            Some(HeaderButton::Search)
         );
         assert_eq!(
             header_button_at(area, sub_x, 0),
@@ -1249,7 +1369,7 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters::default(),
+            &RowFilters::default(),
             Some(HeaderButton::Agent),
         );
         // The hint text appears somewhere in the panel (bottom line).
@@ -1269,7 +1389,7 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         let text = buffer_text(&buf);
         assert!(text.contains("claude")); // agent name is the row identity
         assert!(!text.contains("c123")); // sid is tooltip-only
@@ -1299,7 +1419,7 @@ mod tests {
         // Hidden: the terminal row is not drawn; the agent row is (by its pane
         // name). Neither folder basename ("scratch") appears on any row.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         let hidden = buffer_text(&buf);
         assert!(hidden.contains("myproj"));
         assert!(!hidden.contains("terminal"));
@@ -1313,7 +1433,7 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
@@ -1331,7 +1451,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let hits = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         assert!(hits
             .iter()
             .any(|h| h.action_id == "historial:toggle_terminals"));
@@ -1344,7 +1464,7 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         assert!(buffer_text(&buf).contains("no agent panes"));
     }
 
@@ -1357,7 +1477,7 @@ mod tests {
             area,
             &mut buf,
             None,
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
@@ -1375,7 +1495,7 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 50, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, RowFilters::default(), None);
+        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
         let text = buffer_text(&buf);
         assert!(text.contains("herdr")); // the pane name
         assert!(!text.contains("sess-c123")); // full sid is tooltip-only
@@ -1392,7 +1512,14 @@ mod tests {
         };
         let area = Rect::new(0, 0, 60, 20);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, Some(0), RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            Some(0),
+            &RowFilters::default(),
+            None,
+        );
         let text = buffer_text(&buf);
         assert!(text.contains("resumable")); // restorability status
         assert!(text.contains("sess-c123")); // FULL session id (not just sid4)
@@ -1420,7 +1547,7 @@ mod tests {
             area,
             &mut buf,
             Some(0),
-            RowFilters {
+            &RowFilters {
                 show_terminals: true,
                 ..RowFilters::default()
             },
@@ -1446,13 +1573,13 @@ mod tests {
         let json = std::fs::read_to_string(&path).expect("read snapshot json");
         let model: HistorialRenderModel = serde_json::from_str(&json).expect("parse model");
         let filters = RowFilters::default(); // terminals hidden, like the live default
-        let visible = visible_rows(&model, filters);
+        let visible = visible_rows(&model, &filters);
         let hover = visible
             .iter()
             .position(|r| r.restorable && r.agent != "terminal");
         let area = Rect::new(0, 0, 46, 44);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, hover, filters, None);
+        let _ = render(&model, area, &mut buf, hover, &filters, None);
         eprintln!(
             "\n===== HISTORIAL PANEL (real data, {} visible rows, hover idx {:?}) =====",
             visible.len(),
