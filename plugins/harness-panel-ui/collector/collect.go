@@ -198,7 +198,6 @@ func (c *Collector) runControl(ctx context.Context) {
 			c.snap.Selected = ctl.Selected
 			c.snap.DetailTab = ctl.DetailTab
 			c.snap.Scroll = ctl.Scroll
-				c.snap.Open = ctl.Open
 			c.mu.Unlock()
 			c.refreshDerived(ctx, ctl.View, ctl.Selected)
 			c.publish("selection")

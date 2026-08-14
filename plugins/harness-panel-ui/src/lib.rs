@@ -124,45 +124,6 @@ fn snapshot_from(ctx: &UiFrameContext) -> Snapshot {
         .unwrap_or_default()
 }
 
-/// One clickable line. Used for BOTH the launcher icon (its own one-row band)
-/// and the collapsed panel body, because they are the same affordance: a thing
-/// you click to open the panel.
-///
-/// Note what this deliberately does not do: return an empty layer. A guest
-/// cannot make its panel disappear in this host build — an empty Partial update
-/// merges (the old layer stays), an empty Full update does not clear it either,
-/// and once the host drops the carve the module only ever receives a zero rect,
-/// so it can never claim geometry again and freezes mid-screen. Collapsing to a
-/// single line keeps the carve and stays reversible.
-fn one_liner(ctx: &UiFrameContext, text: &str, role: &str) -> UiUpdate {
-    UiUpdate {
-        layers: vec![UiLayer {
-            surface: ctx.surface,
-            z_index: 0,
-            consumes_mouse: true,
-            nodes: vec![herdr_ui_plugin_api::UiNode::Line {
-                spans: vec![herdr_ui_plugin_api::UiTextSpan {
-                    text: text.into(),
-                    role: Some(role.into()),
-                    bold: true,
-                    ..Default::default()
-                }],
-            }],
-            hits: vec![herdr_ui_plugin_api::UiHitRect {
-                x: ctx.rect.x,
-                y: ctx.rect.y,
-                width: text.chars().count().max(1) as u16,
-                height: 1,
-                action_id: "toggle:panel".into(),
-            }],
-            data: None,
-        }],
-        effects: Vec::new(),
-        scope: UiUpdateScope::Partial,
-        consumed_action_ids: Vec::new(),
-    }
-}
-
 fn on_frame(ctx: &UiFrameContext) -> UiUpdate {
     // Zero rect: the host carves a panel only for a module that ALREADY renders
     // content, so a guest that draws nothing without geometry never gets any —
@@ -173,14 +134,6 @@ fn on_frame(ctx: &UiFrameContext) -> UiUpdate {
     // Only the `panel` surface gets that placeholder. Claiming the right panel
     // the same way would, once #32 makes that surface real, leave this plugin
     // rendering into both slots at once.
-    if ctx.rect.height == 1 && ctx.rect.width > 0 {
-        let open = snapshot_from(ctx).open;
-        return one_liner(
-            ctx,
-            if open { "▨ harness fleet" } else { "▦ harness fleet" },
-            if open { "blue" } else { "muted" },
-        );
-    }
     if ctx.rect.width == 0 || ctx.rect.height == 0 {
         if ctx.surface != UiSurface::Panel {
             return UiUpdate::default();
@@ -305,7 +258,6 @@ fn on_action(action_id: &str) -> UiUpdate {
         "view" => serde_json::json!({ "action": "view", "view": arg }),
         "select" => serde_json::json!({ "action": "select", "target": arg }),
         "spawn" | "stop" | "refresh" => serde_json::json!({ "action": verb, "target": arg }),
-        "toggle" => serde_json::json!({ "action": "toggle" }),
         _ => return UiUpdate::default(),
     };
 
