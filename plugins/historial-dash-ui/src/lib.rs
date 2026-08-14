@@ -53,6 +53,10 @@ static SHOW_TERMINALS: AtomicBool = AtomicBool::new(false);
 /// Whether the legend/help overlay is shown. Default off; toggled by clicks on
 /// `render::ACTION_TOGGLE_LEGEND`. Guest-persistent in memory.
 static SHOW_LEGEND: AtomicBool = AtomicBool::new(false);
+
+/// Whether subagent rows are hidden. Defaults to SHOWN so the panel's contents
+/// do not change under anyone who has been using it; the control is opt-in.
+static HIDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
 /// Monotonic per-agent filter click counter; `AgentFilter::from_index` maps it to
 /// the current selection (all/claude/codex/pi/jcode). Advanced by clicks on
 /// `render::ACTION_CYCLE_AGENT`.
@@ -61,6 +65,7 @@ static AGENT_FILTER_INDEX: AtomicUsize = AtomicUsize::new(0);
 /// The composed header filter state read from the guest's static flags.
 fn current_filters() -> RowFilters {
     RowFilters {
+        hide_subagents: HIDE_SUBAGENTS.load(Ordering::SeqCst),
         show_terminals: SHOW_TERMINALS.load(Ordering::SeqCst),
         agent: AgentFilter::from_index(AGENT_FILTER_INDEX.load(Ordering::SeqCst)),
         show_legend: SHOW_LEGEND.load(Ordering::SeqCst),
@@ -402,6 +407,13 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         *HOVERED.lock().expect("hover mutex poisoned") = None;
         // Re-render immediately with the new filter (falls back to empty only when
         // there is no carved panel, which never happens on a header click).
+        return render_from_cache().unwrap_or_default();
+    }
+    if action_id == render::ACTION_TOGGLE_SUBAGENTS {
+        let hide = !HIDE_SUBAGENTS.load(Ordering::SeqCst);
+        HIDE_SUBAGENTS.store(hide, Ordering::SeqCst);
+        // A stale hover index may now point past the filtered list.
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
         return render_from_cache().unwrap_or_default();
     }
     if action_id == render::ACTION_TOGGLE_LEGEND {

@@ -52,6 +52,9 @@ pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
 /// while shown.
 pub const ACTION_TOGGLE_LEGEND: &str = "historial:toggle_legend";
 
+/// Header toggle for [`RowFilters::hide_subagents`].
+pub const ACTION_TOGGLE_SUBAGENTS: &str = "historial:toggle_subagents";
+
 /// Per-agent-kind filter selected in the header (item: per-agent filter).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum AgentFilter {
@@ -120,11 +123,21 @@ pub struct RowFilters {
     pub show_terminals: bool,
     pub agent: AgentFilter,
     pub show_legend: bool,
+    /// Hide rows whose transcript is an `agent-*` jsonl, i.e. a subagent run.
+    ///
+    /// `HistorialRow::is_subagent` has existed and been documented as driving a
+    /// "hide subagents" header filter since the field was added — but no filter
+    /// ever read it, so a busy session's list was mostly subagent rows with no
+    /// way to see past them. The data was right; the control was missing.
+    pub hide_subagents: bool,
 }
 
 impl RowFilters {
     fn keep(&self, row: &historial_dash_model::HistorialRow) -> bool {
         if !self.show_terminals && row.is_terminal() {
+            return false;
+        }
+        if self.hide_subagents && row.is_subagent {
             return false;
         }
         self.agent.matches(&row.agent)
@@ -138,6 +151,7 @@ impl RowFilters {
 pub enum HeaderButton {
     Agent,
     Terminals,
+    Subagents,
     Legend,
     Collapse,
 }
@@ -158,6 +172,13 @@ impl HeaderButton {
                     "[t] terminals shown  (click to hide)".to_string()
                 } else {
                     "[t] terminals hidden  (click to show)".to_string()
+                }
+            }
+            HeaderButton::Subagents => {
+                if filters.hide_subagents {
+                    "[s] subagents hidden  (click to show)".to_string()
+                } else {
+                    "[s] subagents shown  (click to hide)".to_string()
                 }
             }
             HeaderButton::Legend => "[?] toggle the help legend".to_string(),
@@ -183,6 +204,10 @@ impl HeaderButton {
                     Color::LightGreen
                 }
             }
+            // Teal, not another green: the canon forbids two controls in one
+            // strip sharing a colour role without a declared reason, and this
+            // sits next to the green terminals toggle.
+            HeaderButton::Subagents => Color::Cyan,
             HeaderButton::Legend => Color::Yellow,
             HeaderButton::Collapse => Color::Cyan,
         }
@@ -191,6 +216,10 @@ impl HeaderButton {
 
 /// Fixed glyph width shared by every header button (all glyphs are 3 cols).
 const HEADER_BTN_W: u16 = 3;
+
+/// Subagent filter glyph. Three columns like every other header button, so the
+/// right-to-left hit chain stays uniform.
+const SUBAGENTS_BTN: &str = "[s]";
 
 /// Resolve which header button (if any) the absolute coordinate `(col, row)` is
 /// over. Mirrors the right-to-left hit-rect layout in [`render_full`] exactly so
@@ -202,7 +231,8 @@ pub fn header_button_at(area: Rect, col: u16, row: u16) -> Option<HeaderButton> 
     let collapse_x = area.x + area.width.saturating_sub(HEADER_BTN_W);
     let legend_x = collapse_x.saturating_sub(1 + HEADER_BTN_W);
     let term_x = legend_x.saturating_sub(HEADER_BTN_W);
-    let agent_x = term_x.saturating_sub(HEADER_BTN_W);
+    let sub_x = term_x.saturating_sub(HEADER_BTN_W);
+    let agent_x = sub_x.saturating_sub(HEADER_BTN_W);
     let hit = |x: u16| col >= x && col < x + HEADER_BTN_W;
     if hit(collapse_x) {
         Some(HeaderButton::Collapse)
@@ -210,6 +240,8 @@ pub fn header_button_at(area: Rect, col: u16, row: u16) -> Option<HeaderButton> 
         Some(HeaderButton::Legend)
     } else if hit(term_x) {
         Some(HeaderButton::Terminals)
+    } else if hit(sub_x) {
+        Some(HeaderButton::Subagents)
     } else if hit(agent_x) {
         Some(HeaderButton::Agent)
     } else {
@@ -374,6 +406,10 @@ fn render_full(
         btn_style(HeaderButton::Terminals, filters.show_terminals),
     ));
     header.push(Span::styled(
+        SUBAGENTS_BTN,
+        btn_style(HeaderButton::Subagents, filters.hide_subagents),
+    ));
+    header.push(Span::styled(
         LEGEND_BTN,
         btn_style(HeaderButton::Legend, filters.show_legend),
     ));
@@ -416,7 +452,15 @@ fn render_full(
         height: 1,
         action_id: ACTION_TOGGLE_TERMINALS.to_string(),
     });
-    let agent_x = term_x.saturating_sub(agent_w);
+    let sub_x = term_x.saturating_sub(HEADER_BTN_W);
+    hits.push(UiHitRect {
+        x: sub_x,
+        y: area.y,
+        width: HEADER_BTN_W,
+        height: 1,
+        action_id: ACTION_TOGGLE_SUBAGENTS.to_string(),
+    });
+    let agent_x = sub_x.saturating_sub(agent_w);
     hits.push(UiHitRect {
         x: agent_x,
         y: area.y,
@@ -1009,9 +1053,10 @@ mod tests {
             None,
         );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
-        assert_eq!(ids.len(), 4);
+        assert_eq!(ids.len(), 5);
         assert!(ids.contains(&"historial:toggle_panel"));
         assert!(ids.contains(&"historial:toggle_terminals"));
+        assert!(ids.contains(&"historial:toggle_subagents"));
         assert!(ids.contains(&"historial:toggle_legend"));
         assert!(ids.contains(&"historial:cycle_agent"));
     }
@@ -1037,6 +1082,42 @@ mod tests {
         for f in &cycle {
             assert_eq!(f.glyph().chars().count(), HEADER_BTN_W as usize);
         }
+    }
+
+    /// The model has carried `is_subagent` and documented a "hide subagents"
+    /// filter since the field was added, but nothing read it. This pins the
+    /// control to the data so the two cannot drift apart again.
+    #[test]
+    fn hiding_subagents_removes_exactly_the_subagent_rows() {
+        let mut model = HistorialRenderModel::default();
+        model.rows.push(row("main", true));
+        model.rows.push(HistorialRow {
+            is_subagent: true,
+            ..row("probe", true)
+        });
+        model.rows.push(row("other", true));
+
+        let shown = RowFilters {
+            show_terminals: true,
+            ..RowFilters::default()
+        };
+        assert_eq!(
+            visible_rows(&model, shown).len(),
+            3,
+            "default shows subagents"
+        );
+
+        let hidden = RowFilters {
+            show_terminals: true,
+            hide_subagents: true,
+            ..RowFilters::default()
+        };
+        let rows = visible_rows(&model, hidden);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| !row.is_subagent),
+            "a subagent row survived the filter"
+        );
     }
 
     #[test]
@@ -1123,12 +1204,13 @@ mod tests {
     #[test]
     fn header_button_at_resolves_each_button_right_to_left() {
         let area = Rect::new(0, 0, 44, 12);
-        // Layout (right-to-left): collapse at width-3, then a space, then legend,
-        // terminals, agent — each 3 cols.
+        // Layout (right-to-left): collapse at width-3, then a space, then
+        // legend, terminals, subagents, agent — each 3 cols.
         let collapse_x = area.width - 3;
         let legend_x = collapse_x - 1 - 3;
         let term_x = legend_x - 3;
-        let agent_x = term_x - 3;
+        let sub_x = term_x - 3;
+        let agent_x = sub_x - 3;
         assert_eq!(
             header_button_at(area, collapse_x, 0),
             Some(HeaderButton::Collapse)
@@ -1140,6 +1222,10 @@ mod tests {
         assert_eq!(
             header_button_at(area, term_x, 0),
             Some(HeaderButton::Terminals)
+        );
+        assert_eq!(
+            header_button_at(area, sub_x, 0),
+            Some(HeaderButton::Subagents)
         );
         assert_eq!(
             header_button_at(area, agent_x, 0),
