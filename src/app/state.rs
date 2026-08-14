@@ -1640,9 +1640,13 @@ impl ContextMenuState {
         }
     }
 
-    // Only reachable from the `#[cfg(test)]` `apply_context_menu_action` mirror;
-    // the live click path resolves plugin items from hit-rects in `input/mouse.rs`.
-    #[cfg(test)]
+    /// The plugin-published item at a menu row, if that row is one.
+    ///
+    /// Plugin items are appended after the builtin ones, so a row index past the
+    /// builtin list addresses this vector. Used by the LIVE click path — it was
+    /// `#[cfg(test)]` until a field report of three dead menu entries showed
+    /// why that mattered: the live path had no way to reach a plugin item at
+    /// all, so every such click fell through to "close the menu".
     pub fn plugin_item(&self, idx: usize) -> Option<&UiActionRef> {
         idx.checked_sub(self.builtin_items().len())
             .and_then(|idx| self.plugin_items.get(idx))

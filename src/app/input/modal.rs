@@ -1308,6 +1308,8 @@ impl App {
 
     pub(crate) fn apply_context_menu_action_via_api(&mut self, menu: ContextMenuState, idx: usize) {
         let item = menu.items().get(idx).copied().map(str::to_owned);
+        // Resolved before the match below moves `menu.kind`.
+        let plugin_request = self.plugin_action_from_menu(&menu, idx);
         match (menu.kind, item.as_deref()) {
             (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("New worktree")) => {
                 self.state.request_new_linked_worktree = Some(ws_idx);
@@ -1557,8 +1559,79 @@ impl App {
                     };
                 }
             }
-            _ => leave_modal(&mut self.state),
+            // Any other row: it may be a plugin-published item.
+            //
+            // Menu entries can only come from a wasm module publishing a
+            // `context_menu` surface, and until this branch existed the live
+            // path simply closed the menu on them — the two plugins that
+            // "worked" (button-dash, archive-dash) are hardcoded by name above.
+            // A third-party plugin therefore rendered its items and did nothing
+            // when they were clicked, which is exactly how it was reported:
+            // three dead buttons. The generic parse already existed, but only in
+            // the `#[cfg(test)]` mirror of this function, so the tests asserted
+            // a behaviour the product did not have.
+            _ => {
+                if let Some(request) = plugin_request {
+                    self.state.request_plugin_action = Some(request);
+                }
+                leave_modal(&mut self.state);
+            }
         }
+    }
+
+    /// Resolve a context-menu row to a plugin action request.
+    ///
+    /// Items carry `plugin:<plugin_id>:<action_id>`, the same form
+    /// `input/mouse.rs` parses for hit-rect clicks. The pane is the one the menu
+    /// was opened on where the menu kind names one, so an action resolves the
+    /// pane that was actually right-clicked rather than whatever holds focus.
+    fn plugin_action_from_menu(
+        &self,
+        menu: &ContextMenuState,
+        idx: usize,
+    ) -> Option<crate::app::state::PluginActionRequest> {
+        let item = menu.plugin_item(idx)?;
+        let rest = item.id.strip_prefix("plugin:")?;
+        let (plugin_id, action_id) = rest.split_once(':')?;
+        if plugin_id.is_empty() || action_id.is_empty() {
+            return None;
+        }
+        let (ws_idx, pane_id) = self.menu_pane_target(menu)?;
+        Some(crate::app::state::PluginActionRequest {
+            plugin_id: plugin_id.to_string(),
+            action_id: action_id.to_string(),
+            ws_idx,
+            pane_id,
+        })
+    }
+
+    /// The workspace and pane a context menu was opened on.
+    fn menu_pane_target(
+        &self,
+        menu: &ContextMenuState,
+    ) -> Option<(usize, crate::layout::PaneId)> {
+        let ws_idx = match &menu.kind {
+            ContextMenuKind::Workspace { ws_idx }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. } => *ws_idx,
+            ContextMenuKind::Tab { ws_idx, .. } | ContextMenuKind::Pane { ws_idx, .. } => *ws_idx,
+            _ => self.state.selected,
+        };
+        let pane_id = match &menu.kind {
+            ContextMenuKind::Pane { pane_id, .. } => Some(*pane_id),
+            ContextMenuKind::Tab { ws_idx, tab_idx, .. } => self
+                .state
+                .workspaces
+                .get(*ws_idx)
+                .and_then(|ws| ws.tabs.get(*tab_idx))
+                .map(|tab| tab.layout.focused()),
+            _ => self
+                .state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tabs.get(ws.active_tab))
+                .map(|tab| tab.layout.focused()),
+        }?;
+        Some((ws_idx, pane_id))
     }
 }
 
@@ -1610,6 +1683,53 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique).join("config.toml")
+    }
+
+    /// A plugin's context-menu item must actually dispatch when clicked.
+    ///
+    /// This asserts the LIVE handler, `apply_context_menu_action_via_api`, and
+    /// that is the whole point of it. A generic `plugin:<id>:<action>` parse
+    /// already existed and was covered by a test — but only against the
+    /// `#[cfg(test)]` mirror `apply_context_menu_action`, which the product
+    /// never calls. So the suite was green while every third-party plugin's menu
+    /// entries closed the menu and did nothing, reported from the field as three
+    /// dead buttons. Only `button-dash` and `archive-dash` worked, because the
+    /// live path names them one by one.
+    #[test]
+    fn a_plugin_menu_item_dispatches_from_the_live_path() {
+        let mut app = app_with_test_workspaces(&["alpha"]);
+        let pane_id = app.state.workspaces[0].tabs[0].layout.focused();
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id,
+                source_pane_id: None,
+                has_manual_label: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+            plugin_items: vec![herdr_ui_plugin_api::UiActionRef {
+                id: "plugin:builtin.workspace-ops:copy-metadata".to_string(),
+                label: "Copy metadata".to_string(),
+            }],
+        };
+        let idx = menu.builtin_items().len(); // the first plugin row
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        let request = app
+            .state
+            .request_plugin_action
+            .as_ref()
+            .expect("clicking a plugin menu item must request its action, not just close the menu");
+        assert_eq!(request.plugin_id, "builtin.workspace-ops");
+        assert_eq!(request.action_id, "copy-metadata");
+        assert_eq!(
+            request.pane_id, pane_id,
+            "the action must target the pane the menu was opened on"
+        );
     }
 
     fn app_with_test_workspaces(names: &[&str]) -> App {
