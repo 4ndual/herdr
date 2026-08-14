@@ -120,6 +120,12 @@ pub(super) fn pane_zoom(params: PaneZoomParams) -> std::io::Result<i32> {
     print_method_response("cli:pane:zoom", Method::PaneZoom(params))
 }
 
+pub(super) fn pane_set_color(
+    params: crate::api::schema::PaneSetColorParams,
+) -> std::io::Result<i32> {
+    print_method_response("cli:pane:set-color", Method::PaneSetColor(params))
+}
+
 pub(super) fn pane_rename(params: PaneRenameParams) -> std::io::Result<i32> {
     print_method_response("cli:pane:rename", Method::PaneRename(params))
 }

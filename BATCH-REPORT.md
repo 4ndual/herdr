@@ -310,6 +310,31 @@ roles resolve against the live palette at render time, so a coloured pane
 follows a theme change instead of freezing one colour that looks wrong in every
 other theme.
 
+### Verified live, and two bugs the live check found
+
+`.local/qa/tools/color-persist-check.ts` runs the claim against the real rig:
+set a colour, prove it reaches `session.json`, restart the server, prove it is
+still there, then clear it. **PASS on both halves** — after two real defects
+that the unit tests could not have caught:
+
+1. **The handler resolved the wrong workspace.** It parsed `(ws_idx, pane_id)`
+   and then discarded `ws_idx`, scanning every workspace for that raw `PaneId`.
+   A `PaneId` is unique only WITHIN a workspace, so on a multi-workspace session
+   it could colour a different pane that shared the id — and report success.
+   Found because the colour never appeared in `session.json`: it had been
+   written onto another workspace's terminal.
+
+2. **The check script was wrong twice, in the direction that wastes a night.**
+   It read only stdout — the CLI prints error responses on stderr, so every
+   correct refusal scored as an empty answer — and it string-matched
+   `"color":"danger"` against a pretty-printed file where that literal never
+   appears. Both fixed: it now reads both streams and parses the snapshot.
+   Recorded because both failure modes report a *working* feature as broken.
+
+A `herdr pane set-color <pane_id> [<role>|<#rrggbb>|--clear]` CLI ships with it:
+every other pane method is reachable from the shell, and the verification needed
+one.
+
 ### A note on the operator's instance
 
 The `hr` restart remains for you. The staged binary is

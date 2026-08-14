@@ -27,6 +27,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "zoom" => pane_zoom(&args[1..]),
         "read" => pane_read(&args[1..]),
         "rename" => pane_rename(&args[1..]),
+        "set-color" => pane_set_color(&args[1..]),
         "split" => pane_split(&args[1..]),
         "swap" => pane_swap(&args[1..]),
         "move" => pane_move(&args[1..]),
@@ -437,6 +438,28 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     super::runtime::pane_rename(PaneRenameParams {
         pane_id: super::normalize_pane_id(raw_pane_id),
         label,
+    })
+}
+
+fn pane_set_color(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("usage: herdr pane set-color <pane_id> [<role>|<#rrggbb>|--clear]");
+        return Ok(2);
+    };
+    // No colour, or an explicit --clear, removes it. Clearing has to be reachable
+    // without knowing what the colour currently is.
+    let color = match args.get(1).map(String::as_str) {
+        None | Some("--clear") => None,
+        Some(value) => Some(value.to_string()),
+    };
+    if args.len() > 2 {
+        eprintln!("usage: herdr pane set-color <pane_id> [<role>|<#rrggbb>|--clear]");
+        return Ok(2);
+    }
+
+    super::runtime::pane_set_color(crate::api::schema::PaneSetColorParams {
+        pane_id: super::normalize_pane_id(raw_pane_id),
+        color,
     })
 }
 
@@ -1498,6 +1521,7 @@ fn print_pane_help() {
     );
     eprintln!("  herdr pane zoom [<pane_id>|--pane ID|--current] [--toggle|--on|--off]");
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
+    eprintln!("  herdr pane set-color <pane_id> [<role>|<#rrggbb>|--clear]");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!(
         "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"

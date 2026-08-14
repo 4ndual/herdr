@@ -19,7 +19,7 @@ Read the three "not done" rows first — they are the ones that need you.
 | #32 `rail_icon` | done | `844b8537` | two bundled manifests had already declared the field against a host that ignored it |
 | #25 usage strip | done | `2f75d11d`, `41dbfef0` | per-pane keying + in-flight correlation; the focus event was then found never to fire on the server+client path at all — fixing that took harness-indicator from 562 ms to 74 ms |
 | #34 colors phase 1 | done | `183c4a2c` | strict parser, handler-side validation, one border resolver |
-| #34 phase 2 | **done** | `e5e1eaea` | persisted `color` in `PaneSnapshot` + `pane.set_color` behind the new `Metadata` capability |
+| #34 phase 2 | **done, verified live** | `e5e1eaea` + follow-up | persisted `color` in `PaneSnapshot`, `pane.set_color` behind the new `Metadata` capability, `herdr pane set-color` CLI; colour survived a real server restart on the rig |
 | #37 invisible API | done | `183c4a2c` | `tab.hide`, `tab.create --hidden`, `tab list --hidden`, sidebar filtered, cycling fixed |
 | #19 roster scope | done | `183c4a2c` | composes with a plugin `agent_view` instead of being disabled by one |
 | #18 code half | done | `183c4a2c`, `4bdabb1d` | B1/B2 closed; carve-release-on-disable finally has a test |

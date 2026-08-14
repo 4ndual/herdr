@@ -1280,7 +1280,7 @@ impl App {
         id: String,
         params: crate::api::schema::PaneSetColorParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
         let color = match params.color.as_deref().map(str::trim) {
@@ -1295,11 +1295,14 @@ impl App {
             // returnable to the default.
             _ => None,
         };
+        // The RESOLVED workspace, not a scan of all of them: `PaneId` is unique
+        // only within a workspace, so searching every workspace for the same raw
+        // id will happily colour a different pane that shares it.
         let Some(terminal_id) = self
             .state
             .workspaces
-            .iter()
-            .find_map(|ws| ws.terminal_id(pane_id).cloned())
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id).cloned())
         else {
             return pane_not_found(id, &params.pane_id);
         };
