@@ -314,6 +314,9 @@ fn shell_quote(value: &str) -> String {
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
+/// The close control label, shared by the top-right copy and the footer copy.
+const CLOSE: &str = "[x]";
+
 fn accent() -> Style {
     Style::default()
         .fg(Color::Blue)
@@ -354,6 +357,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let label_width = 10usize;
     let mut y = area.y + 1;
 
+    // Draw a line at an arbitrary column, for rows that share their row with a
+    // control (the footer close button).
+    let put_at = |frame: &mut ratatui::Frame, at_x: u16, y: u16, line: Line| {
+        let room = width.saturating_sub(at_x.saturating_sub(x));
+        frame.render_widget(Paragraph::new(line), Rect::new(at_x, y, room, 1));
+    };
     let put = |frame: &mut ratatui::Frame, y: u16, line: Line| {
         frame.render_widget(Paragraph::new(line), Rect::new(x, y, width, 1));
     };
@@ -371,7 +380,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // way the app is actually driven. It registers a real click rect rather
     // than being painted decoration — the canon gates it under the REAL-CLICK
     // rule, so it has to *work*, not merely appear.
-    const CLOSE: &str = "[x]";
     let close_x = x + width.saturating_sub(CLOSE.len() as u16);
     let close_rect = Rect::new(close_x, y, CLOSE.len() as u16, 1);
     frame.render_widget(
@@ -489,11 +497,24 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     let hint_y = area.y + area.height.saturating_sub(2);
     if hint_y > y {
-        put(
+        // The close control lives HERE as well as at the top right, and this is
+        // the copy that can be trusted. Filmed in the real overlay, the
+        // top-right `[x]` was invisible — the host's box and the PTY's own idea
+        // of its width do not agree at the right edge, so a control placed at
+        // `width - 3` can be clipped away. The footer's LEFT edge is never in
+        // doubt: the row was just drawn there. (Canon §3.1.7.)
+        let close_rect = Rect::new(x, hint_y, CLOSE.len() as u16, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(CLOSE, accent()))),
+            close_rect,
+        );
+        app.clicks.push((close_rect, Click::Cancel));
+        put_at(
             frame,
+            x + CLOSE.len() as u16,
             hint_y,
             Line::from(Span::styled(
-                "↑↓ move · ↵ reopen · esc / [x] close · click to pick",
+                " close · ↑↓ move · ↵ reopen · esc also closes · click to pick",
                 dim(),
             )),
         );
