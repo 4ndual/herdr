@@ -125,6 +125,13 @@ command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/relaunch-skip.sh\" >
 #
 # `plugin pane open` is called directly rather than through a wrapper script —
 # there is nothing to resolve, unlike the resume picker's wrapper hunt.
+#
+# NO --target-pane: the host rejects it for an overlay ("overlay and popup plugin
+# panes target the active pane"), because an overlay always follows the ACTIVE
+# pane. That is also the explanation for the overlay that once appeared in a
+# workspace nobody was looking at — it was invoked over the socket while another
+# workspace was active, not from a click. Clicked from the strip, the active pane
+# is by definition the one on screen.
 [[actions]]
 id = "reference-list"
 title = "Button reference"
