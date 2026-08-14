@@ -344,14 +344,12 @@ fn guest_vocabulary() -> Option<Vec<String>> {
     // The host runs plugin commands with the plugin root as CWD.
     candidates.push(PathBuf::from(REL_WASM));
     let wasm = candidates.into_iter().find(|p| p.exists())?;
-    let out = run_with_timeout(
-        Command::new("strings").arg("-a").arg(&wasm),
-        VERSION_TIMEOUT,
-    )?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    // Read the module and scan it here rather than shelling out to `strings`:
+    // that is binutils, not guaranteed present, and BSD and GNU differ on
+    // defaults — a missing tool made the wasm version silently unknown. The
+    // markers are ASCII, so a lossy decode of the whole file finds them.
+    let bytes = std::fs::read(&wasm).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let found: Vec<String> = InstanceState::ALL
         .iter()
         .filter(|state| text.contains(state.wire_name()))
@@ -480,10 +478,93 @@ fn resolve_hr_bin() -> PathBuf {
     env_path("HERDR_VERSION_HR_BIN", DEFAULT_HR_BIN)
 }
 
-/// Resolve the executable of the process holding `sock` open: `lsof -t <sock>` →
-/// first pid → its exe path (`ps -p <pid> -o comm=`). Returns `None` when nothing
-/// listens or the path doesn't resolve to an existing herdr binary.
+/// Resolve the executable of the process holding `sock` open. Returns `None`
+/// when nothing listens or the path doesn't resolve to an existing herdr binary.
+///
+/// Two platform routes, because neither half of the old macOS-shaped
+/// implementation worked on Linux:
+///
+///   * `lsof` is not installed by default on many distros, and its absence was
+///     silent — the live exe never resolved, so `update-hr.sh` promotion only
+///     ever saw the snapshot.
+///   * `ps -o comm=` prints the full executable PATH only on macOS; on Linux it
+///     prints the bare name `herdr`, which then fails the "is an existing file"
+///     test below. `dash-common.sh:326` and `handoff-herdr.sh:62` already say
+///     exactly this and use `readlink /proc/<pid>/exe` — the shell sweep fixed
+///     it, this Rust twin was missed.
+///
+/// On Linux both problems disappear by reading `/proc` directly: no external
+/// tool, and `/proc/<pid>/exe` is the real path by construction.
 fn live_exe_for_socket(sock: &Path) -> Option<PathBuf> {
+    let exe = live_exe_for_socket_impl(sock)?;
+    // Only trust an existing herdr binary; otherwise fall back to the default.
+    if exe.is_file() && exe.file_name().and_then(|n| n.to_str()) == Some("herdr") {
+        Some(exe)
+    } else {
+        None
+    }
+}
+
+/// Socket-namespace inode of the LISTENING unix socket bound to `path`, parsed
+/// out of `/proc/net/unix`.
+///
+/// The filesystem inode of the socket file is a different number from the one
+/// `/proc/<pid>/fd/*` reports as `socket:[N]`, so the path's `stat` inode cannot
+/// be used to find the holder. Selecting on the listening state also fixes what
+/// the `lsof -t` version got wrong: that returns every process with the socket
+/// open — server AND connected clients, all of them named `herdr` — and the old
+/// code just took the first, so the "live" exe was whichever client happened to
+/// sort first.
+///
+/// Line format: `Num RefCount Protocol Flags Type St Inode Path`, where `St` is
+/// `01` for a bound, listening socket and `03` for a connected peer.
+#[cfg(target_os = "linux")]
+fn listening_socket_inode(table: &str, path: &str) -> Option<u64> {
+    for line in table.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        if fields[7] != path || fields[5] != "01" {
+            continue;
+        }
+        if let Ok(inode) = fields[6].parse::<u64>() {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn live_exe_for_socket_impl(sock: &Path) -> Option<PathBuf> {
+    let table = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let inode = listening_socket_inode(&table, sock.to_str()?)?;
+    let want = format!("socket:[{inode}]");
+
+    for proc in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = proc.file_name();
+        let Some(pid) = name.to_str() else { continue };
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            // Not ours to inspect — every other user's process lands here.
+            continue;
+        };
+        for fd in fds.flatten() {
+            if std::fs::read_link(fd.path())
+                .map(|target| target.as_os_str() == want.as_str())
+                .unwrap_or(false)
+            {
+                return std::fs::read_link(proc.path().join("exe")).ok();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn live_exe_for_socket_impl(sock: &Path) -> Option<PathBuf> {
     let pids = run_with_timeout(Command::new("lsof").arg("-t").arg(sock), VERSION_TIMEOUT)?;
     if !pids.status.success() {
         return None;
@@ -492,6 +573,7 @@ fn live_exe_for_socket(sock: &Path) -> Option<PathBuf> {
         .split_whitespace()
         .next()?
         .to_string();
+    // macOS `ps -o comm=` prints the full executable path.
     let out = run_with_timeout(
         Command::new("ps").args(["-p", &pid, "-o", "comm="]),
         VERSION_TIMEOUT,
@@ -499,13 +581,9 @@ fn live_exe_for_socket(sock: &Path) -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
-    let exe = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    // Only trust an existing herdr binary; otherwise fall back to the default.
-    if exe.is_file() && exe.file_name().and_then(|n| n.to_str()) == Some("herdr") {
-        Some(exe)
-    } else {
-        None
-    }
+    Some(PathBuf::from(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
 }
 
 /// A verification receipt written by `verify-instance.sh`.
@@ -614,20 +692,34 @@ fn read_verification(state_dir: &Path, label: &str, bin: &Path) -> (Verification
     }
 }
 
-/// sha256 of a file, via the `shasum` CLI (no crypto dependency needed for a
-/// build-identity check that already trusts the local filesystem).
+/// sha256 of a file, via whichever hashing CLI this machine has (no crypto
+/// dependency needed for a build-identity check that already trusts the local
+/// filesystem).
+///
+/// `shasum` is a Perl script that ships with macOS but comes from `perl` rather
+/// than coreutils on Linux, so a minimal distro or container has `sha256sum` and
+/// no `shasum` — and the failure was silent (`None`), leaving the strip unable to
+/// tell a staged build from the running one. Both spellings print the digest as
+/// the first whitespace-separated field.
 fn sha256_of(path: &Path) -> Option<String> {
-    let out = run_with_timeout(
-        Command::new("shasum").arg("-a").arg("256").arg(path),
-        VERSION_TIMEOUT,
-    )?;
-    if !out.status.success() {
-        return None;
+    let attempts: [(&str, &[&str]); 2] = [("sha256sum", &[]), ("shasum", &["-a", "256"])];
+    for (bin, args) in attempts {
+        let Some(out) = run_with_timeout(Command::new(bin).args(args).arg(path), VERSION_TIMEOUT)
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        if let Some(digest) = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+        {
+            return Some(digest);
+        }
     }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
+    None
 }
 
 /// Read the live pipeline status written by the update scripts, recomputing the
@@ -1356,6 +1448,44 @@ fn env_nonempty(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use version_dash_model::InstanceState;
+
+    /// Real `/proc/net/unix` excerpt for one herdr session socket: one listening
+    /// entry (`St` 01) and several connected peers (`St` 03) on the same path.
+    #[cfg(target_os = "linux")]
+    const PROC_NET_UNIX: &str = "\
+Num       RefCount Protocol Flags    Type St Inode Path
+0000000000000000: 00000003 00000000 00000000 0001 03 162009167 /home/u/.herdr-hr/sessions/hr/herdr.sock
+0000000000000000: 00000002 00000000 00010000 0001 01 465226 /home/u/.herdr-hr/sessions/hr/herdr.sock
+0000000000000000: 00000003 00000000 00000000 0001 03 481887 /home/u/.herdr-hr/sessions/hr/herdr.sock
+0000000000000000: 00000002 00000000 00010000 0001 01 999999 /home/u/.herdr-test/sessions/t/herdr.sock";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listening_socket_inode_picks_the_listener_not_a_peer() {
+        let inode =
+            listening_socket_inode(PROC_NET_UNIX, "/home/u/.herdr-hr/sessions/hr/herdr.sock");
+        assert_eq!(inode, Some(465226), "must skip the St=03 connected peers");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listening_socket_inode_is_scoped_to_the_requested_path() {
+        assert_eq!(
+            listening_socket_inode(PROC_NET_UNIX, "/home/u/.herdr-test/sessions/t/herdr.sock"),
+            Some(999999)
+        );
+        assert_eq!(listening_socket_inode(PROC_NET_UNIX, "/nope.sock"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listening_socket_inode_tolerates_a_garbage_table() {
+        assert_eq!(listening_socket_inode("", "/x.sock"), None);
+        assert_eq!(
+            listening_socket_inode("header only\nshort line", "/x.sock"),
+            None
+        );
+    }
 
     #[test]
     fn path_component_matches_herdr_for_our_id() {
