@@ -168,6 +168,9 @@ struct Node {
     last_event: Option<String>,
     /// Fleet status, `statusOf` semantics.
     fleet_status: ChipStatus,
+    /// `<harness>/workspace`, canonicalised — the cwd a fleet pane runs in, and
+    /// the only link to its tab that cannot go stale.
+    workspace_dir: Option<PathBuf>,
     /// Tab/pane as tidus recorded them; validated against this instance later.
     tab_id: Option<String>,
     pane_id: Option<String>,
@@ -256,6 +259,7 @@ fn load_fleet(root: &Path) -> Vec<Node> {
             task: task.or(last_task),
             job_tail: job_tail_now.or(job_tail_last),
             last_event,
+            workspace_dir: std::fs::canonicalize(dir.join("workspace")).ok(),
             fleet_status: fleet_status(&name, &state, profile),
             tab_id: read_trim(&state.join("herdr-tab")),
             pane_id: read_trim(&state.join("herdr-pane")),
@@ -436,6 +440,10 @@ fn resolve(focus: &Focus) -> BarInput {
     // target: `state/herdr-tab` is written by whichever herdr the harness was
     // opened in, so an unvalidated id focuses a stranger's tab or nothing.
     let live_tabs = api.as_ref().map(ApiClient::tab_ids).unwrap_or_default();
+    let tab_by_workspace = api
+        .as_ref()
+        .map(|api| api.tabs_by_cwd(&live_tabs))
+        .unwrap_or_default();
 
     let mut chips: Vec<Chip> = Vec::new();
     for node in ancestry {
@@ -444,6 +452,7 @@ fn resolve(focus: &Focus) -> BarInput {
             ChipRole::Ancestor,
             None,
             &live_tabs,
+            &tab_by_workspace,
             &agent_status,
         ));
     }
@@ -453,6 +462,7 @@ fn resolve(focus: &Focus) -> BarInput {
             ChipRole::Current,
             None,
             &live_tabs,
+            &tab_by_workspace,
             &agent_status,
         ));
     }
@@ -462,6 +472,7 @@ fn resolve(focus: &Focus) -> BarInput {
             ChipRole::Child,
             Some(edge),
             &live_tabs,
+            &tab_by_workspace,
             &agent_status,
         ));
     }
@@ -484,13 +495,31 @@ fn chip_for(
     role: ChipRole,
     edge: Option<EdgeKind>,
     live_tabs: &[String],
+    tab_by_workspace: &HashMap<PathBuf, String>,
     agent_status: &HashMap<String, AgentPane>,
 ) -> Chip {
+    // Resolve the tab the chip navigates to, freshest source first:
+    //
+    //   1. the pane whose cwd IS this harness's workspace — costs nothing extra
+    //      (pane.list already carries cwd) and cannot go stale;
+    //   2. `state/herdr-tab`, when it still names a tab that exists here.
+    //
+    // The file alone is not enough. It is rewritten only by the fleet's
+    // SessionStart hook, so every tab replacement invalidates it — including
+    // one caused by moving a pane between workspaces, which is now an ordinary
+    // operation. A bar in that state renders chips that refuse to navigate
+    // ("no pane in this instance") for agents that are plainly on screen.
     let tab_id = node
-        .tab_id
+        .workspace_dir
         .as_ref()
-        .filter(|tab| live_tabs.iter().any(|t| t == *tab))
-        .cloned();
+        .and_then(|dir| tab_by_workspace.get(dir))
+        .cloned()
+        .or_else(|| {
+            node.tab_id
+                .as_ref()
+                .filter(|tab| live_tabs.iter().any(|t| t == *tab))
+                .cloned()
+        });
     // Resolve the pane from the VALIDATED TAB rather than from
     // `state/herdr-pane`: only `harness spawn` writes that file, while the
     // fleet's SessionStart hook keeps `state/herdr-tab` fresh for every child.
@@ -706,6 +735,31 @@ impl ApiClient {
             .unwrap_or_default()
     }
 
+    /// `canonical cwd → tab id` for every live pane, so a harness can find its
+    /// tab by the directory it runs in. Free: `pane.list` is already fetched
+    /// for nothing else here, and cwd rides along on every row.
+    fn tabs_by_cwd(&self, live_tabs: &[String]) -> HashMap<PathBuf, String> {
+        let mut out = HashMap::new();
+        let Some(result) = self.request("pane.list", serde_json::json!({})) else {
+            return out;
+        };
+        let Some(panes) = result.get("panes").and_then(serde_json::Value::as_array) else {
+            return out;
+        };
+        for pane in panes {
+            let (Some(cwd), Some(tab)) = (string_at(pane, "cwd"), string_at(pane, "tab_id")) else {
+                continue;
+            };
+            if !live_tabs.iter().any(|t| *t == tab) {
+                continue;
+            }
+            if let Ok(dir) = std::fs::canonicalize(&cwd) {
+                out.entry(dir).or_insert(tab);
+            }
+        }
+        out
+    }
+
     /// `pane_id → agent_status` for every detected agent pane.
     fn agent_status(&self) -> HashMap<String, AgentPane> {
         let mut out = HashMap::new();
@@ -846,6 +900,7 @@ mod tests {
             task: None,
             job_tail: None,
             last_event: None,
+            workspace_dir: None,
             fleet_status: ChipStatus::Stopped,
             tab_id: None,
             pane_id: None,
@@ -979,6 +1034,7 @@ mod tests {
             ChipRole::Child,
             Some(EdgeKind::Team),
             &["w1:t9".to_string()],
+            &HashMap::new(),
             &agents,
         );
         assert_eq!(chip.status, ChipStatus::Attention);
@@ -1034,6 +1090,7 @@ mod tests {
             Some(EdgeKind::Team),
             &["w1:t2".to_string()],
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id, None);
         assert_eq!(
@@ -1048,9 +1105,38 @@ mod tests {
             Some(EdgeKind::Team),
             &["w9:tZ".to_string()],
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id.as_deref(), Some("w9:tZ"));
         assert!(chip.clickable());
+    }
+
+    #[test]
+    fn a_chip_finds_its_tab_by_workspace_when_the_state_file_is_stale() {
+        // `state/herdr-tab` names a tab that no longer exists — the ordinary
+        // outcome of any tab replacement, including moving the pane to another
+        // workspace. Before this, the chip rendered as "no pane in this
+        // instance" and refused to navigate for an agent plainly on screen.
+        let mut n = node("kid");
+        n.tab_id = Some("w1:tGONE".into());
+        n.workspace_dir = Some(PathBuf::from("/harnesses/kid/workspace"));
+
+        let mut by_cwd = HashMap::new();
+        by_cwd.insert(
+            PathBuf::from("/harnesses/kid/workspace"),
+            "w1:tLIVE".to_string(),
+        );
+
+        let chip = chip_for(
+            &n,
+            ChipRole::Child,
+            Some(EdgeKind::Team),
+            &["w1:tLIVE".to_string()],
+            &by_cwd,
+            &HashMap::new(),
+        );
+        assert_eq!(chip.tab_id.as_deref(), Some("w1:tLIVE"));
+        assert!(chip.clickable(), "the chip must navigate again");
     }
 
     #[test]

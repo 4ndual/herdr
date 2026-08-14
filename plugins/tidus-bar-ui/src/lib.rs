@@ -48,7 +48,14 @@ static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// declared hit-rects, so a bar that wants hover must declare none and do its
 /// own arithmetic — the button-dash / archive-dash model.
 static ROW_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
-static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
+/// Index of the hovered chip, plus the NAME it had when the cursor landed on
+/// it. The name is what makes the hover safe across a changing bar: the index
+/// alone survives a snapshot in which it now addresses a different agent — or
+/// no agent at all — and the row would keep showing a detail line for something
+/// that is no longer there. An independent video gate caught exactly that: with
+/// a plain shell focused, a parked cursor kept the bar reading
+/// `tb-root [idle] · claude · focused …` on a pane that has no harness.
+static HOVERED: Mutex<Option<(usize, String)>> = Mutex::new(None);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -167,14 +174,36 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
             Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
         };
 
+    // Drop a hover that no longer describes what is under the cursor. The
+    // cursor has not moved, so there is no Move event coming to correct it —
+    // the frame that changed the bar is the only chance to notice.
+    forget_stale_hover(&input);
+
     render_from(&input)
+}
+
+/// Clear the hover when the chip it named is gone or has been replaced at that
+/// index by a different agent.
+fn forget_stale_hover(input: &BarInput) {
+    let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
+    let stale = match hovered.as_ref() {
+        Some((index, name)) => input.chips.get(*index).map(|c| &c.name) != Some(name),
+        None => false,
+    };
+    if stale {
+        *hovered = None;
+    }
 }
 
 /// Build the layer for `input` in its current hover state — shared by the frame
 /// path and the mouse path so a hover repaint is the same rendering as a frame
 /// repaint, not a second copy of it.
 fn render_from(input: &BarInput) -> UiUpdate {
-    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let hovered = HOVERED
+        .lock()
+        .expect("hover mutex poisoned")
+        .as_ref()
+        .map(|(index, _)| *index);
     let width = match hovered {
         Some(index) => render::hovered_width(input, index).max(render::content_width(input)),
         None => render::content_width(input),
@@ -244,11 +273,17 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
         // Move (and everything else): update hover, repaint only on a change —
         // a bar that re-rendered on every mouse motion would repaint the bottom
         // row continuously while the user works.
+        let next = hit.and_then(|index| {
+            input
+                .chips
+                .get(index)
+                .map(|chip| (index, chip.name.clone()))
+        });
         let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
-        if *hovered == hit {
+        if *hovered == next {
             return UiUpdate::default();
         }
-        *hovered = hit;
+        *hovered = next;
         drop(hovered);
         return render_from(&input);
     }
@@ -663,6 +698,45 @@ mod tests {
         // The repaint keeps the previous row; clickability comes from the
         // geometry now, not from published rects.
         assert!(!layer.nodes.is_empty(), "and stays drawn");
+    }
+
+    #[test]
+    fn a_parked_cursor_stops_describing_a_bar_that_changed_under_it() {
+        let _guard = test_guard();
+        seed(sample());
+        // Cursor lands on the pinned tb-root chip.
+        let update = click_chip(0, MouseEventKind::Move);
+        assert!(!update.layers.is_empty(), "hover paints the detail row");
+        assert!(HOVERED.lock().expect("hover").is_some());
+
+        // Focus moves to a pane with no harness: the bar has nothing to show.
+        // The cursor has not moved, so only this frame can notice — an
+        // independent video gate caught the bar still reading
+        // "tb-root [idle] · claude · focused" over a plain shell.
+        let update = handle_event(&frame_event(&BarInput::default(), Rect::new(0, 0, 80, 1)));
+        assert!(
+            HOVERED.lock().expect("hover").is_none(),
+            "a hover that names a chip which is gone must be dropped"
+        );
+        assert!(update.layers.is_empty(), "and the band goes neutral");
+    }
+
+    #[test]
+    fn hover_is_dropped_when_the_index_now_names_a_different_agent() {
+        let _guard = test_guard();
+        seed(sample());
+        click_chip(0, MouseEventKind::Move);
+        let before = HOVERED.lock().expect("hover").clone();
+        assert!(before.is_some());
+
+        // Same shape, different lineage: index 0 is someone else now.
+        let mut other = sample();
+        other.chips[0].name = "other-root".into();
+        handle_event(&frame_event(&other, Rect::new(0, 0, 80, 1)));
+        assert!(
+            HOVERED.lock().expect("hover").is_none(),
+            "the detail row must not silently describe a different agent"
+        );
     }
 
     #[test]
