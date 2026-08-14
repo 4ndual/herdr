@@ -2214,9 +2214,19 @@ mod protocol_authority_tests {
     /// the stated reason for a protocol decision. The live endpoints
     /// (herdr.dev/latest.json, herdr.dev/preview.json) are the only authority.
     ///
-    /// Deliberately narrow: mentioning `website/latest.json` is fine (release CI
-    /// genuinely updates it). What fails is mentioning it ON THE SAME LINE as a
-    /// claim about what is published or what the protocol is.
+    /// Deliberately narrow in two ways.
+    ///
+    /// Mentioning `website/latest.json` is fine — release CI genuinely updates
+    /// it. What fails is mentioning it ON THE SAME LINE as a claim about what is
+    /// published or what the protocol is.
+    ///
+    /// And the walk covers `src/` and `docs/next/`, not the repo root. Root
+    /// `CLAUDE.md` correctly says the preview workflow "updates
+    /// website/preview.json, which the website build publishes as
+    /// /preview.json" — a true statement about the deploy DIRECTION (tracked
+    /// file feeds endpoint) that this guard would flag. A check that fires on
+    /// correct sentences gets suppressed, so it stops where the false positives
+    /// begin.
     #[test]
     fn nothing_cites_the_tracked_website_json_as_version_authority() {
         const AUTHORITY_WORDS: &[&str] = &[
