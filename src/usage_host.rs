@@ -190,6 +190,7 @@ mod tests {
         collector: Option<Vec<String>>,
     ) -> PluginManifestUiModule {
         PluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "usage".into(),
             title: "Usage".into(),

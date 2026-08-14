@@ -275,6 +275,7 @@ mod claim_table_tests {
         capabilities: Vec<PluginUiCapability>,
     ) -> PluginManifestUiModule {
         PluginManifestUiModule {
+            rail_icon: None,
             id: id.into(),
             title: id.into(),
             description: None,

@@ -2238,6 +2238,7 @@ mod tests {
             events: vec![],
             panes: vec![],
             ui_modules: vec![PluginManifestUiModule {
+                rail_icon: None,
                 id: "goal-ui".into(),
                 title: "Goal UI".into(),
                 description: None,

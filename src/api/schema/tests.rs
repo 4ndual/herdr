@@ -936,6 +936,7 @@ fn plugin_link_list_unlink_round_trip() {
             command: vec!["bun".into(), "run".into(), "board.ts".into()],
         }],
         ui_modules: vec![PluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),

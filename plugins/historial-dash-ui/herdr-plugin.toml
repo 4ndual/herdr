@@ -24,4 +24,7 @@ surfaces = ["right_panel"]
 capabilities = ["layout_read", "mouse_all"]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON.
+# Right-panel rail glyph. Host-drawn; without it every right-panel plugin
+# draws the same generic marker and can only be told apart by clicking it.
+rail_icon = "🕓"
 ui_input_file = "historial_input.json"

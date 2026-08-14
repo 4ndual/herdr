@@ -687,6 +687,7 @@ mod tests {
             events: vec![],
             panes: vec![],
             ui_modules: vec![crate::api::schema::PluginManifestUiModule {
+                rail_icon: None,
                 max_layers_per_pane: None,
                 id: "images".into(),
                 title: "Images".into(),

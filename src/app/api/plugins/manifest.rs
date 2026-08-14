@@ -123,6 +123,9 @@ struct RawPluginManifestUiModule {
     capabilities: Vec<PluginUiCapability>,
     #[serde(default)]
     ui_input_file: Option<String>,
+    // Right-panel rail glyph (see PluginManifestUiModule::rail_icon).
+    #[serde(default)]
+    rail_icon: Option<String>,
     // fork: optional host-consumed image filename (see PluginManifestUiModule::image_file).
     #[serde(default)]
     image_file: Option<String>,
@@ -593,6 +596,10 @@ fn normalize_manifest_ui_module(
         Some(name) => Some(normalize_image_file(&name)?),
         None => None,
     };
+    let rail_icon = match module.rail_icon {
+        Some(icon) => Some(normalize_rail_icon(&icon)?),
+        None => None,
+    };
     // fork: graphics_roots are absolute directories OUTSIDE the plugin dir, so
     // the single-segment guard above does not apply. They are validated for
     // shape here and canonicalised at use time (a root may legitimately not
@@ -623,6 +630,7 @@ fn normalize_manifest_ui_module(
         placement: module.placement,
         capabilities: module.capabilities,
         ui_input_file,
+        rail_icon,
         image_file,
         graphics_roots,
         max_layers_per_pane: module.max_layers_per_pane,
@@ -630,6 +638,33 @@ fn normalize_manifest_ui_module(
         host_actions,
         host_action_mode: module.host_action_mode,
     })
+}
+
+/// Validate a module's `rail_icon`: short, printable, single-line.
+///
+/// Rejected at load rather than clamped at paint time. A control character or a
+/// ten-character string in a two-cell rail corrupts the whole right column, and
+/// a manifest error names the plugin that did it — a clamp would silently paint
+/// something the author never chose and leave them guessing.
+fn normalize_rail_icon(icon: &str) -> Result<String, (&'static str, String)> {
+    const MAX_CHARS: usize = 2;
+    let icon = icon.trim();
+    let invalid = |reason: &str| {
+        (
+            "invalid_plugin_ui_rail_icon",
+            format!("ui module rail_icon {reason}"),
+        )
+    };
+    if icon.is_empty() {
+        return Err(invalid("must not be empty"));
+    }
+    if icon.chars().any(char::is_control) {
+        return Err(invalid("must not contain control characters"));
+    }
+    if icon.chars().count() > MAX_CHARS {
+        return Err(invalid(&format!("must be at most {MAX_CHARS} characters")));
+    }
+    Ok(icon.to_string())
 }
 
 /// fork(host-actions): validate `host_actions`, rejecting ids the host does not
@@ -918,6 +953,7 @@ mod tests {
     #[test]
     fn ui_module_requires_surface_and_api_version() {
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
@@ -941,6 +977,7 @@ mod tests {
         assert_eq!(err.0, "invalid_plugin_ui_module_api_version");
 
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
@@ -967,6 +1004,7 @@ mod tests {
     #[test]
     fn ui_module_normalizes_wasm_panel_manifest() {
         let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: " Goal UI ".into(),
@@ -1008,6 +1046,7 @@ mod tests {
 
     fn ui_module_with_input_file(name: &str) -> RawPluginManifestUiModule {
         RawPluginManifestUiModule {
+            rail_icon: None,
             max_layers_per_pane: None,
             id: "usage".into(),
             title: "Usage".into(),
@@ -1026,6 +1065,36 @@ mod tests {
             collector: None,
             host_actions: Vec::new(),
             host_action_mode: None,
+        }
+    }
+
+    fn ui_module_with_rail_icon(icon: &str) -> RawPluginManifestUiModule {
+        RawPluginManifestUiModule {
+            rail_icon: Some(icon.into()),
+            ..ui_module_with_input_file("usage_input.json")
+        }
+    }
+
+    /// A right-panel plugin the host was never taught about drew the same
+    /// generic marker as every other one, so the rail could only be read by
+    /// clicking through it. The glyph is the plugin's identity and comes from
+    /// the plugin's manifest.
+    #[test]
+    fn rail_icon_is_accepted_and_trimmed() {
+        let module = normalize_manifest_ui_module(ui_module_with_rail_icon(" 🎯 "))
+            .expect("a one-glyph rail icon is accepted");
+        assert_eq!(module.rail_icon.as_deref(), Some("🎯"));
+    }
+
+    /// Rejected at load, not clamped at paint time: a control character or an
+    /// over-long string corrupts the whole right column, and the manifest error
+    /// names the plugin that did it.
+    #[test]
+    fn rail_icon_rejects_control_characters_and_overlong_values() {
+        for bad in ["", "   ", "a\u{7}", "\n", "far too long"] {
+            let err = normalize_manifest_ui_module(ui_module_with_rail_icon(bad))
+                .expect_err("rail_icon {bad:?} must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_rail_icon", "for {bad:?}");
         }
     }
 

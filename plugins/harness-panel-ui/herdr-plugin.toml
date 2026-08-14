@@ -59,9 +59,10 @@ ui_input_file = "harness_panel_input.json"
 # event-loop collector is alive and exits (see collector/tick.go). Declaring it
 # is also what wires the host's ui_input_file transport.
 collector = ["../../target/release/harness-panel-collector", "tick"]
-# Declared for #32: dead today (the host ignores it and would draw the generic
-# marker), correct the moment the rail lands.
-rail_icon = "🎛"
+# Right-panel rail glyph, now read by the host. Distinct from the harness
+# MANAGER's 🎛: two harness plugins sharing one glyph in a one-column rail is
+# the same "told apart only by clicking" problem the field exists to fix.
+rail_icon = "🛠"
 
 
 # The guest emits an InvokePluginAction with a JSON payload; the host hands that

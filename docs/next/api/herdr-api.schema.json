@@ -8978,6 +8978,13 @@
                 "null"
               ]
             },
+            "rail_icon": {
+              "description": "Glyph the host paints for this module in the right-panel rail.\n\nThe rail glyph used to come from a hardcoded table of `builtin.` plugin\nids in `src/ui.rs`, so every third-party right-panel plugin got the same\ngeneric marker and could only be told apart by clicking it. The icon is\nthe plugin's own identity, so it belongs in the plugin's own manifest.\nOne or two display cells of non-control text; omitted keeps the fallback.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "surfaces": {
               "items": {
                 "$ref": "#/schemas/success_response/$defs/PluginUiSurface"

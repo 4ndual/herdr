@@ -548,9 +548,22 @@ fn build_right_panel_rail(
     icons
 }
 
-/// Glyph shown in a right-panel rail icon for a given plugin id. Falls back to a
-/// generic marker for unknown plugins.
-fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
+/// Glyph shown in a right-panel rail icon for a given plugin.
+///
+/// The plugin's own manifest `rail_icon` first: the icon is part of the
+/// plugin's identity, and a hardcoded host table meant every third-party
+/// right-panel plugin drew the same generic marker and could only be told apart
+/// by clicking it. The bundled ids below stay as a fallback so a plugin that
+/// declares nothing keeps the icon users already know.
+fn right_panel_rail_glyph(app: &AppState, plugin_id: &str) -> String {
+    if let Some(icon) = app.installed_plugins.get(plugin_id).and_then(|plugin| {
+        plugin
+            .ui_modules
+            .iter()
+            .find_map(|module| module.rail_icon.as_deref())
+    }) {
+        return icon.to_string();
+    }
     match plugin_id {
         "builtin.historial-dash" => "\u{1F553}",  // 🕓
         "builtin.harness-manager" => "\u{1F39B}", // 🎛
@@ -558,6 +571,7 @@ fn right_panel_rail_glyph(plugin_id: &str) -> &'static str {
         "builtin.usage-dash" => "\u{1F4CA}",      // 📊
         _ => "\u{25A6}",                          // ▦
     }
+    .to_string()
 }
 
 /// Draw the right-panel rail (host-owned): a vertical strip of plugin icons, the
@@ -575,7 +589,7 @@ fn render_right_panel_rail(app: &AppState, frame: &mut Frame) {
         } else {
             Style::default().fg(app.palette.overlay0)
         };
-        let glyph = right_panel_rail_glyph(&icon.plugin_id);
+        let glyph = right_panel_rail_glyph(app, &icon.plugin_id);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!(" {glyph} "), style))),
             icon.rect,
@@ -2039,6 +2053,70 @@ mod tests {
         layer.plugin_id = "builtin.historial-dash".into();
         layer.module_id = "historial".into();
         layer
+    }
+
+    /// The rail glyph comes from the plugin's manifest, with the bundled ids as
+    /// a fallback. Without this, a third-party right-panel plugin drew the same
+    /// generic marker as every other one.
+    #[test]
+    fn rail_glyph_prefers_the_manifest_icon_over_the_bundled_table() {
+        let mut app = crate::app::state::AppState::test_new();
+        assert_eq!(
+            right_panel_rail_glyph(&app, "builtin.goal-dash"),
+            "\u{1F3AF}",
+            "a bundled plugin with no declaration keeps the icon users know"
+        );
+        assert_eq!(
+            right_panel_rail_glyph(&app, "acme.something"),
+            "\u{25A6}",
+            "an undeclared unknown plugin still gets the generic marker"
+        );
+
+        let mut plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: "acme.something".into(),
+            name: "Something".into(),
+            version: "0.1.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "/tmp/acme/herdr-plugin.toml".into(),
+            plugin_root: "/tmp/acme".into(),
+            enabled: true,
+            platforms: None,
+            build: Vec::new(),
+            startup: Vec::new(),
+            actions: Vec::new(),
+            events: Vec::new(),
+            panes: Vec::new(),
+            ui_modules: Vec::new(),
+            link_handlers: Vec::new(),
+            source: Default::default(),
+            warnings: Vec::new(),
+        };
+        plugin.ui_modules = vec![crate::api::schema::PluginManifestUiModule {
+            rail_icon: Some("\u{1F680}".into()),
+            id: "main".into(),
+            title: "Main".into(),
+            description: None,
+            platforms: None,
+            kind: Default::default(),
+            api_version: 3,
+            module: "dist/main.wasm".into(),
+            hot_reload: Default::default(),
+            surfaces: vec![crate::api::schema::PluginUiSurface::RightPanel],
+            placement: None,
+            capabilities: Vec::new(),
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            max_layers_per_pane: None,
+            collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
+        }];
+        app.installed_plugins
+            .insert("acme.something".into(), plugin);
+
+        assert_eq!(right_panel_rail_glyph(&app, "acme.something"), "\u{1F680}");
     }
 
     #[test]

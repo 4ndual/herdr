@@ -421,6 +421,15 @@ pub struct PluginManifestUiModule {
     /// plugin's own process side writes the file; the host never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_input_file: Option<String>,
+    /// Glyph the host paints for this module in the right-panel rail.
+    ///
+    /// The rail glyph used to come from a hardcoded table of `builtin.` plugin
+    /// ids in `src/ui.rs`, so every third-party right-panel plugin got the same
+    /// generic marker and could only be told apart by clicking it. The icon is
+    /// the plugin's own identity, so it belongs in the plugin's own manifest.
+    /// One or two display cells of non-control text; omitted keeps the fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail_icon: Option<String>,
     /// fork: optional single path segment naming an image file under this
     /// module's plugin directory. When declared, the HOST loads it and paints
     /// it over the module's surface `Rect` (kitty transmit path, or half-block
