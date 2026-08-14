@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn renders_from_the_shipped_collector_snapshot() {
         let _guard = test_guard();
-        let raw = r#"{"pane_id":"w1:p3Q","agent":"claude","harness":{"name":"e2e-codex","runtime":"codex","profile":false,"source":"env"},"agent_cwd":"/home/andual/harnesses/e2e-codex/workspace","shell_cwd":"/home/andual/Projects/herdr","self_focus":false,"home":"/home/andual","config_dir":"/home/andual/harnesses/e2e-codex/config"}"#;
+        let raw = r#"{"pane_id":"w1:p3Q","agent":"claude","harness":{"name":"e2e-codex","runtime":"codex","profile":false,"source":"env"},"agent_cwd":"/home/tester/harnesses/e2e-codex/workspace","shell_cwd":"/home/tester/Projects/herdr","self_focus":false,"home":"/home/tester","config_dir":"/home/tester/harnesses/e2e-codex/config"}"#;
         let event: UiEvent =
             serde_json::from_str(&frame_json(&env_with(raw))).expect("frame parses");
         let update = handle_event(&event);

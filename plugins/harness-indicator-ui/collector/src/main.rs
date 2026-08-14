@@ -587,8 +587,8 @@ mod tests {
     #[test]
     fn claude_project_dir_encoding_matches_claude_code() {
         assert_eq!(
-            encode_cwd("/home/andual/harnesses/e2e-claude/workspace"),
-            "-home-andual-harnesses-e2e-claude-workspace"
+            encode_cwd("/home/tester/harnesses/e2e-claude/workspace"),
+            "-home-tester-harnesses-e2e-claude-workspace"
         );
         // `_` and `.` collapse to `-` as well, which is what makes a repo like
         // `my_app.v2` resolvable at all.

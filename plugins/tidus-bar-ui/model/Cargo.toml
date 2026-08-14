@@ -1,0 +1,12 @@
+[package]
+name = "tidus-bar-model"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "wasm-safe serde model shared by the tidus-bar collector and guest: lineage chips, spawn parentage, status"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

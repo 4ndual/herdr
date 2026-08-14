@@ -267,7 +267,7 @@ mod tests {
         ];
         std::fs::write(&tp, lines.join("\n") + "\n").unwrap();
         let prompts = user_prompts(&tp, 5);
-        let cwd = PathBuf::from("/Users/andual/Projects/goal-widget");
+        let cwd = PathBuf::from("/Users/tester/Projects/goal-widget");
         let out = compose_rebrief(
             Some("Ship the goal dash"),
             "Add clear+rebrief button",
@@ -294,7 +294,7 @@ mod tests {
         // scaffold lines (literal).
         assert!(out.contains(&format!("grep -a '<keyword>' {} | tail -30", tp.display())));
         assert!(out.contains("ls -t ~/.claude/plans/*.md | head -3"));
-        assert!(out.contains("THREAD header matches this cwd (/Users/andual/Projects/goal-widget)"));
+        assert!(out.contains("THREAD header matches this cwd (/Users/tester/Projects/goal-widget)"));
         assert!(out.contains("Known issues:"));
         assert!(out.contains("What wasted tokens last session"));
         // it's a TRUE clear, never a compact.

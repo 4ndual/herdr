@@ -1500,7 +1500,7 @@ Num       RefCount Protocol Flags    Type St Inode Path
         let mut assets = std::collections::HashMap::new();
         assets.insert(
             "macos-aarch64".to_string(),
-            "https://github.com/ogulcancelik/herdr/releases/download/v0.7.2/herdr-macos-aarch64"
+            "https://github.com/herdrdev/herdr/releases/download/v0.7.2/herdr-macos-aarch64"
                 .to_string(),
         );
         let m = Manifest {
@@ -1511,7 +1511,7 @@ Num       RefCount Protocol Flags    Type St Inode Path
         };
         assert_eq!(
             notes_url_from_manifest(&m).as_deref(),
-            Some("https://github.com/ogulcancelik/herdr/releases/tag/v0.7.2")
+            Some("https://github.com/herdrdev/herdr/releases/tag/v0.7.2")
         );
     }
 

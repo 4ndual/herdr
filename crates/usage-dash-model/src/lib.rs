@@ -270,7 +270,7 @@ fn default_true() -> bool {
 
 // ---- pure helpers (unit-tested) ----
 
-/// pi sanitizes a cwd into its sessions dir name: `/Users/andual` -> `--Users-andual--`.
+/// pi sanitizes a cwd into its sessions dir name: `/Users/tester` -> `--Users-tester--`.
 /// Each maximal run of non-alphanumeric chars collapses to a single `-`; the
 /// result is trimmed of leading/trailing `-` and wrapped in `--` … `--`.
 /// Verified against the real `~/.pi/agent/sessions/` dirs (2026-06-17).
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn sanitize_cwd_matches_pi_layout() {
-        assert_eq!(sanitize_cwd("/Users/andual"), "--Users-andual--");
+        assert_eq!(sanitize_cwd("/Users/tester"), "--Users-tester--");
         assert_eq!(
             sanitize_cwd("/private/tmp/pi-bridge/live-monitor"),
             "--private-tmp-pi-bridge-live-monitor--"
