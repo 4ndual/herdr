@@ -225,9 +225,18 @@ impl App {
             );
             return false;
         };
+        // The pane's OWN launch extras, not an empty vec: a harness pane resumed
+        // with only the identity vars looks for its session under ~/.claude and
+        // starts a brand-new conversation instead (DONE-E defect B).
+        let resume_extra_env = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.launch_env.clone())
+            .unwrap_or_default();
         let Some(launch_env) = self
             .find_pane(pane_id)
-            .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, Vec::new()))
+            .and_then(|(ws_idx, _)| self.pane_launch_env(ws_idx, pane_id, resume_extra_env))
         else {
             return false;
         };

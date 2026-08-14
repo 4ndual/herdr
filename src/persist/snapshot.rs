@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use ratatui::layout::Direction;
@@ -109,6 +109,26 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Launch-relevant environment the pane was CREATED with — the `env` extras
+    /// passed to `tab.create` / `pane.split` / `agent.spawn`, never the whole
+    /// process environment.
+    ///
+    /// Without this a harness-launched agent cannot survive a restart: the
+    /// restore path rebuilt the launch env from identity vars alone, so
+    /// `CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `JCODE_HOME` were dropped and the
+    /// runtime looked for the session under the default root, where a harness
+    /// session has never existed (DONE-E defect B).
+    ///
+    /// Filtered ON CAPTURE, not on restore: only what the caller explicitly
+    /// asked for is persisted, so credentials inherited from the server process
+    /// never reach `session.json`. `BTreeMap` for a stable on-disk order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Directory the pane was LAUNCHED in, as opposed to `cwd`, which is the
+    /// live process cwd at capture time and moves with a `cd`. Restore and fork
+    /// provenance want the launch directory (DONE-I: herdr retained it nowhere).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +361,13 @@ fn capture_tab(
             })
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
+        // Capture-time filter: only the extras the pane was CREATED with reach
+        // the file. The server process environment (tokens, keys, the operator s
+        // whole shell) is deliberately never persisted.
+        let env: BTreeMap<String, String> = terminal
+            .map(|terminal| terminal.launch_env.iter().cloned().collect())
+            .unwrap_or_default();
+        let launch_cwd = terminal.and_then(|terminal| terminal.launch_cwd.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -371,6 +398,8 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                env,
+                launch_cwd,
             },
         );
     }
@@ -652,6 +681,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                env: Default::default(),
+                launch_cwd: None,
             },
         );
         panes.insert(
@@ -663,6 +694,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                env: Default::default(),
+                launch_cwd: None,
             },
         );
 
@@ -1212,6 +1245,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                env: Default::default(),
+                launch_cwd: None,
             },
         );
         panes.insert(
@@ -1225,6 +1260,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                env: Default::default(),
+                launch_cwd: None,
             },
         );
 
@@ -1268,6 +1305,78 @@ mod tests {
         assert_eq!(
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
+        );
+    }
+
+    // ── #36 characterization: launch env + launch cwd must survive a restart ──
+    //
+    // DONE-E defect B: a harness-launched agent never survives a restart. The
+    // pane snapshot carries cwd/label/agent/session/argv but NOT the launch
+    // environment, so the restore path calls pane_launch_env(.., Vec::new()) and
+    // CLAUDE_CONFIG_DIR / CODEX_HOME / JCODE_HOME are gone. The runtime then
+    // looks for the session under ~/.claude, where a harness session has never
+    // existed. Proven by re-running the identical resume command with only the
+    // config-dir env restored: both conversations came back.
+    //
+    // Written against the NEW behavior; they fail before the fix.
+
+    fn pane_snapshot_with_env() -> PaneSnapshot {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/home/tester/harnesses/e2e-claude/config".to_string(),
+        );
+        PaneSnapshot {
+            cwd: PathBuf::from("/home/tester/harnesses/e2e-claude/workspace"),
+            label: None,
+            agent_name: Some("claude".to_string()),
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: Some(vec!["claude".to_string(), "--resume".to_string()]),
+            env,
+            launch_cwd: Some(PathBuf::from("/home/tester/harnesses/e2e-claude/workspace")),
+        }
+    }
+
+    #[test]
+    fn pane_snapshot_roundtrips_launch_env_and_cwd() {
+        let pane = pane_snapshot_with_env();
+        let json = serde_json::to_string(&pane).expect("serializes");
+        assert!(
+            json.contains("CLAUDE_CONFIG_DIR"),
+            "the launch env must reach the file: {json}"
+        );
+        let back: PaneSnapshot = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.env, pane.env);
+        assert_eq!(back.launch_cwd, pane.launch_cwd);
+    }
+
+    /// The serde(default) guarantee: every session.json written before this field
+    /// existed must still load. A restore that hard-errors on an old session file
+    /// loses every pane, which is worse than the bug being fixed.
+    #[test]
+    fn pane_snapshot_loads_an_old_fixture_without_env() {
+        let legacy = r#"{"cwd":"/tmp","agent_name":"claude"}"#;
+        let pane: PaneSnapshot = serde_json::from_str(legacy).expect("old fixture still loads");
+        assert!(
+            pane.env.is_empty(),
+            "absent env reads as empty, not an error"
+        );
+        assert_eq!(pane.launch_cwd, None);
+    }
+
+    /// An empty env must not appear in the file at all — every existing session
+    /// snapshot would otherwise churn on the next save.
+    #[test]
+    fn an_empty_launch_env_is_not_serialized() {
+        let mut pane = pane_snapshot_with_env();
+        pane.env.clear();
+        pane.launch_cwd = None;
+        let json = serde_json::to_string(&pane).expect("serializes");
+        assert!(!json.contains("env"), "empty env must be skipped: {json}");
+        assert!(
+            !json.contains("launch_cwd"),
+            "absent launch cwd must be skipped: {json}"
         );
     }
 }

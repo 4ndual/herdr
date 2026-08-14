@@ -173,6 +173,13 @@ pub struct TerminalState {
     pub last_agent_state_change_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    /// The launch-relevant env extras this pane was created with (the `env`
+    /// param of tab.create / pane.split / agent.spawn). Kept so a restart can
+    /// reproduce the launch environment — see PaneSnapshot::env.
+    pub launch_env: Vec<(String, String)>,
+    /// Directory the pane was launched in. `cwd` above is the live process cwd
+    /// and moves with a `cd`; this one does not.
+    pub launch_cwd: Option<PathBuf>,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -207,6 +214,8 @@ impl TerminalState {
             last_agent_state_change_seq: None,
             revision: 0,
             launch_argv: None,
+            launch_env: Vec::new(),
+            launch_cwd: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
             pending_agent_resume_plan: None,
@@ -238,6 +247,18 @@ impl TerminalState {
 
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {
         self.launch_argv = Some(argv);
+        self
+    }
+
+    /// Record the launch-relevant env extras (never the inherited environment).
+    pub fn with_launch_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.launch_env = env;
+        self
+    }
+
+    /// Record the directory the pane was launched in.
+    pub fn with_launch_cwd(mut self, cwd: PathBuf) -> Self {
+        self.launch_cwd = Some(cwd);
         self
     }
 
