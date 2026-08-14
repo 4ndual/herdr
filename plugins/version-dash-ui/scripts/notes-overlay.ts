@@ -26,7 +26,11 @@ import {
   enableMouse,
   isCloseClick,
   isCloseKey,
+  type CloseTarget,
 } from "./overlay-chrome";
+
+/** Cells that close the overlay, registered by the render that drew them. */
+let closeTargets: CloseTarget[] = [];
 
 const STATE_DIR =
   process.env.HERDR_PLUGIN_STATE_DIR ??
@@ -97,11 +101,17 @@ function render() {
     const room = i === 0 ? closeX(width) - 1 : width - 1;
     body.push(style(line.slice(0, Math.max(0, room))));
   }
+  closeTargets = [];
+  const titleRight = closeX(width);
   body[0] =
-    (body[0] ?? "").padEnd(Math.max(0, closeX(width)) + (body[0] ?? "").length - visibleLength(body[0] ?? "")) +
-    `${ACCENT}${CLOSE_LABEL}${RESET}`;
+    (body[0] ?? "").padEnd(
+      Math.max(0, titleRight) + (body[0] ?? "").length - visibleLength(body[0] ?? ""),
+    ) + `${ACCENT}${CLOSE_LABEL}${RESET}`;
+  closeTargets.push({ row: 0, x: titleRight, len: CLOSE_LABEL.length });
   const position = source.length > view ? `${top + 1}-${Math.min(top + view, source.length)}/${source.length}  ` : "";
-  const hint = `${DIM} ${position}↑↓ scroll · pgup/pgdn page · q / esc / [x] close${RESET}`;
+  const hint = `${ACCENT} ${CLOSE_LABEL}${RESET}${DIM} close · ${position}↑↓ scroll · pgup/pgdn page · q / esc also close${RESET}`;
+  // The footer's row is exactly the number of body rows drawn above it.
+  closeTargets.push({ row: body.length, x: 1, len: CLOSE_LABEL.length });
   out.write(`\x1b[H\x1b[2J${body.join("\r\n")}\r\n${hint}`);
 }
 
@@ -124,7 +134,7 @@ function close() {
 function onData(chunk: Buffer) {
   const text = chunk.toString("utf8");
   // The clickable [x], first: a press on it closes exactly like Esc does.
-  if (isCloseClick(text, cols())) return close();
+  if (isCloseClick(text, closeTargets)) return close();
   if (isCloseKey(text)) return close();
   const page = Math.max(1, rows() - 2);
   let index = 0;

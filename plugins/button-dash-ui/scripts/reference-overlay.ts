@@ -29,7 +29,11 @@ import {
   enableMouse,
   isCloseClick,
   isCloseKey,
+  type CloseTarget,
 } from "./overlay-chrome";
+
+/** Cells that close the overlay, registered by the render that drew them. */
+let closeTargets: CloseTarget[] = [];
 
 type Button = {
   id: string;
@@ -91,9 +95,15 @@ const pad = (text: string, to: number) => text + " ".repeat(Math.max(0, to - wid
 function render() {
   const term = cols();
   const lines: string[] = [];
-  // Title row carries the clickable close control at the right (canon §3.1.7).
-  const title = " \x1b[1mButton dash — every button\x1b[0m";
-  lines.push(`${title}${" ".repeat(Math.max(1, closeX(term) - 27))}${ROLE.teal}${CLOSE_LABEL}${RESET}`);
+  closeTargets = [];
+  // Title row carries a close control at the right, and the footer carries one
+  // whose position is known exactly — see overlay-chrome for why both.
+  const title = " Button dash — every button";
+  const titleRight = closeX(term);
+  lines.push(
+    `\x1b[1m${title}\x1b[0m${" ".repeat(Math.max(1, titleRight - title.length))}${ROLE.teal}${CLOSE_LABEL}${RESET}`,
+  );
+  closeTargets.push({ row: 0, x: titleRight, len: CLOSE_LABEL.length });
   lines.push("");
   // Column widths from the data, so a longer label never wraps mid-row.
   const labelW = Math.max(...buttons.map((b) => width(b.label)));
@@ -109,10 +119,13 @@ function render() {
     const desc = [...b.description].slice(0, room).join("");
     lines.push(`${color}${head}${RESET}${DIM}${desc}${RESET}`);
   }
-  // Footer names every key that does anything, including the two that are not
-  // keys at all — the canon's rule that an undocumented key does not exist.
+  // Footer names every key that does anything, and carries the close control
+  // that is always where it says it is: this row was just printed, so its index
+  // and the control's columns are known rather than assumed.
   lines.push("");
-  lines.push(`${DIM} ↵ / q / esc / [x] close${RESET}`);
+  const footerRow = lines.length;
+  lines.push(`${ROLE.teal} ${CLOSE_LABEL}${RESET}${DIM} close · ↵ / q / esc also close${RESET}`);
+  closeTargets.push({ row: footerRow, x: 1, len: CLOSE_LABEL.length });
   out.write(`\x1b[H\x1b[2J${lines.join("\r\n")}`);
 }
 
@@ -139,7 +152,7 @@ process.stdin.on("data", (chunk: Buffer) => {
   const text = chunk.toString("utf8");
   // A press on the [x], or any of the close keys. Everything else is ignored
   // rather than typed into a surface that has no input.
-  if (isCloseClick(text, cols()) || isCloseKey(text) || /[\r\n]/.test(text)) close();
+  if (isCloseClick(text, closeTargets) || isCloseKey(text) || /[\r\n]/.test(text)) close();
 });
 process.on("SIGWINCH", render);
 render();

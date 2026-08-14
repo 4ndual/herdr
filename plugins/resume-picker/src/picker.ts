@@ -37,7 +37,17 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { CLOSE_LABEL, closeX, disableMouse, enableMouse, isCloseClick } from "./overlay-chrome";
+import {
+  CLOSE_LABEL,
+  closeX,
+  disableMouse,
+  enableMouse,
+  isCloseClick,
+  type CloseTarget,
+} from "./overlay-chrome";
+
+/** Cells that close the picker, registered by the render that drew them. */
+let closeTargets: CloseTarget[] = [];
 
 type Runtime = "claude" | "codex" | "pi";
 
@@ -412,8 +422,10 @@ function render() {
   // header carries SGR escapes that occupy no columns.
   const head = `\x1b[1m resume\x1b[0m  ${shown.length}/${all.length} sessions   \x1b[2m↑↓ move · enter resume (skip mode) · q / esc / [x] close\x1b[0m`;
   const headWidth = head.replace(/\x1b\[[0-9;]*m/g, "").length;
+  const titleRight = closeX(width);
+  closeTargets = [{ row: 0, x: titleRight, len: CLOSE_LABEL.length }];
   lines.push(
-    `${head}${" ".repeat(Math.max(1, closeX(width) - headWidth))}\x1b[36m${CLOSE_LABEL}\x1b[0m`,
+    `${head}${" ".repeat(Math.max(1, titleRight - headWidth))}\x1b[36m${CLOSE_LABEL}\x1b[0m`,
   );
   lines.push(` \x1b[36m/\x1b[0m ${query}\x1b[7m \x1b[0m`);
 
@@ -462,7 +474,7 @@ function finish(command: string | null) {
 function onData(chunk: Buffer) {
   const text = chunk.toString("utf8");
   // A press on the [x] cancels, exactly like Esc: one exit, three doors.
-  if (isCloseClick(text, cols())) return finish(null);
+  if (isCloseClick(text, closeTargets)) return finish(null);
   let index = 0;
   let dirty = false;
 
