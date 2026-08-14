@@ -1,0 +1,78 @@
+id = "builtin.workspace-ops"
+name = "Workspace Ops"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Tab/pane context-menu operations: convert a tab (with its tidus children) into its own workspace, move it to another workspace via an overlay picker, and copy a pane's full metadata to the clipboard"
+# Linux only, honestly: attribution reads /proc/<pid>/environ to learn which
+# harness a pane belongs to, and the clipboard path probes wl-copy/xclip/xsel.
+# macOS needs KERN_PROCARGS2 before this could claim support, and claiming it
+# early would ship "copy metadata" that never finds a harness.
+platforms = ["linux"]
+
+# Everything is Go. The guest is TinyGo wasm; the actions and the overlay are
+# ordinary Go binaries. One `go build ./...` plus one `tinygo build` produces
+# every artefact under this plugin's own target dir, so linking never triggers a
+# herdr build.
+[[build]]
+command = ["go", "build", "-trimpath", "-ldflags=-s -w", "-o", "target/", "./cmd/..."]
+
+# Both flags are load-bearing, not style:
+#   -gc=conservative — wasm-unknown ships gc=leaking, which dies after ~15
+#     allocating frames AND fails silently (loaded: true, last_error: none).
+#   -opt=z — keeps the module small; it is pure static data.
+[[build]]
+command = ["tinygo", "build", "-target=wasm-unknown", "-gc=conservative", "-opt=z",
+           "-o", "target/workspace_ops_ui.wasm", "./guest"]
+
+# The guest draws nothing. It exists solely because context-menu entries can
+# ONLY come from a wasm module publishing a `context_menu` surface
+# (ui_plugins.rs::context_menu_items_from_update) — `[[actions]]` alone never
+# reach a menu. The items are constant, so they ship in the static update and
+# the guest never parses an event.
+[[ui_modules]]
+id = "menu"
+title = "Workspace Ops menu"
+description = "Registers the workspace-ops entries in the tab and pane context menus"
+kind = "wasm"
+api_version = 3
+module = "target/workspace_ops_ui.wasm"
+hot_reload = "on"
+surfaces = ["context_menu"]
+capabilities = ["context_menu_augment"]
+
+[[panes]]
+id = "picker"
+title = "move to workspace"
+description = "Overlay list of workspaces; Enter moves the invoked tab (and its tidus children) there"
+placement = "overlay"
+# `exec` shim, not a script: unlike a collector (whose relative program is
+# resolved against the plugin root by `plugin_collector.rs::resolve_program`), a
+# pane entrypoint is spawned through a PATH lookup, so a bare `target/picker`
+# fails with "no viable candidates found in PATH". Every other plugin in this
+# repo uses the same one-line shim to reach `$HERDR_PLUGIN_ROOT`; there is no
+# shell-free form the host supports.
+command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/target/picker\""]
+
+# `contexts` is declared for intent and forward-compatibility: the host parses
+# it (app/api/plugins/manifest.rs:60) but does not yet use it to filter menu
+# items, so all three entries currently appear in the workspace, tab AND pane
+# menus alike. Each action resolves its own target and degrades gracefully
+# rather than assuming which menu invoked it. Spec for honouring `contexts` is
+# filed in .local/prd/overnight-execution-plan-2026-08-13.md.
+[[actions]]
+id = "convert-to-workspace"
+title = "Convert to workspace"
+contexts = ["tab", "pane"]
+command = ["target/convert"]
+
+[[actions]]
+id = "move-to-workspace"
+title = "Move to workspace..."
+contexts = ["tab", "pane"]
+command = ["target/moveto"]
+
+[[actions]]
+id = "copy-metadata"
+title = "Copy metadata"
+contexts = ["pane", "tab"]
+command = ["target/copymeta"]
