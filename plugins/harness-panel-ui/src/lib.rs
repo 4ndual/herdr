@@ -48,7 +48,17 @@ pub extern "C" fn herdr_ui_alloc(len: i32) -> i32 {
     }
 }
 
-static STATIC_UPDATE: &str = r#"{"layers":[]}"#;
+// The host reads this ONCE at load time (`load_module_static`) to learn how much
+// content the module has, and carves a panel rect only for a module whose
+// content is non-empty. An empty `layers` here is therefore fatal rather than
+// merely minimal: no content -> no carve -> no rect -> `on_frame` is never
+// called with geometry -> the module can never produce content. The panel never
+// appears, and the host reports it healthy the whole time (`loaded: true`, no
+// skip reason, `content 0x0`), which reads exactly like a host-side failure.
+//
+// So the static update must already claim the surface with a real line. The
+// first real frame replaces it.
+static STATIC_UPDATE: &str = r#"{"layers":[{"surface":"panel","z_index":0,"consumes_mouse":false,"nodes":[{"kind":"line","spans":[{"text":"harness fleet"}]}]}],"scope":"full"}"#;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn herdr_ui_static_update_ptr() -> i32 {
@@ -414,5 +424,29 @@ pub mod testing {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+}
+
+#[cfg(test)]
+mod static_update_tests {
+    use super::*;
+
+    /// The static update is the module's bootstrap: the host reads it at load
+    /// time and carves a panel only if it already has content. If it fails to
+    /// parse, or parses to nothing, the panel silently never appears — so this
+    /// asserts both, against the host's own `UiUpdate` type.
+    #[test]
+    fn static_update_parses_and_claims_the_panel() {
+        let update: UiUpdate = serde_json::from_str(STATIC_UPDATE)
+            .expect("static update must parse as the host's UiUpdate");
+        let layer = update
+            .layers
+            .first()
+            .expect("static update must contain a layer or the host carves nothing");
+        assert_eq!(layer.surface, UiSurface::Panel, "must claim the panel");
+        assert!(
+            !layer.nodes.is_empty(),
+            "a layer with no nodes is zero content, which is what blocked the carve"
+        );
     }
 }
