@@ -113,3 +113,114 @@ frame change.
   `/proc`), launching the new runtime against the default config root with the
   carried session missing. Falls back to `ps -Eww`. Unverified on real macOS —
   that is #22's Mac rollout.
+
+## Promotion and the #22 E2E
+
+### The E2E found a real gap, which is what it is for
+
+The first promotion shipped a release binary built **before `task/pane-env-persistence`
+was merged**. #36 was committed in its own worktree (`3f4e4f91`) and never merged
+into `feat/host-action-bridge`, so every earlier "#36 is done" statement in this
+report described a commit that was not in the branch being promoted.
+
+Caught by running the actual scenario rather than trusting the commit: a harness
+pane launched through the promoted binary with
+`--env CLAUDE_CONFIG_DIR=~/harnesses/e2e-claude/config` produced a `session.json`
+entry with **no `env` and no `launch_cwd`**. Merged as `80bfae97` and re-promoted.
+
+### Two rig defects found and fixed along the way
+
+1. **The window came back at 2005x971 on a 1600x1000 screen** — the exact
+   viewport defect behind the retracted rail diagnosis, reproduced live because
+   my relaunch used `--geometry=199x51`. `rail-control.ts` caught it on the first
+   run with the right message. Relaunch fixed to `158x51`.
+2. **`rail-control.ts` inherited `HERDR_SOCKET_PATH` from the calling shell** and
+   silently reported on the **live hr instance** while claiming to describe the
+   test rig — the same "measured the wrong thing" class the control exists to
+   prevent. It no longer reads the ambient socket and now prints the socket and
+   display it used, so every answer names its subject.
+
+### The rail claim, settled with evidence
+
+With a correct viewport and the new `plugin.ui.status` fields, from the live
+test instance:
+
+```
+builtin.harness-manager/harness   surfaces=["RightPanel"] nodes=1
+builtin.historial-dash/historial  surfaces=["RightPanel"] nodes=1
+builtin.plugin-manager/plugins    surfaces=["RightPanel"] nodes=43
+```
+
+historial-dash and plugin-manager **do** render right-panel content. The
+"unreachable" verdicts in the earlier gate files were the viewport artifact, as
+the user's correction said. Re-verified rather than assumed.
+
+New finding from the same read, worth a follow-up: **every module reports
+`hit_rects=0`**, including plugin-manager with 43 nodes. Those panels publish no
+declared click targets at all, so clicks can only reach them through the
+`mouse_all` broadcast. That is a plausible root cause for several "dead click"
+reports and was invisible before this fix.
+
+### Server hygiene
+
+The test server initially inherited `CLAUDE_CODE_CHILD_SESSION` from the
+conducting session, which **disables transcript saving in every pane it spawns**
+— any session-resume evidence taken from that rig would have been worthless.
+Restarted from `/tmp/start-herdrtest-clean.sh`, which strips `CLAUDE*`/`HERDR_*`
+before exec. Verified: zero `CLAUDE*` vars in the server's `/proc/<pid>/environ`.
+
+### Four-axis parity
+
+| Axis | Test instance | Live `hr` |
+|---|---|---|
+| 1. Binary identity | PASS | PASS (same sha256 staged) |
+| 2. Running-process identity | PASS — new inode, verified via `/proc/<pid>/exe` | **PENDING A RESTART** |
+| 3. Plugin-registry parity | see below | see below |
+| 4. Config parity | PASS (whitespace only) | PASS |
+
+**Axis 2 on `hr` is deliberately not done.** This batch is running *inside* the
+`hr` session (`HERDR_PANE_ID=w1C:p2`), so restarting that server would kill the
+batch mid-flight, and the plan's own guidance is that restarting `hr` is the
+hazard. The new binary is staged at `~/.herdr-hr/bin/herdr`; the running process
+still holds the previous inode and will pick the new one up on the next restart
+you perform.
+
+**Axis 3 has real drift**, beyond the three documented singleton exclusions
+(herdr-mirror, collie, harness-control):
+
+- enabled on test but not on hr: `builtin.claude-image-preview`,
+  `builtin.harness-panel`, `builtin.image-view-go`
+- `probe.rail` (rooted at `/tmp/rail-probe`) is a throwaway diagnostic from the
+  retracted rail investigation and should be removed from the test instance
+- `claude-image-preview` is linked from *different roots* on the two instances
+  (`~/Projects/herdr-plugins/...` on hr, `~/Projects/herdr/plugins/...` on test)
+
+I have not enabled plugins on the live instance or deleted the probe: both are
+user-visible changes to a running environment, and the root divergence is a
+question about which copy is canonical rather than a mechanical sync. Listed
+here for your decision.
+
+## What is NOT done, and why
+
+Reported plainly rather than left to be discovered:
+
+- **`hr` axis-2 restart** — see above. Binary staged, restart is yours.
+- **Plugin-registry drift** — three plugins and one throwaway probe, listed
+  above. Needs your call on the canonical root for `claude-image-preview`.
+- **#21 collied / herdr-mirror update** — not attempted. 18 live mirror
+  processes bridge hr↔Mac and the plan's own hazard note is that the danger is
+  restarting hr, which this session cannot do from inside itself.
+- **#22 Mac rollout** — gated on Linux being fully green, which requires the
+  `hr` restart above. The macOS-specific fix in this batch (the runtime-swap
+  `ps -Eww` fallback) is therefore **unverified on real macOS**.
+- **#39 QA defect sweep** — the plan's ordered task table does not contain a
+  #39 entry, so there was no specification to work to. The open FAILs in the
+  gate files fall into three classes: tick-shaped focus lag (which #25's
+  event-driven focus fix should have closed — needs re-measurement after the
+  `hr` restart), the mouse-not-forwarded-into-plugin-overlay-panes host gap
+  (filmed on three overlays, still open), and the rail/viewport verdicts
+  (retracted above).
+- **#34 phase 2** (`pane.set_color` behind `PluginUiCapability::Metadata`) — the
+  plan makes it conditional on the §7 open question coming back "yes"; it has
+  not been answered, so phase 1 only.
+- **#26 / #24** — design documents only, as the plan directs.
