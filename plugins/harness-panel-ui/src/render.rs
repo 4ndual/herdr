@@ -78,9 +78,16 @@ pub fn fit(s: &str, max: usize) -> String {
     out
 }
 
+/// The daemon's real status vocabulary, enumerated from a live fleet rather than
+/// guessed: `stopped`, `idle`, `busy`, `profile`. An earlier version only knew
+/// `running`/`live`, so every idle and busy harness fell through to the muted
+/// "stopped" styling — a live fleet rendered as if nothing was up. `running` and
+/// the error spellings are kept as aliases in case the daemon widens the set.
 fn status_role(status: &str) -> Option<&'static str> {
     match status {
-        "running" | "live" => Some("success"),
+        "busy" => Some("warning"),
+        "idle" | "running" | "live" => Some("success"),
+        "profile" => Some("teal"),
         "starting" | "pending" => Some("warning"),
         "error" | "failed" => Some("danger"),
         _ => Some("muted"),
@@ -91,7 +98,11 @@ fn status_glyph(status: &str) -> &'static str {
     // No images in a terminal, so status degrades to a glyph + colour — the
     // "terminal-capable" rule from the brief.
     match status {
-        "running" | "live" => "●",
+        // Live and working vs live and waiting are the distinction an operator
+        // scans for, so they get different glyphs, not just different colours.
+        "busy" => "◉",
+        "idle" | "running" | "live" => "●",
+        "profile" => "◈",
         "starting" | "pending" => "◐",
         "error" | "failed" => "✖",
         _ => "○",
@@ -720,5 +731,37 @@ mod tests {
         let t = text_of(&p);
         assert!(t.contains("offline"), "must say it is offline");
         assert!(t.contains("alpha"), "must still show the last known fleet");
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// The four statuses a live daemon actually emits, enumerated from
+    /// /api/fleet: stopped, idle, busy, profile. Each must be visually distinct
+    /// from "stopped", or a running fleet reads as a dead one.
+    #[test]
+    fn the_real_status_vocabulary_is_distinguished() {
+        let stopped = (status_glyph("stopped"), status_role("stopped"));
+        for live in ["idle", "busy", "profile"] {
+            let got = (status_glyph(live), status_role(live));
+            assert_ne!(
+                got, stopped,
+                "status {live:?} renders identically to stopped"
+            );
+        }
+        // busy and idle are both live but mean different things to an operator.
+        assert_ne!(
+            (status_glyph("busy"), status_role("busy")),
+            (status_glyph("idle"), status_role("idle")),
+            "busy and idle must be tellable apart"
+        );
+    }
+
+    #[test]
+    fn an_unknown_status_degrades_quietly() {
+        assert_eq!(status_glyph("something-new"), "○");
+        assert_eq!(status_role("something-new"), Some("muted"));
     }
 }
