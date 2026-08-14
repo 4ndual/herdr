@@ -48,14 +48,68 @@ pub struct CustomThemeColors {
     pub peach: Option<String>,
 }
 
+/// Why a color string was rejected. Carried to the API caller verbatim, so it
+/// has to say what was wrong rather than just that something was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColorError(pub String);
+
+impl std::fmt::Display for ColorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Longest color string worth parsing. `rgb(255, 255, 255)` is 18.
+const MAX_COLOR_LEN: usize = 32;
+
+/// Parse a color string, REJECTING anything unrecognised.
+///
+/// [`parse_color`] warns and returns cyan for input it does not understand,
+/// which is right for a config file the user can see and edit, and wrong for an
+/// API: a caller that sends a typo gets a cyan pane and no way to learn why.
+/// Every API path uses this one.
+pub fn try_parse_color(s: &str) -> Result<ratatui::style::Color, ColorError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(ColorError("color must not be empty".into()));
+    }
+    if trimmed.len() > MAX_COLOR_LEN {
+        return Err(ColorError(format!(
+            "color must be at most {MAX_COLOR_LEN} characters"
+        )));
+    }
+    let lowered = trimmed.to_lowercase();
+    match parse_color_inner(&lowered) {
+        Some(color) => Ok(color),
+        None => Err(ColorError(format!("unknown color: {trimmed}"))),
+    }
+}
+
 /// Parse a color string into a ratatui Color.
 /// Supports: hex (#rrggbb, #rgb), named colors, rgb(r,g,b), and reset aliases.
+///
+/// Lenient by design and CONFIG-ONLY: unknown input warns and falls back to
+/// cyan. API callers must use [`try_parse_color`], which rejects instead.
 pub fn parse_color(s: &str) -> ratatui::style::Color {
     use ratatui::style::Color;
     let s = s.trim().to_lowercase();
+    match parse_color_inner(&s) {
+        Some(color) => color,
+        None => {
+            warn!(color = s, "unknown color, defaulting to cyan");
+            Color::Cyan
+        }
+    }
+}
 
-    match s.as_str() {
-        "reset" | "default" | "none" | "transparent" => return Color::Reset,
+/// The shared parse. `None` means "not a color I recognise" — the two public
+/// entry points differ only in what they do with that.
+fn parse_color_inner(s: &str) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    let s = s.trim();
+
+    match s {
+        "reset" | "default" | "none" | "transparent" => return Some(Color::Reset),
         _ => {}
     }
 
@@ -66,7 +120,7 @@ pub fn parse_color(s: &str) -> ratatui::style::Color {
                 u8::from_str_radix(&hex[2..4], 16),
                 u8::from_str_radix(&hex[4..6], 16),
             ) {
-                return Color::Rgb(r, g, b);
+                return Some(Color::Rgb(r, g, b));
             }
         } else if hex.len() == 3 {
             let chars: Vec<u8> = hex
@@ -74,7 +128,7 @@ pub fn parse_color(s: &str) -> ratatui::style::Color {
                 .filter_map(|c| u8::from_str_radix(&c.to_string(), 16).ok())
                 .collect();
             if chars.len() == 3 {
-                return Color::Rgb(chars[0] * 17, chars[1] * 17, chars[2] * 17);
+                return Some(Color::Rgb(chars[0] * 17, chars[1] * 17, chars[2] * 17));
             }
         }
     }
@@ -87,12 +141,12 @@ pub fn parse_color(s: &str) -> ratatui::style::Color {
                 parts[1].trim().parse::<u8>(),
                 parts[2].trim().parse::<u8>(),
             ) {
-                return Color::Rgb(r, g, b);
+                return Some(Color::Rgb(r, g, b));
             }
         }
     }
 
-    match s.as_str() {
+    let color = match s {
         "black" => Color::Black,
         "red" => Color::Red,
         "green" => Color::Green,
@@ -109,11 +163,9 @@ pub fn parse_color(s: &str) -> ratatui::style::Color {
         "lightblue" => Color::LightBlue,
         "lightmagenta" => Color::LightMagenta,
         "lightcyan" => Color::LightCyan,
-        _ => {
-            warn!(color = s, "unknown color, defaulting to cyan");
-            Color::Cyan
-        }
-    }
+        _ => return None,
+    };
+    Some(color)
 }
 
 #[cfg(test)]

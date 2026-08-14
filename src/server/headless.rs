@@ -993,6 +993,7 @@ impl HeadlessServer {
                 focus: true,
                 label,
                 env: Default::default(),
+                hidden: false,
             }),
         )
     }

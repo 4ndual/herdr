@@ -89,6 +89,32 @@ pub(crate) fn agent_panel_toggle_rect(area: Rect, sort: AgentPanelSort) -> Rect 
     agent_panel_header_label_rect(area, agent_panel_sort_label(sort))
 }
 
+/// Rect of the scope control, immediately LEFT of the sort control.
+///
+/// Two separate hit-rects rather than one cycling control: scope and sort are
+/// independent questions ("which agents" vs "in what order"), and folding them
+/// into one toggle would make three of the six combinations unreachable.
+/// Non-overlapping by construction — the scope rect stops where the sort rect
+/// begins, with one cell of gap.
+pub(crate) fn agent_panel_scope_toggle_rect(
+    area: Rect,
+    sort: AgentPanelSort,
+    scope: crate::app::state::AgentPanelScope,
+) -> Rect {
+    let sort_rect = agent_panel_toggle_rect(area, sort);
+    if sort_rect == Rect::default() {
+        return Rect::default();
+    }
+    let label_width = display_width_u16(scope.label());
+    let right_edge = sort_rect.x.saturating_sub(1);
+    if label_width == 0 || right_edge <= area.x || label_width >= right_edge - area.x {
+        // No room beside the sort control: the scope stays reachable by keeping
+        // no rect at all rather than overlapping its neighbour.
+        return Rect::default();
+    }
+    Rect::new(right_edge - label_width, sort_rect.y, label_width, 1)
+}
+
 fn agent_panel_header_label_rect(area: Rect, label: &str) -> Rect {
     if area.width == 0 || area.height < 2 {
         return Rect::default();
@@ -154,6 +180,11 @@ fn collect_agent_panel_entries_with_runtimes(
             let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
             ws.pane_details(&app.terminals)
                 .into_iter()
+                // A hidden tab is hidden EVERYWHERE. It was filtered out of the
+                // tab bar and left fully listed in the sidebar, so "make
+                // invisible" moved a tab rather than hiding it. `tab.list
+                // {hidden:true}` is the way back to one (ADR-001).
+                .filter(|detail| ws.tabs.get(detail.tab_idx).is_some_and(|tab| !tab.hidden))
                 .map(move |detail| {
                     let show_tab = multi_tab
                         || ws
@@ -1428,6 +1459,25 @@ fn render_agent_detail(
     );
     let control_label = active_agent_view_label(app)
         .unwrap_or_else(|| agent_panel_sort_label(app.agent_panel_sort));
+    let scope_rect =
+        agent_panel_scope_toggle_rect(area, app.agent_panel_sort, app.agent_panel_scope);
+    if scope_rect != Rect::default() {
+        // Highlighted when it is actually narrowing something, so a scoped panel
+        // never looks like an empty one.
+        let color = if app.agent_panel_scope == crate::app::state::AgentPanelScope::All {
+            p.overlay0
+        } else {
+            p.accent
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                app.agent_panel_scope.label(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            scope_rect,
+        );
+    }
     let toggle_rect = agent_panel_header_label_rect(area, control_label);
     if toggle_rect != Rect::default() {
         let color = if app.agent_view_override.is_some() {
@@ -1452,9 +1502,20 @@ fn render_agent_detail(
     if body == Rect::default() {
         return;
     }
-    if details.is_empty() && app.agent_view_override.is_some() {
+    if details.is_empty()
+        && (app.agent_view_override.is_some()
+            || app.agent_panel_scope != crate::app::state::AgentPanelScope::All)
+    {
+        // A scoped panel with no matches must SAY so. Rendering blank reads as a
+        // broken panel, which is how a narrowing control gets blamed for the
+        // absence of agents rather than credited with it.
+        let message = match (app.agent_view_override.is_some(), app.agent_panel_scope) {
+            (true, _) => " no matching agents",
+            (false, crate::app::state::AgentPanelScope::CurrentTab) => " no agents in this tab",
+            (false, _) => " no agents in this space",
+        };
         frame.render_widget(
-            Paragraph::new(" no matching agents")
+            Paragraph::new(message)
                 .style(Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)),
             Rect::new(body.x, body.y, body.width, 1),
         );

@@ -148,15 +148,19 @@ Worktrees are normal Herdr workspaces with Git checkout provenance. `worktree cr
 ## Tabs
 
 ```bash
-herdr tab list [--workspace <workspace_id>]
-herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]
+herdr tab list [--workspace <workspace_id>] [--hidden | --visible]
+herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus] [--hidden]
 herdr tab get <tab_id>
 herdr tab focus <tab_id>
 herdr tab rename <tab_id> <label>
 herdr tab close <tab_id>
+herdr tab hide <tab_id>
+herdr tab show <tab_id> [--focus]
 ```
 
 A tab is another terminal layout inside a workspace. Without `--workspace`, `tab create` uses the active workspace and fails if none exists. Its JSON response exposes `.result.tab.tab_id` and `.result.root_pane.pane_id`. Closing a workspace's last tab also closes the workspace, matching the TUI close-tab action; when `confirm_close` is enabled and that would also close a whole worktree group, `tab close` returns a `confirmation_required` error instead.
+
+A hidden tab keeps running with its panes intact; it is simply not drawn in the tab bar or the sidebar. `tab list --hidden` is how you find one again, and `tab show` brings it back. Herdr refuses to hide a workspace's last visible tab, and rejects `--hidden` together with `--focus`.
 
 Workspace and tab creation, and pane splitting, leave focus unchanged by default. `--focus` selects the new layout; `--no-focus` states the default explicitly. Without `--cwd`, new terminals follow the configured `terminal.new_cwd` policy, which follows the source pane or workspace by default. Each `--env KEY=VALUE` adds or replaces that variable in the new root shell.
 

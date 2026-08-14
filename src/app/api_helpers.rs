@@ -213,6 +213,11 @@ const MAX_METADATA_TOKEN_KEYS_PER_REQUEST: usize = 16;
 pub(super) const MAX_METADATA_TOKEN_KEYS_PER_RESOURCE: usize = 32;
 const MAX_METADATA_TOKEN_KEY_LEN: usize = 32;
 const MAX_METADATA_TOKEN_VALUE_LEN: usize = 80;
+/// Metadata key the host interprets instead of merely displaying: it tints the
+/// sidebar row and the pane border. Reserved, and validated at the handler so an
+/// invalid value is a request error with the prior state untouched — validating
+/// at render time instead would accept the write and then silently ignore it.
+pub(crate) const METADATA_COLOR_KEY: &str = "color";
 
 pub(super) fn normalize_metadata_source(value: String) -> Result<String, &'static str> {
     let value = value.trim();
@@ -280,9 +285,56 @@ pub(super) fn normalize_metadata_tokens(
                     .collect::<String>();
                 (!normalized.trim().is_empty()).then(|| normalized.trim().to_string())
             });
+            // The reserved `color` key is interpreted by the host, not merely
+            // displayed, so a bad value is a request error here rather than a
+            // silently ignored write. Clearing it (value `None`) is always legal.
+            let value = match (key.as_str(), value) {
+                (METADATA_COLOR_KEY, Some(value)) => Some(validate_metadata_color(&value)?),
+                (_, value) => value,
+            };
             Ok((key, value))
         })
         .collect()
+}
+
+/// Theme role names accepted for the reserved `color` token.
+///
+/// Mirrors the `plugin_span_style` vocabulary in `src/ui.rs` and
+/// `guest::color_role()` in the plugin API crate. A role is resolved against the
+/// LIVE palette at render time, which is the point: `red` means "this theme's
+/// red", so a tinted row still looks right after a theme change. A caller that
+/// wants a fixed red asks for `#ff0000`.
+pub(crate) const METADATA_COLOR_ROLES: &[&str] = &[
+    "accent", "muted", "success", "warning", "danger", "green", "yellow", "red", "blue", "teal",
+    "cyan", "mauve", "magenta", "subtext", "gray", "peach", "text",
+];
+
+/// Validate the reserved `color` token, returning the normalized value.
+///
+/// Accepts a theme role or an explicit color literal (hex / `rgb()` / reset).
+/// Rejects anything else \u2014 including bare ANSI names that are not roles, which
+/// would otherwise read as "some fixed color" while behaving like neither the
+/// theme's nor the caller's. Rejection happens here, at the handler, so the
+/// prior value survives a bad write instead of being replaced by a default.
+pub(crate) fn validate_metadata_color(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_lowercase();
+    if METADATA_COLOR_ROLES.contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+    let looks_literal = normalized.starts_with('#')
+        || normalized.starts_with("rgb(")
+        || matches!(
+            normalized.as_str(),
+            "reset" | "default" | "none" | "transparent"
+        );
+    if !looks_literal {
+        return Err(format!(
+            "unknown color role `{normalized}`; use one of {} or an explicit #rrggbb",
+            METADATA_COLOR_ROLES.join(", ")
+        ));
+    }
+    crate::config::theme::try_parse_color(&normalized).map_err(|err| err.to_string())?;
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -319,5 +371,66 @@ mod metadata_token_tests {
             .map(|index| (format!("key{index}"), Some("value".into())))
             .collect();
         assert!(normalize_metadata_tokens(too_many).is_err());
+    }
+
+    /// The reserved `color` key is INTERPRETED by the host, so a bad value has
+    /// to fail the request. Validating at render instead would accept the write
+    /// and then quietly ignore it, which is how a user concludes the feature is
+    /// broken rather than their value.
+    #[test]
+    fn color_token_accepts_roles_and_literals_and_rejects_the_rest() {
+        for good in [
+            "accent",
+            " Danger ",
+            "#ff0000",
+            "#f00",
+            "rgb(1, 2, 3)",
+            "reset",
+        ] {
+            let tokens = normalize_metadata_tokens(std::collections::HashMap::from([(
+                METADATA_COLOR_KEY.to_string(),
+                Some(good.to_string()),
+            )]))
+            .unwrap_or_else(|err| panic!("{good:?} should be accepted: {err}"));
+            assert!(tokens[METADATA_COLOR_KEY].is_some(), "{good:?}");
+        }
+
+        for bad in ["lightcyan", "chartreuse", "#gg0000", "rgb(300,0,0)"] {
+            let err = normalize_metadata_tokens(std::collections::HashMap::from([(
+                METADATA_COLOR_KEY.to_string(),
+                Some(bad.to_string()),
+            )]))
+            .expect_err("{bad:?} must be rejected");
+            assert!(!err.is_empty(), "the caller is told why: {bad:?}");
+        }
+    }
+
+    /// Clearing the color is always legal — otherwise a pane tinted by a plugin
+    /// that has since been uninstalled could never be un-tinted.
+    #[test]
+    fn color_token_can_always_be_cleared() {
+        let tokens = normalize_metadata_tokens(std::collections::HashMap::from([(
+            METADATA_COLOR_KEY.to_string(),
+            None,
+        )]))
+        .expect("clearing is legal");
+        assert_eq!(tokens[METADATA_COLOR_KEY], None);
+    }
+
+    /// The strict parser exists because the lenient one answers cyan to
+    /// everything, which is right for a config file and wrong for an API.
+    #[test]
+    fn strict_and_lenient_color_parsers_differ_only_on_bad_input() {
+        use ratatui::style::Color;
+        assert_eq!(
+            crate::config::theme::try_parse_color("#ff0000"),
+            Ok(Color::Rgb(255, 0, 0))
+        );
+        assert!(crate::config::theme::try_parse_color("chartreuse").is_err());
+        assert_eq!(
+            crate::config::theme::parse_color("chartreuse"),
+            Color::Cyan,
+            "config keeps its warn-and-default behaviour"
+        );
     }
 }

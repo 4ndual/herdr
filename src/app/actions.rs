@@ -1469,27 +1469,31 @@ impl AppState {
         self.refresh_tab_bar_view();
     }
 
+    /// Cycle to the next VISIBLE tab.
+    ///
+    /// The modular arithmetic this replaces walked raw indices, and `switch_tab`
+    /// rejects a hidden index — so cycling onto a hidden tab was a dead
+    /// keypress, and two consecutive hidden tabs made the cycle untraversable in
+    /// that direction. `next_visible_tab` skips them.
     #[cfg(test)]
     pub fn next_tab(&mut self) {
-        if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
-            if !ws.tabs.is_empty() {
-                let next = (ws.active_tab + 1) % ws.tabs.len();
-                self.switch_tab(next);
-            }
+        if let Some(next) = self
+            .active
+            .and_then(|i| self.workspaces.get(i))
+            .and_then(|ws| ws.next_visible_tab(true))
+        {
+            self.switch_tab(next);
         }
     }
 
     #[cfg(test)]
     pub fn previous_tab(&mut self) {
-        if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
-            if !ws.tabs.is_empty() {
-                let prev = if ws.active_tab == 0 {
-                    ws.tabs.len() - 1
-                } else {
-                    ws.active_tab - 1
-                };
-                self.switch_tab(prev);
-            }
+        if let Some(prev) = self
+            .active
+            .and_then(|i| self.workspaces.get(i))
+            .and_then(|ws| ws.next_visible_tab(false))
+        {
+            self.switch_tab(prev);
         }
     }
 

@@ -135,8 +135,8 @@ fn layer_area_for_text(layer: &PaneTextLayer, inner: Rect) -> Option<Rect> {
 
 /// Map a named colour to ratatui's ANSI palette.
 ///
-/// Named only, never `Rgb`. Herdr remaps buffer colours to the active theme via
-/// `recolor_to_palette`, and truecolor passes through that remap untouched — so
+/// Named only, never `Rgb`. Herdr renders buffer colours through the active
+/// theme palette, and a truecolor value passes through untouched — so
 /// an overlay allowed to pick a hex value would be the one thing on screen that
 /// ignores the user's theme, and would do it without any error. An unrecognised
 /// name yields `None`, meaning "inherit", so a typo costs the styling and not
@@ -297,7 +297,7 @@ mod tests {
             let color = named_color(name).expect("known colour");
             assert!(
                 !matches!(color, Color::Rgb(..)),
-                "{name} must not map to Rgb: truecolor bypasses recolor_to_palette"
+                "{name} must not map to Rgb: truecolor bypasses the theme palette"
             );
         }
     }

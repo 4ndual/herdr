@@ -385,6 +385,7 @@ mod tests {
                 focus: true,
                 label: None,
                 env: Default::default(),
+                hidden: false,
             },
         );
         let _: SuccessResponse = serde_json::from_str(&response).unwrap();

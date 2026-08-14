@@ -15,6 +15,8 @@ pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
         "focus" => tab_focus(&args[1..]),
         "rename" => tab_rename(&args[1..]),
         "close" => tab_close(&args[1..]),
+        "hide" => tab_hide(&args[1..]),
+        "show" => tab_show(&args[1..]),
         "help" | "--help" | "-h" => {
             print_tab_help();
             Ok(0)
@@ -28,6 +30,9 @@ pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
 
 fn tab_list(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
+    // The filter the API already accepted but the CLI hardcoded to None, which
+    // made hidden tabs unlistable from the shell — the only way back to one.
+    let mut hidden: Option<bool> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -39,6 +44,14 @@ fn tab_list(args: &[String]) -> std::io::Result<i32> {
                 };
                 workspace_id = Some(super::normalize_workspace_id(value));
                 index += 2;
+            }
+            "--hidden" => {
+                hidden = Some(true);
+                index += 1;
+            }
+            "--visible" => {
+                hidden = Some(false);
+                index += 1;
             }
             other => {
                 eprintln!("unknown option: {other}");
@@ -52,7 +65,7 @@ fn tab_list(args: &[String]) -> std::io::Result<i32> {
     // inventing a second default, so a hidden tab is still discoverable here.
     super::runtime::tab_list(TabListParams {
         workspace_id,
-        hidden: None,
+        hidden,
     })
 }
 
@@ -62,6 +75,7 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
     let mut focus = false;
     let mut label = None;
     let mut env = HashMap::new();
+    let mut hidden = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -98,6 +112,10 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            "--hidden" => {
+                hidden = true;
+                index += 1;
+            }
             "--env" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --env");
@@ -126,6 +144,7 @@ fn tab_create(args: &[String]) -> std::io::Result<i32> {
         focus,
         label,
         env,
+        hidden,
     })
 }
 
@@ -180,14 +199,42 @@ fn tab_close(args: &[String]) -> std::io::Result<i32> {
     super::runtime::tab_close(super::normalize_tab_id(raw_tab_id))
 }
 
+fn tab_hide(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_tab_id) = args.first().filter(|_| args.len() == 1) else {
+        eprintln!("usage: herdr tab hide <tab_id>");
+        return Ok(2);
+    };
+
+    super::runtime::tab_hide(super::normalize_tab_id(raw_tab_id))
+}
+
+fn tab_show(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_tab_id) = args.first() else {
+        eprintln!("usage: herdr tab show <tab_id> [--focus]");
+        return Ok(2);
+    };
+    let focus = match args.len() {
+        1 => false,
+        2 if args[1] == "--focus" => true,
+        _ => {
+            eprintln!("usage: herdr tab show <tab_id> [--focus]");
+            return Ok(2);
+        }
+    };
+
+    super::runtime::tab_show(super::normalize_tab_id(raw_tab_id), focus)
+}
+
 fn print_tab_help() {
     eprintln!("herdr tab commands:");
-    eprintln!("  herdr tab list [--workspace <workspace_id>]");
+    eprintln!("  herdr tab list [--workspace <workspace_id>] [--hidden | --visible]");
     eprintln!(
-        "  herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]"
+        "  herdr tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus] [--hidden]"
     );
     eprintln!("  herdr tab get <tab_id>");
     eprintln!("  herdr tab focus <tab_id>");
     eprintln!("  herdr tab rename <tab_id> <label>");
     eprintln!("  herdr tab close <tab_id>");
+    eprintln!("  herdr tab hide <tab_id>");
+    eprintln!("  herdr tab show <tab_id> [--focus]");
 }

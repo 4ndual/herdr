@@ -5,7 +5,7 @@ mod keybinds;
 mod model;
 mod sidebar;
 mod sound;
-mod theme;
+pub(crate) mod theme;
 
 pub use self::{
     io::{

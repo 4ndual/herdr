@@ -465,6 +465,33 @@ impl AppState {
         })
     }
 
+    /// Whether a click landed on the roster-scope control.
+    ///
+    /// Deliberately NOT gated on `agent_view_override`, unlike the sort toggle:
+    /// the scope narrows a plugin's view rather than competing with it, so it
+    /// has to stay live while one is active — otherwise a plugin view makes the
+    /// user's own "show me this tab" control inert.
+    pub(super) fn on_agent_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+        );
+        let rect = crate::ui::agent_panel_scope_toggle_rect(
+            detail_area,
+            self.agent_panel_sort,
+            self.agent_panel_scope,
+        );
+        rect.width > 0
+            && col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height
+    }
+
     pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed || self.agent_view_override.is_some() {
             return false;

@@ -4268,6 +4268,58 @@ command = ["act.exe"]
         let _ = std::fs::remove_dir_all(registry_dir);
     }
 
+    /// `516c91e6` wired carve release into the plugin lifecycle with no tests at
+    /// all. The unit test on `clear_pane_carves_for_owner` proves the setter;
+    /// this proves the WIRING — that `plugin.disable` actually calls it, which
+    /// is the half that leaves a permanently shrunken pane when it regresses.
+    #[tokio::test]
+    async fn disabling_a_plugin_releases_the_carves_it_owned() {
+        let mut app = test_app();
+        let plugin_id = app
+            .state
+            .installed_plugins
+            .keys()
+            .next()
+            .cloned()
+            .expect("the test app auto-links the bundled dashboards");
+        let pane_id = app.state.workspaces.first().map(|ws| ws.tabs[0].root_pane);
+        let Some(pane_id) = pane_id else {
+            // The default test app has no workspace; give it one so there is a
+            // pane to carve from.
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("one")];
+            app.state.active = Some(0);
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            return carve_release_case(app, plugin_id, pane_id).await;
+        };
+        carve_release_case(app, plugin_id, pane_id).await
+    }
+
+    async fn carve_release_case(mut app: App, plugin_id: String, pane_id: crate::layout::PaneId) {
+        let owner = format!("plugin:{plugin_id}");
+        app.state.upsert_pane_carve(
+            pane_id,
+            crate::app::state::PaneCarve {
+                edge: crate::api::schema::PaneCarveEdge::Bottom,
+                cells: 5,
+                owner: Some(owner.clone()),
+            },
+        );
+        assert_eq!(app.state.pane_carve_totals(pane_id), (0, 5, 0, 0));
+
+        app.handle_plugin_disable(
+            "req".into(),
+            crate::api::schema::PluginSetEnabledParams {
+                plugin_id: plugin_id.clone(),
+            },
+        );
+
+        assert_eq!(
+            app.state.pane_carve_totals(pane_id),
+            (0, 0, 0, 0),
+            "a disabled plugin must not leave the pane shrunk"
+        );
+    }
+
     /// A painting module must be distinguishable from a dead one.
     ///
     /// `panel_content_w/h` are filled from the panel SKIP record, so a module

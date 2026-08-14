@@ -95,6 +95,8 @@ pub enum Method {
     TabList(TabListParams),
     #[serde(rename = "tab.show")]
     TabShow(TabVisibilityParams),
+    #[serde(rename = "tab.hide")]
+    TabHide(TabVisibilityParams),
     #[serde(rename = "tab.get")]
     TabGet(TabTarget),
     #[serde(rename = "tab.focus")]

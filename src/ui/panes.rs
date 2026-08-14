@@ -11,6 +11,7 @@ use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
 use super::text::display_width;
 use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
+use crate::app::api_helpers::METADATA_COLOR_KEY;
 use crate::app::state::Palette;
 use crate::app::{AppState, Mode};
 use crate::layout::PaneInfo;
@@ -442,6 +443,69 @@ struct LineCell {
     right: bool,
 }
 
+/// Border color for a pane: its own `color` metadata token when it set one,
+/// otherwise the focus palette.
+///
+/// One resolver for every border-drawing site (borders, titles, empty state).
+/// The choice used to be an inline `if focused { accent } else { overlay0 }`
+/// repeated in four places, which is exactly how a per-pane color ends up
+/// applied to three of them.
+///
+/// A custom color is DIMMED when unfocused rather than replaced: the focused /
+/// unfocused distinction is load-bearing in a tiled layout, and a user color
+/// that overrode it would trade one signal for another.
+pub(crate) fn pane_border_color(
+    app: &AppState,
+    terminal_id: Option<&crate::terminal::TerminalId>,
+    focused: bool,
+) -> ratatui::style::Color {
+    let custom = terminal_id
+        .and_then(|id| app.terminals.get(id))
+        .and_then(|terminal| terminal.metadata_tokens.values().remove(METADATA_COLOR_KEY))
+        .and_then(|value| resolve_pane_color(app, &value));
+    match (custom, focused) {
+        (Some(color), true) => color,
+        (Some(color), false) => dim_color(color),
+        (None, true) => app.palette.accent,
+        (None, false) => app.palette.overlay0,
+    }
+}
+
+/// Resolve a validated `color` token: a theme role against the live palette
+/// first, then an explicit literal. Roles resolve here, not at validation time,
+/// so a tinted pane follows a theme change instead of freezing the color the
+/// theme happened to have when the token was written.
+fn resolve_pane_color(app: &AppState, value: &str) -> Option<ratatui::style::Color> {
+    let palette = &app.palette;
+    let role = match value {
+        "accent" => palette.accent,
+        "muted" | "subtext" | "gray" => palette.overlay0,
+        "success" | "green" => palette.green,
+        "warning" | "yellow" => palette.yellow,
+        "danger" | "red" => palette.red,
+        "blue" => palette.blue,
+        "teal" | "cyan" => palette.teal,
+        "mauve" | "magenta" => palette.mauve,
+        "peach" => palette.peach,
+        "text" => palette.text,
+        // Not a role: an explicit literal, already validated at the handler.
+        literal => return crate::config::theme::try_parse_color(literal).ok(),
+    };
+    Some(role)
+}
+
+/// Halve an RGB color's brightness. Indexed and named colors have no
+/// component to scale, so they map to the terminal's dim variant instead of
+/// being left at full strength and losing the unfocused signal.
+fn dim_color(color: ratatui::style::Color) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        Color::White | Color::Gray => Color::DarkGray,
+        other => other,
+    }
+}
+
 fn render_pane_borders(
     app: &AppState,
     ws: &crate::workspace::Workspace,
@@ -478,11 +542,11 @@ fn render_pane_borders(
         }
         let cell = &mut buf[(x, y)];
         cell.set_symbol(symbol);
-        let color = if focused {
-            app.palette.accent
-        } else {
-            app.palette.overlay0
-        };
+        let pane_terminal = pane_infos
+            .iter()
+            .find(|info| line_touches_pane(x, y, info, app.pane_gaps))
+            .and_then(|info| ws.terminal_id(info.id));
+        let color = pane_border_color(app, pane_terminal, focused);
         cell.set_style(Style::default().fg(color));
     }
 
@@ -645,11 +709,7 @@ fn render_pane_border_titles(
         if start_x >= end_x {
             continue;
         }
-        let color = if info.is_focused {
-            app.palette.accent
-        } else {
-            app.palette.overlay0
-        };
+        let color = pane_border_color(app, ws.terminal_id(info.id), info.is_focused);
         let mut style = Style::default().fg(color);
         if info.is_focused {
             style = style.add_modifier(Modifier::BOLD);
@@ -1209,6 +1269,58 @@ mod tests {
         assert_eq!(buffer[(2, 2)].style().fg, Some(app.palette.accent));
         assert_eq!(buffer[(2, 1)].symbol(), "│");
         assert_eq!(buffer[(2, 1)].style().fg, Some(app.palette.accent));
+    }
+
+    /// A pane's `color` metadata token tints its border, and stays
+    /// distinguishable focused vs unfocused: the tiled layout depends on that
+    /// signal, so a custom color dims rather than replacing it.
+    #[test]
+    fn pane_color_token_tints_the_border_and_still_dims_when_unfocused() {
+        let mut app = AppState::test_new();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), "/tmp".into());
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                METADATA_COLOR_KEY.to_string(),
+                Some("#ff0000".to_string()),
+            )]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.terminals.insert(terminal_id.clone(), terminal);
+
+        let focused = pane_border_color(&app, Some(&terminal_id), true);
+        let unfocused = pane_border_color(&app, Some(&terminal_id), false);
+        assert_eq!(focused, ratatui::style::Color::Rgb(255, 0, 0));
+        assert_ne!(
+            focused, unfocused,
+            "focused and unfocused must stay distinguishable"
+        );
+
+        // A theme ROLE resolves against the live palette, not a frozen literal.
+        app.terminals
+            .get_mut(&terminal_id)
+            .expect("the terminal")
+            .metadata_tokens
+            .patch(
+                std::collections::HashMap::from([(
+                    METADATA_COLOR_KEY.to_string(),
+                    Some("danger".to_string()),
+                )]),
+                None,
+                std::time::Instant::now(),
+            );
+        assert_eq!(
+            pane_border_color(&app, Some(&terminal_id), true),
+            app.palette.red
+        );
+
+        // No token: the plain focus palette, exactly as before.
+        let plain = crate::terminal::TerminalId::alloc();
+        assert_eq!(
+            pane_border_color(&app, Some(&plain), true),
+            app.palette.accent
+        );
     }
 
     #[test]

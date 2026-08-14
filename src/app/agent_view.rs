@@ -51,6 +51,16 @@ pub(crate) fn validate_agent_view_source(source: &str) -> Result<String, String>
 }
 
 pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry>) {
+    // The local scope narrows FIRST and unconditionally: it composes with a
+    // plugin's `agent_view` override rather than being replaced by one. A
+    // plugin that filters to "blocked agents" and a user scoped to "this tab"
+    // both mean what they say, and the user still gets an answer to "what is
+    // running here" while a plugin view is active.
+    //
+    // One function covers the sidebar, the mobile roster, hit-testing, indexed
+    // focus and next/prev-agent, because they all read the same projected list.
+    apply_agent_panel_scope(app, entries);
+
     if let Some(spec) = app.agent_view_override.as_ref() {
         if let Some(filter) = &spec.filter {
             entries.retain(|entry| matches_filter(app, entry, filter));
@@ -75,6 +85,28 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
             )
         });
     }
+}
+
+/// Narrow the roster to the presented workspace or its active tab.
+///
+/// Uses [`presented_workspace_idx`] rather than `app.active` so the panel
+/// follows what the user is LOOKING at in navigate mode, matching every other
+/// sidebar projection.
+fn apply_agent_panel_scope(app: &AppState, entries: &mut Vec<AgentPanelEntry>) {
+    use crate::app::state::AgentPanelScope;
+    let scope = app.agent_panel_scope;
+    if scope == AgentPanelScope::All {
+        return;
+    }
+    let Some(ws_idx) = presented_workspace_idx(app) else {
+        return;
+    };
+    let active_tab = app.workspaces.get(ws_idx).map(|ws| ws.active_tab_index());
+    entries.retain(|entry| match scope {
+        AgentPanelScope::All => true,
+        AgentPanelScope::CurrentSpace => entry.ws_idx == ws_idx,
+        AgentPanelScope::CurrentTab => entry.ws_idx == ws_idx && active_tab == Some(entry.tab_idx),
+    });
 }
 
 pub(crate) fn presented_workspace_idx(app: &AppState) -> Option<usize> {
@@ -569,5 +601,51 @@ mod tests {
         assert!(validate_agent_view(&mut spec)
             .unwrap_err()
             .contains("context type"));
+    }
+
+    /// The scope narrows a plugin's `agent_view` rather than being replaced by
+    /// it: a plugin filtering to one workspace and a user scoping to this tab
+    /// both mean what they say. The control this restores was deleted in
+    /// 54490254, leaving no TUI way to ask "what is running HERE".
+    #[test]
+    fn agent_panel_scope_narrows_the_roster_and_composes_with_a_plugin_view() {
+        use crate::app::state::AgentPanelScope;
+        let mut state = state_with_agents();
+        assert_eq!(
+            crate::ui::agent_panel_entries(&state).len(),
+            2,
+            "the default scope shows agents from every workspace"
+        );
+
+        state.agent_panel_scope = AgentPanelScope::CurrentSpace;
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1, "scoped to the presented workspace");
+        assert_eq!(entries[0].ws_idx, 0);
+
+        // Composition: a plugin view narrowed to workspace 1 plus a user scope
+        // of workspace 0 is empty, not "whichever won".
+        state.agent_view_override = Some(current_workspace_view());
+        state.mode = Mode::Navigate;
+        state.selected = 1;
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(
+            entries.len(),
+            1,
+            "both narrow to the presented workspace, so it survives"
+        );
+        assert_eq!(entries[0].ws_idx, 1);
+    }
+
+    /// Presentation state: cycles widest first, defaults to showing everything.
+    #[test]
+    fn agent_panel_scope_cycles_widest_first() {
+        use crate::app::state::AgentPanelScope;
+        assert_eq!(AgentPanelScope::default(), AgentPanelScope::All);
+        assert_eq!(AgentPanelScope::All.next(), AgentPanelScope::CurrentSpace);
+        assert_eq!(
+            AgentPanelScope::CurrentSpace.next(),
+            AgentPanelScope::CurrentTab
+        );
+        assert_eq!(AgentPanelScope::CurrentTab.next(), AgentPanelScope::All);
     }
 }

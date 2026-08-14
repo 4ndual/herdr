@@ -1071,6 +1071,7 @@ impl App {
             }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabShow(params) => return self.handle_tab_show(request.id, params),
+            Method::TabHide(params) => return self.handle_tab_hide(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
             Method::TabCreate(params) => return self.handle_tab_create(request.id, params),
             Method::TabFocus(target) => return self.handle_tab_focus(request.id, target),

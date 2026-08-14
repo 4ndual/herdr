@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
         assert_eq!(
             frame_digest(&frame),
-            "ce383feeaac30922502b7c4f8af53b5ca30e816ec4503ca6d015738b584da487"
+            "bc46d6a297c827e4616d88a6a6ef673bec48f59bd8124990c9f1c4ab5b4561e8"
         );
     }
 
@@ -367,9 +367,13 @@ mod tests {
         assert_eq!(app.view.pane_infos.len(), 2);
         assert!(!app.view.split_borders.is_empty());
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
+        // Digest updated for #19: the agents panel header gained a roster-scope
+        // control beside the sort control. Verified to be the ONLY frame change
+        // by re-running this pair with the control suppressed, which reproduced
+        // the previous digest exactly.
         assert_eq!(
             frame_digest(&frame),
-            "2ef512f5b0d518233c674e36be59270c471bae5e14dde07644e7e67bcf915c46"
+            "4a2d296004fbd75c2daf3b5ee042d4d2494e251ca6309f481c9e347d6a2c604b"
         );
     }
 

@@ -1185,6 +1185,44 @@ pub enum AgentPanelSort {
     Priority,
 }
 
+/// How much of the agent roster the Agents panel shows.
+///
+/// The equivalent control was deleted in `54490254` when sorting replaced
+/// scoping, which left no way to answer "what is running HERE" from the TUI at
+/// all — on a busy machine the panel is a wall of every agent in every
+/// workspace. The API-only `agent_view` engine can express it, but nothing in
+/// the TUI reaches that.
+///
+/// Presentation state, deliberately: not serialized, not on the wire, and
+/// narrows rather than replaces a plugin's `agent_view` override.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentPanelScope {
+    #[default]
+    All,
+    CurrentSpace,
+    CurrentTab,
+}
+
+impl AgentPanelScope {
+    /// Cycle order for the header control: widest first, then narrowing.
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::CurrentSpace,
+            Self::CurrentSpace => Self::CurrentTab,
+            Self::CurrentTab => Self::All,
+        }
+    }
+
+    /// Short label for the panel header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::CurrentSpace => "space",
+            Self::CurrentTab => "tab",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings UI state
 // ---------------------------------------------------------------------------
@@ -1820,6 +1858,9 @@ pub struct AppState {
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
+    /// Session-local roster scope for the Agents panel. Presentation state: no
+    /// serde, never snapshotted, never on the wire.
+    pub agent_panel_scope: AgentPanelScope,
     /// Transient session-wide projection override for the built-in Agents view.
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
@@ -2859,6 +2900,7 @@ impl AppState {
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
+            agent_panel_scope: AgentPanelScope::default(),
             agent_view_override: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),

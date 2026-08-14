@@ -16,6 +16,14 @@ pub struct TabCreateParams {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Create the tab already hidden.
+    ///
+    /// A hidden tab exists, runs, and is reachable through `tab.list
+    /// {hidden:true}` — it is simply not drawn in the tab bar or the sidebar.
+    /// Contradictory with `focus`, and rejected rather than silently resolved:
+    /// there is no sensible answer to "focus the tab you cannot see".
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

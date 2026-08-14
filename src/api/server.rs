@@ -369,6 +369,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabCreate(_) => "tab.create",
         Method::TabList(_) => "tab.list",
         Method::TabShow(_) => "tab.show",
+        Method::TabHide(_) => "tab.hide",
         Method::TabGet(_) => "tab.get",
         Method::TabFocus(_) => "tab.focus",
         Method::TabRename(_) => "tab.rename",

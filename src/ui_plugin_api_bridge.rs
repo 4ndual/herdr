@@ -71,6 +71,7 @@ const WRITE_METHODS: &[&str] = &[
     // only make an already-owned tab visible again, which is strictly less
     // destructive than `tab.close`, already allowed here.
     "tab.show",
+    "tab.hide",
     "workspace.create",
     "workspace.focus",
     "workspace.rename",

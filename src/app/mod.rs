@@ -9,7 +9,7 @@ mod agent_resume;
 pub(crate) mod agent_view;
 mod agents;
 mod api;
-mod api_helpers;
+pub(crate) mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 mod creation;
@@ -1005,6 +1005,7 @@ impl App {
             sidebar_section_split,
             agent_panel_sort,
             agent_view_override: None,
+            agent_panel_scope: Default::default(),
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,
@@ -1533,6 +1534,7 @@ impl App {
                         focus: true,
                         label,
                         env: Default::default(),
+                        hidden: false,
                     },
                 );
                 needs_render = true;
@@ -3097,8 +3099,7 @@ impl App {
             .state
             .workspaces
             .iter()
-            .enumerate()
-            .flat_map(|(_, ws)| {
+            .flat_map(|ws| {
                 ws.tabs.iter().flat_map(move |tab| {
                     tab.layout
                         .pane_ids()

@@ -65,6 +65,25 @@ pub(super) fn tab_focus(tab_id: String) -> std::io::Result<i32> {
     print_method_response("cli:tab:focus", Method::TabFocus(TabTarget { tab_id }))
 }
 
+pub(super) fn tab_show(tab_id: String, focus: bool) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:tab:show",
+        Method::TabShow(crate::api::schema::TabVisibilityParams { tab_id, focus }),
+    )
+}
+
+pub(super) fn tab_hide(tab_id: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:tab:hide",
+        Method::TabHide(crate::api::schema::TabVisibilityParams {
+            tab_id,
+            // Hiding a tab and focusing it in the same call is contradictory and
+            // the handler rejects it; the CLI never asks for it.
+            focus: false,
+        }),
+    )
+}
+
 pub(super) fn tab_rename(params: TabRenameParams) -> std::io::Result<i32> {
     print_method_response("cli:tab:rename", Method::TabRename(params))
 }

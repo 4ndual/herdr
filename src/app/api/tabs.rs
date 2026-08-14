@@ -53,7 +53,18 @@ impl App {
             focus,
             label,
             env,
+            hidden,
         } = params;
+        // Contradictory, and answered loudly rather than by picking one: a caller
+        // asking for both has a bug, and silently returning a visible tab (or an
+        // unfocusable one) hides it.
+        if hidden && focus {
+            return encode_error(
+                id,
+                "invalid_request",
+                "a tab cannot be created hidden and focused at once",
+            );
+        }
         let ws_idx = if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
                 return workspace_not_found(id, &workspace_id);
@@ -118,6 +129,22 @@ impl App {
                 if focus {
                     self.state.switch_workspace_tab(ws_idx, tab_idx);
                     self.state.mode = Mode::Terminal;
+                }
+                // Applied AFTER the tab is built, through the same setter, so a
+                // refusal is reported instead of returning a tab that quietly
+                // ignored the flag.
+                if hidden
+                    && !self
+                        .state
+                        .workspaces
+                        .get_mut(ws_idx)
+                        .is_some_and(|ws| ws.set_tab_hidden(tab_idx, true))
+                {
+                    return encode_error(
+                        id,
+                        "invalid_request",
+                        "cannot create the only tab hidden",
+                    );
                 }
                 self.schedule_session_save();
                 self.emit_tab_created_events(ws_idx, tab_idx);
@@ -439,6 +466,43 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Hide a tab: it keeps running, keeps its panes, and disappears from the
+    /// tab bar and the sidebar until `tab.show` (or `tab.list {hidden:true}`)
+    /// brings it back.
+    ///
+    /// Routed through the same `Workspace::set_tab_hidden` setter as
+    /// `handle_tab_show`, so the last-visible refusal and the focus move off a
+    /// hidden active tab are enforced in exactly one place.
+    pub(super) fn handle_tab_hide(&mut self, id: String, params: TabVisibilityParams) -> String {
+        let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
+            return tab_not_found(id, &params.tab_id);
+        };
+        if params.focus {
+            return encode_error(id, "invalid_request", "cannot focus a tab while hiding it");
+        }
+        let hidden = self
+            .state
+            .workspaces
+            .get_mut(ws_idx)
+            .is_some_and(|ws| ws.set_tab_hidden(tab_idx, true));
+        if !hidden {
+            // The setter refuses to hide the last visible tab: a workspace with
+            // nothing drawn in its tab bar is unrecoverable from the TUI.
+            return encode_error(
+                id,
+                "invalid_request",
+                "cannot hide the last visible tab in a workspace",
+            );
+        }
+        self.state.mark_session_dirty();
+        if self.state.active == Some(ws_idx) {
+            self.state.refresh_tab_bar_view();
+        }
+        self.schedule_session_save();
+        let tab = self.tab_info(ws_idx, tab_idx).expect("hidden tab exists");
+        encode_success(id, ResponseResult::TabInfo { tab })
+    }
+
     pub(super) fn handle_tab_show(&mut self, id: String, params: TabVisibilityParams) -> String {
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
             return tab_not_found(id, &params.tab_id);
@@ -507,6 +571,173 @@ mod tests {
         config::{Config, ShellModeConfig},
         workspace::Workspace,
     };
+
+    fn app_with_two_tabs() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = Workspace::test_new("tabs");
+        workspace.test_add_tab(Some("two"));
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app
+    }
+
+    fn error_code(response: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(response)
+            .expect("a json response")
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(|code| code.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `tab.hide` is the API counterpart of the "Make invisible" menu row, and
+    /// routes through the same setter so the two cannot diverge.
+    #[test]
+    fn api_tab_hide_hides_the_tab_and_tab_show_brings_it_back() {
+        let mut app = app_with_two_tabs();
+        let tab_id = app.public_tab_id(0, 1).unwrap();
+
+        let response = app.handle_tab_hide(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id: tab_id.clone(),
+                focus: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::TabInfo { .. }));
+        assert!(app.state.workspaces[0].tabs[1].hidden);
+
+        let response = app.handle_tab_show(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id,
+                focus: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(success.result, ResponseResult::TabInfo { .. }));
+        assert!(!app.state.workspaces[0].tabs[1].hidden);
+    }
+
+    /// Hiding the last visible tab would leave a workspace with an empty tab bar
+    /// and no way back from the TUI, so it is refused — and refused LOUDLY, not
+    /// by returning a tab that quietly stayed visible.
+    #[test]
+    fn api_tab_hide_refuses_the_last_visible_tab() {
+        let mut app = app_with_two_tabs();
+        let first = app.public_tab_id(0, 0).unwrap();
+        let second = app.public_tab_id(0, 1).unwrap();
+
+        app.handle_tab_hide(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id: second,
+                focus: false,
+            },
+        );
+        let response = app.handle_tab_hide(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id: first,
+                focus: false,
+            },
+        );
+
+        assert_eq!(error_code(&response), "invalid_request");
+        assert!(
+            app.state.workspaces[0].tabs.iter().any(|tab| !tab.hidden),
+            "a workspace always keeps one visible tab"
+        );
+    }
+
+    /// Showing a tab that is already visible is a no-op that SUCCEEDS. It used
+    /// to depend on the setter reporting a change, which made an idempotent call
+    /// look like a missing tab.
+    #[test]
+    fn api_tab_show_on_an_already_visible_tab_succeeds() {
+        let mut app = app_with_two_tabs();
+        let tab_id = app.public_tab_id(0, 1).unwrap();
+
+        let response = app.handle_tab_show(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id,
+                focus: false,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(
+            matches!(success.result, ResponseResult::TabInfo { .. }),
+            "an already-visible tab is not a missing tab"
+        );
+    }
+
+    /// Hidden and focused at once is contradictory; both entry points say so
+    /// rather than picking one and leaving the caller to discover which.
+    #[test]
+    fn api_rejects_hidden_together_with_focus() {
+        let mut app = app_with_two_tabs();
+        let tab_id = app.public_tab_id(0, 1).unwrap();
+
+        let hide = app.handle_tab_hide(
+            "req".into(),
+            TabVisibilityParams {
+                tab_id,
+                focus: true,
+            },
+        );
+        assert_eq!(error_code(&hide), "invalid_request");
+
+        let create = app.handle_tab_create(
+            "req".into(),
+            TabCreateParams {
+                workspace_id: None,
+                cwd: None,
+                focus: true,
+                label: None,
+                env: Default::default(),
+                hidden: true,
+            },
+        );
+        assert_eq!(error_code(&create), "invalid_request");
+    }
+
+    /// A hidden tab must not be reachable in the sidebar either: it was filtered
+    /// out of the tab bar and left fully listed in the sidebar, so "make
+    /// invisible" moved a tab rather than hiding it.
+    #[test]
+    fn a_hidden_tab_leaves_the_sidebar_too() {
+        let mut app = app_with_two_tabs();
+        app.state.ensure_test_terminals();
+        // A pane only appears in the sidebar once it has an agent to name.
+        for terminal in app.state.terminals.values_mut() {
+            terminal.agent_name = Some("claude".to_string());
+        }
+        let before = crate::ui::all_agent_panel_entries(&app.state).len();
+        assert!(
+            before > 0,
+            "the fixture must produce sidebar rows to begin with"
+        );
+
+        app.state.workspaces[0].set_tab_hidden(1, true);
+        let after = crate::ui::all_agent_panel_entries(&app.state).len();
+
+        assert!(
+            after < before,
+            "hiding a tab must remove its rows from the sidebar ({before} -> {after})"
+        );
+    }
 
     #[test]
     fn api_tab_close_last_tab_closes_workspace_and_emits_both_events() {
@@ -658,6 +889,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                hidden: false,
             },
         );
 

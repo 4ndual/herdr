@@ -1162,6 +1162,7 @@ impl App {
                         focus: true,
                         label,
                         env: Default::default(),
+                        hidden: false,
                     },
                 );
             }
@@ -2439,8 +2440,11 @@ mod tests {
     }
 
     // fork(ADR-001): "Make invisible" mutates core tab state, so it stays
-    // host-owned in BOTH dispatch paths and there is no `tab.hide` API method to
-    // cover it from outside. The three tests below pin the dispatch itself —
+    // host-owned in BOTH dispatch paths. It now has an API counterpart
+    // (`tab.hide`, #37) routing through the same `Workspace::set_tab_hidden`
+    // setter, so the menu and the API cannot diverge; these tests still pin the
+    // MENU dispatch, which the API does not exercise. The three below pin the
+    // dispatch itself —
     // previously only the menu row and its mouse index were covered, which an
     // upstream merge that reworked the handlers could pass while silently
     // dropping the effect.

@@ -3308,7 +3308,7 @@
           "type": "object"
         },
         "PaneTextSpanParams": {
-          "description": "fork(+128): one styled run within an overlay line.\n\nColours are NAMED, never RGB. Herdr remaps buffer colours to the active\npalette (`recolor_to_palette`), and a truecolor `Rgb` passes through that\nremap untouched — so an overlay that picked its own hex would be the one\nelement on screen that ignores the user's theme, and would do it silently.\nAn unrecognised name is treated as \"unset\" rather than refused: a plugin\nnaming a colour the host does not know should lose the styling, not the text.",
+          "description": "fork(+128): one styled run within an overlay line.\n\nColours are NAMED, never RGB. Herdr renders buffer colours through the\nactive theme palette, and a truecolor `Rgb` passes through it untouched —\nso an overlay that picked its own hex would be the one\nelement on screen that ignores the user's theme, and would do it silently.\nAn unrecognised name is treated as \"unset\" rather than refused: a plugin\nnaming a colour the host does not know should lose the styling, not the text.",
           "properties": {
             "bg": {
               "default": "",
@@ -4278,6 +4278,11 @@
               "default": false,
               "type": "boolean"
             },
+            "hidden": {
+              "default": false,
+              "description": "Create the tab already hidden.\n\nA hidden tab exists, runs, and is reachable through `tab.list\n{hidden:true}` — it is simply not drawn in the tab bar or the sidebar.\nContradictory with `focus`, and rejected rather than silently resolved:\nthere is no sensible answer to \"focus the tab you cannot see\".",
+              "type": "boolean"
+            },
             "label": {
               "type": [
                 "string",
@@ -5065,6 +5070,22 @@
           "properties": {
             "method": {
               "const": "tab.show",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabVisibilityParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "tab.hide",
               "type": "string"
             },
             "params": {

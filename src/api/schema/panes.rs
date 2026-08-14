@@ -355,9 +355,9 @@ pub(crate) const PANE_TEXT_SET_MAX_BYTES: usize = 64 * 1024;
 
 /// fork(+128): one styled run within an overlay line.
 ///
-/// Colours are NAMED, never RGB. Herdr remaps buffer colours to the active
-/// palette (`recolor_to_palette`), and a truecolor `Rgb` passes through that
-/// remap untouched — so an overlay that picked its own hex would be the one
+/// Colours are NAMED, never RGB. Herdr renders buffer colours through the
+/// active theme palette, and a truecolor `Rgb` passes through it untouched —
+/// so an overlay that picked its own hex would be the one
 /// element on screen that ignores the user's theme, and would do it silently.
 /// An unrecognised name is treated as "unset" rather than refused: a plugin
 /// naming a colour the host does not know should lose the styling, not the text.
