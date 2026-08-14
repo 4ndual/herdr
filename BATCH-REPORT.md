@@ -169,14 +169,19 @@ conducting session, which **disables transcript saving in every pane it spawns**
 Restarted from `/tmp/start-herdrtest-clean.sh`, which strips `CLAUDE*`/`HERDR_*`
 before exec. Verified: zero `CLAUDE*` vars in the server's `/proc/<pid>/environ`.
 
-### Four-axis parity
+### Four-axis parity (final state, re-verified after the #36 merge)
 
 | Axis | Test instance | Live `hr` |
 |---|---|---|
 | 1. Binary identity | PASS | PASS (same sha256 staged) |
-| 2. Running-process identity | PASS — new inode, verified via `/proc/<pid>/exe` | **PENDING A RESTART** |
-| 3. Plugin-registry parity | see below | see below |
-| 4. Config parity | PASS (whitespace only) | PASS |
+| 2. Running-process identity | PASS — verified by HASHING `/proc/<pid>/exe`, not just reading its path | **PENDING A RESTART** |
+| 3. Plugin-registry parity | drift, see below | drift, see below |
+| 4. Config parity | PASS — `[theme]`/`[ui]` blocks identical | PASS |
+
+Final binary: `30b1907d6fd8fccbe50a500f23eaa92dfd382516f42c38264e6ef5e08004e5f6`,
+identical across `~/.herdr-hr/bin/herdr`, `~/.local/bin/herdrtest` and
+`target/release/herdr`. The test server's `/proc/<pid>/exe` hashes to exactly
+that. `hr`'s still reads `(deleted)` — the previous inode, held open.
 
 **Axis 2 on `hr` is deliberately not done.** This batch is running *inside* the
 `hr` session (`HERDR_PANE_ID=w1C:p2`), so restarting that server would kill the
@@ -190,8 +195,9 @@ you perform.
 
 - enabled on test but not on hr: `builtin.claude-image-preview`,
   `builtin.harness-panel`, `builtin.image-view-go`
-- `probe.rail` (rooted at `/tmp/rail-probe`) is a throwaway diagnostic from the
-  retracted rail investigation and should be removed from the test instance
+- `probe.rail` (rooted at `/tmp/rail-probe`) — **removed.** Unlinked from the
+  test instance and its directory deleted. A throwaway diagnostic from the
+  retracted rail investigation, so removing it needed no decision from you.
 - `claude-image-preview` is linked from *different roots* on the two instances
   (`~/Projects/herdr-plugins/...` on hr, `~/Projects/herdr/plugins/...` on test)
 
@@ -224,3 +230,42 @@ Reported plainly rather than left to be discovered:
   plan makes it conditional on the §7 open question coming back "yes"; it has
   not been answered, so phase 1 only.
 - **#26 / #24** — design documents only, as the plan directs.
+
+## #22 — the E2E, proven
+
+Recording: `.local/qa/batch-e2e.mp4` (827.7 s, burned clock), gates in
+`.local/qa/batch-e2e-gates.md`, timeline in `.local/qa/batch-e2e.timeline`.
+
+The plan's success criterion for #36 is that harness panes restore **without**
+`CLAUDE_CONFIG_DIR`/`CODEX_HOME` exported into the server. Both halves were
+proven on the promoted binary, with the server's `/proc/<pid>/environ` verified
+to contain neither variable:
+
+**Capture.** A pane launched with
+`agent start --env CLAUDE_CONFIG_DIR=~/harnesses/e2e-claude/config` produced:
+
+```json
+{ "cwd": "/home/andual/harnesses/e2e-claude/workspace",
+  "agent_name": "e2e36b",
+  "env": { "CLAUDE_CONFIG_DIR": "/home/andual/harnesses/e2e-claude/config" },
+  "launch_cwd": "/home/andual/harnesses/e2e-claude/workspace",
+  "launch_argv": ["claude", "--dangerously-skip-permissions"] }
+```
+
+**Restore.** After a full server stop/start, the restored pane answered
+`POST=/home/andual/harnesses/e2e-claude/config`.
+
+### Why the proof uses a shell probe rather than a claude resume
+
+The first attempt resumed a real claude session and got *No conversation found
+with session ID*. That looks like #36 failing, and it is worth being precise
+about why it is not: **no transcript existed in any root**. The pane's claude had
+been started while the server still carried an inherited
+`CLAUDE_CODE_CHILD_SESSION`, which disables transcript saving — so herdr
+recorded a session id for a conversation that was never written to disk. A
+resume of a non-existent transcript fails whichever config root it looks in, so
+that test could not distinguish the two causes.
+
+The shell probe (`echo POST=$CLAUDE_CONFIG_DIR` in a restored pane) isolates
+exactly what #36 changes — whether a pane's launch env survives the restart —
+with no dependency on claude's transcript behaviour. That is the evidence above.
