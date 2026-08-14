@@ -54,7 +54,7 @@ if [[ ${#ROWS[@]} -eq 0 || -z "$SID" ]]; then
   hold
 fi
 
-MIGRATE="${HERDR_RELOCATE_MIGRATE:-$HOME/.claude/skills/relocate/scripts/migrate-session.sh}"
+MIGRATE="${HERDR_RELOCATE_MIGRATE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/relocate/scripts/migrate-session.sh}"
 
 printf 'Relocate this conversation\n'
 printf '  session : %s\n' "$SID"

@@ -22,7 +22,7 @@
 # team-lead ack after sandbox E2E.
 #
 # Env overrides (all optional — sandbox E2E points these at throwaway clones):
-#   HERDR_REPO        fork checkout                (default ~/Projects/herdr)
+#   HERDR_REPO        fork checkout                (default: this script's git toplevel)
 #   VD_TEST_BIN       destination binary            (default ~/.local/bin/herdrtest)
 #   VD_TARGET_DIR     isolated cargo target dir     (default ~/Projects/herdr/target-versiondash-build)
 #   VD_TEST_TMUX      herdrtest tmux host session   (default test-host)
@@ -30,10 +30,24 @@
 #   VD_TEST_ROOT      herdrtest XDG root            (default ~/.herdr-test)
 #   VD_TEST_SESSION   herdr session name            (default test)
 #   VD_DO_RESTART     "1" to actually restart       (default off: swap only)
-#   ZIG / DEVELOPER_DIR   toolchain (default the herdr build toolchain)
+#   ZIG / DEVELOPER_DIR   toolchain (default: zig from PATH, then the pinned path)
 set -euo pipefail
 
-HERDR_REPO="${HERDR_REPO:-$HOME/Projects/herdr}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Repo root: explicit override wins, else the git toplevel containing this
+# script. Never a hardcoded path — the checkout lives wherever the user cloned
+# it, and this repo has already burned the `~/Projects` assumption twice
+# (dash-common.sh:386, full-restart-herdr.sh:125). Same idiom as the sibling
+# install-collector-agent.sh.
+if [ -n "${HERDR_REPO:-}" ]; then
+  HERDR_REPO="$HERDR_REPO"
+else
+  HERDR_REPO="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+fi
+if [ -z "$HERDR_REPO" ] || [ ! -f "$HERDR_REPO/Cargo.toml" ]; then
+  HERDR_REPO="$HOME/Projects/herdr"
+fi
 VD_TEST_BIN="${VD_TEST_BIN:-$HOME/.local/bin/herdrtest}"
 VD_TARGET_DIR="${VD_TARGET_DIR:-$HERDR_REPO/target-versiondash-build}"
 VD_TEST_TMUX="${VD_TEST_TMUX:-test-host}"
@@ -41,7 +55,11 @@ VD_TEST_GEOM="${VD_TEST_GEOM:-220x55}"
 VD_TEST_ROOT="${VD_TEST_ROOT:-$HOME/.herdr-test}"
 VD_TEST_SESSION="${VD_TEST_SESSION:-test}"
 VD_DO_RESTART="${VD_DO_RESTART:-0}"
-export ZIG="${ZIG:-$HOME/.local/zig/0.15.2/zig}"
+# Prefer whatever zig is on PATH; the pinned path is the last resort. The
+# hardcoded default named one install layout and one version, so on a box where
+# zig lives anywhere else (the Windows VM uses a different path entirely) the
+# build failed against a dead path. 57ecd926 did this everywhere else.
+export ZIG="${ZIG:-$(command -v zig 2>/dev/null || echo "$HOME/.local/zig/0.15.2/zig")}"
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
 
 log() { printf '» %s\n' "$*"; }

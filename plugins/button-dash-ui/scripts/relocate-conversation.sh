@@ -43,7 +43,7 @@ command -v jq >/dev/null 2>&1 || { toast "Relocate failed" "jq is not installed"
 
 # The migration itself belongs to the relocate skill. Overridable, absolute
 # default — never a relative path escape.
-MIGRATE="${HERDR_RELOCATE_MIGRATE:-$HOME/.claude/skills/relocate/scripts/migrate-session.sh}"
+MIGRATE="${HERDR_RELOCATE_MIGRATE:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/relocate/scripts/migrate-session.sh}"
 if [[ ! -f "$MIGRATE" ]]; then
   toast "Relocate unavailable" \
     "the relocate skill is not installed — expected migrate-session.sh at $MIGRATE (override with HERDR_RELOCATE_MIGRATE)"

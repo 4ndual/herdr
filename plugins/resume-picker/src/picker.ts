@@ -138,8 +138,10 @@ function scanCodexRoot(root: string, harness: string, out: Session[]) {
 }
 
 /** pi layout: ~/.pi/agent/sessions/<slug>/<ts>_<uuid>.jsonl, keyed by PATH. */
-function scanPiRoot(root: string, out: Session[]) {
-  const sessions = join(root, "agent", "sessions");
+/// `sessions` is pi's session DIRECTORY (what `pi --session-dir` and
+/// `PI_SESSION_DIR` name), not the `.pi` root — the override points straight at
+/// it, so taking the root here would have made it unusable.
+function scanPiSessions(sessions: string, out: Session[]) {
   for (const slug of safeReaddir(sessions)) {
     const dir = join(sessions, slug);
     for (const name of safeReaddir(dir)) {
@@ -156,7 +158,13 @@ function discover(): Session[] {
   const out: Session[] = [];
   scanClaudeRoot(process.env.CLAUDE_CONFIG_DIR || join(HOME, ".claude"), "", out);
   scanCodexRoot(process.env.CODEX_HOME || join(HOME, ".codex"), "", out);
-  scanPiRoot(join(HOME, ".pi"), out);
+  // pi honors PI_SESSION_DIR the same way claude/codex honor their roots above;
+  // without it a pi session under a non-default dir was invisible to the picker
+  // while its sibling swap-runtime.ts already looked there.
+  scanPiSessions(
+    process.env.PI_SESSION_DIR || join(HOME, ".pi", "agent", "sessions"),
+    out,
+  );
 
   // Fleet harnesses. harness.json is authoritative for the runtime; a harness
   // without one is skipped rather than assumed to be claude (several exist).
