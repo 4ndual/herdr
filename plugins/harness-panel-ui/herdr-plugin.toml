@@ -1,0 +1,86 @@
+# harness-panel: the fleet website, replicated in herdr's right-side panel.
+#
+# Two halves:
+#
+# - a wasm guest (src/) that renders every view and owns clicks, tabs, scroll
+#   and tooltips;
+# - a long-lived Go collector (collector/) that holds ONE WebSocket to the fleet
+#   daemon and writes this plugin's `ui_input_file` whenever the daemon pushes.
+#   The guest has no sockets, so the collector is the data plane.
+#
+# MOUNT — read this before changing `surfaces`:
+#
+# The plugin declares BOTH `right_panel` and `panel`. `right_panel` is the slot
+# this belongs in and the one Plugin Manager uses, but on herdr 0.8.0+193 that
+# surface paints nothing: a guest emitting a non-empty RightPanel layer gets no
+# rail icon and no panel, while the SAME guest emitting the SAME nodes on
+# `panel` in the SAME frame renders. Verified by isolation, not inference.
+# Task #32 fixes it.
+#
+# So the working mount today is `panel` with `region = "bottom_band"`, which carves a
+# column off the right of the pane area — the same geometry the right panel
+# would take. The guest emits its RightPanel layer only when the host hands it a
+# non-zero right-panel rect, so when #32 lands this plugin moves to the real
+# slot with no code change and no double render.
+id = "builtin.harness-panel"
+name = "Harness Panel"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "The harness fleet daemon GUI, replicated in the right-side panel (wasm render + Go collector)"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
+
+[[build]]
+command = ["sh", "-lc", "cd collector && go build -o ../../../target/release/harness-panel-collector ."]
+
+[[ui_modules]]
+id = "panel"
+title = "Harness Panel"
+description = "Fleet list, harness detail, orchestrator, templates, models and memory"
+kind = "wasm"
+api_version = 3
+module = "target/wasm32-unknown-unknown/release/harness_panel_ui.wasm"
+hot_reload = "on"
+surfaces = ["panel"]
+capabilities = ["layout_read", "api_read", "api_write", "mouse_all", "toasts"]
+# BLOCKER, isolated by bisection on 2026-08-14 — read before re-enabling.
+#
+# Declaring ui_input_file makes this module render NOTHING. Same wasm, same
+# placement, same session: with the line present the panel is blank and the host
+# reports no layer content and no skip reason; with it absent the panel renders
+# its header, tabs and rows. Payload size is not the cause (a 120-byte input
+# blanks identically), the state dir the host resolves is the one the collector
+# writes, and the file is present and readable.
+#
+# So the panel currently renders WITHOUT its data feed. Re-enable this line the
+# moment the host-side cause is found; the collector already writes the file and
+# the guest already parses it (see the frame tests).
+# ui_input_file = "harness_panel_input.json"
+# Declared for #32: dead today (the host ignores it and would draw the generic
+# marker), correct the moment the rail lands.
+rail_icon = "🎛"
+
+[ui_modules.placement]
+region = "right"
+align = "start"
+size = "40"
+min_peer = 24
+z = 60
+
+# The guest emits an InvokePluginAction with a JSON payload; the host hands that
+# to this command as HERDR_PLUGIN_PAYLOAD_JSON, and `op` both performs the
+# daemon mutation and moves the panel view state the collector watches.
+[[actions]]
+id = "panel-op"
+title = "Harness panel operation"
+description = "Apply a view/selection change and/or a fleet mutation via the daemon API"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/../../target/release/harness-panel-collector\" op"]
+
+# Start the long-lived collector with herdr. It takes an exclusive lock, so
+# firing this on every start (or after a plugin reload) never stacks two.
+[[event_hooks]]
+on = "startup"
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/../../target/release/harness-panel-collector\" collect >/dev/null 2>&1 &"]

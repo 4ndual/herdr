@@ -1,0 +1,3 @@
+# Built by the manifest's [[build]] steps, not committed.
+target/
+collector/harness-panel-collector
