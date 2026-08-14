@@ -427,11 +427,28 @@ struct Segment {
     width: u16,
 }
 
-fn chip_label(item: &ArchiveItem) -> String {
+/// One chip: `[<emoji> <label>]`, with the label truncated to whatever the panel
+/// can actually show.
+///
+/// D5: the budget used to be a flat [`LABEL_MAX_CHARS`], so in a narrow slot the
+/// chip was simply wider than the panel — and a chip that does not fit cannot be
+/// wrapped away either, so it bled past the right edge with its label cut by the
+/// host mid-word. The chrome (`[`, the emoji, a space, `]`) costs 5 columns plus
+/// the one-column gutter the strip keeps on each side; whatever is left is the
+/// label's, down to a floor of 3 characters — below that the chip is unreadable
+/// anyway and the tooltip is the answer.
+fn chip_label(item: &ArchiveItem, panel_width: u16) -> String {
+    // "[" + emoji(2) + " " + "]" is 5, and a truncated label costs one more for
+    // the "…" that truncate_chars appends.
+    const CHROME: u16 = 6;
+    const GUTTERS: u16 = 2;
+    let budget = panel_width
+        .saturating_sub(CHROME + GUTTERS)
+        .clamp(3, LABEL_MAX_CHARS as u16) as usize;
     format!(
         "[{} {}]",
         agent_emoji(&item.agent),
-        truncate_chars(&item.label, LABEL_MAX_CHARS)
+        truncate_chars(&item.label, budget)
     )
 }
 
@@ -449,7 +466,7 @@ fn strip_rows(items: &[ArchiveItem]) -> (Vec<Vec<UiTextSpan>>, Vec<Segment>) {
 
     push_gap(&mut spans, &mut col, " ");
     for (index, item) in items.iter().enumerate() {
-        let label = chip_label(item);
+        let label = chip_label(item, panel_width);
         let width = cell_width(&label);
         if col > 1 && col.saturating_add(width) > panel_width {
             rows.push(std::mem::take(&mut spans));
@@ -506,28 +523,79 @@ const FORK_TEXT: &str = "[fork]";
 const DEL_TEXT: &str = "[del]";
 const MENU_GAP: &str = " ";
 
-/// The menu row is rendered directly BELOW the (wrapped) strip, indented under
-/// the chip's start `x`. Returns the two button rects' strip-relative x extents.
-fn menu_segments() -> (u16, u16, u16, u16) {
-    let fork_x = MENU_INDENT;
-    let fork_w = cell_width(FORK_TEXT);
-    let del_x = fork_x + fork_w + cell_width(MENU_GAP);
-    let del_w = cell_width(DEL_TEXT);
-    (fork_x, fork_w, del_x, del_w)
+/// Indent the menu row can afford at `panel_width`.
+///
+/// D5: the menu was laid out at a fixed 2-column indent regardless of how wide
+/// the host actually carved this panel. In a narrow slot — this plugin asks for
+/// 30% of what is left of the band after the button strip takes its 42 columns —
+/// `  [fork] [del]` is 15 columns of content in a 13-column panel, so the host
+/// clipped it mid-word (`[fork] [de…`) and the `[del]` target became unclickable
+/// even though the click math still believed it was there. The indent is the
+/// first thing to give up, exactly as the canon says a menu near an edge shifts
+/// to fit rather than being clipped.
+fn menu_indent(panel_width: u16) -> u16 {
+    let content = cell_width(FORK_TEXT) + cell_width(MENU_GAP) + cell_width(DEL_TEXT);
+    if panel_width >= content + MENU_INDENT {
+        MENU_INDENT
+    } else {
+        0
+    }
+}
+
+/// Whether both menu buttons fit on ONE row at this width. When they do not, the
+/// row is split so each button stays whole and clickable.
+fn menu_fits_one_row(panel_width: u16) -> bool {
+    let content = cell_width(FORK_TEXT) + cell_width(MENU_GAP) + cell_width(DEL_TEXT);
+    panel_width >= content
+}
+
+/// The menu row is rendered directly BELOW the (wrapped) strip. Returns the two
+/// buttons' strip-relative `(x, width)` and the row each sits on, measured from
+/// the first menu row — so render and hit-testing cannot disagree about a layout
+/// that now depends on the panel width.
+fn menu_segments(panel_width: u16) -> (Segment2, Segment2) {
+    let indent = menu_indent(panel_width);
+    let fork = Segment2 {
+        row: 0,
+        x: indent,
+        width: cell_width(FORK_TEXT),
+    };
+    let del = if menu_fits_one_row(panel_width) {
+        Segment2 {
+            row: 0,
+            x: fork.x + fork.width + cell_width(MENU_GAP),
+            width: cell_width(DEL_TEXT),
+        }
+    } else {
+        Segment2 {
+            row: 1,
+            x: indent,
+            width: cell_width(DEL_TEXT),
+        }
+    };
+    (fork, del)
+}
+
+/// One menu button's position within the menu block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Segment2 {
+    row: u16,
+    x: u16,
+    width: u16,
 }
 
 /// Resolve a click on the open menu's `[fork]`/`[del]` button, if any.
 fn menu_button_at(abs_col: u16, abs_row: u16) -> Option<(usize, MenuButton)> {
     let chip = (*MENU_OPEN.lock().expect("menu mutex poisoned"))?;
     let (ox, oy) = (*STRIP_ORIGIN.lock().expect("strip origin mutex poisoned"))?;
-    if abs_row != oy + strip_row_count() {
-        return None;
-    }
+    let menu_row = abs_row.checked_sub(oy + strip_row_count())?;
     let rel = abs_col.checked_sub(ox)?;
-    let (fx, fw, dx, dw) = menu_segments();
-    if rel >= fx && rel < fx + fw {
+    let panel_width = *PANEL_WIDTH.lock().expect("panel width mutex poisoned");
+    let (fork, del) = menu_segments(panel_width);
+    let hit = |seg: Segment2| menu_row == seg.row && rel >= seg.x && rel < seg.x + seg.width;
+    if hit(fork) {
         Some((chip, MenuButton::Fork))
-    } else if rel >= dx && rel < dx + dw {
+    } else if hit(del) {
         Some((chip, MenuButton::Delete))
     } else {
         None
@@ -561,7 +629,10 @@ fn archive_layer() -> UiLayer {
 
     if let Some(chip) = menu {
         if items.get(chip).is_some() {
-            nodes.push(UiNode::Line { spans: menu_spans() });
+            let width = *PANEL_WIDTH.lock().expect("panel width mutex poisoned");
+            for spans in menu_rows(width) {
+                nodes.push(UiNode::Line { spans });
+            }
         }
     } else if let Some(chip) = hovered {
         if let Some(item) = items.get(chip) {
@@ -583,13 +654,25 @@ fn archive_layer() -> UiLayer {
     }
 }
 
-fn menu_spans() -> Vec<UiTextSpan> {
-    vec![
-        plain("  "),
-        span(FORK_TEXT, "green"),
-        plain(MENU_GAP),
-        span(DEL_TEXT, "red"),
-    ]
+/// The menu rows for `panel_width` — one row when both buttons fit, otherwise
+/// one row each. Laid out from [`menu_segments`] so the rendered columns are the
+/// same columns the click math tests (D5).
+fn menu_rows(panel_width: u16) -> Vec<Vec<UiTextSpan>> {
+    let (fork, del) = menu_segments(panel_width);
+    let indent = " ".repeat(fork.x as usize);
+    if del.row == fork.row {
+        vec![vec![
+            plain(&indent),
+            span(FORK_TEXT, "green"),
+            plain(MENU_GAP),
+            span(DEL_TEXT, "red"),
+        ]]
+    } else {
+        vec![
+            vec![plain(&indent), span(FORK_TEXT, "green")],
+            vec![plain(&indent), span(DEL_TEXT, "red")],
+        ]
+    }
 }
 
 /// Wrap the résumé over up to `RESUME_MAX_ROWS` rows of the panel width so a
@@ -827,6 +910,7 @@ mod tests {
         reset();
         set_items(vec![item(1, "x", "codex", "r")]);
         *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        *PANEL_WIDTH.lock().unwrap() = 80; // wide: the menu is one row (see D5)
         let items = ITEMS.lock().unwrap().clone();
         let (_, segs) = strip_rows(&items);
         let s = &segs[0];
@@ -846,9 +930,10 @@ mod tests {
         set_items(vec![item(7, "y", "claude", "r")]);
         *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
         *MENU_OPEN.lock().unwrap() = Some(0);
-        let (fx, fw, dx, dw) = menu_segments();
+        *PANEL_WIDTH.lock().unwrap() = 80;
+        let (fork, del) = menu_segments(80);
         // fork button (menu row is at oy+1 == row 1)
-        let update = handle_mouse(&mouse("left_down", fx + fw / 2, 1));
+        let update = handle_mouse(&mouse("left_down", fork.x + fork.width / 2, 1));
         match update.effects.first().expect("fork effect") {
             HostEffectV3::InvokePluginAction {
                 action_id,
@@ -865,7 +950,7 @@ mod tests {
 
         // reopen, click delete
         *MENU_OPEN.lock().unwrap() = Some(0);
-        let update = handle_mouse(&mouse("left_down", dx + dw / 2, 1));
+        let update = handle_mouse(&mouse("left_down", del.x + del.width / 2, 1 + del.row));
         match update.effects.first().expect("delete effect") {
             HostEffectV3::InvokePluginAction {
                 action_id,
@@ -936,6 +1021,7 @@ mod tests {
         reset();
         set_items(vec![item(1, "a", "claude", "r")]);
         *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        *PANEL_WIDTH.lock().unwrap() = 80; // wide: the menu is one row (see D5)
         assert_eq!(archive_layer().nodes.len(), 1);
         *HOVERED.lock().unwrap() = Some(0);
         assert_eq!(archive_layer().nodes.len(), 2);
@@ -1004,6 +1090,69 @@ mod tests {
         let event: V3Event = serde_json::from_str(&frame_json).unwrap();
         let _ = handle_event(&event);
         assert_eq!(ITEMS.lock().unwrap().len(), MAX_CHIPS);
+        reset();
+    }
+
+    // ── D5: nothing may render past the panel's right edge ───────────────────
+    // This plugin asks for 30% of what is LEFT of the bottom band after the
+    // button strip takes its 42 columns, so "narrow" is the normal case, not an
+    // edge case. Before this, chips and the menu row were laid out at fixed
+    // widths and the host clipped them mid-word.
+
+    #[test]
+    fn a_chip_never_exceeds_the_panel_width() {
+        let long = item(1, "a-very-long-session-label", "claude", "r");
+        for width in [12u16, 16, 20, 30, 80] {
+            let label = chip_label(&long, width);
+            let chip_w = cell_width(&label);
+            assert!(
+                chip_w + 2 <= width.max(12),
+                "at panel width {width} the chip renders {chip_w} columns ({label}) — \
+                 a chip that does not fit cannot be wrapped away either, so it bleeds \
+                 past the edge",
+            );
+        }
+    }
+
+    #[test]
+    fn the_menu_stays_inside_a_narrow_panel() {
+        // `  [fork] [del]` is 15 columns; the button strip's neighbour slot is
+        // routinely narrower than that.
+        for width in [10u16, 11, 12, 14, 15, 40] {
+            let (fork, del) = menu_segments(width);
+            let rows = menu_rows(width);
+            assert_eq!(
+                rows.len(),
+                if del.row == fork.row { 1 } else { 2 },
+                "menu_rows and menu_segments disagree about the row count at {width}",
+            );
+            for (row_index, spans) in rows.iter().enumerate() {
+                let drawn: u16 = spans.iter().map(|s| cell_width(&s.text)).sum();
+                assert!(
+                    drawn <= width,
+                    "menu row {row_index} draws {drawn} columns in a {width}-column panel",
+                );
+            }
+            assert!(fork.x + fork.width <= width);
+            assert!(del.x + del.width <= width);
+        }
+    }
+
+    #[test]
+    fn narrow_menu_clicks_land_on_the_button_that_was_drawn() {
+        let _g = guard();
+        reset();
+        set_items(vec![item(3, "y", "claude", "r")]);
+        *STRIP_ORIGIN.lock().unwrap() = Some((0, 0));
+        *PANEL_WIDTH.lock().unwrap() = 11; // one column short of a single-row menu
+        *MENU_OPEN.lock().unwrap() = Some(0);
+        let (fork, del) = menu_segments(11);
+        assert_ne!(fork.row, del.row, "11 columns must split the menu");
+        let update = handle_mouse(&mouse("left_down", del.x + del.width / 2, 1 + del.row));
+        match update.effects.first().expect("delete effect") {
+            HostEffectV3::InvokePluginAction { action_id, .. } => assert_eq!(action_id, "delete"),
+            other => panic!("expected InvokePluginAction, got {other:?}"),
+        }
         reset();
     }
 }
