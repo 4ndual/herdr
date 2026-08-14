@@ -195,6 +195,31 @@ fn forget_stale_hover(input: &BarInput) {
     }
 }
 
+/// Say "I have nothing to show" in the one way the host understands.
+///
+/// `UiUpdate::default()` is NOT that: v3 updates default to
+/// [`UiUpdateScope::Partial`], and `merge_layers` only replaces the surfaces an
+/// update actually names. An update with no layers therefore names no surface,
+/// replaces nothing, and leaves the previously painted row on screen — forever.
+///
+/// That is how the bar kept showing a full chip row over a plain shell with no
+/// harness: the collector correctly emitted an empty snapshot within ~60 ms,
+/// the guest correctly decided there was nothing to draw, and the host
+/// correctly kept the last thing it had been given. An independent video gate
+/// failed this twice before the meaning of "empty" was pinned down.
+///
+/// `Full` scope with no layers replaces this module's entire contribution with
+/// nothing, which is exactly the claim. It is used ONLY where the bar has
+/// genuinely nothing to show — every other `UiUpdate::default()` in this guest
+/// still means "no change", which is what a no-op mouse move must send.
+fn clear_bar() -> UiUpdate {
+    UiUpdate {
+        layers: Vec::new(),
+        scope: herdr_ui_plugin_api::UiUpdateScope::Full,
+        ..Default::default()
+    }
+}
+
 /// Build the layer for `input` in its current hover state — shared by the frame
 /// path and the mouse path so a hover repaint is the same rendering as a frame
 /// repaint, not a second copy of it.
@@ -209,7 +234,7 @@ fn render_from(input: &BarInput) -> UiUpdate {
         None => render::content_width(input),
     };
     if width == 0 {
-        return UiUpdate::default();
+        return clear_bar();
     }
     let content = Rect::new(0, 0, width, 1);
     let mut buf = Buffer::empty(content);
@@ -719,6 +744,11 @@ mod tests {
             "a hover that names a chip which is gone must be dropped"
         );
         assert!(update.layers.is_empty(), "and the band goes neutral");
+        assert_eq!(
+            update.scope,
+            herdr_ui_plugin_api::UiUpdateScope::Full,
+            "an empty PARTIAL update names no surface and so clears nothing"
+        );
     }
 
     #[test]
@@ -740,9 +770,48 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_bar_emits_no_layer_so_the_host_carves_no_band() {
+    /// The bar with nothing to show must CLEAR the surface, not merely decline
+    /// to redraw it.
+    ///
+    /// v3 updates default to `Partial`, where `merge_layers` replaces only the
+    /// surfaces an update names. An empty Partial update names none, so the
+    /// host keeps the last row it was given: on a plain shell the bar kept
+    /// showing a full chip row for a harness that pane has nothing to do with.
+    /// Two independent video gates failed on that before the contract was
+    /// pinned here.
+    #[test]
+    fn an_empty_bar_clears_the_surface_rather_than_leaving_the_old_row() {
         let _guard = test_guard();
-        let update = handle_event(&frame_event(&BarInput::default(), Rect::new(0, 0, 80, 1)));
-        assert!(update.layers.is_empty());
+        // Paint a real bar first, so there IS something to leave behind.
+        let painted = handle_event(&frame_event(&sample(), Rect::new(0, 30, 120, 1)));
+        assert!(!painted.layers.is_empty(), "precondition: a row was painted");
+
+        let update = handle_event(&frame_event(&BarInput::default(), Rect::new(0, 30, 120, 1)));
+        assert!(update.layers.is_empty(), "nothing to draw");
+        assert_eq!(
+            update.scope,
+            herdr_ui_plugin_api::UiUpdateScope::Full,
+            "and it must say so with Full scope, or the old row survives"
+        );
+    }
+
+    /// The inverse: a no-op event must NOT clear the bar. If "no change" and
+    /// "nothing to show" both cleared, a mouse move that changes no hover would
+    /// blank the row the user is looking at.
+    #[test]
+    fn a_no_change_event_leaves_the_bar_alone() {
+        let _guard = test_guard();
+        // seed() installs the row rect the click helper aims at; sending a
+        // frame with a different rect here would move the row out from under it.
+        seed(sample());
+        let again = click_chip(0, MouseEventKind::Move);
+        let noop = click_chip(0, MouseEventKind::Move);
+        assert!(!again.layers.is_empty(), "the first hover repaints");
+        assert!(noop.layers.is_empty(), "the second is a no-op");
+        assert_eq!(
+            noop.scope,
+            herdr_ui_plugin_api::UiUpdateScope::Partial,
+            "a no-op must stay Partial so it changes nothing"
+        );
     }
 }
