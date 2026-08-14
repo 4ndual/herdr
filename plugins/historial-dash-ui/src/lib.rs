@@ -58,6 +58,22 @@ static SHOW_LEGEND: AtomicBool = AtomicBool::new(false);
 /// do not change under anyone who has been using it; the control is opt-in.
 static HIDE_SUBAGENTS: AtomicBool = AtomicBool::new(false);
 
+/// Sessions that are OPEN right now: session id → the tab holding it.
+///
+/// historial's rows are CLOSED panes, so a row is "open" when its `sid` matches
+/// a live pane's `agent_session.value` — verified against the running server:
+/// the value is the same UUID on both sides, and that pane's `tab_id` is what
+/// to focus.
+///
+/// This is refreshed on `FocusChanged`, never on a timer: focus is the event
+/// that changes which sessions are live from the user's point of view, and
+/// re-listing panes every frame would be polling with extra steps.
+static OPEN_SESSIONS: Mutex<Option<std::collections::BTreeMap<String, String>>> = Mutex::new(None);
+
+/// The in-flight `pane.list` request id, so a late or foreign `ApiResult` is
+/// ignored rather than parsed into the open-session map.
+const REQ_PANE_LIST: &str = "historial:pane-list";
+
 /// The live search query, as typed. Empty means no search and is the fast path
 /// through `RowFilters::keep`.
 static SEARCH_QUERY: Mutex<String> = Mutex::new(String::new());
@@ -174,6 +190,14 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         UiEvent::Frame(ctx) => handle_frame(ctx),
         UiEvent::Mouse(mouse) => handle_mouse(mouse),
         UiEvent::Key(key) => handle_key(key),
+        // Focus changed: which sessions are live may have changed with it.
+        UiEvent::FocusChanged(_) => refresh_open_sessions(),
+        UiEvent::ApiResult {
+            request_id,
+            ok,
+            response,
+            ..
+        } => handle_api_result(request_id, *ok, response.as_ref()),
         UiEvent::Action {
             action_id, kind, ..
         } => handle_action(action_id, *kind),
@@ -216,7 +240,18 @@ fn render_from_cache() -> Option<UiUpdate> {
     let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, &filters, header_hover);
+    let hits = render::render(
+        model,
+        area,
+        &mut buf,
+        hovered,
+        &filters,
+        header_hover,
+        OPEN_SESSIONS
+            .lock()
+            .expect("open sessions mutex poisoned")
+            .as_ref(),
+    );
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
     Some(UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
@@ -224,6 +259,54 @@ fn render_from_cache() -> Option<UiUpdate> {
         scope: UiUpdateScope::Partial,
         consumed_action_ids: Vec::new(),
     })
+}
+
+/// Ask the host which panes are live. Answer arrives as `UiEvent::ApiResult`.
+fn refresh_open_sessions() -> UiUpdate {
+    UiUpdate {
+        effects: vec![HostEffect::Api {
+            request_id: REQ_PANE_LIST.to_string(),
+            method: "pane.list".to_string(),
+            params: serde_json::Value::Object(serde_json::Map::new()),
+        }],
+        ..Default::default()
+    }
+}
+
+/// Fold a `pane.list` response into the open-session map, then repaint.
+///
+/// A failed or foreign result is dropped WITHOUT touching the map: losing the
+/// map would silently turn every open row back into a closed one, and the row's
+/// click would go from "focus that pane" to "fork it" — the exact confusion this
+/// feature exists to remove. Stale-but-known beats blank.
+fn handle_api_result(request_id: &str, ok: bool, response: Option<&serde_json::Value>) -> UiUpdate {
+    if request_id != REQ_PANE_LIST || !ok {
+        return UiUpdate::default();
+    }
+    let Some(panes) = response
+        .and_then(|value| value.get("panes"))
+        .and_then(|panes| panes.as_array())
+    else {
+        return UiUpdate::default();
+    };
+
+    let mut live = std::collections::BTreeMap::new();
+    for pane in panes {
+        let Some(session) = pane
+            .get("agent_session")
+            .and_then(|session| session.get("value"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(tab) = pane.get("tab_id").and_then(|tab| tab.as_str()) else {
+            continue;
+        };
+        live.insert(session.to_string(), tab.to_string());
+    }
+    *OPEN_SESSIONS.lock().expect("open sessions mutex poisoned") = Some(live);
+    render_from_cache().unwrap_or_default()
 }
 
 /// Search-box typing. Only runs while the box is open, because that is the only
@@ -405,6 +488,18 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     if !ensure_model(ctx) {
         return UiUpdate::default();
     }
+    // One request on the first frame after load, because FocusChanged only
+    // fires on a CHANGE and the panel must be right before the user touches
+    // anything. After that the map is event-driven.
+    let seeded = OPEN_SESSIONS
+        .lock()
+        .expect("open sessions mutex poisoned")
+        .is_some();
+    let seed_effects = if seeded {
+        Vec::new()
+    } else {
+        refresh_open_sessions().effects
+    };
 
     let area = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
 
@@ -458,12 +553,23 @@ fn handle_frame(ctx: &UiFrameContext) -> UiUpdate {
     let header_hover = *HEADER_HOVER.lock().expect("header hover mutex poisoned");
     let filters = current_filters();
     let mut buf = Buffer::empty(area);
-    let hits = render::render(model, area, &mut buf, hovered, &filters, header_hover);
+    let hits = render::render(
+        model,
+        area,
+        &mut buf,
+        hovered,
+        &filters,
+        header_hover,
+        OPEN_SESSIONS
+            .lock()
+            .expect("open sessions mutex poisoned")
+            .as_ref(),
+    );
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     UiUpdate {
         layers: vec![right_panel_layer(nodes, hits)],
-        effects: Vec::new(),
+        effects: seed_effects,
         scope: UiUpdateScope::Partial,
         consumed_action_ids: Vec::new(),
     }
@@ -486,6 +592,27 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         // Re-render immediately with the new filter (falls back to empty only when
         // there is no carved panel, which never happens on a header click).
         return render_from_cache().unwrap_or_default();
+    }
+    // An OPEN row focuses the tab already holding that session. It never
+    // restores and never forks: the conversation is on screen, so the only
+    // sensible thing a click can mean is "take me there".
+    //
+    // `tab.focus`, not `pane.focus` — the latter exists as an API method but is
+    // NOT in the bridge's allow-list, so a guest calling it is silently denied
+    // (checked against `ui_plugin_api_bridge.rs`, which is also what
+    // `bridgecheck` enforces).
+    if let Some(tab_id) = action_id.strip_prefix(render::ACTION_FOCUS_PREFIX) {
+        if tab_id.is_empty() {
+            return UiUpdate::default();
+        }
+        return UiUpdate {
+            effects: vec![HostEffect::Api {
+                request_id: "historial:focus".to_string(),
+                method: "tab.focus".to_string(),
+                params: serde_json::json!({ "tab_id": tab_id }),
+            }],
+            ..Default::default()
+        };
     }
     if action_id == render::ACTION_TOGGLE_SEARCH {
         if SEARCH_OPEN.load(Ordering::SeqCst) {

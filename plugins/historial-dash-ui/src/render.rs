@@ -52,6 +52,13 @@ pub const ACTION_CYCLE_AGENT: &str = "historial:cycle_agent";
 /// while shown.
 pub const ACTION_TOGGLE_LEGEND: &str = "historial:toggle_legend";
 
+/// Click prefix for an OPEN row: focus the tab holding that session.
+///
+/// Deliberately NOT the restore prefix. Restoring an open session would fork a
+/// second copy of a conversation that is already on screen — the Chrome rule is
+/// that clicking an open tab takes you TO it, and this is that rule.
+pub const ACTION_FOCUS_PREFIX: &str = "historial:focus:";
+
 /// Header toggle for the search box.
 pub const ACTION_TOGGLE_SEARCH: &str = "historial:toggle_search";
 
@@ -375,6 +382,7 @@ pub fn render(
     hovered: Option<usize>,
     filters: &RowFilters,
     header_hover: Option<HeaderButton>,
+    open: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Vec<UiHitRect> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -382,7 +390,7 @@ pub fn render(
     if area.width <= 3 {
         return render_handle(area, buf);
     }
-    render_full(model, area, buf, hovered, filters, header_hover)
+    render_full(model, area, buf, hovered, filters, header_hover, open)
 }
 
 /// Slim collapsed handle: a single ">" glyph near the top, clickable to expand.
@@ -414,6 +422,7 @@ fn render_full(
     hovered: Option<usize>,
     filters: &RowFilters,
     header_hover: Option<HeaderButton>,
+    open: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Vec<UiHitRect> {
     let width = area.width as usize;
     let mut hits = Vec::new();
@@ -594,7 +603,15 @@ fn render_full(
     let visible = rows.len().min(max_rows);
     for (i, row) in rows.iter().take(max_rows).enumerate() {
         let y = area.y + 1 + i as u16;
-        render_row(row, area.x, y, width, buf, &mut hits);
+        render_row(
+            row,
+            area.x,
+            y,
+            width,
+            buf,
+            &mut hits,
+            open.and_then(|open| open.get(row.sid.as_str()).map(String::as_str)),
+        );
     }
 
     // Hover tooltip: draw workspace name + first/last prompt directly beneath the
@@ -914,14 +931,30 @@ fn render_row(
     width: usize,
     buf: &mut Buffer,
     hits: &mut Vec<UiHitRect>,
+    open_tab: Option<&str>,
 ) {
+    let is_open = open_tab.is_some();
     // Right side: fork + delete buttons for restorable rows.
     let actions_w = if row.restorable {
         (FORK_BTN.width() + DEL_BTN.width()) as u16
     } else {
         0
     };
-    let reltime_w = row.reltime.width() as u16;
+    // `ts_unix_ms` in the host's `PaneCloseRecord` is the pane's CLOSE time
+    // (`src/pane_close_history.rs`), so `reltime` has always meant "closed N
+    // ago" — it was just never labelled, which reads as last-activity. An OPEN
+    // session has no meaningful close time at all: the pane closed once, the
+    // session came back, and printing "4h" beside a live conversation is simply
+    // wrong. True last-activity is not in the data; that needs the host change
+    // specced in the pipeline doc.
+    let time_text = if is_open {
+        "live".to_string()
+    } else if row.reltime.trim().is_empty() {
+        String::new()
+    } else {
+        format!("closed {}", row.reltime)
+    };
+    let reltime_w = time_text.width() as u16;
     // Left text budget = total - reltime - actions - separators.
     let reserved = reltime_w + actions_w + 2;
     let text_budget = (width as u16).saturating_sub(reserved).max(4) as usize;
@@ -934,7 +967,11 @@ fn render_row(
     let restore_w = label.width() as u16;
     // Restorable rows read in their agent color and bold (the actionable ones);
     // non-restorable rows (dead agent refs, plain terminals) read dim.
-    let style = if row.restorable {
+    let style = if is_open {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
+    } else if row.restorable {
         Style::default()
             .fg(agent_color(&row.agent))
             .add_modifier(Modifier::BOLD)
@@ -949,10 +986,20 @@ fn render_row(
     let pad = total.saturating_sub(used).max(1);
     spans.push(Span::raw(" ".repeat(pad as usize)));
     spans.push(Span::styled(
-        row.reltime.clone(),
-        Style::default().fg(Color::DarkGray),
+        time_text,
+        if is_open {
+            // Blue is the canon's navigation role: this row takes you somewhere
+            // that exists, rather than rebuilding something that does not.
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
     ));
-    if row.restorable {
+    // An open session offers no fork/delete: both act on a closed recording, and
+    // offering them beside a live conversation is how you get two of it.
+    if row.restorable && !is_open {
         spans.push(Span::styled(FORK_BTN, Style::default().fg(Color::Yellow)));
         spans.push(Span::styled(DEL_BTN, Style::default().fg(Color::Red)));
     }
@@ -967,8 +1014,17 @@ fn render_row(
         buf,
     );
 
-    // Restore hit: the left label region.
-    if row.restorable && restore_w > 0 {
+    // The row's ONE primary action, per the canon: focus if it is live, restore
+    // if it is not. Never both, and never fork on a left click.
+    if is_open && restore_w > 0 {
+        hits.push(UiHitRect {
+            x,
+            y,
+            width: restore_w,
+            height: 1,
+            action_id: format!("{ACTION_FOCUS_PREFIX}{}", open_tab.unwrap_or_default()),
+        });
+    } else if row.restorable && restore_w > 0 {
         hits.push(UiHitRect {
             x,
             y,
@@ -1070,6 +1126,7 @@ mod tests {
                 ..RowFilters::default()
             },
             None,
+            None,
         );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
         assert!(ids.contains(&"historial:toggle_panel"));
@@ -1094,6 +1151,7 @@ mod tests {
                 show_terminals: true,
                 ..RowFilters::default()
             },
+            None,
             None,
         );
         assert!(hits
@@ -1121,6 +1179,7 @@ mod tests {
                 show_terminals: true,
                 ..RowFilters::default()
             },
+            None,
             None,
         );
         let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
@@ -1162,6 +1221,85 @@ mod tests {
     /// Substring-per-term, order-independent, case-insensitive — the rule the
     /// resume-picker settled on, because that is what people expect a history
     /// box to do.
+    /// Chrome semantics: a row whose session is LIVE takes you to it. It must
+    /// not offer restore (a second copy of a conversation already on screen) and
+    /// must not offer fork or delete beside it.
+    #[test]
+    fn an_open_row_focuses_its_tab_and_never_restores_or_forks() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let mut open = std::collections::BTreeMap::new();
+        open.insert("sess-c123".to_string(), "w1:t9".to_string());
+
+        let area = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+            Some(&open),
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        assert!(
+            ids.contains(&"historial:focus:w1:t9"),
+            "an open row must offer focus, got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.starts_with("historial:restore:")),
+            "an open row must not offer restore, got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.starts_with("historial:fork:")),
+            "an open row must not offer fork, got {ids:?}"
+        );
+        // And it says it is live rather than printing a stale close time.
+        let text = buffer_text(&buf);
+        assert!(text.contains("live"), "open row should read live: {text}");
+        assert!(
+            !text.contains("closed"),
+            "open row must not show a close time: {text}"
+        );
+    }
+
+    /// The same row with no live session keeps today's behaviour exactly.
+    #[test]
+    fn a_closed_row_restores_and_labels_its_time_as_closed() {
+        let model = HistorialRenderModel {
+            rows: vec![row("1:w_1_p_1", true)],
+        };
+        let area = Rect::new(0, 0, 50, 12);
+        let mut buf = Buffer::empty(area);
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters {
+                show_terminals: true,
+                ..RowFilters::default()
+            },
+            None,
+            None,
+        );
+        let ids: Vec<&str> = hits.iter().map(|h| h.action_id.as_str()).collect();
+        assert!(ids.iter().any(|id| id.starts_with("historial:restore:")));
+        assert!(!ids.iter().any(|id| id.starts_with("historial:focus:")));
+        // The host records a pane CLOSE time, so the row now says so instead of
+        // leaving "5m" to be read as last activity.
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("closed 5m"),
+            "expected a labelled close time: {text}"
+        );
+    }
+
     #[test]
     fn search_matches_every_term_in_any_order() {
         let mut model = HistorialRenderModel::default();
@@ -1274,7 +1412,7 @@ mod tests {
             show_legend: true,
             ..RowFilters::default()
         };
-        let _ = render(&model, area, &mut buf, None, &f, None);
+        let _ = render(&model, area, &mut buf, None, &f, None, None);
         let text = buffer_text(&buf);
         // Legend content is shown; the row's label ("herdr") is not.
         assert!(text.contains("agent filter"));
@@ -1295,7 +1433,15 @@ mod tests {
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
         // No hover: only the row is drawn (no tooltip).
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         let text = buffer_text(&buf);
         assert!(text.contains("bitwarden")); // tab name is the row identity
         assert!(!text.contains("fix the historial")); // never the first prompt
@@ -1312,7 +1458,15 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         assert!(buffer_text(&buf).contains("claude"));
     }
 
@@ -1371,6 +1525,7 @@ mod tests {
             None,
             &RowFilters::default(),
             Some(HeaderButton::Agent),
+            None,
         );
         // The hint text appears somewhere in the panel (bottom line).
         assert!(buffer_text(&buf).contains("filter:"));
@@ -1389,7 +1544,15 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 60, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         let text = buffer_text(&buf);
         assert!(text.contains("claude")); // agent name is the row identity
         assert!(!text.contains("c123")); // sid is tooltip-only
@@ -1419,7 +1582,15 @@ mod tests {
         // Hidden: the terminal row is not drawn; the agent row is (by its pane
         // name). Neither folder basename ("scratch") appears on any row.
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         let hidden = buffer_text(&buf);
         assert!(hidden.contains("myproj"));
         assert!(!hidden.contains("terminal"));
@@ -1438,6 +1609,7 @@ mod tests {
                 ..RowFilters::default()
             },
             None,
+            None,
         );
         let shown = buffer_text(&buf);
         assert!(shown.contains("terminal"));
@@ -1451,7 +1623,15 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let hits = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let hits = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         assert!(hits
             .iter()
             .any(|h| h.action_id == "historial:toggle_terminals"));
@@ -1464,7 +1644,15 @@ mod tests {
         };
         let area = Rect::new(0, 0, 44, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         assert!(buffer_text(&buf).contains("no agent panes"));
     }
 
@@ -1482,6 +1670,7 @@ mod tests {
                 ..RowFilters::default()
             },
             None,
+            None,
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action_id, "historial:toggle_panel");
@@ -1495,7 +1684,15 @@ mod tests {
         let model = HistorialRenderModel { rows: vec![r] };
         let area = Rect::new(0, 0, 50, 12);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, None, &RowFilters::default(), None);
+        let _ = render(
+            &model,
+            area,
+            &mut buf,
+            None,
+            &RowFilters::default(),
+            None,
+            None,
+        );
         let text = buffer_text(&buf);
         assert!(text.contains("herdr")); // the pane name
         assert!(!text.contains("sess-c123")); // full sid is tooltip-only
@@ -1518,6 +1715,7 @@ mod tests {
             &mut buf,
             Some(0),
             &RowFilters::default(),
+            None,
             None,
         );
         let text = buffer_text(&buf);
@@ -1552,6 +1750,7 @@ mod tests {
                 ..RowFilters::default()
             },
             None,
+            None,
         );
         let text = buffer_text(&buf);
         assert!(text.contains("no resume")); // status still shown
@@ -1579,7 +1778,7 @@ mod tests {
             .position(|r| r.restorable && r.agent != "terminal");
         let area = Rect::new(0, 0, 46, 44);
         let mut buf = Buffer::empty(area);
-        let _ = render(&model, area, &mut buf, hover, &filters, None);
+        let _ = render(&model, area, &mut buf, hover, &filters, None, None);
         eprintln!(
             "\n===== HISTORIAL PANEL (real data, {} visible rows, hover idx {:?}) =====",
             visible.len(),

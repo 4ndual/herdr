@@ -25,7 +25,17 @@ surfaces = ["right_panel"]
 # stops those keys ALSO reaching the focused agent while the search box is open.
 # Both are needed and both are separately visible in `plugin list` — capture is
 # the larger power (it redirects), which is why the host splits them.
-capabilities = ["layout_read", "mouse_all", "keyboard_input", "keyboard_capture"]
+# api_read: pane.list, to learn which recorded sessions are open right now.
+# api_write: tab.focus, so clicking an OPEN row takes you to it instead of
+# forking a second copy of a conversation already on screen.
+capabilities = [
+    "layout_read",
+    "mouse_all",
+    "keyboard_input",
+    "keyboard_capture",
+    "api_read",
+    "api_write",
+]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON.
 # Right-panel rail glyph. Host-drawn; without it every right-panel plugin
