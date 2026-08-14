@@ -8,10 +8,10 @@
 //! Shapes, one per [`PaneState`]:
 //!
 //! ```text
-//! ⛺ e2e-claude · claude · ~/harnesses/e2e-claude/workspace
-//! ⛺ e2e-codex ⚠ codex≠claude · claude · ~/harnesses/e2e-codex/workspace
-//! ⛺ no harness · claude · ~/Projects/herdr
-//! ⛺ shell · ~/Projects/herdr
+//! harness e2e-claude · claude · ~/harnesses/e2e-claude/workspace
+//! harness e2e-codex ⚠ codex≠claude · claude · ~/harnesses/e2e-codex/workspace
+//! harness no harness · claude · ~/Projects/herdr
+//! harness shell · ~/Projects/herdr
 //! ```
 //!
 //! When the agent's folder and the pane's shell folder differ — `(cd x && claude)`,
@@ -28,8 +28,20 @@ use ratatui::widgets::{Paragraph, Widget};
 const MUTED: Color = Color::DarkGray;
 const SUBTEXT: Color = Color::Gray;
 
-/// Leading glyph. A tent: the harness you are camped in.
-const ICON: &str = "\u{26FA}"; // ⛺
+/// Leading tag. Deliberately PLAIN TEXT, not a glyph.
+///
+/// This was `⛺` (U+26FA) and it rendered wrong in live use. The codepoint is
+/// Emoji_Presentation=Yes, so unicode-width — and therefore ratatui, and
+/// therefore the slot this guest asks the host to carve — counts it as TWO
+/// columns, while the terminal paints it from a colour-emoji font at its own
+/// advance width. Measured on the rig: every sibling strip starts flush at
+/// column 0 and this one started with a ragged gap, and the glyph ignored the
+/// SUBTEXT theme role because a colour font has its own colours.
+///
+/// No other glyph fixes that class of bug — it is inherent to emoji
+/// presentation in a monospace grid — and every sibling strip (`image …`,
+/// `hr …`) leads with a word anyway, so the strip now does too.
+const TAG: &str = "harness";
 /// Separator between tokens.
 const SEP: &str = " \u{00B7} "; // " · "
 /// Divergence arrow: agent folder → shell folder.
@@ -52,10 +64,7 @@ const INFERRED: &str = "\u{2248}"; // ≈
 /// reserving a row to display emptiness.
 pub fn line(input: &IndicatorInput) -> Option<Line<'static>> {
     let home = input.home.as_deref().unwrap_or_default();
-    let mut spans = vec![Span::styled(
-        format!("{ICON} "),
-        Style::default().fg(SUBTEXT),
-    )];
+    let mut spans = vec![Span::styled(format!("{TAG} "), Style::default().fg(MUTED))];
 
     match input.state() {
         PaneState::Empty => return None,
@@ -170,7 +179,7 @@ fn hovered_line(input: &IndicatorInput) -> Option<Line<'static>> {
     // Nothing to elaborate when the summary itself has nothing to say.
     line(input)?;
     Some(Line::from(vec![
-        Span::styled(format!("{ICON} "), Style::default().fg(SUBTEXT)),
+        Span::styled(format!("{TAG} "), Style::default().fg(MUTED)),
         Span::styled(detail(input), Style::default().fg(MUTED)),
     ]))
 }
@@ -272,11 +281,27 @@ mod tests {
         }
     }
 
+    fn no_harness() -> IndicatorInput {
+        IndicatorInput {
+            harness: None,
+            ..in_harness()
+        }
+    }
+
+    fn shell_pane() -> IndicatorInput {
+        IndicatorInput {
+            pane_id: Some("w1:p1".into()),
+            shell_cwd: Some("/home/x".into()),
+            home: Some("/home/x".into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn harness_pane_reads_name_agent_folder() {
         assert_eq!(
             text(&in_harness()),
-            "⛺ e2e-claude · claude · ~/harnesses/e2e-claude/workspace"
+            "harness e2e-claude · claude · ~/harnesses/e2e-claude/workspace"
         );
     }
 
@@ -286,7 +311,7 @@ mod tests {
         input.agent = Some("codex".into());
         assert_eq!(
             text(&input),
-            "⛺ e2e-claude ⚠ claude≠codex · codex · ~/harnesses/e2e-claude/workspace"
+            "harness e2e-claude ⚠ claude≠codex · codex · ~/harnesses/e2e-claude/workspace"
         );
     }
 
@@ -296,7 +321,7 @@ mod tests {
         input.shell_cwd = Some("/home/x/Projects/herdr".into());
         assert_eq!(
             text(&input),
-            "⛺ e2e-claude · claude · ~/harnesses/e2e-claude/workspace → ~/Projects/herdr"
+            "harness e2e-claude · claude · ~/harnesses/e2e-claude/workspace → ~/Projects/herdr"
         );
     }
 
@@ -315,7 +340,10 @@ mod tests {
         input.harness = None;
         input.agent_cwd = Some("/home/x/Projects/herdr".into());
         input.shell_cwd = Some("/home/x/Projects/herdr".into());
-        assert_eq!(text(&input), "⛺ no harness · claude · ~/Projects/herdr");
+        assert_eq!(
+            text(&input),
+            "harness no harness · claude · ~/Projects/herdr"
+        );
     }
 
     #[test]
@@ -327,7 +355,7 @@ mod tests {
             home: Some("/home/x".into()),
             ..Default::default()
         };
-        assert_eq!(text(&input), "⛺ shell · ~");
+        assert_eq!(text(&input), "harness shell · ~");
     }
 
     #[test]
@@ -336,16 +364,20 @@ mod tests {
         assert_eq!(content_width(&IndicatorInput::default()), 0);
     }
 
+    /// Every character the strip emits must be one column wide, so the slot the
+    /// host carves matches what the terminal paints. A wide or emoji-presentation
+    /// codepoint sneaking back in shows up here as a width/char mismatch — which
+    /// is exactly how the `⛺` misrender got shipped.
     #[test]
-    fn content_width_counts_display_columns_not_chars() {
-        // ⛺ is a WIDE glyph: one char, two columns. Measuring chars would carve
-        // a slot one column short and clip the last character of the folder —
-        // the exact end of the line that carries the information.
-        let input = in_harness();
-        assert_eq!(
-            content_width(&input),
-            text(&input).chars().count() as u16 + 1
-        );
+    fn every_glyph_is_one_column_so_layout_matches_paint() {
+        for input in [in_harness(), no_harness(), shell_pane()] {
+            let rendered = text(&input);
+            assert_eq!(
+                content_width(&input) as usize,
+                rendered.chars().count(),
+                "width != chars, a multi-column glyph is present in: {rendered}"
+            );
+        }
     }
 
     #[test]
