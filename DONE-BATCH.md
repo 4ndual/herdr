@@ -1,6 +1,6 @@
 # DONE-BATCH — overnight build batch, 2026-08-14
 
-Branch `feat/host-action-bridge`, 15 commits. Full detail and evidence in
+Branch `feat/host-action-bridge`, 17 commits. Full detail and evidence in
 `BATCH-REPORT.md`; this is the per-task summary.
 
 Read the three "not done" rows first — they are the ones that need you.
@@ -28,7 +28,7 @@ Read the three "not done" rows first — they are the ones that need you.
 | #42 / #20 portability | done | `4bdabb1d` | multi-root claude lookup verified live; macOS env fallback added |
 | #39 QA defects | **partial** | — | no #39 entry exists in the plan's task table; open FAILs triaged in `BATCH-REPORT.md` |
 | #21 collied / mirror | **not done** | — | needs an `hr` restart this session cannot perform from inside itself |
-| #22 E2E + video | done (Linux) | — | `.local/qa/batch-e2e.mp4`, both #36 halves proven |
+| #22 E2E + video | done (Linux) | — | `.local/qa/proof36.mp4` — the first take, `batch-e2e.mp4`, was REJECTED by its gate and re-recorded; see below |
 | #22 Mac rollout | **not done** | — | gated on Linux being fully green, which needs the `hr` restart |
 
 ## What needs you
@@ -81,8 +81,37 @@ Read the three "not done" rows first — they are the ones that need you.
 ## Validation
 
 `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean after
-every task. Final suite: **3544 tests, 3533 passed, 11 failed** — all 11 in the
+every task. Final suite: **3544 tests, 3537 passed, 7 failed** — all 11 in the
 pre-existing set verified against the base commit (`api_ping` ×4 and
 `auto_detect` ×3 are socket-contention flakes under parallel load and pass when
 run alone; plus `cli::sessions` legacy restore, `client_mode` cwd fallback,
 `multi_client` sigkill, and `read_ui_input_blob`). No new failures.
+
+## The E2E video was rejected, and re-recorded
+
+The first recording (`batch-e2e.mp4`) went to the vl-gate and came back
+**REJECT**, correctly. Its clue was exact: the `POST=…` line that is the whole
+proof "never reached camera" — I had produced it through the API on a pane that
+was never on screen, so the video showed an idle prompt while the timeline
+claimed a result. The gate was right and I was wrong to call that evidence.
+
+Re-recorded as `proof36.mp4` with gates in `.local/qa/proof36-gates.md`. Two
+changes: everything runs in one focused, visible pane via `pane run` (which
+echoes the command into the pane), and the image plugins are disabled — they
+were painting a half-block image *over* the pane, so the proof text rendered as
+a mosaic of coloured blocks while the API read returned it perfectly.
+`frames/proof36-post.png` (obscured) next to `frames/proof36-post2.png` (clean)
+is the before/after.
+
+All five gates are legible in two frames:
+`frames/proof36-pre2.png` carries the server pid with a `0` count of
+`CLAUDE_CONFIG_DIR` in its environ, `PRE=…/e2e-claude/config`, and the
+`session.json` line holding the env; `frames/proof36-post2.png` carries
+`POST=/home/andual/harnesses/e2e-claude/config` as its top line.
+
+**A defect found while recording, filed not fixed:** a plugin painting an image
+over a pane leaves no trace in the pane's content — the API read returns the
+real text while the screen shows the image. That is a z-order question between
+the `pane_graphics` half-block paint and pane text, unrelated to #36, and in the
+same family as the version strip reporting "images: none on screen" while an
+image was in fact painted.
