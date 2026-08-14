@@ -178,7 +178,7 @@ before exec. Verified: zero `CLAUDE*` vars in the server's `/proc/<pid>/environ`
 | 3. Plugin-registry parity | drift, see below | drift, see below |
 | 4. Config parity | PASS — `[theme]`/`[ui]` blocks identical | PASS |
 
-Final binary: `30b1907d6fd8fccbe50a500f23eaa92dfd382516f42c38264e6ef5e08004e5f6`,
+Final binary: `09d791f2710a8427e24c37b18969556dca17a5b56aa8846653b2ef94078b9424`,
 identical across `~/.herdr-hr/bin/herdr`, `~/.local/bin/herdrtest` and
 `target/release/herdr`. The test server's `/proc/<pid>/exe` hashes to exactly
 that. `hr`'s still reads `(deleted)` — the previous inode, held open.
@@ -330,6 +330,9 @@ that the unit tests could not have caught:
    `"color":"danger"` against a pretty-printed file where that literal never
    appears. Both fixed: it now reads both streams and parses the snapshot.
    Recorded because both failure modes report a *working* feature as broken.
+   A third instance of the same family followed: the check read `session.json`
+   immediately after the API call, but the session save is DEBOUNCED, so it
+   found the previous contents. It now polls for the value.
 
 A `herdr pane set-color <pane_id> [<role>|<#rrggbb>|--clear]` CLI ships with it:
 every other pane method is reachable from the shell, and the verification needed
@@ -338,6 +341,5 @@ one.
 ### A note on the operator's instance
 
 The `hr` restart remains for you. The staged binary is
-`30b1907d…` (now superseded — see below); the running server still holds the
-previous inode. I have not restarted it and will not: your orchestrator session
+`09d791f2…`; the running server still holds the previous inode. I have not restarted it and will not: your orchestrator session
 lives in that instance.

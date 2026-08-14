@@ -34,7 +34,7 @@ Read the three "not done" rows first — they are the ones that need you.
 ## What needs you
 
 1. **Restart `hr`.** The new binary is staged at `~/.herdr-hr/bin/herdr`
-   (sha256 `30b1907d…`), but the running server still holds the previous inode.
+   (sha256 `09d791f2…`), but the running server still holds the previous inode.
    This batch runs *inside* the `hr` session, so restarting it would have killed
    the batch — and the plan's own note is that restarting `hr` is the hazard.
    Everything else on that instance is already in place.
