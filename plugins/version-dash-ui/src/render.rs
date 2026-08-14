@@ -561,3 +561,26 @@ mod tests {
         assert!(!stale_style.add_modifier.contains(Modifier::BOLD));
     }
 }
+
+/// The row as it reads WHILE A TOKEN IS HOVERED: that instance's full detail,
+/// in place of the summary.
+///
+/// The canon puts detail on hover, but this module's carve is exactly one row
+/// (`[ui_modules.placement].size = "1"`), so there is no slack row for a tooltip
+/// and the guest API has no positioned node to float one. Swapping the row's own
+/// content keeps the single hover trigger without covering anything or resizing
+/// anything — the shape harness-indicator and tidus-bar use.
+pub fn hovered_line(detail: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("\u{1F5F3} ", Style::default().fg(MUTED)),
+        Span::styled(detail.to_string(), Style::default().fg(MUTED)),
+    ])
+}
+
+pub fn hovered_width(detail: &str) -> u16 {
+    hovered_line(detail).width() as u16
+}
+
+pub fn render_hovered(detail: &str, area: Rect, buf: &mut Buffer) {
+    Paragraph::new(hovered_line(detail)).render(area, buf);
+}

@@ -21,7 +21,8 @@
 mod render;
 
 use herdr_ui_plugin_api::{
-    HostEffect, UiActionKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate, UiUpdateScope,
+    HostEffect, MouseEvent, MouseEventKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate,
+    UiUpdateScope,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -35,7 +36,8 @@ const PLUGIN_ID: &str = "builtin.version-dash";
 /// Action id prefix for a per-instance hit rect: `version:instance:<label>`.
 /// The `kind` (LeftDown/RightDown) on the resulting `UiEvent::Action` decides
 /// toast vs update.
-const INSTANCE_ACTION_PREFIX: &str = "version:instance:";
+// The per-instance action-id prefix is gone with the hit-rects: presses are
+// resolved against the drawn token ranges now, so there is no id to dispatch.
 
 /// Declared plugin actions (see herdr-plugin.toml `[[actions]]`). `test` pulls
 /// the fork integration-tip build; `hr` may ONLY pull the exact build running in
@@ -49,6 +51,14 @@ const ACTION_SHOW_NOTES: &str = "show-latest-notes";
 /// Cache of the last input we rendered, so a click can build its toast from the
 /// same data the strip is showing without re-reading any file.
 static LAST_INPUT: Mutex<Option<VersionRenderInput>> = Mutex::new(None);
+
+/// The carved row's absolute rect (x, y, width), the token ranges the row was
+/// drawn with, and the token the cursor is over. All three are needed because
+/// hover and clicks are resolved from the RAW mouse stream (capability
+/// `mouse_all`): the host suppresses raw `Move` over a module's own hit-rects.
+static PANEL_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
+static RANGES: Mutex<Vec<(String, u16, u16)>> = Mutex::new(Vec::new());
+static HOVERED: Mutex<Option<String>> = Mutex::new(None);
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
@@ -136,9 +146,7 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &UiEvent) -> UiUpdate {
     let ctx = match event {
         UiEvent::Frame(ctx) => ctx,
-        UiEvent::Action {
-            action_id, kind, ..
-        } => return handle_action(action_id, *kind),
+        UiEvent::Mouse(mouse) => return handle_mouse(mouse),
         _ => return UiUpdate::default(),
     };
 
@@ -161,12 +169,49 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     // so the host can measure the natural width and carve the slot even on the
     // first content frame (before which `ctx.rect` is still zero). The per-instance
     // hit rects come from the real (carved) panel rect so clicks map to cells.
-    let content = Rect::new(0, 0, render::content_width(&input).max(1), 1);
+    *PANEL_RECT.lock().expect("panel rect mutex poisoned") =
+        if ctx.rect.width == 0 || ctx.rect.height == 0 {
+            None
+        } else {
+            Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
+        };
+
+    render_from(&input)
+}
+
+/// Build the layer for `input` in its current hover state. Shared by the frame
+/// path and the mouse path, so a hover repaint is the same rendering as a frame
+/// repaint rather than a second, drifting copy of it.
+fn render_from(input: &VersionRenderInput) -> UiUpdate {
+    let hovered = HOVERED.lock().expect("hover mutex poisoned").clone();
+    let (content_w, detail) = match &hovered {
+        Some(label) => {
+            let detail = toast_message(input, label);
+            (render::hovered_width(&detail).max(1), Some(detail))
+        }
+        None => (render::content_width(input).max(1), None),
+    };
+    let content = Rect::new(0, 0, content_w, 1);
     let mut buf = Buffer::empty(content);
-    let ranges = render::render(&input, content, &mut buf);
+    // The token ranges always come from the SUMMARY layout: they are what the
+    // next press is resolved against, and a press lands on the row as it was
+    // before the hover swapped it (the swap is what the cursor is sitting on).
+    let ranges = render::render(
+        input,
+        Rect::new(0, 0, render::content_width(input).max(1), 1),
+        &mut Buffer::empty(Rect::new(0, 0, render::content_width(input).max(1), 1)),
+    );
+    *RANGES.lock().expect("ranges mutex poisoned") = ranges
+        .iter()
+        .map(|span| (span.label.clone(), span.start, span.width))
+        .collect();
+    match &detail {
+        Some(detail) => render::render_hovered(detail, content, &mut buf),
+        None => {
+            let _ = render::render(input, content, &mut buf);
+        }
+    }
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
-    let panel = Rect::new(ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height);
-    let hits = instance_hits(panel, &ranges);
 
     UiUpdate {
         layers: vec![UiLayer {
@@ -174,61 +219,78 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
             z_index: 0,
             consumes_mouse: false,
             nodes,
-            hits,
+            // NO hit-rects: the host suppresses the raw `Move` events hover
+            // needs over a module's own rects (the F5 dedupe). Presses are
+            // resolved against the same ranges the row was drawn from.
+            hits: Vec::<UiHitRect>::new(),
             data: None,
         }],
         ..Default::default()
     }
 }
 
-/// Map each instance's line-relative column range to an absolute hit rect on the
-/// carved panel row. Clamped to the panel width so a rect never spills past the
-/// slot. Empty until the panel has been carved (rect still zero at bootstrap).
-fn instance_hits(panel: Rect, ranges: &[render::InstanceSpan]) -> Vec<UiHitRect> {
-    if panel.width == 0 || panel.height == 0 {
-        return Vec::new();
+/// Which instance token covers an absolute cell, from the SAME ranges the row
+/// was drawn from.
+fn token_at(column: u16, row: u16) -> Option<String> {
+    let (ox, oy, width) = (*PANEL_RECT.lock().expect("panel rect mutex poisoned"))?;
+    if row != oy {
+        return None;
     }
-    let mut hits = Vec::new();
-    for span in ranges {
-        if span.start >= panel.width {
-            break;
-        }
-        let width = span.width.min(panel.width - span.start);
-        if width == 0 {
-            continue;
-        }
-        hits.push(UiHitRect {
-            x: panel.x + span.start,
-            y: panel.y,
-            width,
-            height: 1,
-            action_id: format!("{INSTANCE_ACTION_PREFIX}{}", span.label),
-        });
+    let rel = column.checked_sub(ox)?;
+    if rel >= width {
+        return None;
     }
-    hits
+    RANGES
+        .lock()
+        .expect("ranges mutex poisoned")
+        .iter()
+        .find(|(_, start, w)| rel >= *start && rel < start + w)
+        .map(|(label, _, _)| label.clone())
 }
 
-fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
-    let Some(label) = action_id.strip_prefix(INSTANCE_ACTION_PREFIX) else {
-        return UiUpdate::default();
-    };
-    // The `latest` token is not an instance and owns no binary, so neither the
-    // toast nor the promotion path applies: EITHER button opens the release
-    // notes. Discoverability beats button purity here — a user who right-clicks
-    // it is asking the same question as one who left-clicks it, and the answer
-    // is never destructive.
-    if label == render::LATEST_LABEL {
-        return match kind {
-            UiActionKind::LeftDown | UiActionKind::RightDown => notes_effect(),
-            _ => UiUpdate::default(),
-        };
-    }
+/// Hover reveals, clicks act.
+///
+/// Left-click used to TOAST the hovered instance's detail — "click to find out
+/// what this is", the pattern the canon removes: on a band whose other chips all
+/// do something when clicked, a describing click is indistinguishable from an
+/// acting one. Detail is on hover now, and left-click is reserved: it opens the
+/// release notes on the `latest` token and is inert on an instance token, which
+/// owns no non-destructive primary action.
+///
+/// Right-click still invokes the guarded promotion. That is a deliberate,
+/// documented exception to the canon's "right-click opens a menu" rule: a
+/// one-row carve cannot host a menu, and the promotion is already gated on a
+/// sha-bound verification receipt rather than on a dialog. The canon-shaped
+/// replacement — right-click ARMS, a second right-click confirms — is specified
+/// in plugin-ux-standard.md and left to the worker who owns the promotion path.
+fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
+    let hit = token_at(mouse.column, mouse.row);
 
-    match kind {
-        // Fire once per physical click (press only).
-        UiActionKind::LeftDown => toast_effect(label),
-        UiActionKind::RightDown => update_effect(label),
-        _ => UiUpdate::default(),
+    match mouse.kind {
+        MouseEventKind::LeftDown => match hit.as_deref() {
+            Some(render::LATEST_LABEL) => notes_effect(),
+            // An instance token has no non-destructive primary action: its
+            // detail is on hover and its promotion is on right-click.
+            _ => UiUpdate::default(),
+        },
+        MouseEventKind::RightDown => match hit.as_deref() {
+            Some(render::LATEST_LABEL) => notes_effect(),
+            Some(label) => update_effect(label),
+            None => UiUpdate::default(),
+        },
+        _ => {
+            let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
+            if *hovered == hit {
+                // No boundary crossed ⇒ no repaint.
+                return UiUpdate::default();
+            }
+            *hovered = hit;
+            drop(hovered);
+            let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
+                return UiUpdate::default();
+            };
+            render_from(&input)
+        }
     }
 }
 
@@ -246,23 +308,6 @@ fn notes_effect() -> UiUpdate {
             action_id: ACTION_SHOW_NOTES.to_string(),
             payload_json: None,
         }],
-        scope: UiUpdateScope::Partial,
-        consumed_action_ids: Vec::new(),
-    }
-}
-
-/// Left-click: toast the clicked instance's version detail (or latest info).
-fn toast_effect(label: &str) -> UiUpdate {
-    let message = LAST_INPUT
-        .lock()
-        .expect("input mutex poisoned")
-        .as_ref()
-        .map(|input| toast_message(input, label))
-        .unwrap_or_else(|| "version: no data yet".to_string());
-
-    UiUpdate {
-        layers: Vec::new(),
-        effects: vec![HostEffect::ShowToast { message }],
         scope: UiUpdateScope::Partial,
         consumed_action_ids: Vec::new(),
     }
@@ -450,8 +495,41 @@ mod tests {
         )
     }
 
+    /// Drive the strip the way the host does: a frame that carves the row at
+    /// (0, 0), then a raw mouse event on the CELLS THAT WERE DRAWN. Returns the
+    /// update the press produced.
+    fn press(label: &str, kind: herdr_ui_plugin_api::MouseEventKind, edge: Edge) -> UiUpdate {
+        let event: UiEvent = serde_json::from_str(&frame_json(&env_with_input(&sample_input())))
+            .expect("frame parses");
+        let _ = handle_event(&event);
+        let (_, ranges) = render::build(&sample_input());
+        let span = ranges
+            .iter()
+            .find(|s| s.label == label)
+            .expect("token is drawn");
+        let column = match edge {
+            Edge::First => span.start,
+            Edge::Middle => span.start + span.width / 2,
+            Edge::Last => span.start + span.width - 1,
+        };
+        handle_event(&UiEvent::Mouse(herdr_ui_plugin_api::MouseEvent {
+            kind,
+            column,
+            row: 0,
+        }))
+    }
+
+    #[derive(Clone, Copy)]
+    enum Edge {
+        First,
+        Middle,
+        Last,
+    }
+
+    /// No hit-rects: declaring one would make the host suppress the raw `Move`
+    /// events hover needs. The row is still driven — see the press tests below.
     #[test]
-    fn renders_panel_layer_with_per_instance_hits() {
+    fn renders_panel_layer_with_no_hit_rects() {
         let _guard = test_guard();
         let event: UiEvent = serde_json::from_str(&frame_json(&env_with_input(&sample_input())))
             .expect("frame parses");
@@ -459,9 +537,10 @@ mod tests {
         assert_eq!(update.layers.len(), 1);
         assert!(matches!(update.layers[0].surface, UiSurface::Panel));
         assert!(!update.layers[0].nodes.is_empty());
-        let hits = &update.layers[0].hits;
-        assert!(hits.iter().any(|h| h.action_id == "version:instance:hr"));
-        assert!(hits.iter().any(|h| h.action_id == "version:instance:test"));
+        assert!(
+            update.layers[0].hits.is_empty(),
+            "hit rects would kill the hover the canon requires"
+        );
     }
 
     /// The contract that actually breaks in the field is collector-output →
@@ -496,48 +575,83 @@ mod tests {
         assert!(handle_event(&event).layers.is_empty());
     }
 
+    /// The token ranges a press is resolved against must be disjoint and in
+    /// order: a token that overlaps its neighbour steals its clicks, which is
+    /// exactly how a press lands on the wrong instance and promotes the wrong
+    /// binary.
     #[test]
-    fn instance_hits_are_disjoint_and_clamped() {
+    fn token_ranges_are_disjoint_and_in_order() {
         let (_, ranges) = render::build(&sample_input());
-        let panel = Rect::new(3, 9, 40, 1);
-        let hits = instance_hits(panel, &ranges);
-        // Two instances + `latest`.
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].x, 3); // first token at panel.x
-        for pair in hits.windows(2) {
-            // disjoint, in order — a token that overlaps its neighbour steals
-            // its clicks, which is exactly how a click lands on the wrong
-            // instance and promotes the wrong binary.
+        assert_eq!(ranges.len(), 3, "two instances + latest");
+        for pair in ranges.windows(2) {
             assert!(
-                pair[0].x + pair[0].width <= pair[1].x,
+                pair[0].start + pair[0].width <= pair[1].start,
                 "{:?} overlaps {:?}",
-                pair[0],
-                pair[1]
+                (pair[0].start, pair[0].width),
+                (pair[1].start, pair[1].width),
             );
-        }
-        for h in &hits {
-            assert!(h.x + h.width <= panel.x + panel.width, "clamped to panel");
-            assert_eq!(h.y, 9);
-            assert_eq!(h.height, 1);
         }
     }
 
+    /// Canon §2: HOVERING an instance token reveals its detail in place. It
+    /// used to require a left-click, which toasted — "click to find out what
+    /// this is" on a band whose other chips all act when clicked.
     #[test]
-    fn left_click_hr_toasts_hr_detail() {
+    fn hovering_hr_shows_hr_detail_in_place() {
+        use herdr_ui_plugin_api::MouseEventKind;
         let _guard = test_guard();
-        *LAST_INPUT.lock().unwrap() = Some(sample_input());
-        let action: UiEvent =
-            serde_json::from_str(&action_json("version:instance:hr", "left_down")).expect("action");
-        let update = handle_event(&action);
-        assert_eq!(update.effects.len(), 1);
-        match &update.effects[0] {
-            HostEffect::ShowToast { message } => {
-                assert!(message.contains("hr 0.7.3"), "{message}");
-                assert!(message.contains("+107 local"), "{message}");
-                assert!(message.contains("update available"), "{message}");
-            }
-            other => panic!("expected toast, got {other:?}"),
+        let update = press("hr", MouseEventKind::Move, Edge::Middle);
+        let text = text_of(&update);
+        assert!(update.effects.is_empty(), "detail is drawn, never toasted");
+        assert!(text.contains("hr 0.7.3"), "{text}");
+        assert!(text.contains("+107 local"), "{text}");
+        assert!(text.contains("update available"), "{text}");
+    }
+
+    /// Canon §1: left-click is reserved for a primary action. An instance token
+    /// has none that is safe, so it is inert — and inert must be provably inert,
+    /// not accidentally dead.
+    #[test]
+    fn left_click_on_an_instance_is_inert() {
+        use herdr_ui_plugin_api::MouseEventKind;
+        let _guard = test_guard();
+        for edge in [Edge::First, Edge::Middle, Edge::Last] {
+            let update = press("hr", MouseEventKind::LeftDown, edge);
+            assert!(
+                update.effects.is_empty(),
+                "an instance token must not act on left-click"
+            );
         }
+    }
+
+    /// Canon §10: the first and last cell of a token are as clickable as its
+    /// middle. `latest` is the token with a real left-click action.
+    #[test]
+    fn the_edges_of_the_latest_token_open_the_notes() {
+        use herdr_ui_plugin_api::MouseEventKind;
+        let _guard = test_guard();
+        for edge in [Edge::First, Edge::Middle, Edge::Last] {
+            let update = press(render::LATEST_LABEL, MouseEventKind::LeftDown, edge);
+            assert_eq!(
+                invoked_action(&update),
+                Some(ACTION_SHOW_NOTES),
+                "an edge cell of the latest token is dead"
+            );
+        }
+    }
+
+    fn text_of(update: &UiUpdate) -> String {
+        update
+            .layers
+            .iter()
+            .flat_map(|layer| layer.nodes.iter())
+            .filter_map(|node| match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|span| span.text.clone())
+            .collect()
     }
 
     /// `LAST_INPUT` is process-global guest state, so tests that seed it must
@@ -567,13 +681,49 @@ mod tests {
         }
     }
 
+    /// Right-press a token on the cells it was drawn at. Note this seeds a
+    /// frame from `sample_input()`, then presses; tests that need a DIFFERENT
+    /// input seed it after the frame via LAST_INPUT, which is what the guest
+    /// itself reads when it acts.
     fn right_click(label: &str) -> UiUpdate {
-        let action: UiEvent = serde_json::from_str(&action_json(
-            &format!("version:instance:{label}"),
-            "right_down",
-        ))
-        .expect("action");
-        handle_event(&action)
+        press_seeded(
+            label,
+            herdr_ui_plugin_api::MouseEventKind::RightDown,
+            Edge::Middle,
+        )
+    }
+
+    /// Like `press` but keeps whatever LAST_INPUT the test has already seeded:
+    /// the geometry comes from the sample layout, the DECISION comes from the
+    /// seeded input.
+    fn press_seeded(
+        label: &str,
+        kind: herdr_ui_plugin_api::MouseEventKind,
+        edge: Edge,
+    ) -> UiUpdate {
+        let seeded = LAST_INPUT.lock().expect("input mutex poisoned").clone();
+        let event: UiEvent = serde_json::from_str(&frame_json(&env_with_input(&sample_input())))
+            .expect("frame parses");
+        let _ = handle_event(&event);
+        // Restore unconditionally, INCLUDING None: "no snapshot at all" is a
+        // case the fail-closed tests depend on, and a frame that seeded the
+        // sample would quietly hand them data they asked not to have.
+        *LAST_INPUT.lock().expect("input mutex poisoned") = seeded;
+        let (_, ranges) = render::build(&sample_input());
+        let span = ranges
+            .iter()
+            .find(|s| s.label == label)
+            .expect("token is drawn");
+        let column = match edge {
+            Edge::First => span.start,
+            Edge::Middle => span.start + span.width / 2,
+            Edge::Last => span.start + span.width - 1,
+        };
+        handle_event(&UiEvent::Mouse(herdr_ui_plugin_api::MouseEvent {
+            kind,
+            column,
+            row: 0,
+        }))
     }
 
     fn invoked_action(update: &UiUpdate) -> Option<&str> {
@@ -586,12 +736,11 @@ mod tests {
     // ── the `latest` token: notes, never a binary ──────────────────────────
 
     fn click_latest(kind: &str) -> UiUpdate {
-        let action: UiEvent = serde_json::from_str(&action_json(
-            &format!("version:instance:{}", render::LATEST_LABEL),
-            kind,
-        ))
-        .expect("action");
-        handle_event(&action)
+        let kind = match kind {
+            "left_down" => herdr_ui_plugin_api::MouseEventKind::LeftDown,
+            _ => herdr_ui_plugin_api::MouseEventKind::RightDown,
+        };
+        press_seeded(render::LATEST_LABEL, kind, Edge::Middle)
     }
 
     #[test]
@@ -723,10 +872,7 @@ mod tests {
     fn right_click_test_invokes_update_from_latest() {
         let _guard = test_guard();
         seed(input_with_test_state(InstanceState::Verified));
-        let action: UiEvent =
-            serde_json::from_str(&action_json("version:instance:test", "right_down"))
-                .expect("action");
-        let update = handle_event(&action);
+        let update = right_click("test");
         assert_eq!(update.effects.len(), 1);
         match &update.effects[0] {
             HostEffect::InvokePluginAction {
@@ -746,10 +892,7 @@ mod tests {
         let _guard = test_guard();
         // Only reachable with a VERIFIED test build — see the inert-button tests.
         seed(input_with_test_state(InstanceState::Verified));
-        let action: UiEvent =
-            serde_json::from_str(&action_json("version:instance:hr", "right_down"))
-                .expect("action");
-        let update = handle_event(&action);
+        let update = right_click("hr");
         match &update.effects[0] {
             HostEffect::InvokePluginAction { action_id, .. } => {
                 assert_eq!(action_id, ACTION_UPDATE_HR);

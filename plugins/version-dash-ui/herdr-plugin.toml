@@ -29,7 +29,16 @@ surfaces = ["panel"]
 # (which carry the injected HERDR_PLUGIN_UI_INPUT_JSON). toasts: left-click shows
 # an instance's detail as a toast. plugin_actions: right-click invokes the staged
 # update actions declared below (InvokePluginAction → plugin.action.invoke).
-capabilities = ["layout_read", "focused_session", "toasts", "plugin_actions"]
+# mouse_all: hover is the canon trigger for detail, and the host only delivers
+# raw Move events to a module that declares no hit-rects of its own (the F5
+# click-dedupe). toasts stays for the promotion refusals, which are outcomes.
+capabilities = [
+  "layout_read",
+  "focused_session",
+  "toasts",
+  "plugin_actions",
+  "mouse_all",
+]
 # The host reads this file from the module's HERDR_PLUGIN_STATE_DIR each frame
 # (size-capped, mtime-cached) and injects it as HERDR_PLUGIN_UI_INPUT_JSON. The
 # out-of-process `version-dash-collector` below writes it.
