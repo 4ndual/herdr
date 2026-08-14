@@ -177,16 +177,26 @@ fn child_spans(chip: &Chip) -> Vec<(String, Style)> {
     if chip.status.is_alarming() {
         name_style = name_style.add_modifier(Modifier::BOLD);
     }
-    if chip.status.is_dormant() {
-        // Reaped/finished children stay attached but must not compete with
-        // live ones for attention.
+    if chip.status.is_dormant() || chip.finished {
+        // Reaped children, and children whose dispatch is over and are being
+        // held through their retention grace, stay attached but must not
+        // compete with live ones for attention.
+        //
+        // `finished` is checked separately from `is_dormant`: a child can end a
+        // job and still be a running process — a supervised harness goes back
+        // to `idle`, not `stopped` — so status alone would leave a finished
+        // dispatch rendered as brightly as a live one.
         name_style = Style::default().fg(MUTED);
     }
+    let dot_style = if chip.finished {
+        // The dot carries most of the row's colour, so leaving it bright beside
+        // a greyed name would keep reading as "live".
+        Style::default().fg(MUTED)
+    } else {
+        Style::default().fg(color)
+    };
     let mut out = vec![
-        (
-            format!("{} ", chip.status.dot()),
-            Style::default().fg(color),
-        ),
+        (format!("{} ", chip.status.dot()), dot_style),
         (chip.name.clone(), name_style),
     ];
     // Only a job actually in flight earns the disambiguating tail; a finished
@@ -236,88 +246,6 @@ pub fn render(input: &BarInput, area: Rect, buf: &mut Buffer) {
     Paragraph::new(line).render(area, buf);
 }
 
-/// The row as it reads WHILE A CHIP IS HOVERED: that chip's detail, in place of
-/// the summary row.
-///
-/// The canon puts detail on hover, but this module's carve is exactly one row
-/// (`[ui_modules.placement].size = "1"`), so there is no slack row for a tooltip
-/// and the guest API has no positioned node to float one beside the bar.
-/// Swapping the row's own content keeps the single hover trigger without
-/// covering anything or resizing anything — the shape harness-indicator uses.
-pub fn hovered_line(input: &BarInput, index: usize) -> Option<Line<'static>> {
-    let chip = input.chips.get(index)?;
-    Some(Line::from(vec![
-        Span::styled(format!("{ICON} "), Style::default().fg(MUTED)),
-        Span::styled(detail(input, chip), Style::default().fg(MUTED)),
-    ]))
-}
-
-/// Width of the hovered form, so the host carves a slot that fits it.
-pub fn hovered_width(input: &BarInput, index: usize) -> u16 {
-    hovered_line(input, index)
-        .map(|line| line.width() as u16)
-        .unwrap_or(0)
-}
-
-pub fn render_hovered(input: &BarInput, index: usize, area: Rect, buf: &mut Buffer) {
-    if let Some(line) = hovered_line(input, index) {
-        Paragraph::new(line).render(area, buf);
-    }
-}
-
-/// The detail shown on HOVER, and reused as the refusal text when a chip has no
-/// pane to navigate to. Joined with ` · ` because the host's toast is single
-/// line and silently strips newlines.
-pub fn detail(input: &BarInput, chip: &Chip) -> String {
-    let mut parts = vec![format!("{} [{}]", chip.name, chip.status.label())];
-    if let Some(runtime) = &chip.runtime {
-        parts.push(runtime.clone());
-    }
-    parts.push(
-        match chip.role {
-            ChipRole::Ancestor => "ancestor",
-            ChipRole::Current => "focused",
-            ChipRole::Child => match chip.edge {
-                Some(EdgeKind::Dispatch) => "child via live dispatch",
-                Some(EdgeKind::Team) => "child via team",
-                Some(EdgeKind::History) => "child via last job",
-                None => "child",
-            },
-        }
-        .to_string(),
-    );
-    if let Some(exec) = &chip.exec {
-        // `light` children run inside conductor and have no PTY of their own,
-        // so "no pane" is a property of the child, not a lookup failure.
-        parts.push(format!("exec {exec}"));
-    }
-    if let Some(tail) = &chip.job_tail {
-        parts.push(format!("job …{tail}"));
-    }
-    match &chip.tab_id {
-        Some(tab) => parts.push(format!("tab {tab}")),
-        None => parts.push("no pane in this instance".to_string()),
-    }
-    if let Some(task) = &chip.task {
-        parts.push(format!("task: {}", first_line(task, 60)));
-    }
-    if let Some(evidence) = &input.evidence {
-        parts.push(format!("via {evidence}"));
-    }
-    parts.join(" \u{00B7} ")
-}
-
-fn first_line(text: &str, max: usize) -> String {
-    let line = text.lines().next().unwrap_or("").trim();
-    let chars: Vec<char> = line.chars().collect();
-    if chars.len() <= max {
-        return line.to_string();
-    }
-    let mut out: String = chars[..max].iter().collect();
-    out.push('\u{2026}');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +263,7 @@ mod tests {
             job_tail: None,
             exec: None,
             runtime: Some("claude".into()),
+            finished: false,
         }
     }
 
@@ -475,36 +404,6 @@ mod tests {
         // Dormant states must not compete with live ones for the eye.
         assert_eq!(status_color(ChipStatus::Stopped), MUTED);
         assert_eq!(status_color(ChipStatus::Done), MUTED);
-    }
-
-    #[test]
-    fn detail_names_the_edge_and_never_contains_a_newline() {
-        let mut kid = chip("kid", ChipRole::Child, ChipStatus::Idle);
-        kid.edge = Some(EdgeKind::Team);
-        kid.task = Some("line one\nline two".into());
-        let input = bar(vec![
-            chip("main", ChipRole::Current, ChipStatus::Idle),
-            kid.clone(),
-        ]);
-        let text = detail(&input, &kid);
-        assert!(text.contains("child via team"), "{text}");
-        assert!(text.contains("line one"));
-        assert!(!text.contains("line two"), "only the first line survives");
-        // The host's toast is single-line and silently strips newlines, which
-        // is how a multi-field report becomes one unreadable run-on.
-        assert!(!text.contains('\n'), "{text}");
-    }
-
-    #[test]
-    fn detail_says_when_a_chip_has_no_pane_to_open() {
-        let mut light = chip("lightling", ChipRole::Child, ChipStatus::Done);
-        light.tab_id = None;
-        light.pane_id = None;
-        light.exec = Some("light".into());
-        let input = bar(vec![chip("main", ChipRole::Current, ChipStatus::Idle)]);
-        let text = detail(&input, &light);
-        assert!(text.contains("no pane in this instance"), "{text}");
-        assert!(text.contains("exec light"), "{text}");
     }
 
     #[test]

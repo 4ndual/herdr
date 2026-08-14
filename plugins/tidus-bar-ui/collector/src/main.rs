@@ -45,7 +45,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tidus_bar_model::{
     job_tail, BarInput, Chip, ChipRole, ChipStatus, EdgeKind, EmptyReason, MAX_ANCESTRY, SCHEMA,
@@ -142,6 +142,24 @@ fn string_at(value: &serde_json::Value, key: &str) -> Option<String> {
 
 // ── fleet model ────────────────────────────────────────────────────────────
 
+/// How long a FINISHED dispatch keeps its chip on the bar, greyed.
+///
+/// Ten minutes. The number is a human span, not a technical one: it answers
+/// "did anything run here while I was reading something else?", and the
+/// operator scenario that motivated it — a `codex-gp` dispatch that completes
+/// in about seven seconds with no team edge to fall back on — is invisible at
+/// any window shorter than the gap between two glances at the bar.
+///
+/// Measured from `last-result.json`'s own `t`, so this needs no state carried
+/// between ticks: the collector is a fresh process on every dash tick, and a
+/// sidecar file recording finish times would be one more thing to keep
+/// consistent, expire, and explain when it goes stale.
+///
+/// A TEAM edge is not subject to this. Team is a declared, persistent
+/// affiliation — those children stay on the bar whether or not they have run
+/// recently, which is the whole difference between the two edges.
+const DISPATCH_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// One harness as the collector sees it on disk.
 #[derive(Debug, Clone)]
 struct Node {
@@ -161,6 +179,11 @@ struct Node {
     dispatch_parent: Option<String>,
     /// Parent of the most recent finished job.
     history_parent: Option<String>,
+    /// When that job finished, from `last-result.json → t`. `None` when the
+    /// file has no parseable timestamp, which is treated as "too old to hold"
+    /// rather than "hold forever": an unreadable clock must not pin a chip to
+    /// the bar permanently.
+    history_at: Option<SystemTime>,
     live: bool,
     task: Option<String>,
     job_tail: Option<String>,
@@ -174,8 +197,6 @@ struct Node {
     /// Tab/pane as tidus recorded them; validated against this instance later.
     tab_id: Option<String>,
     pane_id: Option<String>,
-    /// Runtime session id, used to attribute profile panes.
-    session_id: Option<String>,
 }
 
 /// What herdr knows about the pane behind a harness's tab, keyed by tab id.
@@ -191,27 +212,53 @@ struct AgentPane {
 
 impl Node {
     /// The edge to `parent`, strongest first, or `None` if unrelated.
-    fn edge_to(&self, parent: &str) -> Option<EdgeKind> {
+    ///
+    /// `now` is threaded in rather than read here so the whole snapshot is
+    /// computed against ONE instant: a tick that read the clock per node could
+    /// expire one chip and keep its sibling from the same job.
+    fn edge_to(&self, parent: &str, now: SystemTime) -> Option<EdgeKind> {
         if self.dispatch_parent.as_deref() == Some(parent) {
             return Some(EdgeKind::Dispatch);
         }
         if self.team.as_deref() == Some(parent) {
             return Some(EdgeKind::Team);
         }
-        if self.history_parent.as_deref() == Some(parent) {
+        if self.history_parent.as_deref() == Some(parent) && self.within_grace(now) {
             return Some(EdgeKind::History);
         }
         None
     }
 
+    /// Whether the last finished job is recent enough to keep its chip.
+    ///
+    /// A missing or unparseable timestamp answers false — an unreadable clock
+    /// must not pin a chip to the bar forever, and the fleet has written `t` on
+    /// every result since this file existed.
+    fn within_grace(&self, now: SystemTime) -> bool {
+        let Some(at) = self.history_at else {
+            return false;
+        };
+        now.duration_since(at)
+            // A result stamped in the future is a clock skew, not an ancient
+            // job; treat it as fresh rather than expiring it instantly.
+            .map_or(true, |elapsed| elapsed <= DISPATCH_GRACE)
+    }
+
     /// The single parent used for walking UP the ancestor chain. A live
     /// dispatch is the truest "who is running me"; team is the durable
     /// fallback; history is last.
-    fn primary_parent(&self) -> Option<&str> {
+    fn primary_parent(&self, now: SystemTime) -> Option<&str> {
         self.dispatch_parent
             .as_deref()
             .or(self.team.as_deref())
-            .or(self.history_parent.as_deref())
+            .or_else(|| {
+                // Same grace as `edge_to`: an expired history edge must not keep
+                // walking the ancestor chain, or the bar would pin a lineage
+                // that the children band no longer shows.
+                self.within_grace(now)
+                    .then_some(self.history_parent.as_deref())
+                    .flatten()
+            })
     }
 }
 
@@ -244,7 +291,9 @@ fn load_fleet(root: &Path) -> Vec<Node> {
 
         let state = dir.join("state");
         let (dispatch_parent, live, task, job_tail_now) = read_dispatch(&state);
-        let (history_parent, last_event, last_task, job_tail_last) = read_last_result(&state);
+        let last = read_last_result(&state);
+        let (history_parent, last_event, last_task, job_tail_last, history_at) =
+            (last.parent, last.event, last.task, last.job_tail, last.at);
 
         nodes.push(Node {
             name: name.clone(),
@@ -255,6 +304,7 @@ fn load_fleet(root: &Path) -> Vec<Node> {
             team: string_at(&meta, "team"),
             dispatch_parent,
             history_parent,
+            history_at,
             live,
             task: task.or(last_task),
             job_tail: job_tail_now.or(job_tail_last),
@@ -263,7 +313,6 @@ fn load_fleet(root: &Path) -> Vec<Node> {
             fleet_status: fleet_status(&name, &state, profile),
             tab_id: read_trim(&state.join("herdr-tab")),
             pane_id: read_trim(&state.join("herdr-pane")),
-            session_id: read_trim(&state.join("session-id")),
         });
     }
     nodes
@@ -290,27 +339,102 @@ fn read_dispatch(state: &Path) -> (Option<String>, bool, Option<String>, Option<
     )
 }
 
-/// Most recent finished job → `(parent, event, task, job_tail)`.
-fn read_last_result(
-    state: &Path,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+/// The most recent finished job, as `last-result.json` records it.
+#[derive(Debug, Default, Clone)]
+struct LastResult {
+    parent: Option<String>,
+    event: Option<String>,
+    task: Option<String>,
+    job_tail: Option<String>,
+    /// When it finished. `None` means undatable, which the grace treats as too
+    /// old to hold rather than as "hold forever".
+    at: Option<SystemTime>,
+}
+
+/// Read the most recent finished job.
+fn read_last_result(state: &Path) -> LastResult {
     let Ok(raw) = std::fs::read(state.join("last-result.json")) else {
-        return (None, None, None, None);
+        return LastResult::default();
     };
     let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return (None, None, None, None);
+        return LastResult::default();
     };
-    (
-        string_at(&ev, "parent").filter(|p| p != CLI_PARENT),
-        string_at(&ev, "event"),
-        string_at(&ev, "task"),
-        string_at(&ev, "id").and_then(|id| job_tail(&id)),
-    )
+    // The file's own `t` is preferred over its mtime: mtime moves when anything
+    // touches the file, and a copy or a restore would silently renew every
+    // chip's grace. Falling back to mtime is still better than dropping the
+    // chip outright when `t` is missing or unparseable.
+    let finished_at = string_at(&ev, "t")
+        .and_then(|stamp| parse_rfc3339(&stamp))
+        .or_else(|| {
+            std::fs::metadata(state.join("last-result.json"))
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        });
+    LastResult {
+        parent: string_at(&ev, "parent").filter(|p| p != CLI_PARENT),
+        event: string_at(&ev, "event"),
+        task: string_at(&ev, "task"),
+        job_tail: string_at(&ev, "id").and_then(|id| job_tail(&id)),
+        at: finished_at,
+    }
+}
+
+/// Parse the fleet's timestamps (`2026-08-14T09:05:30-05:00`) into a
+/// `SystemTime`.
+///
+/// Hand-rolled rather than pulling `chrono` in: the collector ships in every
+/// herdr install, the fleet writes exactly one shape, and a date crate for one
+/// field is a dependency the plugin would carry forever. Anything that does not
+/// match that shape returns `None`, which the caller treats as "no grace".
+fn parse_rfc3339(stamp: &str) -> Option<SystemTime> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num =
+        |range: std::ops::Range<usize>| -> Option<i64> { stamp.get(range)?.parse::<i64>().ok() };
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, minute, second) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    // Days from the civil epoch — Howard Hinnant's days_from_civil, which is
+    // exact for every proleptic Gregorian date and avoids a calendar table.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let mut epoch = days * 86_400 + hour * 3_600 + minute * 60 + second;
+
+    // Offset. `Z` (or an absent offset) is already UTC; otherwise subtract the
+    // stated offset to get there. The fleet writes local time with an offset,
+    // so ignoring this would mis-date every chip by the timezone.
+    let rest = &stamp[19..];
+    let rest = rest.strip_prefix(|c| c == '.').map_or(rest, |frac| {
+        // Drop fractional seconds if present.
+        let end = frac
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(frac.len());
+        &frac[end..]
+    });
+    if let Some(sign) = rest.chars().next() {
+        if sign == '+' || sign == '-' {
+            let oh: i64 = rest.get(1..3)?.parse().ok()?;
+            let om: i64 = rest.get(4..6).unwrap_or("0").parse().unwrap_or(0);
+            let offset = oh * 3_600 + om * 60;
+            epoch += if sign == '+' { -offset } else { offset };
+        }
+    }
+
+    if epoch < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(epoch as u64))
 }
 
 /// Mirror of `statusOf` (go/lifecycle.go:30). Kept in lock-step deliberately:
@@ -394,6 +518,8 @@ fn resolve(focus: &Focus) -> BarInput {
     input.focus_harness = Some(focus_name.clone());
     input.evidence = Some(evidence);
 
+    // One instant for the whole snapshot: see `Node::edge_to`.
+    let now = SystemTime::now();
     let by_name: HashMap<&str, &Node> = nodes.iter().map(|n| (n.name.as_str(), n)).collect();
 
     // Ancestors: walk up the spawn edges, root-most first. Cycle-guarded — a
@@ -402,7 +528,7 @@ fn resolve(focus: &Focus) -> BarInput {
     let mut seen: Vec<&str> = vec![focus_name.as_str()];
     let mut cursor = by_name.get(focus_name.as_str()).copied();
     while let Some(node) = cursor {
-        let Some(parent_name) = node.primary_parent() else {
+        let Some(parent_name) = node.primary_parent(now) else {
             break;
         };
         if seen.contains(&parent_name) || ancestry.len() >= MAX_ANCESTRY {
@@ -426,7 +552,7 @@ fn resolve(focus: &Focus) -> BarInput {
         // has no managed process and nobody spawns it, so it can be an
         // orchestrator but never a child.
         .filter(|n| !n.profile)
-        .filter_map(|n| n.edge_to(&focus_name).map(|edge| (n, edge)))
+        .filter_map(|n| n.edge_to(&focus_name, now).map(|edge| (n, edge)))
         .collect();
     // Live work first, then declared members, then history; alphabetical inside
     // each band so the bar does not reshuffle under the cursor every tick.
@@ -467,19 +593,54 @@ fn resolve(focus: &Focus) -> BarInput {
         ));
     }
     for (node, edge) in children {
-        chips.push(chip_for(
+        let chip = chip_for(
             node,
             ChipRole::Child,
             Some(edge),
             &live_tabs,
             &tab_by_workspace,
             &agent_status,
-        ));
+        );
+        if chip_is_worth_a_slot(&chip, edge) {
+            chips.push(chip);
+        }
     }
 
     input.empty_reason = None;
     input.chips = chips;
     input
+}
+
+/// Whether a child has earned a slot on the bar.
+///
+/// The row is a live picture of what is happening around the orchestrator, not
+/// a roster of everything affiliated with it. A fleet accumulates team members
+/// — one operator's bar showed seven (`codex1`, `conductor`, `docs-writer`,
+/// `jcode1`, `pi1`, `security-reviewer`, `test`) none of which had a pane open,
+/// so the bar was mostly a list of things that were not there, and the chips
+/// that mattered had to be found among them.
+///
+/// A chip renders when at least one of these is true:
+///
+///   * it has an open pane/tab IN THIS herdr session — something to navigate to;
+///   * a dispatch is in flight — it is working right now, and a `light` child
+///     running inside conductor has no pane of its own but is still live;
+///   * it is inside the finished-dispatch retention grace (`DISPATCH_GRACE`) —
+///     it ran recently enough to be worth reporting.
+///
+/// Mere team membership with no pane renders nothing. The pinned orchestrator
+/// and its ancestors are not subject to this: "where am I" must always answer.
+fn chip_is_worth_a_slot(chip: &Chip, edge: EdgeKind) -> bool {
+    if chip.tab_id.is_some() {
+        return true;
+    }
+    match edge {
+        // In flight, or recently finished — both are events, and an event with
+        // no pane is exactly what a `light` child looks like.
+        EdgeKind::Dispatch | EdgeKind::History => true,
+        // Affiliation alone, with nothing open: not news.
+        EdgeKind::Team => false,
+    }
 }
 
 fn edge_rank(edge: EdgeKind) -> u8 {
@@ -540,6 +701,11 @@ fn chip_for(
         // Nothing is hidden until the host's create-hidden work lands; the
         // field exists now so phase 2 is a collector change, not a protocol one.
         hidden: false,
+        // Greyed on the bar: the job is over, the chip is being held through
+        // its grace so a seven-second dispatch is still visible afterwards.
+        // A team child is never `finished` — its edge is an affiliation, not a
+        // job, so it has nothing to have finished.
+        finished: edge == Some(EdgeKind::History),
         task: node.task.clone(),
         job_tail: node.job_tail.clone(),
         exec: node.exec.clone(),
@@ -592,11 +758,7 @@ fn status_for(node: &Node, pane_status: Option<&str>) -> ChipStatus {
 /// Attribute the focused pane to a harness or profile. Returns the name and a
 /// short description of the evidence, which the toast shows so a wrong answer
 /// can be argued with rather than merely disbelieved.
-fn attribute(
-    focus: &Focus,
-    nodes: &[Node],
-    api: Option<&ApiClient>,
-) -> Option<(String, String)> {
+fn attribute(focus: &Focus, nodes: &[Node], api: Option<&ApiClient>) -> Option<(String, String)> {
     let pane_id = focus.pane_id.as_deref()?;
 
     if let Some(api) = api {
@@ -637,15 +799,39 @@ fn attribute(
         }
     }
 
-    // 3. A profile records its session id via the SessionStart hook, so the
-    //    focused pane's session ref identifies it even though a profile has no
-    //    HARNESS_NAME and may share a config dir with the default root.
+    // 3. Resolve a PROFILE from the focused pane's own session, by asking
+    //    whether that session's transcript lives under the profile's config
+    //    dir.
+    //
+    //    This is per-pane on purpose. The obvious check — comparing the focused
+    //    session against `<profile>/state/session-id` — is last-writer-wins
+    //    across every concurrent session of that profile, and a profile is
+    //    precisely the fleet member that has many at once: it is the human's
+    //    own config root (`~/.claude`), and every agent pane the operator opens
+    //    on it rewrites that one file. Measured during this fix: three live
+    //    sessions under `~/.claude`, the file naming exactly one of them (and
+    //    not the operator's), so the operator's own orchestrator pane attributed
+    //    to nothing and the bar declared it `not_tidus`. `state/herdr-tab` is
+    //    stale for the same reason.
+    //
+    //    The fleet already resolves it correctly and this mirrors it:
+    //    `profileAgent` (go/tidus.go) walks the herdr agent registry and keeps
+    //    the agent whose `agent_session.value` has a transcript under the
+    //    profile, via `findSession`. Here the focused pane IS the agent, so the
+    //    same question is asked of one session instead of all of them.
+    //
+    //    Consequence, and the point of the fix: EVERY live session of a profile
+    //    resolves to that profile, so each is its own orchestrator root. Two
+    //    operator panes on `~/.claude` are two roots, not one root and one
+    //    orphan.
     if let Some(session) = focus.session_ref.as_deref() {
-        if let Some(node) = nodes
-            .iter()
-            .find(|n| n.session_id.as_deref() == Some(session))
-        {
-            return Some((node.name.clone(), "state/session-id".to_string()));
+        for node in nodes.iter().filter(|n| n.profile) {
+            let Some(dir) = node.config_dir.as_deref() else {
+                continue;
+            };
+            if profile_owns_session(dir, session) {
+                return Some((node.name.clone(), format!("{}'s transcript", node.name)));
+            }
         }
     }
 
@@ -655,6 +841,74 @@ fn attribute(
         return Some((node.name.clone(), "state/herdr-pane".to_string()));
     }
     None
+}
+
+/// Whether `session` has a transcript under this config dir.
+///
+/// Mirrors the fleet's `findSession`, but shaped for a per-tick collector:
+/// `findSession` walks the whole `projects` tree, while this stats one candidate
+/// path per project directory. Measured on the operator's root — 10 project
+/// dirs — at ~16 ms for the walk, so the cheaper shape is a margin rather than
+/// a necessity, and it stays a margin as the tree grows.
+///
+/// Both on-disk layouts are checked because a profile may point at either
+/// runtime's root:
+///
+///   claude: `<config>/projects/<encoded-cwd>/<session>.jsonl`
+///   codex:  `<config>/sessions/<yyyy>/<mm>/<dd>/rollout-<ts>-<session>.jsonl`
+///
+/// pi and jcode are deliberately absent: pi is not config-isolated by env and
+/// has no id-addressable session list, so there is nothing here to match. A
+/// profile on one of those falls through to the later mechanisms rather than
+/// being answered wrongly.
+fn profile_owns_session(config_dir: &Path, session: &str) -> bool {
+    // A session ref that is itself a path (pi) is not a claude/codex id; the
+    // component check keeps such a value from being pasted into a path.
+    if session.is_empty() || session.contains('/') || session.contains("..") {
+        return false;
+    }
+
+    let projects = config_dir.join("projects");
+    if let Ok(entries) = std::fs::read_dir(&projects) {
+        let needle = format!("{session}.jsonl");
+        for entry in entries.flatten() {
+            if entry.path().join(&needle).exists() {
+                return true;
+            }
+        }
+    }
+
+    // codex: the id is the filename's trailing uuid, so the date directories
+    // have to be walked. Bounded by the layout (year/month/day), not by the
+    // number of sessions.
+    let sessions = config_dir.join("sessions");
+    let Ok(years) = std::fs::read_dir(&sessions) else {
+        return false;
+    };
+    for year in years.flatten() {
+        let Ok(months) = std::fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months.flatten() {
+            let Ok(days) = std::fs::read_dir(month.path()) else {
+                continue;
+            };
+            for day in days.flatten() {
+                let Ok(files) = std::fs::read_dir(day.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let name = file.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if name.starts_with("rollout-") && name.ends_with(&format!("-{session}.jsonl"))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn read_proc_env(pid: i64) -> HashMap<String, String> {
@@ -750,7 +1004,7 @@ impl ApiClient {
             let (Some(cwd), Some(tab)) = (string_at(pane, "cwd"), string_at(pane, "tab_id")) else {
                 continue;
             };
-            if !live_tabs.iter().any(|t| *t == tab) {
+            if !live_tabs.contains(&tab) {
                 continue;
             }
             if let Ok(dir) = std::fs::canonicalize(&cwd) {
@@ -896,6 +1150,9 @@ mod tests {
             team: None,
             dispatch_parent: None,
             history_parent: None,
+            // Fresh by default so edge tests exercise edge PRECEDENCE without
+            // every one of them also having to opt into the grace window.
+            history_at: Some(SystemTime::now()),
             live: false,
             task: None,
             job_tail: None,
@@ -904,7 +1161,6 @@ mod tests {
             fleet_status: ChipStatus::Stopped,
             tab_id: None,
             pane_id: None,
-            session_id: None,
         }
     }
 
@@ -917,22 +1173,282 @@ mod tests {
 
     #[test]
     fn dispatch_beats_team_beats_history() {
+        let now = SystemTime::now();
         let mut n = node("kid");
         n.history_parent = Some("old".into());
-        assert_eq!(n.edge_to("old"), Some(EdgeKind::History));
-        assert_eq!(n.primary_parent(), Some("old"));
+        assert_eq!(n.edge_to("old", now), Some(EdgeKind::History));
+        assert_eq!(n.primary_parent(now), Some("old"));
 
         n.team = Some("boss".into());
-        assert_eq!(n.edge_to("boss"), Some(EdgeKind::Team));
-        assert_eq!(n.primary_parent(), Some("boss"));
+        assert_eq!(n.edge_to("boss", now), Some(EdgeKind::Team));
+        assert_eq!(n.primary_parent(now), Some("boss"));
 
         n.dispatch_parent = Some("now".into());
-        assert_eq!(n.edge_to("now"), Some(EdgeKind::Dispatch));
-        assert_eq!(n.primary_parent(), Some("now"));
+        assert_eq!(n.edge_to("now", now), Some(EdgeKind::Dispatch));
+        assert_eq!(n.primary_parent(now), Some("now"));
         // The weaker edges still resolve for their own parents — a child can be
         // on one parent's bar by team while serving a dispatch from another.
-        assert_eq!(n.edge_to("boss"), Some(EdgeKind::Team));
-        assert_eq!(n.edge_to("stranger"), None);
+        assert_eq!(n.edge_to("boss", now), Some(EdgeKind::Team));
+        assert_eq!(n.edge_to("stranger", now), None);
+    }
+
+    // ── #51: per-pane profile resolution ────────────────────────────────────
+
+    /// Build a profile whose config dir holds transcripts for `sessions`.
+    fn profile_with_sessions(tag: &str, sessions: &[&str]) -> (Node, PathBuf) {
+        let dir = tempdir(tag);
+        let projects = dir.join("projects").join("-home-andual-Projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        for session in sessions {
+            std::fs::write(projects.join(format!("{session}.jsonl")), b"{}").unwrap();
+        }
+        let mut node = node("main");
+        node.profile = true;
+        node.config_dir = Some(dir.clone());
+        (node, dir)
+    }
+
+    /// EVERY live session of a profile is its own orchestrator root.
+    ///
+    /// The bug this pins: profile attribution used to compare the focused
+    /// session against the single `<profile>/state/session-id` file, which is
+    /// last-writer-wins across every concurrent session of that profile. A
+    /// profile IS the fleet member with many at once — it is the human's own
+    /// config root — so the operator's orchestrator pane attributed to nothing
+    /// and the bar declared it `not_tidus`. Reproduced live: three sessions
+    /// under `~/.claude`, the file naming one of them, and not the operator's.
+    #[test]
+    fn every_concurrent_session_of_a_profile_resolves_to_it() {
+        let operator = "e26394d9-3bc6-4a23-b69f-814d3c27214b";
+        let other = "a22b6837-411e-4597-8156-22434bd4652a";
+        let third = "ec160211-1b5e-4902-9f54-617e160081f6";
+        let (node, _dir) = profile_with_sessions("profile-concurrent", &[operator, other, third]);
+        let nodes = vec![node];
+
+        for session in [operator, other, third] {
+            let focus = Focus {
+                pane_id: Some("w1:p1".into()),
+                session_ref: Some(session.to_string()),
+                is_self_focus: false,
+            };
+            let resolved = attribute(&focus, &nodes, None);
+            assert_eq!(
+                resolved.as_ref().map(|(name, _)| name.as_str()),
+                Some("main"),
+                "session {session} must resolve to the profile that owns its transcript"
+            );
+        }
+    }
+
+    /// A session with no transcript under the profile is not that profile.
+    /// Without this the fix would attribute every pane in the instance to the
+    /// first profile it found.
+    #[test]
+    fn a_foreign_session_does_not_resolve_to_the_profile() {
+        let (node, _dir) =
+            profile_with_sessions("profile-foreign", &["aaaaaaaa-0000-0000-0000-000000000000"]);
+        let focus = Focus {
+            pane_id: Some("w1:p1".into()),
+            session_ref: Some("bbbbbbbb-1111-1111-1111-111111111111".into()),
+            is_self_focus: false,
+        };
+        assert!(attribute(&focus, &[node], None).is_none());
+    }
+
+    /// The stale `state/session-id` file must have no say at all.
+    ///
+    /// It is left holding another pane's session on purpose: if the old
+    /// mechanism were still consulted, this focus would resolve through it.
+    #[test]
+    fn the_single_session_id_file_is_no_longer_consulted() {
+        let operator = "e26394d9-3bc6-4a23-b69f-814d3c27214b";
+        let (node, dir) = profile_with_sessions("profile-stale", &[operator]);
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(
+            dir.join("state").join("session-id"),
+            b"a22b6837-411e-4597-8156-22434bd4652a\n",
+        )
+        .unwrap();
+
+        // The pane whose session the file names has NO transcript here, so the
+        // only way it could resolve is through the file.
+        let focus = Focus {
+            pane_id: Some("w1:p1".into()),
+            session_ref: Some("a22b6837-411e-4597-8156-22434bd4652a".into()),
+            is_self_focus: false,
+        };
+        assert!(
+            attribute(&focus, &[node], None).is_none(),
+            "the stale file must not attribute a pane whose transcript is elsewhere"
+        );
+    }
+
+    /// codex profiles keep their rollout layout.
+    #[test]
+    fn a_codex_rollout_resolves_the_profile() {
+        let dir = tempdir("profile-codex");
+        let day = dir.join("sessions").join("2026").join("08").join("13");
+        std::fs::create_dir_all(&day).unwrap();
+        let session = "019ffb15-1111-2222-3333-444455556666";
+        std::fs::write(
+            day.join(format!("rollout-2026-08-13T07-25-44-{session}.jsonl")),
+            b"{}",
+        )
+        .unwrap();
+        assert!(profile_owns_session(&dir, session));
+        assert!(!profile_owns_session(
+            &dir,
+            "019ffb15-0000-0000-0000-000000000000"
+        ));
+    }
+
+    /// A pi session ref is a PATH, not an id. Pasting it into a path join would
+    /// escape the config dir, so it is refused before any filesystem call.
+    #[test]
+    fn a_path_shaped_session_ref_is_refused() {
+        let dir = tempdir("profile-path");
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        assert!(!profile_owns_session(
+            &dir,
+            "/home/andual/.pi/agent/sessions/x.jsonl"
+        ));
+        assert!(!profile_owns_session(&dir, "../../etc/passwd"));
+        assert!(!profile_owns_session(&dir, ""));
+    }
+
+    // ── #51: dispatch retention grace ───────────────────────────────────────
+
+    /// A finished dispatch keeps its chip through the grace window, then drops.
+    ///
+    /// The operator scenario: a `codex-gp` dispatch answers in about seven
+    /// seconds with no team edge to fall back on, so without a grace the chip
+    /// appears and vanishes between two glances and the bar reports that
+    /// nothing happened at exactly the moment something did.
+    #[test]
+    fn a_finished_dispatch_is_held_for_the_grace_window() {
+        let now = SystemTime::now();
+        let mut child = node("codex-gp");
+        child.history_parent = Some("main".into());
+
+        child.history_at = Some(now - Duration::from_secs(7));
+        assert_eq!(
+            child.edge_to("main", now),
+            Some(EdgeKind::History),
+            "a job that just finished is still on the bar"
+        );
+
+        child.history_at = Some(now - DISPATCH_GRACE + Duration::from_secs(30));
+        assert_eq!(
+            child.edge_to("main", now),
+            Some(EdgeKind::History),
+            "and stays until the window is actually up"
+        );
+
+        child.history_at = Some(now - DISPATCH_GRACE - Duration::from_secs(1));
+        assert_eq!(
+            child.edge_to("main", now),
+            None,
+            "past the window it drops off"
+        );
+    }
+
+    /// A TEAM child is not subject to the grace: team is a declared, persistent
+    /// affiliation rather than a job, so it has nothing to have finished.
+    #[test]
+    fn a_team_child_outlives_the_grace_window() {
+        let now = SystemTime::now();
+        let mut child = node("member");
+        child.team = Some("main".into());
+        child.history_parent = Some("main".into());
+        child.history_at = Some(now - DISPATCH_GRACE - Duration::from_secs(3600));
+
+        assert_eq!(
+            child.edge_to("main", now),
+            Some(EdgeKind::Team),
+            "team keeps the chip long after any job of its own expired"
+        );
+        assert_eq!(child.primary_parent(now), Some("main"));
+    }
+
+    /// An undatable result must not pin a chip to the bar forever.
+    #[test]
+    fn a_result_with_no_timestamp_is_not_held() {
+        let now = SystemTime::now();
+        let mut child = node("codex-gp");
+        child.history_parent = Some("main".into());
+        child.history_at = None;
+        assert_eq!(child.edge_to("main", now), None);
+        assert_eq!(child.primary_parent(now), None);
+    }
+
+    /// A result stamped in the future is clock skew, not an ancient job.
+    #[test]
+    fn a_future_timestamp_counts_as_fresh() {
+        let now = SystemTime::now();
+        let mut child = node("codex-gp");
+        child.history_parent = Some("main".into());
+        child.history_at = Some(now + Duration::from_secs(600));
+        assert_eq!(child.edge_to("main", now), Some(EdgeKind::History));
+    }
+
+    #[test]
+    fn rfc3339_parsing_matches_the_fleets_stamps() {
+        // The exact shape last-result.json writes, with a negative offset.
+        let parsed = parse_rfc3339("2026-08-14T09:05:30-05:00").expect("parses");
+        let epoch = parsed.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // 2026-08-14T14:05:30Z, cross-checked against `date -u -d` rather than
+        // computed by hand — the first version of this constant was a day out,
+        // and a wrong expectation here would have been read as a parser bug.
+        assert_eq!(epoch, 1_786_716_330);
+
+        // Z and a positive offset land where they should relative to it.
+        let utc = parse_rfc3339("2026-08-14T14:05:30Z").expect("parses");
+        assert_eq!(utc.duration_since(UNIX_EPOCH).unwrap().as_secs(), epoch);
+        let plus = parse_rfc3339("2026-08-14T16:05:30+02:00").expect("parses");
+        assert_eq!(plus.duration_since(UNIX_EPOCH).unwrap().as_secs(), epoch);
+
+        for bad in ["", "nonsense", "2026-13-01T00:00:00Z", "2026-08-14"] {
+            assert!(parse_rfc3339(bad).is_none(), "{bad:?} must not parse");
+        }
+    }
+
+    // ── #51: a chip must earn its slot ──────────────────────────────────────
+
+    fn slot_chip(tab: Option<&str>) -> Chip {
+        Chip {
+            name: "member".into(),
+            role: ChipRole::Child,
+            status: ChipStatus::Idle,
+            edge: None,
+            tab_id: tab.map(str::to_string),
+            pane_id: None,
+            hidden: false,
+            finished: false,
+            task: None,
+            job_tail: None,
+            exec: None,
+            runtime: Some("claude".into()),
+        }
+    }
+
+    /// Team membership alone does not render. One operator bar carried seven
+    /// such chips — none with a pane open — so the row was mostly a list of
+    /// things that were not there.
+    #[test]
+    fn a_team_member_with_no_pane_gets_no_slot() {
+        assert!(!chip_is_worth_a_slot(&slot_chip(None), EdgeKind::Team));
+        assert!(
+            chip_is_worth_a_slot(&slot_chip(Some("w1:t9")), EdgeKind::Team),
+            "the same member WITH a pane open is worth showing"
+        );
+    }
+
+    /// A live dispatch and a recently finished one always render, pane or not:
+    /// a `light` child runs inside conductor and never has a pane of its own.
+    #[test]
+    fn an_event_earns_a_slot_without_a_pane() {
+        assert!(chip_is_worth_a_slot(&slot_chip(None), EdgeKind::Dispatch));
+        assert!(chip_is_worth_a_slot(&slot_chip(None), EdgeKind::History));
     }
 
     #[test]
@@ -968,11 +1484,17 @@ mod tests {
             br#"{"id":"main-1786360945768895251","parent":"boss","event":"failed","task":"t"}"#,
         )
         .unwrap();
-        let (parent, event, task, tail) = read_last_result(&dir);
-        assert_eq!(parent.as_deref(), Some("boss"));
-        assert_eq!(event.as_deref(), Some("failed"));
-        assert_eq!(task.as_deref(), Some("t"));
-        assert_eq!(tail.as_deref(), Some("895251"));
+        let last = read_last_result(&dir);
+        assert_eq!(last.parent.as_deref(), Some("boss"));
+        assert_eq!(last.event.as_deref(), Some("failed"));
+        assert_eq!(last.task.as_deref(), Some("t"));
+        assert_eq!(last.job_tail.as_deref(), Some("895251"));
+        // No `t` in this fixture, so the mtime fallback answers — the point is
+        // that SOMETHING dates the result, or the chip could never be held.
+        assert!(
+            last.at.is_some(),
+            "a result with no t must still be datable"
+        );
     }
 
     #[test]

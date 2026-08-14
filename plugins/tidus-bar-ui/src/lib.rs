@@ -48,14 +48,24 @@ static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// declared hit-rects, so a bar that wants hover must declare none and do its
 /// own arithmetic — the button-dash / archive-dash model.
 static ROW_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
-/// Index of the hovered chip, plus the NAME it had when the cursor landed on
-/// it. The name is what makes the hover safe across a changing bar: the index
-/// alone survives a snapshot in which it now addresses a different agent — or
-/// no agent at all — and the row would keep showing a detail line for something
-/// that is no longer there. An independent video gate caught exactly that: with
-/// a plain shell focused, a parked cursor kept the bar reading
-/// `tb-root [idle] · claude · focused …` on a pane that has no harness.
-static HOVERED: Mutex<Option<(usize, String)>> = Mutex::new(None);
+// The bar is HOVER-INERT. There is deliberately no hover state here.
+//
+// It used to swap the whole row for a detail line about the chip under the
+// cursor. Three things were wrong with that, and they compound:
+//
+//   * the row is navigation-dense — chips sit shoulder to shoulder, so moving
+//     the mouse ACROSS the bar to reach one rewrote the row under the cursor
+//     several times on the way;
+//   * the swap changed the row's WIDTH, so the host re-carved the slot and the
+//     chips moved while being aimed at;
+//   * a parked cursor kept a stale detail line on screen after the bar changed
+//     beneath it — no Move event is coming to correct a cursor that has not
+//     moved, which cost an independent video gate two failures.
+//
+// The summary row now renders statically and hover changes nothing. Detail is
+// not lost: a chip's own text carries its status dot, and left-click still
+// navigates to the agent itself, which is the answer the detail line was
+// standing in for.
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -174,25 +184,7 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
             Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
         };
 
-    // Drop a hover that no longer describes what is under the cursor. The
-    // cursor has not moved, so there is no Move event coming to correct it —
-    // the frame that changed the bar is the only chance to notice.
-    forget_stale_hover(&input);
-
     render_from(&input)
-}
-
-/// Clear the hover when the chip it named is gone or has been replaced at that
-/// index by a different agent.
-fn forget_stale_hover(input: &BarInput) {
-    let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
-    let stale = match hovered.as_ref() {
-        Some((index, name)) => input.chips.get(*index).map(|c| &c.name) != Some(name),
-        None => false,
-    };
-    if stale {
-        *hovered = None;
-    }
 }
 
 /// Say "I have nothing to show" in the one way the host understands.
@@ -220,34 +212,23 @@ fn clear_bar() -> UiUpdate {
     }
 }
 
-/// Build the layer for `input` in its current hover state — shared by the frame
-/// path and the mouse path so a hover repaint is the same rendering as a frame
-/// repaint, not a second copy of it.
+/// Build the layer for `input`. One rendering, used by the frame path and by
+/// the click path, so what a click lands on is by construction what was drawn.
 fn render_from(input: &BarInput) -> UiUpdate {
-    let hovered = HOVERED
-        .lock()
-        .expect("hover mutex poisoned")
-        .as_ref()
-        .map(|(index, _)| *index);
-    let width = match hovered {
-        Some(index) => render::hovered_width(input, index).max(render::content_width(input)),
-        None => render::content_width(input),
-    };
+    let width = render::content_width(input);
     if width == 0 {
         return clear_bar();
     }
     let content = Rect::new(0, 0, width, 1);
     let mut buf = Buffer::empty(content);
-    match hovered {
-        Some(index) => render::render_hovered(input, index, content, &mut buf),
-        None => render::render(input, content, &mut buf),
-    }
+    render::render(input, content, &mut buf);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
-    // NO declarative hit-rects: the host suppresses raw `Move` over a module's
-    // own rects (the F5 click-dedupe), and hover is the canon trigger for
-    // detail. Clicks are resolved from the same layout the row was drawn from,
-    // so the cell that was clicked is by construction the cell that was drawn.
+    // NO declarative hit-rects. Clicks are resolved from the same layout the
+    // row was drawn from, so the cell that was clicked is by construction the
+    // cell that was drawn. (The rects were originally omitted so raw `Move`
+    // would reach the guest for hover; hover is gone, and resolving clicks from
+    // the layout is worth keeping on its own — one geometry, not two.)
     let hits: Vec<UiHitRect> = Vec::new();
 
     UiUpdate {
@@ -295,22 +276,10 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     let hit = chip_at(&input, mouse.column, mouse.row);
 
     if !matches!(mouse.kind, MouseEventKind::LeftDown) {
-        // Move (and everything else): update hover, repaint only on a change —
-        // a bar that re-rendered on every mouse motion would repaint the bottom
-        // row continuously while the user works.
-        let next = hit.and_then(|index| {
-            input
-                .chips
-                .get(index)
-                .map(|chip| (index, chip.name.clone()))
-        });
-        let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
-        if *hovered == next {
-            return UiUpdate::default();
-        }
-        *hovered = next;
-        drop(hovered);
-        return render_from(&input);
+        // Move, right-click, wheel: nothing. The bar is hover-inert, so the
+        // mouse crossing it must not repaint the row, must not change its
+        // width, and must not move the chips the user is aiming at.
+        return UiUpdate::default();
     }
 
     let Some(index) = hit else {
@@ -370,10 +339,7 @@ mod tests {
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Hover and the remembered row rect are process-global: a test that
-        // left a chip hovered would hand the next one the detail row instead
-        // of the summary.
-        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        // The remembered row rect is process-global.
         *ROW_RECT.lock().expect("row rect mutex poisoned") = None;
         *LAST_INPUT.lock().expect("input mutex poisoned") = None;
         guard
@@ -392,12 +358,12 @@ mod tests {
             job_tail: None,
             exec: None,
             runtime: Some("claude".into()),
+            finished: false,
         }
     }
 
     fn seed(input: BarInput) {
         *LAST_INPUT.lock().expect("input mutex poisoned") = Some(input);
-        *HOVERED.lock().expect("hover mutex poisoned") = None;
         // The row as the host would carve it: origin (0, 0), 200 columns.
         *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((0, 0, 200));
     }
@@ -572,26 +538,28 @@ mod tests {
 
     /// Canon §2: hovering a chip reveals that chip's detail in place, and
     /// leaving the row restores the summary. No toast is involved.
+    /// The bar is hover-inert: crossing it changes nothing.
+    ///
+    /// The row is navigation-dense, so a hover that rewrote it also changed its
+    /// width, re-carved the host slot, and moved the chips the user was aiming
+    /// at — while a parked cursor kept describing a bar that had since changed
+    /// underneath it.
     #[test]
-    fn hovering_a_chip_shows_its_detail_in_place() {
+    fn hovering_a_chip_changes_nothing() {
         let _guard = test_guard();
         seed(sample());
         let summary = text_of(&render_from(&sample()));
-        let hovered = click_chip(2, MouseEventKind::Move);
-        let hovered_text = text_of(&hovered);
-        assert!(hovered.effects.is_empty(), "detail is drawn, never toasted");
-        assert_ne!(hovered_text, summary, "hover must change the row");
-        assert!(
-            hovered_text.contains("kid"),
-            "the hovered chip's own detail must be shown: {hovered_text}"
-        );
-        // Leaving the row restores the summary.
-        let left = handle_mouse(&MouseEvent {
-            kind: MouseEventKind::Move,
-            column: 199,
-            row: 0,
-        });
-        assert_eq!(text_of(&left), summary);
+
+        for index in 0..3 {
+            let moved = click_chip(index, MouseEventKind::Move);
+            assert!(
+                moved.layers.is_empty() && moved.effects.is_empty(),
+                "a move over chip {index} must produce no update at all"
+            );
+        }
+
+        // And the row itself is unchanged after all that crossing.
+        assert_eq!(text_of(&render_from(&sample())), summary);
     }
 
     /// Canon §10: the edges of a chip are as clickable as its middle.
@@ -725,51 +693,65 @@ mod tests {
         assert!(!layer.nodes.is_empty(), "and stays drawn");
     }
 
+    /// A cursor parked on the bar must not keep a stale row on screen when the
+    /// bar changes underneath it.
+    ///
+    /// This was the hover pattern's sharpest failure — no Move event is coming
+    /// to correct a cursor that has not moved, so the guest kept describing an
+    /// agent that was no longer there, and an independent video gate caught the
+    /// bar reading "tb-root [idle] · claude · focused" over a plain shell.
+    /// Being hover-inert removes the failure at the source: there is no
+    /// cursor-dependent state left to go stale.
     #[test]
-    fn a_parked_cursor_stops_describing_a_bar_that_changed_under_it() {
+    fn a_parked_cursor_cannot_describe_a_bar_that_changed_under_it() {
         let _guard = test_guard();
         seed(sample());
-        // Cursor lands on the pinned tb-root chip.
-        let update = click_chip(0, MouseEventKind::Move);
-        assert!(!update.layers.is_empty(), "hover paints the detail row");
-        assert!(HOVERED.lock().expect("hover").is_some());
+        let _ = click_chip(0, MouseEventKind::Move);
 
         // Focus moves to a pane with no harness: the bar has nothing to show.
-        // The cursor has not moved, so only this frame can notice — an
-        // independent video gate caught the bar still reading
-        // "tb-root [idle] · claude · focused" over a plain shell.
         let update = handle_event(&frame_event(&BarInput::default(), Rect::new(0, 0, 80, 1)));
-        assert!(
-            HOVERED.lock().expect("hover").is_none(),
-            "a hover that names a chip which is gone must be dropped"
-        );
-        assert!(update.layers.is_empty(), "and the band goes neutral");
+        assert!(update.layers.is_empty(), "the band goes neutral");
         assert_eq!(
             update.scope,
             herdr_ui_plugin_api::UiUpdateScope::Full,
             "an empty PARTIAL update names no surface and so clears nothing"
         );
+
+        // The cursor has not moved. A move event at the same cell still says
+        // nothing, and in particular does not resurrect a row for the vanished
+        // lineage. Sent raw rather than through `click_chip`, which needs a
+        // drawn row to aim at and there is deliberately no longer one.
+        let after = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Move,
+            column: 2,
+            row: 0,
+        });
+        assert!(after.layers.is_empty(), "no layer comes back from a hover");
     }
 
+    /// Index 0 naming a different agent used to be a hover-invalidation
+    /// problem. With no hover there is nothing to invalidate — the frame simply
+    /// draws whoever is there now.
     #[test]
-    fn hover_is_dropped_when_the_index_now_names_a_different_agent() {
+    fn a_changed_lineage_is_simply_redrawn() {
         let _guard = test_guard();
         seed(sample());
-        click_chip(0, MouseEventKind::Move);
-        let before = HOVERED.lock().expect("hover").clone();
-        assert!(before.is_some());
+        let _ = click_chip(0, MouseEventKind::Move);
 
-        // Same shape, different lineage: index 0 is someone else now.
         let mut other = sample();
         other.chips[0].name = "other-root".into();
-        handle_event(&frame_event(&other, Rect::new(0, 0, 80, 1)));
+        let update = handle_event(&frame_event(&other, Rect::new(0, 0, 80, 1)));
+        let text = text_of(&update);
         assert!(
-            HOVERED.lock().expect("hover").is_none(),
-            "the detail row must not silently describe a different agent"
+            text.contains("other-root"),
+            "the new lineage is drawn: {text}"
+        );
+        assert!(
+            !text.contains("tb-root"),
+            "and the previous one is gone: {text}"
         );
     }
 
-    #[test]
     /// The bar with nothing to show must CLEAR the surface, not merely decline
     /// to redraw it.
     ///
@@ -784,7 +766,10 @@ mod tests {
         let _guard = test_guard();
         // Paint a real bar first, so there IS something to leave behind.
         let painted = handle_event(&frame_event(&sample(), Rect::new(0, 30, 120, 1)));
-        assert!(!painted.layers.is_empty(), "precondition: a row was painted");
+        assert!(
+            !painted.layers.is_empty(),
+            "precondition: a row was painted"
+        );
 
         let update = handle_event(&frame_event(&BarInput::default(), Rect::new(0, 30, 120, 1)));
         assert!(update.layers.is_empty(), "nothing to draw");
@@ -798,20 +783,26 @@ mod tests {
     /// The inverse: a no-op event must NOT clear the bar. If "no change" and
     /// "nothing to show" both cleared, a mouse move that changes no hover would
     /// blank the row the user is looking at.
+    /// Mouse motion across the bar is a no-op, and a no-op must stay
+    /// `Partial`: an empty `Full` update would CLEAR the row, so a cursor
+    /// crossing the bar would erase it.
     #[test]
-    fn a_no_change_event_leaves_the_bar_alone() {
+    fn a_move_event_leaves_the_bar_alone() {
         let _guard = test_guard();
         // seed() installs the row rect the click helper aims at; sending a
         // frame with a different rect here would move the row out from under it.
         seed(sample());
-        let again = click_chip(0, MouseEventKind::Move);
-        let noop = click_chip(0, MouseEventKind::Move);
-        assert!(!again.layers.is_empty(), "the first hover repaints");
-        assert!(noop.layers.is_empty(), "the second is a no-op");
-        assert_eq!(
-            noop.scope,
-            herdr_ui_plugin_api::UiUpdateScope::Partial,
-            "a no-op must stay Partial so it changes nothing"
-        );
+        for index in [0, 1, 2] {
+            let noop = click_chip(index, MouseEventKind::Move);
+            assert!(
+                noop.layers.is_empty(),
+                "a move over chip {index} is a no-op"
+            );
+            assert_eq!(
+                noop.scope,
+                herdr_ui_plugin_api::UiUpdateScope::Partial,
+                "a no-op must stay Partial so it changes nothing"
+            );
+        }
     }
 }

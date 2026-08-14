@@ -180,6 +180,16 @@ pub struct Chip {
     /// Runtime declared by `harness.json` (claude/codex/pi/jcode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// This child's dispatch has FINISHED and the chip is being held on the bar
+    /// through its retention grace (see `DISPATCH_GRACE` in the collector).
+    ///
+    /// Rendered greyed. A short job — a `codex-gp` dispatch answers in about
+    /// seven seconds — otherwise appears and vanishes between two glances, so
+    /// the bar reports that nothing happened at exactly the moment something
+    /// did. The chip is dimmed rather than dropped so "ran recently" and
+    /// "running now" stay tellable apart at a glance.
+    #[serde(default)]
+    pub finished: bool,
 }
 
 impl Chip {
@@ -311,6 +321,7 @@ mod tests {
             tab_id: Some("w1:t2".into()),
             pane_id: None,
             hidden: false,
+            finished: false,
             task: None,
             job_tail: None,
             exec: None,
