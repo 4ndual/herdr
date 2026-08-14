@@ -1265,6 +1265,62 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Set (or clear) a pane's reserved `color` token.
+    ///
+    /// The narrow, persisted, capability-gated half of #34. Everything a plugin
+    /// needs to colour a pane, and nothing else: it cannot claim an agent, a
+    /// title or a session identity through this method, which is why it can be
+    /// granted to a guest while `pane.report_metadata` stays host-reserved.
+    ///
+    /// The value is validated HERE. An invalid colour fails the request with the
+    /// previous colour intact, rather than being accepted and silently ignored
+    /// at render time.
+    pub(super) fn handle_pane_set_color(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneSetColorParams,
+    ) -> String {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let color = match params.color.as_deref().map(str::trim) {
+            Some(value) if !value.is_empty() => {
+                match crate::app::api_helpers::validate_metadata_color(value) {
+                    Ok(color) => Some(color),
+                    Err(message) => return encode_error(id, "invalid_metadata_token", message),
+                }
+            }
+            // Absent or empty clears it. Clearing is always legal: a pane
+            // coloured by a plugin that has since been uninstalled must still be
+            // returnable to the default.
+            _ => None,
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.terminal_id(pane_id).cloned())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        terminal.metadata_tokens.patch(
+            std::collections::HashMap::from([(
+                crate::app::api_helpers::METADATA_COLOR_KEY.to_string(),
+                color,
+            )]),
+            // No TTL. A colour is a preference the user expects to persist, not
+            // a status line that should decay.
+            None,
+            std::time::Instant::now(),
+        );
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_report_metadata(
         &mut self,
         id: String,
@@ -1904,6 +1960,92 @@ mod tests {
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let public_pane_id = app.public_pane_id(0, pane_id).unwrap();
         (app, public_pane_id)
+    }
+
+    /// #34 phase 2, end to end: a colour set through the API is validated,
+    /// stored, rendered and CAPTURED into the session snapshot — a colour that
+    /// vanished on restart would make "set a colour" a session-scoped novelty
+    /// rather than a property of the pane.
+    #[tokio::test]
+    async fn pane_set_color_validates_persists_and_renders() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+
+        // A role is accepted and reaches the border resolver.
+        let response = app.handle_pane_set_color(
+            "req".into(),
+            crate::api::schema::PaneSetColorParams {
+                pane_id: public_pane_id.clone(),
+                color: Some(" Danger ".into()),
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(success.result, ResponseResult::Ok {});
+
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("the pane's terminal");
+        assert_eq!(
+            crate::ui::pane_border_color(&app.state, Some(&terminal_id), true),
+            app.state.palette.red,
+            "a role resolves against the live palette"
+        );
+
+        // It is captured into the snapshot, which is what makes it survive.
+        let snapshot = crate::persist::snapshot::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            Default::default(),
+        );
+        let colors: Vec<Option<String>> = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.values())
+            .map(|pane| pane.color.clone())
+            .collect();
+        assert!(
+            colors.contains(&Some("danger".to_string())),
+            "the colour must reach the snapshot: {colors:?}"
+        );
+
+        // An invalid colour fails the request and leaves the previous one alone.
+        let response = app.handle_pane_set_color(
+            "req".into(),
+            crate::api::schema::PaneSetColorParams {
+                pane_id: public_pane_id.clone(),
+                color: Some("chartreuse".into()),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).expect("an error response");
+        assert_eq!(error.error.code, "invalid_metadata_token");
+        assert_eq!(
+            crate::ui::pane_border_color(&app.state, Some(&terminal_id), true),
+            app.state.palette.red,
+            "a rejected write must not clear the colour that was already there"
+        );
+
+        // Clearing is always legal.
+        let response = app.handle_pane_set_color(
+            "req".into(),
+            crate::api::schema::PaneSetColorParams {
+                pane_id: public_pane_id,
+                color: None,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).expect("success");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(
+            crate::ui::pane_border_color(&app.state, Some(&terminal_id), true),
+            app.state.palette.accent,
+            "cleared means back to the focus palette"
+        );
     }
 
     fn app_with_send_key_runtime(

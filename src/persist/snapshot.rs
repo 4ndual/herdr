@@ -129,6 +129,16 @@ pub struct PaneSnapshot {
     /// provenance want the launch directory (DONE-I: herdr retained it nowhere).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_cwd: Option<PathBuf>,
+    /// The pane's reserved `color` metadata token.
+    ///
+    /// ONLY that key. The rest of `metadata_tokens` is deliberately ephemeral —
+    /// most of it is TTL'd status text written by a plugin that will write it
+    /// again within seconds, and persisting a TTL'd value would resurrect stale
+    /// status across a restart. A colour is different: the user (or a plugin
+    /// acting for them) chose it deliberately and expects it to still be there
+    /// tomorrow, which is the whole point of #34 phase 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +378,12 @@ fn capture_tab(
             .map(|terminal| terminal.launch_env.iter().cloned().collect())
             .unwrap_or_default();
         let launch_cwd = terminal.and_then(|terminal| terminal.launch_cwd.clone());
+        let color = terminal.and_then(|terminal| {
+            terminal
+                .metadata_tokens
+                .values()
+                .remove(crate::app::api_helpers::METADATA_COLOR_KEY)
+        });
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
@@ -400,6 +416,7 @@ fn capture_tab(
                 launch_argv,
                 env,
                 launch_cwd,
+                color,
             },
         );
     }
@@ -683,6 +700,7 @@ mod tests {
                 launch_argv: None,
                 env: Default::default(),
                 launch_cwd: None,
+                color: None,
             },
         );
         panes.insert(
@@ -696,6 +714,7 @@ mod tests {
                 launch_argv: None,
                 env: Default::default(),
                 launch_cwd: None,
+                color: None,
             },
         );
 
@@ -1247,6 +1266,7 @@ mod tests {
                 launch_argv: None,
                 env: Default::default(),
                 launch_cwd: None,
+                color: None,
             },
         );
         panes.insert(
@@ -1262,6 +1282,7 @@ mod tests {
                 launch_argv: None,
                 env: Default::default(),
                 launch_cwd: None,
+                color: None,
             },
         );
 
@@ -1335,7 +1356,39 @@ mod tests {
             launch_argv: Some(vec!["claude".to_string(), "--resume".to_string()]),
             env,
             launch_cwd: Some(PathBuf::from("/home/tester/harnesses/e2e-claude/workspace")),
+            color: Some("danger".to_string()),
         }
+    }
+
+    /// #34 phase 2: a colour the user chose must still be there after a
+    /// restart. Only the reserved `color` key is persisted — the rest of
+    /// `metadata_tokens` is TTL'd status text that would come back stale.
+    #[test]
+    fn pane_snapshot_roundtrips_the_reserved_color() {
+        let pane = pane_snapshot_with_env();
+        let json = serde_json::to_string(&pane).expect("serializes");
+        assert!(
+            json.contains("\"color\":\"danger\""),
+            "colour must reach the file: {json}"
+        );
+        let back: PaneSnapshot = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.color.as_deref(), Some("danger"));
+    }
+
+    /// An uncoloured pane must not gain a `color` key, or every existing
+    /// session snapshot churns on the next save.
+    #[test]
+    fn an_absent_color_is_not_serialized() {
+        let mut pane = pane_snapshot_with_env();
+        pane.color = None;
+        let json = serde_json::to_string(&pane).expect("serializes");
+        assert!(
+            !json.contains("color"),
+            "absent colour must be skipped: {json}"
+        );
+        let legacy: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp"}"#).expect("an old snapshot still loads");
+        assert_eq!(legacy.color, None);
     }
 
     #[test]

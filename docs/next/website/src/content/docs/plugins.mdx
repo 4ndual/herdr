@@ -132,6 +132,37 @@ keys such as `HERDR_PLUGIN_ID`, `HERDR_UI_MODULE_ID`,
 `HERDR_FOCUS_SESSION_ID`, `HERDR_FOCUS_SESSION_REF`, `HERDR_FOCUS_CWD`, and
 `HERDR_FOCUS_AGENT`.
 
+### Colouring panes
+
+A module that declares the `metadata` capability may call `pane.set_color`:
+
+```toml
+capabilities = ["metadata"]
+```
+
+```json
+{"method": "pane.set_color", "params": {"pane_id": "w1:p1", "color": "danger"}}
+```
+
+`color` is either a theme role — `accent`, `muted`, `success`, `warning`,
+`danger`, `green`, `yellow`, `red`, `blue`, `teal`, `cyan`, `mauve`,
+`magenta`, `subtext`, `gray`, `peach`, `text` — or an explicit literal
+(`#rrggbb`, `#rgb`, `rgb(r,g,b)`, or `reset`). Omitting `color` clears it.
+
+Prefer a role. Roles resolve against the live palette at render time, so a
+coloured pane follows a theme change; a literal freezes one colour that will
+look wrong in every other theme. Anything else is rejected with
+`invalid_metadata_token` and the pane keeps the colour it already had — an
+invalid value is never silently ignored.
+
+The colour is persisted with the session and survives a restart. It tints the
+pane border, dimmed while the pane is unfocused so the focus signal survives.
+
+This capability grants **only** `pane.set_color`. `pane.report_metadata` stays
+host-reserved: colouring a pane is a preference, while claiming its agent,
+title or session identity is an authority claim, and a plugin that wants the
+first does not thereby acquire the second.
+
 Top-level `id`, `name`, `version`, and `min_herdr_version` are required.
 Set `min_herdr_version` to the oldest Herdr version that supports the plugin
 APIs, event names, and manifest fields your plugin uses. Herdr refuses to link

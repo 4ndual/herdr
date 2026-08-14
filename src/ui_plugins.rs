@@ -2017,6 +2017,7 @@ fn map_capability(capability: crate::api::schema::PluginUiCapability) -> UiCapab
         crate::api::schema::PluginUiCapability::PluginAdmin => UiCapability::PluginAdmin,
         crate::api::schema::PluginUiCapability::HostActions => UiCapability::HostActions,
         crate::api::schema::PluginUiCapability::KeyboardCapture => UiCapability::KeyboardCapture,
+        crate::api::schema::PluginUiCapability::Metadata => UiCapability::Metadata,
     }
 }
 

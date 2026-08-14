@@ -467,6 +467,19 @@ pub struct PaneReportAgentSessionParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSetColorParams {
+    pub pane_id: String,
+    /// A theme role (`accent`, `danger`, …) or an explicit literal
+    /// (`#rrggbb`, `rgb(r,g,b)`, `reset`). `None` clears the colour.
+    ///
+    /// Roles resolve against the LIVE palette at render time, so a coloured pane
+    /// follows a theme change instead of freezing whatever the theme happened to
+    /// be when the colour was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportMetadataParams {
     pub pane_id: String,
     pub source: String,

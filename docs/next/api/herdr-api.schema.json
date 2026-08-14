@@ -3156,6 +3156,24 @@
           ],
           "type": "object"
         },
+        "PaneSetColorParams": {
+          "properties": {
+            "color": {
+              "description": "A theme role (`accent`, `danger`, …) or an explicit literal\n(`#rrggbb`, `rgb(r,g,b)`, `reset`). `None` clears the colour.\n\nRoles resolve against the LIVE palette at render time, so a coloured pane\nfollows a theme change instead of freezing whatever the theme happened to\nbe when the colour was set.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneSplitParams": {
           "properties": {
             "cwd": {
@@ -5892,6 +5910,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneReportMetadataParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.set_color",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneSetColorParams"
             }
           },
           "required": [
@@ -9257,6 +9291,11 @@
             {
               "const": "plugin_admin",
               "description": "fork: `plugin.enable`/`plugin.disable` via `HostEffect::Api`. Kept out of\n`ApiWrite` for the same reason as the two above: a module holding this\ncan switch OTHER modules off, so it has to be declared and visible in\n`plugin list` rather than arriving as a side effect of ordinary writes.\n`plugin.link`/`plugin.unlink` remain host-reserved — installing code from\na path is a strictly larger power than flipping an installed plugin's\nenabled bit, and nothing in-guest needs it.",
+              "type": "string"
+            },
+            {
+              "const": "metadata",
+              "description": "fork(#34): set the reserved `color` metadata token on a pane or workspace\nvia `HostEffect::Api` (`pane.set_color`).\n\nDeliberately NOT `ApiWrite`, and deliberately not `pane.report_metadata`\n(which stays host-reserved): this is a NARROW grant to one validated,\npersisted, user-visible property. A plugin that colours panes should not\nthereby be able to rewrite a pane's reported agent, title or session\nidentity — those are authority claims, a colour is a preference.",
               "type": "string"
             }
           ]

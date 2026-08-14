@@ -655,6 +655,15 @@ pub enum PluginUiCapability {
     /// a path is a strictly larger power than flipping an installed plugin's
     /// enabled bit, and nothing in-guest needs it.
     PluginAdmin,
+    /// fork(#34): set the reserved `color` metadata token on a pane or workspace
+    /// via `HostEffect::Api` (`pane.set_color`).
+    ///
+    /// Deliberately NOT `ApiWrite`, and deliberately not `pane.report_metadata`
+    /// (which stays host-reserved): this is a NARROW grant to one validated,
+    /// persisted, user-visible property. A plugin that colours panes should not
+    /// thereby be able to rewrite a pane's reported agent, title or session
+    /// identity — those are authority claims, a colour is a preference.
+    Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

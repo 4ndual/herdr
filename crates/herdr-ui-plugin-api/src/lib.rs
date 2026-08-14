@@ -122,6 +122,15 @@ pub enum UiCapability {
     /// only `KeyboardInput` must never be able to starve the user's terminal
     /// of keystrokes.
     KeyboardCapture,
+    /// fork(#34): set the reserved `color` metadata token on a pane
+    /// (`pane.set_color`).
+    ///
+    /// A narrow grant to ONE validated, persisted, user-visible property, kept
+    /// out of `ApiWrite` and separate from `pane.report_metadata` (which stays
+    /// host-reserved). Colouring a pane is a preference; claiming its agent,
+    /// title or session identity is an authority claim, and a plugin that wants
+    /// the first must not thereby acquire the second.
+    Metadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

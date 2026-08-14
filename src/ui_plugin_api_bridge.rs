@@ -140,6 +140,12 @@ const PANE_GRAPHICS_METHODS: &[&str] = &[
 /// power than toggling something the user already chose to install.
 const PLUGIN_ADMIN_METHODS: &[&str] = &["plugin.enable", "plugin.disable"];
 
+/// fork(#34): the one method `PluginUiCapability::Metadata` grants. Narrow on
+/// purpose — a plugin that colours panes must not thereby be able to claim a
+/// pane's agent or session identity, so `pane.report_metadata` stays in the
+/// deny list below and this is its only sanctioned sibling.
+const METADATA_METHODS: &[&str] = &["pane.set_color"];
+
 /// Host-reserved administration: exact-name denies regardless of capability.
 const DENIED_EXACT_METHODS: &[&str] = &[
     "plugin.link",
@@ -208,6 +214,9 @@ pub(crate) fn decide(method: &str) -> ApiMethodDecision {
     if PLUGIN_ADMIN_METHODS.contains(&method) {
         return ApiMethodDecision::Allow(PluginUiCapability::PluginAdmin);
     }
+    if METADATA_METHODS.contains(&method) {
+        return ApiMethodDecision::Allow(PluginUiCapability::Metadata);
+    }
     ApiMethodDecision::Deny
 }
 
@@ -222,7 +231,32 @@ mod tests {
             .chain(INPUT_METHODS.iter())
             .chain(PANE_GRAPHICS_METHODS.iter())
             .chain(PLUGIN_ADMIN_METHODS.iter())
+            .chain(METADATA_METHODS.iter())
             .copied()
+    }
+
+    /// fork(#34): `pane.set_color` is reachable ONLY with the Metadata
+    /// capability, and granting it must not drag `pane.report_metadata` along —
+    /// colouring a pane is a preference, claiming its agent or session identity
+    /// is an authority claim.
+    #[test]
+    fn metadata_capability_grants_set_color_and_nothing_else() {
+        assert!(matches!(
+            decide("pane.set_color"),
+            ApiMethodDecision::Allow(PluginUiCapability::Metadata)
+        ));
+        assert!(matches!(
+            decide("pane.report_metadata"),
+            ApiMethodDecision::Deny
+        ));
+        assert!(matches!(
+            decide("pane.report_agent"),
+            ApiMethodDecision::Deny
+        ));
+        assert!(matches!(
+            decide("pane.report_agent_session"),
+            ApiMethodDecision::Deny
+        ));
     }
 
     /// Guard demanded by the adversarial spec review: every allow-row method

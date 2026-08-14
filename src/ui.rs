@@ -42,7 +42,8 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
-pub(crate) use self::panes::popup_pane_rects;
+#[cfg_attr(not(test), allow(unused_imports))] // used by the api color tests
+pub(crate) use self::panes::{pane_border_color, popup_pane_rects};
 use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,

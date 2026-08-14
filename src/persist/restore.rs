@@ -519,6 +519,10 @@ fn restore_tab(
             })
             .unwrap_or_default();
         let saved_launch_cwd = saved_pane.and_then(|p| p.launch_cwd.clone());
+        // #34 phase 2: a colour the user chose has to still be there after a
+        // restart, or "set a colour" is a session-scoped novelty rather than a
+        // property of the pane.
+        let saved_color = saved_pane.and_then(|p| p.color.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -657,6 +661,18 @@ fn restore_tab(
                     .with_launch_env(saved_launch_env.clone());
                 if let Some(launch_cwd) = saved_launch_cwd.clone() {
                     terminal = terminal.with_launch_cwd(launch_cwd);
+                }
+                if let Some(color) = saved_color.clone() {
+                    // No TTL: a persisted colour that expired minutes after a
+                    // restart would be worse than not persisting it at all.
+                    terminal.metadata_tokens.patch(
+                        std::collections::HashMap::from([(
+                            crate::app::api_helpers::METADATA_COLOR_KEY.to_string(),
+                            Some(color),
+                        )]),
+                        None,
+                        std::time::Instant::now(),
+                    );
                 }
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
@@ -1231,6 +1247,7 @@ mod tests {
                             launch_argv: None,
                             env: Default::default(),
                             launch_cwd: None,
+                            color: None,
                         },
                     )]),
                     zoomed: false,
@@ -1315,6 +1332,7 @@ mod tests {
                                 launch_argv: None,
                                 env: Default::default(),
                                 launch_cwd: None,
+                                color: None,
                             },
                         ),
                         (
@@ -1328,6 +1346,7 @@ mod tests {
                                 launch_argv: None,
                                 env: Default::default(),
                                 launch_cwd: None,
+                                color: None,
                             },
                         ),
                     ]),
@@ -1383,6 +1402,7 @@ mod tests {
                     launch_argv: None,
                     env: Default::default(),
                     launch_cwd: None,
+                    color: None,
                 },
             )
         };
@@ -1400,6 +1420,7 @@ mod tests {
             launch_argv: None,
             env: Default::default(),
             launch_cwd: None,
+            color: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1559,6 +1580,7 @@ mod tests {
                             launch_argv: None,
                             env: Default::default(),
                             launch_cwd: None,
+                            color: None,
                         },
                     )]),
                     zoomed: false,
@@ -1722,6 +1744,7 @@ mod tests {
                 launch_argv: None,
                 env: Default::default(),
                 launch_cwd: None,
+                color: None,
             },
         );
         let history = SessionHistorySnapshot {

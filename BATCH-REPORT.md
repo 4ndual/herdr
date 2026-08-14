@@ -226,9 +226,11 @@ Reported plainly rather than left to be discovered:
   `hr` restart), the mouse-not-forwarded-into-plugin-overlay-panes host gap
   (filmed on three overlays, still open), and the rail/viewport verdicts
   (retracted above).
-- **#34 phase 2** (`pane.set_color` behind `PluginUiCapability::Metadata`) — the
-  plan makes it conditional on the §7 open question coming back "yes"; it has
-  not been answered, so phase 1 only.
+- **#34 phase 2** — **shipped.** I originally skipped it on a false premise:
+  I read §7's open questions (default "no") and missed the
+  `USER ANSWERS (2026-08-13 ~18:00)` section ~45 lines further down in the same
+  file, which explicitly overrides the listed defaults and answers both
+  questions "yes". Corrected and delivered; see the section below.
 - **#26 / #24** — design documents only, as the plan directs.
 
 ## #22 — the E2E, proven
@@ -269,3 +271,48 @@ that test could not distinguish the two causes.
 The shell probe (`echo POST=$CLAUDE_CONFIG_DIR` in a restored pane) isolates
 exactly what #36 changes — whether a pane's launch env survives the restart —
 with no dependency on claude's transcript behaviour. That is the evidence above.
+
+## #34 phase 2 — persisted colors and `pane.set_color`
+
+Shipped after the correction. Two halves, both answering the same requirement:
+a colour is a property of the pane, not a decoration that lives until the next
+restart.
+
+**Persistence.** `PaneSnapshot` gains a `color` field, captured from the
+terminal's reserved `color` token and re-applied on restore with no TTL. Only
+that one key is persisted — the rest of `metadata_tokens` is TTL'd status text
+written by plugins that rewrite it within seconds, and persisting a TTL'd value
+would resurrect stale status across a restart. `skip_serializing_if` keeps an
+uncoloured pane's snapshot byte-identical, so existing session files do not
+churn, and an old snapshot with no `color` key still loads.
+
+**`pane.set_color`, behind a new `Metadata` capability.** The method validates
+through the same `validate_metadata_color` the phase-1 handler uses, so an
+invalid value fails the request with the previous colour intact rather than
+being accepted and ignored at render time. Clearing is always legal — a pane
+coloured by a since-uninstalled plugin has to be returnable to the default.
+
+The capability is deliberately narrow. `pane.report_metadata` stays
+host-reserved and `Metadata` grants exactly one method, pinned by a test that
+asserts `pane.report_metadata`, `pane.report_agent` and
+`pane.report_agent_session` all still deny. Colouring a pane is a preference;
+claiming its agent or session identity is an authority claim, and a plugin that
+wants the first must not acquire the second as a side effect.
+
+**Protocol version: not bumped, deliberately.** Source is at 19; stable
+publishes 17 and preview publishes 18, so protocol 19 has never been published
+in either channel. Per the repo rule, a bump is due only when the *published*
+protocol changes incompatibly — and adding a method is additive regardless.
+
+Docs updated for plugin authors (`plugins.mdx`) and API callers
+(`socket-api.mdx`), including the "prefer a role over a literal" guidance:
+roles resolve against the live palette at render time, so a coloured pane
+follows a theme change instead of freezing one colour that looks wrong in every
+other theme.
+
+### A note on the operator's instance
+
+The `hr` restart remains for you. The staged binary is
+`30b1907d…` (now superseded — see below); the running server still holds the
+previous inode. I have not restarted it and will not: your orchestrator session
+lives in that instance.
