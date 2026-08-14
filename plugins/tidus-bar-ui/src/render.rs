@@ -13,10 +13,11 @@
 //! ⑂ ▛you▟ │ (no children)
 //! ```
 //!
-//! Every chip is its own hit rect, so the bar is a row of buttons rather than
-//! one line with a meaning. Left-click navigates (the terminal area swaps to
-//! that agent); right-click reports, which is the only safe second gesture for
-//! a surface you are looking at rather than driving.
+//! Every chip is its own click target, so the bar is a row of buttons rather
+//! than one line with a meaning. HOVER a chip and the row swaps to that chip's
+//! detail; left-click navigates (the terminal area swaps to that agent);
+//! right-click is inert, because the canon reserves it for a contextual menu
+//! and this bar has no secondary actions.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -48,12 +49,14 @@ const HERE_CLOSE: &str = "\u{2590}"; // ▐
 /// Shown when the focused orchestrator has spawned nothing.
 const NO_CHILDREN: &str = "no children";
 
-/// Action id prefix for a chip click. The index is the chip's position in
-/// `BarInput::chips`, which is also the render order.
-pub const CHIP_ACTION: &str = "tidus-bar:chip:";
+// The bar publishes NO hit-rects any more: hover needs the raw mouse stream and
+// the host suppresses that over a module's own rects, so clicks are resolved
+// from [`layout`] instead. The old "tidus-bar:chip:<n>" action id is deliberately
+// gone rather than kept as a reserved constant — an id nothing can dispatch is
+// how a dead click target survives a refactor.
 
 /// One laid-out chip: the spans that draw it and where it sits on the row, so
-/// the guest can publish an exact hit rect per chip.
+/// the guest can resolve a press against the exact cells it drew.
 pub struct Placed {
     pub index: usize,
     /// Column offset from the start of the row.
@@ -233,7 +236,36 @@ pub fn render(input: &BarInput, area: Rect, buf: &mut Buffer) {
     Paragraph::new(line).render(area, buf);
 }
 
-/// The report shown on a right-click, or on a left-click of a chip that has no
+/// The row as it reads WHILE A CHIP IS HOVERED: that chip's detail, in place of
+/// the summary row.
+///
+/// The canon puts detail on hover, but this module's carve is exactly one row
+/// (`[ui_modules.placement].size = "1"`), so there is no slack row for a tooltip
+/// and the guest API has no positioned node to float one beside the bar.
+/// Swapping the row's own content keeps the single hover trigger without
+/// covering anything or resizing anything — the shape harness-indicator uses.
+pub fn hovered_line(input: &BarInput, index: usize) -> Option<Line<'static>> {
+    let chip = input.chips.get(index)?;
+    Some(Line::from(vec![
+        Span::styled(format!("{ICON} "), Style::default().fg(MUTED)),
+        Span::styled(detail(input, chip), Style::default().fg(MUTED)),
+    ]))
+}
+
+/// Width of the hovered form, so the host carves a slot that fits it.
+pub fn hovered_width(input: &BarInput, index: usize) -> u16 {
+    hovered_line(input, index)
+        .map(|line| line.width() as u16)
+        .unwrap_or(0)
+}
+
+pub fn render_hovered(input: &BarInput, index: usize, area: Rect, buf: &mut Buffer) {
+    if let Some(line) = hovered_line(input, index) {
+        Paragraph::new(line).render(area, buf);
+    }
+}
+
+/// The detail shown on HOVER, and reused as the refusal text when a chip has no
 /// pane to navigate to. Joined with ` · ` because the host's toast is single
 /// line and silently strips newlines.
 pub fn detail(input: &BarInput, chip: &Chip) -> String {

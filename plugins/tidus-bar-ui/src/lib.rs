@@ -29,7 +29,7 @@
 mod render;
 
 use herdr_ui_plugin_api::{
-    HostEffect, UiActionKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate,
+    HostEffect, MouseEvent, MouseEventKind, UiEvent, UiHitRect, UiLayer, UiSurface, UiUpdate,
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -41,6 +41,14 @@ use tidus_bar_model::BarInput;
 static LAST_INPUT: Mutex<Option<BarInput>> = Mutex::new(None);
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// The carved row's absolute rect (x, y, width) from the last frame, and the
+/// chip the cursor is over. Both are resolved from the RAW mouse stream
+/// (capability `mouse_all`): the host suppresses raw `Move` over a module's own
+/// declared hit-rects, so a bar that wants hover must declare none and do its
+/// own arithmetic — the button-dash / archive-dash model.
+static ROW_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
+static HOVERED: Mutex<Option<usize>> = Mutex::new(None);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -115,9 +123,7 @@ pub extern "C" fn herdr_ui_on_event_len() -> i32 {
 fn handle_event(event: &UiEvent) -> UiUpdate {
     let ctx = match event {
         UiEvent::Frame(ctx) => ctx,
-        UiEvent::Action {
-            action_id, kind, ..
-        } => return handle_action(action_id, *kind),
+        UiEvent::Mouse(mouse) => return handle_mouse(mouse),
         _ => return UiUpdate::default(),
     };
 
@@ -154,41 +160,41 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     // Render into a CONTENT-sized buffer, independent of the incoming rect, so
     // the host can measure the natural width and carve the slot on the very
     // first content frame (before which `ctx.rect` is still zero).
-    let width = render::content_width(&input);
+    *ROW_RECT.lock().expect("row rect mutex poisoned") =
+        if ctx.rect.width == 0 || ctx.rect.height == 0 {
+            None
+        } else {
+            Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
+        };
+
+    render_from(&input)
+}
+
+/// Build the layer for `input` in its current hover state — shared by the frame
+/// path and the mouse path so a hover repaint is the same rendering as a frame
+/// repaint, not a second copy of it.
+fn render_from(input: &BarInput) -> UiUpdate {
+    let hovered = *HOVERED.lock().expect("hover mutex poisoned");
+    let width = match hovered {
+        Some(index) => render::hovered_width(input, index).max(render::content_width(input)),
+        None => render::content_width(input),
+    };
     if width == 0 {
         return UiUpdate::default();
     }
     let content = Rect::new(0, 0, width, 1);
     let mut buf = Buffer::empty(content);
-    render::render(&input, content, &mut buf);
+    match hovered {
+        Some(index) => render::render_hovered(input, index, content, &mut buf),
+        None => render::render(input, content, &mut buf),
+    }
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
-    // One hit rect PER CHIP. `UiHitRect` is ABSOLUTE (screen cells), not
-    // relative to the panel: a rect at 0,0 silently points at the terminal's
-    // top-left corner, so the click does nothing and some unrelated cell
-    // answers instead — a failure with no error anywhere, which is why every
-    // rect is anchored on `ctx.rect` and covered by a test.
-    let hits = if ctx.rect.width == 0 || ctx.rect.height == 0 {
-        Vec::new()
-    } else {
-        render::layout(&input)
-            .map(|(_, placed)| {
-                placed
-                    .into_iter()
-                    .filter(|p| p.x < ctx.rect.width)
-                    .map(|p| UiHitRect {
-                        action_id: format!("{}{}", render::CHIP_ACTION, p.index),
-                        x: ctx.rect.x + p.x,
-                        y: ctx.rect.y,
-                        // Clip at the panel edge so a chip scrolled off the
-                        // right cannot claim cells outside the bar.
-                        width: p.width.min(ctx.rect.width - p.x),
-                        height: 1,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    // NO declarative hit-rects: the host suppresses raw `Move` over a module's
+    // own rects (the F5 click-dedupe), and hover is the canon trigger for
+    // detail. Clicks are resolved from the same layout the row was drawn from,
+    // so the cell that was clicked is by construction the cell that was drawn.
+    let hits: Vec<UiHitRect> = Vec::new();
 
     UiUpdate {
         layers: vec![UiLayer {
@@ -203,15 +209,51 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
     }
 }
 
-/// Left-click navigates, right-click reports.
-fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
-    let Some(index) = action_id
-        .strip_prefix(render::CHIP_ACTION)
-        .and_then(|raw| raw.parse::<usize>().ok())
-    else {
+/// Which chip covers an absolute cell, from the SAME layout the row was drawn
+/// from — so the cell that answers a click is by construction the cell that was
+/// drawn there, with no second copy of the geometry to drift.
+fn chip_at(input: &BarInput, column: u16, row: u16) -> Option<usize> {
+    let (ox, oy, width) = (*ROW_RECT.lock().expect("row rect mutex poisoned"))?;
+    if row != oy {
+        return None;
+    }
+    let rel = column.checked_sub(ox)?;
+    if rel >= width {
+        return None;
+    }
+    let (_, placed) = render::layout(input)?;
+    placed
+        .iter()
+        .find(|p| rel >= p.x && rel < p.x + p.width)
+        .map(|p| p.index)
+}
+
+/// Hover reveals, left-click navigates, right-click does nothing.
+///
+/// Right-click used to report the chip's detail as a toast. The canon reserves
+/// right-click for a contextual MENU and puts detail on hover; this bar has no
+/// secondary actions, so right-click is inert rather than being given a second,
+/// undiscoverable meaning.
+fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
+    let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
         return UiUpdate::default();
     };
-    let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
+    let hit = chip_at(&input, mouse.column, mouse.row);
+
+    if !matches!(mouse.kind, MouseEventKind::LeftDown) {
+        // Move (and everything else): update hover, repaint only on a change —
+        // a bar that re-rendered on every mouse motion would repaint the bottom
+        // row continuously while the user works.
+        let mut hovered = HOVERED.lock().expect("hover mutex poisoned");
+        if *hovered == hit {
+            return UiUpdate::default();
+        }
+        *hovered = hit;
+        drop(hovered);
+        return render_from(&input);
+    }
+
+    let Some(index) = hit else {
         return UiUpdate::default();
     };
     let Some(chip) = input.chips.get(index) else {
@@ -221,21 +263,18 @@ fn handle_action(action_id: &str, kind: UiActionKind) -> UiUpdate {
         return UiUpdate::default();
     };
 
-    let report = || UiUpdate {
-        effects: vec![HostEffect::ShowToast {
-            message: render::detail(&input, chip),
-        }],
-        ..Default::default()
-    };
-
-    if !matches!(kind, UiActionKind::LeftDown) {
-        return report();
-    }
-    // No pane in this instance — a `light` child living inside conductor, or
-    // one the reaper took. There is nothing to swap the terminal area to, so
-    // the chip reports what it knows instead of failing silently.
+    // No pane in this instance — a `light` child living inside conductor, or one
+    // the reaper took. There is nothing to swap the terminal area to, so the
+    // click REFUSES OUT LOUD (canon §7: an action that cannot be performed says
+    // so) rather than doing nothing. This is the only toast the bar emits, and
+    // it is an outcome, not a description.
     let Some(tab_id) = chip.tab_id.clone() else {
-        return report();
+        return UiUpdate {
+            effects: vec![HostEffect::ShowToast {
+                message: format!("{} has no pane to open", chip.name),
+            }],
+            ..Default::default()
+        };
     };
 
     // Swap the terminal area to this agent. `tab.show` un-hides AND focuses in
@@ -270,7 +309,14 @@ mod tests {
     /// concurrently.
     fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Hover and the remembered row rect are process-global: a test that
+        // left a chip hovered would hand the next one the detail row instead
+        // of the summary.
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        *ROW_RECT.lock().expect("row rect mutex poisoned") = None;
+        *LAST_INPUT.lock().expect("input mutex poisoned") = None;
+        guard
     }
 
     fn chip(name: &str, role: ChipRole) -> Chip {
@@ -291,6 +337,58 @@ mod tests {
 
     fn seed(input: BarInput) {
         *LAST_INPUT.lock().expect("input mutex poisoned") = Some(input);
+        *HOVERED.lock().expect("hover mutex poisoned") = None;
+        // The row as the host would carve it: origin (0, 0), 200 columns.
+        *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((0, 0, 200));
+    }
+
+    /// Press a chip at the CENTRE of the cells the row actually drew for it.
+    /// The click path under test IS the geometry, so a test that called the
+    /// handler with a chip id would prove nothing about a real press.
+    fn click_chip(index: usize, kind: MouseEventKind) -> UiUpdate {
+        let input = LAST_INPUT
+            .lock()
+            .expect("input mutex poisoned")
+            .clone()
+            .expect("seeded");
+        let (_, placed) = render::layout(&input).expect("a row to click");
+        match placed.iter().find(|p| p.index == index) {
+            Some(p) => handle_mouse(&MouseEvent {
+                kind,
+                column: p.x + p.width / 2,
+                row: 0,
+            }),
+            // No such chip drawn — press past the end of the row, which is what
+            // clicking a chip that vanished actually looks like.
+            None => handle_mouse(&MouseEvent {
+                kind,
+                column: 199,
+                row: 0,
+            }),
+        }
+    }
+
+    /// Press the FIRST and LAST cell of a chip, not just its middle: an
+    /// off-by-one in the width only shows at the edges (canon §10).
+    fn click_chip_edges(index: usize) -> (UiUpdate, UiUpdate) {
+        let input = LAST_INPUT
+            .lock()
+            .expect("input mutex poisoned")
+            .clone()
+            .expect("seeded");
+        let (_, placed) = render::layout(&input).expect("a row to click");
+        let p = placed
+            .iter()
+            .find(|p| p.index == index)
+            .expect("chip is drawn");
+        let press = |column| {
+            handle_mouse(&MouseEvent {
+                kind: MouseEventKind::LeftDown,
+                column,
+                row: 0,
+            })
+        };
+        (press(p.x), press(p.x + p.width - 1))
     }
 
     fn sample() -> BarInput {
@@ -337,7 +435,7 @@ mod tests {
     fn a_left_click_focuses_that_chips_tab() {
         let _guard = test_guard();
         seed(sample());
-        let update = handle_action("tidus-bar:chip:2", UiActionKind::LeftDown);
+        let update = click_chip(2, MouseEventKind::LeftDown);
         match update.effects.as_slice() {
             [HostEffect::Api { method, params, .. }] => {
                 assert_eq!(method, "tab.focus");
@@ -351,7 +449,7 @@ mod tests {
     fn clicking_the_pinned_parent_swaps_back_the_same_way() {
         let _guard = test_guard();
         seed(sample());
-        let update = handle_action("tidus-bar:chip:0", UiActionKind::LeftDown);
+        let update = click_chip(0, MouseEventKind::LeftDown);
         match update.effects.as_slice() {
             [HostEffect::Api { method, params, .. }] => {
                 assert_eq!(method, "tab.focus");
@@ -367,7 +465,7 @@ mod tests {
         let mut input = sample();
         input.chips[2].hidden = true;
         seed(input);
-        let update = handle_action("tidus-bar:chip:2", UiActionKind::LeftDown);
+        let update = click_chip(2, MouseEventKind::LeftDown);
         match update.effects.as_slice() {
             [HostEffect::Api { method, params, .. }] => {
                 // tab.focus alone cannot reveal a hidden tab; this is the one
@@ -388,28 +486,83 @@ mod tests {
         input.chips[2].pane_id = None;
         input.chips[2].exec = Some("light".into());
         seed(input);
-        let update = handle_action("tidus-bar:chip:2", UiActionKind::LeftDown);
+        let update = click_chip(2, MouseEventKind::LeftDown);
         match update.effects.as_slice() {
             [HostEffect::ShowToast { message }] => {
-                assert!(message.contains("no pane in this instance"), "{message}");
+                assert!(message.contains("no pane to open"), "{message}");
             }
             other => panic!("expected a report, got {other:?}"),
         }
     }
 
+    /// Canon §1: right-click opens a contextual MENU or does nothing. This bar
+    /// has no secondary actions, so right-click is inert — it must not navigate
+    /// and must not describe (hover already does that).
     #[test]
-    fn a_right_click_reports_and_never_navigates() {
+    fn a_right_click_neither_navigates_nor_reports() {
         let _guard = test_guard();
         seed(sample());
-        let update = handle_action("tidus-bar:chip:2", UiActionKind::RightDown);
+        let update = click_chip(2, MouseEventKind::RightDown);
         assert!(
-            update
-                .effects
-                .iter()
-                .all(|e| matches!(e, HostEffect::ShowToast { .. })),
-            "a reporting gesture must not move the user: {:?}",
+            update.effects.is_empty(),
+            "right-click must be inert, got {:?}",
             update.effects
         );
+    }
+
+    /// Canon §2: hovering a chip reveals that chip's detail in place, and
+    /// leaving the row restores the summary. No toast is involved.
+    #[test]
+    fn hovering_a_chip_shows_its_detail_in_place() {
+        let _guard = test_guard();
+        seed(sample());
+        let summary = text_of(&render_from(&sample()));
+        let hovered = click_chip(2, MouseEventKind::Move);
+        let hovered_text = text_of(&hovered);
+        assert!(hovered.effects.is_empty(), "detail is drawn, never toasted");
+        assert_ne!(hovered_text, summary, "hover must change the row");
+        assert!(
+            hovered_text.contains("kid"),
+            "the hovered chip's own detail must be shown: {hovered_text}"
+        );
+        // Leaving the row restores the summary.
+        let left = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::Move,
+            column: 199,
+            row: 0,
+        });
+        assert_eq!(text_of(&left), summary);
+    }
+
+    /// Canon §10: the edges of a chip are as clickable as its middle.
+    #[test]
+    fn the_first_and_last_cell_of_a_chip_both_click() {
+        let _guard = test_guard();
+        seed(sample());
+        let (first, last) = click_chip_edges(2);
+        for (which, update) in [("first", first), ("last", last)] {
+            match update.effects.as_slice() {
+                [HostEffect::Api { method, params, .. }] => {
+                    assert_eq!(method, "tab.focus", "{which} cell");
+                    assert_eq!(params["tab_id"], "w1:t-kid", "{which} cell");
+                }
+                other => panic!("{which} cell of the chip is dead: {other:?}"),
+            }
+        }
+    }
+
+    fn text_of(update: &UiUpdate) -> String {
+        update
+            .layers
+            .iter()
+            .flat_map(|layer| layer.nodes.iter())
+            .filter_map(|node| match node {
+                herdr_ui_plugin_api::UiNode::Line { spans } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .map(|span| span.text.clone())
+            .collect()
     }
 
     #[test]
@@ -418,40 +571,38 @@ mod tests {
         seed(sample());
         // The bar changed between the frame and the press. Opening a
         // neighbouring agent would be worse than doing nothing.
-        let update = handle_action("tidus-bar:chip:9", UiActionKind::LeftDown);
+        let update = click_chip(9, MouseEventKind::LeftDown);
         assert!(update.effects.is_empty());
-        let update = handle_action("tidus-bar:not-a-chip", UiActionKind::LeftDown);
+        let update = click_chip(42, MouseEventKind::LeftDown);
         assert!(update.effects.is_empty());
     }
 
+    /// The bar publishes NO hit-rects: declaring one makes the host suppress
+    /// the raw Move events hover needs (the F5 dedupe). Clicks are resolved
+    /// from the same layout the row was drawn from — see click_chip.
     #[test]
-    fn hit_rects_are_absolute_and_one_per_chip() {
+    fn no_hit_rects_are_published_so_hover_keeps_working() {
         let _guard = test_guard();
         let input = sample();
         let rect = Rect::new(7, 42, 80, 1);
         let update = handle_event(&frame_event(&input, rect));
         let layer = update.layers.first().expect("a layer");
-        assert_eq!(layer.hits.len(), 3, "one hit rect per chip");
-        for hit in &layer.hits {
-            // Anchored on the panel, not on 0,0 — the bug that made an earlier
-            // strip's click land on the tab bar with no error anywhere.
-            assert!(hit.x >= rect.x, "hit {hit:?} left of the panel");
-            assert_eq!(hit.y, rect.y);
-            assert!(
-                hit.x + hit.width <= rect.x + rect.width,
-                "{hit:?} overflows"
-            );
-        }
-        // Action ids must address the chips in order.
-        let ids: Vec<&str> = layer.hits.iter().map(|h| h.action_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["tidus-bar:chip:0", "tidus-bar:chip:1", "tidus-bar:chip:2"]
-        );
+        assert!(layer.hits.is_empty(), "hit rects would kill hover");
+        // and the row is still clickable, from its own geometry
+        seed(input.clone());
+        *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((rect.x, rect.y, rect.width));
+        let (_, placed) = render::layout(&input).expect("row");
+        let p = placed.iter().find(|p| p.index == 2).expect("chip");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: rect.x + p.x + p.width / 2,
+            row: rect.y,
+        });
+        assert!(!update.effects.is_empty(), "the drawn cell must click");
     }
 
     #[test]
-    fn the_first_frame_has_no_rect_yet_and_publishes_no_dead_hit_rects() {
+    fn the_first_frame_has_no_rect_yet_and_is_not_clickable() {
         let _guard = test_guard();
         let input = sample();
         let update = handle_event(&frame_event(&input, Rect::new(0, 0, 0, 0)));
@@ -509,7 +660,9 @@ mod tests {
             .layers
             .first()
             .expect("the previous bar is repainted");
-        assert_eq!(layer.hits.len(), 3, "and stays clickable");
+        // The repaint keeps the previous row; clickability comes from the
+        // geometry now, not from published rects.
+        assert!(!layer.nodes.is_empty(), "and stays drawn");
     }
 
     #[test]

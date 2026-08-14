@@ -37,7 +37,10 @@ surfaces = ["panel"]
 # must go through `harness send`, never raw pane writes.
 # toasts: chips with no PTY (a `light` child inside conductor, or a reaped one)
 # report instead of navigating, and right-click reports everywhere.
-capabilities = ["layout_read", "focused_session", "api_write", "toasts"]
+# mouse_all: hover is the canon trigger for detail, and the host only delivers
+# raw Move events to a module that declares no hit-rects of its own (the F5
+# click-dedupe). toasts stays for ONE case: refusing a chip with no pane.
+capabilities = ["layout_read", "focused_session", "api_write", "toasts", "mouse_all"]
 ui_input_file = "tidus_bar_input.json"
 # Run by App::tick_plugin_collectors on the dash tick. Relative argv[0] resolves
 # against the plugin root (src/plugin_collector.rs::resolve_program).
