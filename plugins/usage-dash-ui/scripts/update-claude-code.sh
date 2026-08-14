@@ -27,6 +27,27 @@ set -uo pipefail
 LOG="$HOME/.herdr-cli-update.log"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG"; }
 
+# Say it out loud, every time. The strip's version token INVITES this click and
+# then arms a confirmation, so a branch that exits quietly reads as a dead
+# affordance — which is exactly how this script was reported as a broken button
+# while its own log showed three successful runs (canon §7: an action that
+# cannot be performed says so).
+say() {
+  log "TOAST: $*"
+  local shown=""
+  if [[ -n "${HERDR:-}" ]]; then
+    shown="$("$HERDR" notification show "Claude Code update" --body "$*" 2>&1)"
+  fi
+  case "$shown" in
+    *'"shown":true'* | *'"shown": true'*) return 0 ;;
+  esac
+  # herdr toasts are delivery-off by default; the desktop notifier is the
+  # fallback the dash scripts already standardised on.
+  command -v notify-send >/dev/null 2>&1 &&
+    notify-send -a herdr -- "Claude Code update" "$*" >>"$LOG" 2>&1
+  return 0
+}
+
 HERDR="${HERDR_BIN_PATH:-herdr}"
 PANE="${HERDR_PANE_ID:-}"
 
@@ -56,19 +77,53 @@ AFTER="$("$CLAUDE_BIN" --version 2>/dev/null | tr -d '\n')"
 log "update-claude-code: rc=$RC before='$BEFORE' after='$AFTER' out='${OUT//$'\n'/ | }'"
 
 if [[ $RC -ne 0 ]]; then
+  say "the updater failed (rc=$RC) — the pane was left running"
   log "update-claude-code: updater failed, leaving the pane alone"
   exit "$RC"
 fi
 
-# Nothing changed → nothing to resume onto. Restarting the pane would interrupt
-# the user for no benefit whatsoever.
-if [[ -n "$BEFORE" && "$BEFORE" == "$AFTER" ]]; then
-  log "update-claude-code: already current ($AFTER) — pane left running"
+# ── 1b. What is the PANE running? ───────────────────────────────────────────
+#
+# THE BUG THIS CLOSES. The version the strip shows — and therefore the version
+# in "2.1.231→2.1.232 click to update?" — is the one stamped on the pane's own
+# transcript records, i.e. the build the agent was STARTED with. The binary on
+# disk is a different fact. Once `claude update` has installed 2.1.232, every
+# further click found BEFORE == AFTER, logged "already current", and exited
+# silently — while the pane went on running 2.1.231 and the affordance went on
+# asking to be clicked. Three real runs in the plugin log, exit 0 each time, and
+# a user correctly reporting a dead button.
+#
+# So the question is not "did the binary change" but "is this pane behind the
+# binary". The strip's own snapshot is the authority for the first half, since
+# it is literally what the user is looking at.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/builtin.usage-dash"
+PANE_VER=""
+if command -v jq >/dev/null 2>&1 && [[ -r "$STATE_DIR/usage_input.json" ]]; then
+  PANE_VER="$(jq -r '.snapshot.versions.claude.current // empty' \
+    "$STATE_DIR/usage_input.json" 2>/dev/null)"
+fi
+# `claude --version` prints "2.1.232 (Claude Code)"; the transcript stamps the
+# bare number. Compare the numbers.
+INSTALLED_VER="${AFTER%% *}"
+log "update-claude-code: installed='$INSTALLED_VER' pane='${PANE_VER:-unknown}'"
+
+if [[ -n "$PANE_VER" && "$PANE_VER" == "$INSTALLED_VER" ]]; then
+  # Truly nothing to do: the pane is already on the installed build.
+  say "already on $INSTALLED_VER — nothing to update"
+  log "update-claude-code: pane already on $INSTALLED_VER — nothing to do"
   exit 0
+fi
+
+if [[ -n "$BEFORE" && "$BEFORE" == "$AFTER" ]]; then
+  # The binary did not move, but the PANE is behind it: relaunching this session
+  # on the installed build is exactly what the user asked for by clicking. Fall
+  # through to the resume handoff instead of exiting.
+  log "update-claude-code: binary already $AFTER; pane on ${PANE_VER:-unknown} — relaunching the pane onto it"
 fi
 
 # ── 2. Resume this pane on the new build ────────────────────────────────────
 if [[ -z "$PANE" ]]; then
+  say "updated to $AFTER — open a new pane to use it (no pane in this click's context)"
   log "update-claude-code: no HERDR_PANE_ID — updated to $AFTER, pane not restarted"
   exit 0
 fi
@@ -77,21 +132,14 @@ fi
 # resumable handoff. `pane get` answers with
 # {"result":{"pane":{"agent_session":{"value":"<sid>"},"cwd":"<dir>",...}}}.
 INFO="$("$HERDR" pane get "$PANE" 2>/dev/null)"
-read -r SID CWD <<<"$(printf '%s' "$INFO" | python3 -c '
-import sys, json
-try:
-    pane = json.load(sys.stdin)["result"]["pane"]
-except Exception:
-    print(" ")
-    raise SystemExit
-sid = (pane.get("agent_session") or {}).get("value") or ""
-cwd = pane.get("cwd") or ""
-# Space-separated is safe here: session ids are uuids and a cwd containing a
-# space would fail the -d test below and take the fail-safe path.
-print(f"{sid} {cwd}")
-' 2>/dev/null)"
+# jq, not python3: jq is already a hard dependency of every dash script on this
+# box, and a bare `python3` is one `command not found` away from turning this
+# whole path into another silent no-op.
+SID="$(printf '%s' "$INFO" | jq -r '.result.pane.agent_session.value // empty' 2>/dev/null)"
+CWD="$(printf '%s' "$INFO" | jq -r '.result.pane.cwd // .result.pane.foreground_cwd // empty' 2>/dev/null)"
 
 if [[ -z "$SID" || -z "$CWD" || ! -d "$CWD" ]]; then
+  say "$AFTER is installed, but this pane has no resumable session yet — restart it yourself"
   log "update-claude-code: updated to $AFTER but sid/cwd unresolved (sid='$SID' cwd='$CWD') — pane left running, resume it yourself"
   exit 0
 fi
@@ -112,4 +160,5 @@ log "update-claude-code: handoff written (sid=$SID cwd=$CWD); asking pane $PANE 
 sleep 1
 "$HERDR" pane send-keys "$PANE" Enter >/dev/null 2>&1
 
+say "relaunching this pane on $INSTALLED_VER"
 log "update-claude-code: done — $BEFORE → $AFTER, pane $PANE resuming session $SID"
