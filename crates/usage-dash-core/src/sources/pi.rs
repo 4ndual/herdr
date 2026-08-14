@@ -94,7 +94,15 @@ pub fn estimate_tokens(content: &str) -> u64 {
         };
         match v.get("type").and_then(|t| t.as_str()) {
             Some("message") | Some("custom_message") | Some("thinking") => {
-                bytes += content_len(v.get("content"));
+                // pi nests the payload under `message` as of 0.84 —
+                //   {"type":"message","message":{"role":…,"content":[{"type":"text",…}]}}
+                // — while older sessions put `content` at the top level. Reading
+                // only the top level silently summed nothing, so the strip showed
+                // `0 tokens` for a session that had plainly been used: an
+                // estimate that is always zero looks exactly like a working
+                // estimate of an idle agent.
+                let nested = v.get("message").and_then(|m| m.get("content"));
+                bytes += content_len(nested.or_else(|| v.get("content")));
             }
             _ => {}
         }
@@ -176,5 +184,45 @@ mod tests {
     fn window_defaults_to_codex_size() {
         assert_eq!(ctx_window_for(Some("gpt-5.4")), 258_400);
         assert_eq!(ctx_window_for(None), 258_400);
+    }
+}
+
+#[cfg(test)]
+mod nested_content_tests {
+    use super::*;
+
+    /// pi 0.84 nests message payloads under `message`; earlier sessions did not.
+    /// Reading only the top level summed nothing, and a context estimate that is
+    /// always zero is indistinguishable from a correct estimate of an idle
+    /// agent — which is why it survived unnoticed.
+    #[test]
+    fn tokens_are_counted_from_the_nested_message_shape() {
+        let line = r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"abcdefgh"}]}}"#;
+        assert_eq!(
+            estimate_tokens(line),
+            2,
+            "8 chars of nested text is 2 tokens"
+        );
+    }
+
+    #[test]
+    fn the_older_flat_shape_still_counts() {
+        let line = r#"{"type":"message","content":[{"type":"text","text":"abcdefgh"}]}"#;
+        assert_eq!(estimate_tokens(line), 2);
+    }
+
+    #[test]
+    fn a_real_session_is_not_estimated_as_empty() {
+        let session = [
+            r#"{"type":"session","version":3,"cwd":"/tmp/x"}"#,
+            r#"{"type":"model_change","modelId":"lfm2.5-2.6b"}"#,
+            r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"What is 2+2? Reply with just the number."}]}}"#,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"4"}]}}"#,
+        ]
+        .join("\n");
+        assert!(
+            estimate_tokens(&session) > 0,
+            "a session with two real turns must not estimate to zero"
+        );
     }
 }
