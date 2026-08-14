@@ -113,16 +113,20 @@ fi
 # vocabularies belong to different layers and only meet at this line.
 LAUNCH_VERB="$VERB"
 [[ "$VERB" == "restore" ]] && LAUNCH_VERB="resume"
+
+# Label the new tab after the archived session. Derived before the command
+# because it also names the restored claude session's Remote Control prefix
+# (dash-common.sh §3b) — the archived chip's label is the name the human
+# recognises this conversation by, here and in the Claude app.
+DEST_LABEL="$LABEL"
+[[ "$VERB" == "fork" ]] && DEST_LABEL="${LABEL% fork} fork"
+
 # On refusal the helper prints the REASON instead of a command (see its header).
-if ! CMD="$(agent_launch_cmd "$LAUNCH_VERB" "$AGENT" "$VALUE")"; then
+if ! CMD="$(agent_launch_cmd "$LAUNCH_VERB" "$AGENT" "$VALUE" skip "$DEST_LABEL")"; then
   toast "Archive $VERB not available" "$CMD"
   exit 8
 fi
 log "cmd: $CMD"
-
-# Label the new tab after the archived session.
-DEST_LABEL="$LABEL"
-[[ "$VERB" == "fork" ]] && DEST_LABEL="${LABEL% fork} fork"
 
 CREATE_JSON="$(hd tab create --workspace "$WS" --cwd "$CWD" --label "$DEST_LABEL" --focus 2>>"$LOG")"
 ROOT_PANE="$(printf '%s' "$CREATE_JSON" | jq -r '.result.root_pane.pane_id // empty')"

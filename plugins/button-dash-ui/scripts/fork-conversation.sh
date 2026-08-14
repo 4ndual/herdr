@@ -119,21 +119,14 @@ if [[ -z "$VALUE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Build the per-agent fork command. The matrix (and every refusal reason)
-#    lives in dash-common.sh so the archive dash cannot drift away from it.
-# ---------------------------------------------------------------------------
-# On refusal the helper prints the REASON instead of a command (see its header).
-if ! FORK_CMD="$(agent_launch_cmd fork "$AGENT" "$VALUE")"; then
-  toast "Fork not available" "$FORK_CMD"
-  exit 7
-fi
-log "fork cmd: $FORK_CMD"
-
-# ---------------------------------------------------------------------------
-# 3b. Derive the fork's label from the SOURCE tab's name: "<name> fork" (e.g.
-#     the "herdr" tab forks to "herdr fork"). Falls back to the cwd basename,
-#     then a bare "fork" if the source tab is unnamed. Re-forking a "<name> fork"
-#     tab keeps a single " fork" suffix (no "herdr fork fork").
+# 3. Derive the fork's label from the SOURCE tab's name: "<name> fork" (e.g.
+#    the "herdr" tab forks to "herdr fork"). Falls back to the cwd basename,
+#    then a bare "fork" if the source tab is unnamed. Re-forking a "<name> fork"
+#    tab keeps a single " fork" suffix (no "herdr fork fork").
+#
+#    Derived BEFORE the command because it is also what names the fork's Remote
+#    Control session: the tab the human sees is the only label that means
+#    anything once the session is listed in the Claude app.
 # ---------------------------------------------------------------------------
 TAB_ID="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.tab_id // empty')"
 SRC_NAME=""
@@ -150,6 +143,17 @@ else
   LABEL="fork"
 fi
 log "fork label: $LABEL (source tab=$TAB_ID)"
+
+# ---------------------------------------------------------------------------
+# 3b. Build the per-agent fork command. The matrix (and every refusal reason)
+#     lives in dash-common.sh so the archive dash cannot drift away from it.
+# ---------------------------------------------------------------------------
+# On refusal the helper prints the REASON instead of a command (see its header).
+if ! FORK_CMD="$(agent_launch_cmd fork "$AGENT" "$VALUE" skip "$LABEL")"; then
+  toast "Fork not available" "$FORK_CMD"
+  exit 7
+fi
+log "fork cmd: $FORK_CMD"
 
 # ---------------------------------------------------------------------------
 # 4. Create the destination surface and run the fork in its root pane.

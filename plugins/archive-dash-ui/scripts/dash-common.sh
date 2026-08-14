@@ -1,12 +1,13 @@
 # dash-common.sh — shared helpers for this plugin's action scripts.
 # SOURCED, never executed (no shebang, not +x on purpose).
 #
-# It owns the three things that were copy-pasted into every script and had
+# It owns the things that were copy-pasted into every script and had
 # already drifted apart:
 #
 #   1. PATH + binary resolution   -> $HERDR, hd(), find_exe()
 #   2. user-visible messaging     -> toast()
 #   3. the per-agent resume/fork matrix -> agent_launch_cmd()
+#   3b. Remote Control on every claude launch -> rc_flags()
 #
 # The caller may set $LOG before sourcing; otherwise a per-plugin default is
 # used. Sourcing defines log(), so callers no longer carry their own copy.
@@ -134,7 +135,7 @@ desktop_notify() {
 }
 
 # ── 3. The per-agent resume/fork matrix ──────────────────────────────────────
-# agent_launch_cmd <resume|fork> <agent> <session-value> [skip|noskip]
+# agent_launch_cmd <resume|fork> <agent> <session-value> [skip|noskip] [rc-name]
 #
 # On success: prints the exact command line to `exec` in a fresh pane, exit 0.
 # On refusal: prints a human-readable REASON, exit 1. Callers must therefore
@@ -167,6 +168,12 @@ desktop_notify() {
 # `codex fork` themselves (verified with `codex resume --help`), so it goes AFTER
 # the subcommand, not before it. pi and jcode have no verified equivalent and are
 # emitted unchanged rather than given a guessed flag.
+#
+# The 5th argument names the Remote Control session prefix (see §3b) and is
+# claude-only. Callers pass the most meaningful label they hold — the fork's tab
+# name, the archived chip's label — because that is what the human will be
+# looking at in the Claude app. With none given it falls back to the fleet
+# harness that owns the session, which is the only context this function has.
 #
 # Two traps encoded here on purpose:
 #
@@ -201,8 +208,13 @@ desktop_notify() {
 # Lookup is glob-only (no `find`): claude names one file per session id, and a
 # codex rollout filename ends in the uuid, so both are a single glob per root.
 #
-# harness_env_prefix <agent> <session-value> -> "env VAR=/path " or "" (always 0)
-harness_env_prefix() {
+# harness_owner <agent> <session-value>
+#   -> two lines, the owning harness NAME then its CONFIG DIR; nothing at all
+#      when the session lives under the default root. Always exits 0.
+#
+# Two lines rather than one field: a harness directory name is user-chosen and a
+# single space-joined line could not be split back apart safely.
+harness_owner() {
   _h_agent="$1"
   _h_value="$2"
   [ -n "$_h_value" ] || return 0
@@ -223,23 +235,119 @@ harness_env_prefix() {
     fi
     [ "$_h_rt" = "$_h_agent" ] || continue
 
+    _h_root="${_h_dir%/}"
     case "$_h_agent" in
       claude)
         for _h_f in "$_h_dir"config/projects/*/"$_h_value".jsonl; do
           [ -f "$_h_f" ] || continue
-          printf 'env CLAUDE_CONFIG_DIR=%q ' "${_h_dir%/}/config"
+          printf '%s\n%s\n' "${_h_root##*/}" "$_h_root/config"
           return 0
         done
         ;;
       codex)
         for _h_f in "$_h_dir"config/sessions/*/*/*/rollout-*-"$_h_value".jsonl; do
           [ -f "$_h_f" ] || continue
-          printf 'env CODEX_HOME=%q ' "${_h_dir%/}/config"
+          printf '%s\n%s\n' "${_h_root##*/}" "$_h_root/config"
           return 0
         done
         ;;
     esac
   done
+  return 0
+}
+
+# harness_env_prefix <agent> <session-value> -> "env VAR=/path " or "" (always 0)
+harness_env_prefix() {
+  _hp_dir="$(harness_owner "$1" "$2" | tail -n +2)"
+  [ -n "$_hp_dir" ] || return 0
+  case "$1" in
+    claude) printf 'env CLAUDE_CONFIG_DIR=%q ' "$_hp_dir" ;;
+    codex) printf 'env CODEX_HOME=%q ' "$_hp_dir" ;;
+  esac
+  return 0
+}
+
+# harness_name <agent> <session-value> -> "<harness>" or "" (always 0)
+harness_name() { harness_owner "$1" "$2" | head -1; }
+
+# ── 3b. Remote Control on every claude launch ────────────────────────────────
+# Every claude session a plugin starts is Remote-Control-enabled by default, so
+# it can be picked up from the phone / claude.ai without first walking over to
+# the machine and typing `/remote-control` into the live REPL (which is all
+# remote-control.sh can do — that button acts on an ALREADY RUNNING session and
+# is unrelated to this).
+#
+# Two escape hatches, because a flag that cannot be turned off breaks something
+# eventually:
+#
+#   HARNESS_RC=off   opt out, honoured at every call site. Test rigs set it so a
+#                    CI/e2e launch never registers a Remote Control session.
+#   version guard    a claude too old to know the flags gets none of them. The
+#                    launch must never die on an unknown option.
+#
+# ORDERING IS LOAD-BEARING. `--remote-control [name]` takes an OPTIONAL value,
+# so the argv word after it is swallowed as the session name unless it starts
+# with `-`. Emitting `--remote-control-session-name-prefix` IMMEDIATELY after it
+# guarantees that, which is what keeps a trailing positional prompt (runtime-swap
+# hands claude its handoff text that way) out of the session name. Never split
+# the pair, and never put `--remote-control` last.
+
+# Memoized per process: "yes" | "no" | "" (not probed yet).
+RC_SUPPORT=""
+
+_rc_cache_file() { printf '%s/herdr/remote-control-support' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+
+# `claude --help` costs ~0.5s warm and ~3s cold — too much to pay on every
+# button press — so the answer is cached on disk, keyed on the binary's own
+# size+mtime so that `claude update` re-probes by itself.
+rc_probe() {
+  RC_SUPPORT=no
+  _rc_exe="$(command -v claude 2>/dev/null)"
+  [ -n "$_rc_exe" ] || _rc_exe="$(find_exe claude)" || return 0
+  [ -x "$_rc_exe" ] || return 0
+
+  # `ls -Ln`, not stat(1): its flags are incompatible between macOS and Linux.
+  _rc_stamp="$(ls -Ln "$_rc_exe" 2>/dev/null | awk '{ print $5 "-" $6 "-" $7 "-" $8 }')"
+  _rc_file="$(_rc_cache_file)"
+  if [ -n "$_rc_stamp" ] && [ -r "$_rc_file" ]; then
+    _rc_line="$(cat "$_rc_file" 2>/dev/null)"
+    case "$_rc_line" in
+      "$_rc_stamp yes") RC_SUPPORT=yes; return 0 ;;
+      "$_rc_stamp no") RC_SUPPORT=no; return 0 ;;
+    esac
+  fi
+
+  if "$_rc_exe" --help 2>/dev/null | grep -q -- '--remote-control-session-name-prefix'; then
+    RC_SUPPORT=yes
+  fi
+  if [ -n "$_rc_stamp" ]; then
+    mkdir -p "${_rc_file%/*}" 2>/dev/null
+    printf '%s %s\n' "$_rc_stamp" "$RC_SUPPORT" >"$_rc_file" 2>/dev/null || true
+  fi
+  return 0
+}
+
+rc_supported() {
+  [ -n "$RC_SUPPORT" ] || rc_probe
+  [ "$RC_SUPPORT" = "yes" ]
+}
+
+# A Remote Control session name is shown in the Claude app, so keep it to the
+# portable identifier charset and a glanceable length. An empty or fully-stripped
+# name degrades to "herdr" rather than emitting an empty prefix.
+rc_name() {
+  _rn="$(printf '%s' "${1:-}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-' |
+    LC_ALL=C sed -e 's/--*/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)"
+  [ -n "$_rn" ] || _rn="herdr"
+  printf '%s' "$_rn"
+}
+
+# rc_flags [name] -> " --remote-control --remote-control-session-name-prefix <n>"
+# (leading space, shell-quoted, ready to append) or "". Always exits 0.
+rc_flags() {
+  [ "${HARNESS_RC:-}" = "off" ] && return 0
+  rc_supported || return 0
+  printf ' --remote-control --remote-control-session-name-prefix %q' "$(rc_name "${1:-}")"
   return 0
 }
 
@@ -277,6 +385,7 @@ agent_launch_cmd() {
   _a_agent="$2"
   _a_value="$3"
   _a_mode="${4:-skip}"
+  _a_rc_name="${5:-}"
 
   # Legacy archive records and display skins can carry "cx" — a cosmetic label
   # for Claude Code driven through a gateway, never a distinct runtime.
@@ -318,6 +427,14 @@ agent_launch_cmd() {
     esac
   fi
 
+  # Remote Control, claude only — codex/pi/jcode have no such feature and must
+  # be emitted exactly as before.
+  _a_rc=""
+  if [ "$_a_agent" = "claude" ]; then
+    [ -n "$_a_rc_name" ] || _a_rc_name="$(harness_name claude "$_a_value")"
+    _a_rc="$(rc_flags "$_a_rc_name")"
+  fi
+
   # Harness-owned sessions need their config root back (see harness_env_prefix).
   # Captured into a variable rather than printed here: the refusal arm below
   # prints a human-readable REASON on the same stdout, and a stray `env …`
@@ -325,11 +442,11 @@ agent_launch_cmd() {
   _a_pfx="$(harness_env_prefix "$_a_agent" "$_a_value")"
 
   case "$_a_verb:$_a_agent" in
-    resume:claude) printf '%s%s --resume %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
+    resume:claude) printf '%s%s --resume %q%s%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" "$_a_rc" ;;
     resume:codex) printf '%s%s resume %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
     resume:pi) printf '%s --session %q' "$_a_exe" "$_a_value" ;;
     resume:jcode) printf '%s --resume %q' "$_a_exe" "$_a_value" ;;
-    fork:claude) printf '%s%s --resume %q --fork-session%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
+    fork:claude) printf '%s%s --resume %q --fork-session%s%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" "$_a_rc" ;;
     fork:codex) printf '%s%s fork %q%s' "$_a_pfx" "$_a_exe" "$_a_value" "$_a_skip" ;;
     fork:pi) printf '%s --fork %q' "$_a_exe" "$_a_value" ;;
     *)

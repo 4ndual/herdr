@@ -29,6 +29,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { rcFlags } from "./remote-control";
 
 // ── jcode's import caps (import.rs:35-37) ──────────────────────────────────
 const MAX_MESSAGES = 160;
@@ -769,7 +770,21 @@ async function buildPlan(
   const messages = parseTranscript(source.runtime, transcript);
   if (!messages.length) throw new Error(`transcript ${transcript} has no replayable user/assistant turns yet`);
   const handoff = buildHandoff(source, target, messages, transcript);
-  const launch = [target, ...trustFlags(target, source.cwd), ...SKIP_FLAGS[target]];
+  const launch = [
+    target,
+    ...trustFlags(target, source.cwd),
+    ...SKIP_FLAGS[target],
+    // Remote Control on the reopened session, claude only (remote-control.ts).
+    // The prefix names the project directory the swap happens in: the pane is
+    // replaced in place and carries no label of its own, so the cwd is the only
+    // thing that identifies this conversation in the Claude app.
+    //
+    // Position matters. `--remote-control` takes an OPTIONAL value, and for
+    // claude the very next word is `handoff.prompt` (TAKES_ARGV_PROMPT) — the
+    // whole flattened conversation. rcFlags() ends on the prefix VALUE, so the
+    // prompt can never be read as the session name.
+    ...(target === "claude" ? rcFlags(basename(source.cwd)) : []),
+  ];
   const viaArgv = TAKES_ARGV_PROMPT[target];
   return {
     argv: viaArgv ? [...launch, handoff.prompt] : launch,

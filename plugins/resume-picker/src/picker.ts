@@ -45,6 +45,7 @@ import {
   isCloseClick,
   type CloseTarget,
 } from "./overlay-chrome";
+import { rcFlags } from "./remote-control";
 
 /** Cells that close the picker, registered by the render that drew them. */
 let closeTargets: CloseTarget[] = [];
@@ -320,8 +321,15 @@ function resumeCommand(session: Session): string {
     ? `env ${session.runtime === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME"}=${shq(session.configRoot)} `
     : "";
   let argv: string;
-  if (session.runtime === "claude") argv = `claude --resume ${shq(session.id)} --dangerously-skip-permissions`;
-  else if (session.runtime === "codex") argv = `codex resume ${shq(session.id)} --dangerously-bypass-approvals-and-sandbox`;
+  if (session.runtime === "claude") {
+    // Remote Control by default (remote-control.ts). The prefix names the
+    // harness that owns the session when there is one — that is what
+    // distinguishes two otherwise identical rows in this very picker — and
+    // otherwise the project directory the conversation ran in.
+    const rc = rcFlags(session.harness || basename(detail.cwd || "")).map(shq).join(" ");
+    argv = `claude --resume ${shq(session.id)} --dangerously-skip-permissions${rc ? ` ${rc}` : ""}`;
+  } else if (session.runtime === "codex")
+    argv = `codex resume ${shq(session.id)} --dangerously-bypass-approvals-and-sandbox`;
   else argv = `pi --session ${shq(session.id)}`; // pi has no verified bypass flag
 
   const exec = `exec ${envPrefix}${argv}`;

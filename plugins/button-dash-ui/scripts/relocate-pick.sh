@@ -19,6 +19,19 @@ PAYLOAD="${1:?usage: relocate-pick.sh <payload-file>}"
 LOG="${HERDR_RELOCATE_LOG:-$HOME/.herdr-relocate.log}"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
+# Remote Control on the resumed session, like every other claude launch these
+# plugins make. Sourced rather than re-implemented so the opt-out (HARNESS_RC=off)
+# and the version guard stay in one place; this script runs IN a pane created by
+# relocate-conversation.sh and so has the same scripts/ directory beside it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r "$SCRIPT_DIR/dash-common.sh" ]]; then
+  # shellcheck source=dash-common.sh
+  . "$SCRIPT_DIR/dash-common.sh"
+else
+  # A relocate that still works beats a relocate that dies over a missing flag.
+  rc_flags() { :; }
+fi
+
 hold() {
   printf '\n'
   # /bin/sh, not /bin/zsh: zsh is the macOS default login shell but is not
@@ -112,11 +125,17 @@ log "migrated OK sid=$SID -> $TARGET"
 cd "$TARGET" || { echo "relocate: cannot enter $TARGET"; hold; }
 
 printf 'resuming in %s …\n\n' "$TARGET"
+# The Remote Control prefix is the project the conversation was just relocated
+# INTO — the whole point of this button is that the old name was wrong, so the
+# new project is the only meaningful label the resumed session can carry.
+RC="$(rc_flags "$(basename "$TARGET")")"
 if command -v claude >/dev/null 2>&1; then
-  exec claude --resume "$SID"
+  # RC is a shell-quoted fragment from dash-common.sh (or empty); eval is what
+  # turns it back into argv words, exactly as relaunch-skip.sh does.
+  eval "exec claude --resume $(printf '%q' "$SID")$RC"
 fi
 
 echo "relocate: migrated, but claude is not on PATH."
-echo "run:  cd '$TARGET' && claude --resume $SID"
+echo "run:  cd '$TARGET' && claude --resume $SID$RC"
 log "FATAL(pick): claude not on PATH"
 hold

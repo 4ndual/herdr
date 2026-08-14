@@ -66,8 +66,21 @@ AGENT="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.agent // empty')"
 VALUE="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.agent_session.value // empty')"
 CWD="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.cwd // .result.pane.foreground_cwd // empty')"
 TAB_ID="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.tab_id // empty')"
+WS="$(printf '%s' "$PANE_JSON" | jq -r '.result.pane.workspace_id // empty')"
 [[ -z "$CWD" ]] && CWD="$HOME"
-log "pane=$PANE agent=$AGENT value=$VALUE cwd=$CWD tab=$TAB_ID"
+[[ -z "$WS" ]] && WS="${HERDR_WORKSPACE_ID:-}"
+log "pane=$PANE agent=$AGENT value=$VALUE cwd=$CWD tab=$TAB_ID ws=$WS"
+
+# The tab's own name, for the relaunched claude session's Remote Control prefix
+# (dash-common.sh §3b). The relaunch stays in the SAME tab, so that name is
+# exactly what the human will be looking at when the session shows up in the
+# Claude app; the cwd basename is the fallback for an unnamed tab.
+TAB_NAME=""
+if [[ -n "$TAB_ID" && -n "$WS" ]]; then
+  TAB_NAME="$(hd tab list --workspace "$WS" 2>/dev/null \
+    | jq -r --arg t "$TAB_ID" '.result.tabs[]? | select(.tab_id == $t) | .label // empty')"
+fi
+[[ -z "$TAB_NAME" ]] && TAB_NAME="$(basename "$CWD")"
 
 if [[ -z "$AGENT" ]]; then
   toast "Relaunch: no agent here" "This pane has no running agent to relaunch."
@@ -108,7 +121,7 @@ if [[ -z "$TAB_ID" ]]; then
 fi
 
 # 3. Build the resume argv WITH the skip flag (mode defaults to skip).
-if ! CMD="$(agent_launch_cmd resume "$AGENT" "$VALUE")"; then
+if ! CMD="$(agent_launch_cmd resume "$AGENT" "$VALUE" skip "$TAB_NAME")"; then
   toast "Relaunch not available" "$CMD"
   exit 7
 fi

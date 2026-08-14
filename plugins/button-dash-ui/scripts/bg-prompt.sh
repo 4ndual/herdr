@@ -20,6 +20,20 @@ set -u
 LOG="${HERDR_BG_LOG:-$HOME/.herdr-bg-dispatch.log}"
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
 
+# Remote Control on the dispatched agent, like every other claude launch these
+# plugins make — a background agent is exactly the kind you want to check on
+# from the phone. `--bg` and `--remote-control` coexist (verified against claude
+# 2.1.232: the pair parses and the agent still backgrounds). The opt-out and the
+# version guard live in dash-common.sh so this script cannot drift from them.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r "$SCRIPT_DIR/dash-common.sh" ]]; then
+  # shellcheck source=dash-common.sh
+  . "$SCRIPT_DIR/dash-common.sh"
+else
+  # A dispatch that still works beats a dispatch that dies over a missing flag.
+  rc_flags() { :; }
+fi
+
 # Resolve `claude` as a BINARY. In an interactive shell `claude` may be a
 # function that re-launches itself inside tmux; a non-interactive bash never
 # sees it, but be explicit so a stray PATH can't surprise us.
@@ -40,7 +54,13 @@ if [[ -z "$PROMPT" ]]; then
 fi
 
 log "dispatching background agent (cwd=$PWD): $PROMPT"
-"$CLAUDE" --bg "$PROMPT"
+# The project directory names the session: a background agent has no tab and no
+# label of its own, so the cwd it was dispatched from is the only context that
+# identifies it later. The flags go BEFORE `--bg` and its prompt so the optional
+# value of `--remote-control` can never swallow the prompt (dash-common.sh §3b).
+RC_FLAGS="$(rc_flags "$(basename "$PWD")")"
+eval "set -- $RC_FLAGS"
+"$CLAUDE" "$@" --bg "$PROMPT"
 RC=$?
 if [[ $RC -ne 0 ]]; then
   echo "claude --bg exited with status $RC — nothing was dispatched."
