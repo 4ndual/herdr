@@ -4153,6 +4153,19 @@ impl HeadlessServer {
     }
 
     fn render_and_stream(&mut self) {
+        // Emit the plugin focus event on the path that actually renders `hr`.
+        //
+        // `sync_ui_plugin_focus_event` was wired only into the direct-TUI render
+        // loop, and a server+client herdr never runs that loop — so in the
+        // configuration every real user runs, no plugin received a FocusChanged
+        // event at all and every "realtime" surface was left re-reading its
+        // input file on the ~1 Hz dash tick. Measured against the live rig
+        // before this: 726 ms average focus-switch lag, worst 1337 ms, and
+        // tick-shaped. Same both-call-sites lesson as the +127/+128 paint paths.
+        //
+        // Cheap to call per frame: it early-returns unless the focused pane,
+        // session, cwd or agent actually changed.
+        self.app.sync_ui_plugin_focus_event();
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
