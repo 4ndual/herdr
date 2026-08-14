@@ -77,7 +77,10 @@ z = 80
 id = "panel-op"
 title = "Harness panel operation"
 description = "Apply a view/selection change and/or a fleet mutation via the daemon API"
-contexts = ["tab", "pane"]
+# Global: a panel click carries no tab/pane target — the host invokes this
+# effect with an empty PluginInvocationContext, so a tab/pane-scoped action
+# can never be satisfied from the panel.
+contexts = ["global"]
 command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/../../target/release/harness-panel-collector\" op"]
 
 # Start the long-lived collector with herdr. It takes an exclusive lock, so
