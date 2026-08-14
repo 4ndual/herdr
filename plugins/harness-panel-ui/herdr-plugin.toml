@@ -43,7 +43,7 @@ kind = "wasm"
 api_version = 3
 module = "target/wasm32-unknown-unknown/release/harness_panel_ui.wasm"
 hot_reload = "on"
-surfaces = ["panel"]
+surfaces = ["right_panel"]
 # plugin_actions is what lets the guest's InvokePluginAction effect survive
 # the host's capability filter (ui_plugins.rs: filter_effects_for_module).
 # Without it every click is delivered to the guest, the guest emits its op
@@ -63,16 +63,6 @@ collector = ["../../target/release/harness-panel-collector", "tick"]
 # marker), correct the moment the rail lands.
 rail_icon = "🎛"
 
-[ui_modules.placement]
-region = "right"
-align = "start"
-size = "96"
-# min_peer is counted in COLUMNS of the PANE AREA for a side band, not of the
-# screen (src/ui.rs: max_slot = terminal.width - min_peer). At 24 the carve
-# collapsed to a ~4-column sliver that looked exactly like the panel failing to
-# render at all. 10 leaves the peer usable and the panel readable.
-min_peer = 10
-z = 80
 
 # The guest emits an InvokePluginAction with a JSON payload; the host hands that
 # to this command as HERDR_PLUGIN_PAYLOAD_JSON, and `op` both performs the

@@ -258,6 +258,7 @@ fn on_action(action_id: &str) -> UiUpdate {
         "view" => serde_json::json!({ "action": "view", "view": arg }),
         "select" => serde_json::json!({ "action": "select", "target": arg }),
         "spawn" | "stop" | "refresh" => serde_json::json!({ "action": verb, "target": arg }),
+        "toggle" => serde_json::json!({ "action": "toggle" }),
         _ => return UiUpdate::default(),
     };
 

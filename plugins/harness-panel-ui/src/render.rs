@@ -114,10 +114,27 @@ fn status_glyph(status: &str) -> &'static str {
 fn header(snap: &Snapshot, ctx: &Ctx, out: &mut Painted, y: &mut u16) {
     let live = if snap.connected { "live" } else { "offline" };
     let live_role = if snap.connected { "success" } else { "danger" };
+    // Title row, with a mouse-clickable close at the right edge. Opening the
+    // panel from its icon is only half an affordance: once open, that same cell
+    // is the tab strip, so without this there is no way back to the collapsed
+    // state except the CLI.
+    let title = "harness fleet ";
+    let close_col = ctx.width.saturating_sub(1);
+    let pad = (close_col as usize)
+        .saturating_sub(title.chars().count() + live.chars().count());
     out.nodes.push(line(vec![
-        span("harness fleet ", None, true),
+        span(title, None, true),
         span(live, Some(live_role), false),
+        span(" ".repeat(pad), None, false),
+        span("✕", Some("muted"), true),
     ]));
+    out.hits.push(UiHitRect {
+        x: close_col,
+        y: *y,
+        width: 1,
+        height: 1,
+        action_id: "toggle:panel".into(),
+    });
     *y += 1;
 
     // Tab row. On a narrow panel the labels alone would overflow, so tabs wrap
@@ -293,6 +310,31 @@ pub fn paint(snap: &Snapshot, ctx: &Ctx) -> Painted {
         hits: Vec::new(),
         total_rows: 0,
     };
+    // Collapsed: one clickable line, and nothing else. This lives here rather
+    // than in the ABI wrapper because it IS the rendered contract — a caller
+    // that renders a closed snapshot must get the collapsed panel, and a test
+    // that renders one must see it.
+    //
+    // Never an empty layer: a guest that stops emitting one is stranded, because
+    // the host drops its carve and afterwards only ever sends a zero rect, so it
+    // can never claim geometry again and freezes mid-screen.
+    if !snap.open {
+        out.nodes.push(line(vec![span(
+            fit("▦ harness fleet — click to open", ctx.width as usize),
+            Some("muted"),
+            true,
+        )]));
+        out.hits.push(UiHitRect {
+            x: 0,
+            y: 0,
+            width: ctx.width,
+            height: 1,
+            action_id: "toggle:panel".into(),
+        });
+        out.total_rows = 1;
+        return out;
+    }
+
     let mut y: u16 = 0;
     header(snap, ctx, &mut out, &mut y);
 
