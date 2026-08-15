@@ -421,7 +421,7 @@ impl App {
             // capabilities, ui_input_file, collector argv) before the wasm
             // mtime watch, so a manifest change re-syncs the manager the same
             // tick its metadata is read for frame dispatch.
-            let manifests_changed = self.hot_reload_ui_plugin_manifests();
+            self.hot_reload_ui_plugin_manifests();
             let changed_ui_modules = self.ui_plugins.detect_changed_modules();
             let changed_reload = if changed_ui_modules.is_empty() {
                 false
@@ -445,12 +445,21 @@ impl App {
                 );
             }
             self.next_dash_tick = now + DASH_TICK_INTERVAL;
-            // Same rule as the headless tick: the tick firing is not itself a
-            // change, so it must not force a repaint on an idle screen.
-            changed |= manifests_changed
-                || !changed_ui_modules.is_empty()
-                || changed_ui_events
-                || has_pending;
+            // NOT gated the way the headless tick is, and the asymmetry is
+            // load-bearing. There, `dispatch_ui_plugin_frame_events` runs inside
+            // this block, so its return value truthfully answers "did this tick
+            // produce a new layer?" and a false answer means there is nothing to
+            // repaint. Here the frame events are dispatched inside the render
+            // closure instead (`App::draw`, mod.rs — right after `compute_view`,
+            // because the surface rects depend on freshly computed geometry), so
+            // the repaint IS what delivers this tick's refreshed collector data
+            // to the guests. Gating it on the pre-render signals would starve the
+            // strip: data refreshed, no render, so the Frame event never fires
+            // and the layer keeps showing stale values until some unrelated event
+            // happens to repaint. Direct mode is the monolithic TUI, not the
+            // server+client `hr` (see the note above), so this costs a repaint per
+            // second only in a mode production does not run.
+            changed = true;
         }
 
         changed
