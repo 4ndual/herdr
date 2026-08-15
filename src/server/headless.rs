@@ -4659,7 +4659,7 @@ impl HeadlessServer {
             // capabilities, ui_input_file, collector argv) before the wasm
             // mtime watch, so a manifest change re-syncs the manager the same
             // tick its metadata is read for frame dispatch.
-            self.app.hot_reload_ui_plugin_manifests();
+            let manifests_changed = self.app.hot_reload_ui_plugin_manifests();
             // feat/native-dashes: mirror the ui-plugin hot-reload + tick dispatch
             // from the direct-mode `App::handle_scheduled_tasks` loop. The server
             // owns the UiPluginManager, so without this the mtime-poll reload and
@@ -4696,9 +4696,20 @@ impl HeadlessServer {
             // Frame layer in the manager's loaded-updates cache. The render then
             // reads the populated UsageStrip/RightPanel layers. `dispatch_event_update`
             // re-reads each `.wasm` from disk, so a rebuilt module hot-reloads next tick.
-            self.app.dispatch_ui_plugin_frame_events();
+            let frame_changed = self.app.dispatch_ui_plugin_frame_events();
             self.app.next_dash_tick = now + app::DASH_TICK_INTERVAL;
-            changed = true;
+            // The tick itself is NOT a change. `dashboards_need_tick()` is true
+            // whenever any UI module is loaded, so an unconditional `changed =
+            // true` here forced a full repaint — every plugin layer re-rendered
+            // — once per DASH_TICK_INTERVAL forever, on an idle screen with
+            // nothing to show. Repaint only when this tick actually produced
+            // something: a reloaded manifest/module, a guest event, a queued
+            // notification/effect, or a new layer from the frame dispatch.
+            changed |= manifests_changed
+                || !changed_ui_modules.is_empty()
+                || changed_ui_events
+                || has_pending
+                || frame_changed;
         }
 
         changed
@@ -6875,6 +6886,92 @@ next_tab = ""
 
         assert!(!server.handle_scheduled_tasks_headless(now, false));
         assert_eq!(server.app.next_agent_manifest_update_check, None);
+    }
+
+    /// Regression: the ~1 Hz dashboard tick is not itself a change.
+    /// `dashboards_need_tick()` is true whenever an agent pane is focused or
+    /// any UI module is loaded — i.e. permanently, in production — so the
+    /// unconditional `changed = true` at the end of that block forced a full
+    /// repaint (every plugin layer re-rendered, `render_ui_plugin_layers`
+    /// once per second) on a completely idle screen, for the lifetime of the
+    /// server. The tick must still run and re-arm; it just must not claim a
+    /// change it did not make.
+    #[test]
+    fn headless_empty_dash_tick_does_not_request_a_repaint() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces =
+            vec![crate::workspace::Workspace::test_adversarial_identity_state()];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.ensure_test_terminals();
+
+        // The focused pane must resolve to an agent, or `dashboards_need_tick()`
+        // is false and the tick block never runs (which would make this test
+        // vacuous — asserted below).
+        let terminal_id = {
+            let ws = server.app.state.workspaces.first().expect("workspace");
+            let pane_id = ws.focused_pane_id().expect("focused pane");
+            ws.terminal_id(pane_id).expect("terminal id").clone()
+        };
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal state")
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".to_string(),
+                agent: "codex".to_string(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(
+                    "11111111-1111-1111-1111-111111111111",
+                )
+                .expect("valid session id"),
+            });
+        assert!(
+            server.app.dashboards_need_tick(),
+            "fixture must actually reach the dash tick"
+        );
+
+        // The tick block is also gated on a rendering client.
+        let (client_tx, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let now = Instant::now();
+
+        // Baseline: identical state, dash tick NOT due. Isolates the tick's own
+        // contribution from any unrelated scheduled work in this fixture.
+        server.app.next_dash_tick = now + Duration::from_secs(3600);
+        let without_tick = server.handle_scheduled_tasks_headless(now, false);
+
+        // Same state, dash tick due. No UI modules are loaded, so the tick
+        // genuinely produces nothing to draw.
+        server.app.next_dash_tick = now - Duration::from_millis(1);
+        let with_tick = server.handle_scheduled_tasks_headless(now, false);
+
+        assert!(
+            server.app.next_dash_tick > now,
+            "the dash tick must still run and re-arm"
+        );
+        assert_eq!(
+            with_tick, without_tick,
+            "an empty dash tick must not change the repaint decision"
+        );
+        assert!(
+            !with_tick,
+            "an idle server with no loaded UI modules must not request a repaint"
+        );
     }
 
     #[tokio::test]
