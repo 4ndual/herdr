@@ -2692,7 +2692,11 @@ impl App {
         }
     }
 
-    pub(crate) fn dispatch_ui_plugin_frame_events(&mut self) {
+    /// Returns whether any module actually emitted a new layer this frame.
+    /// Callers use it to decide whether the frame is worth repainting — the
+    /// dash tick runs at a flat ~1 Hz, but a tick that produced no new layer
+    /// must not force a redraw (see `handle_scheduled_tasks_headless`).
+    pub(crate) fn dispatch_ui_plugin_frame_events(&mut self) -> bool {
         let focus = crate::plugin_focus::focus_input(&self.state);
         let plugin_context = self.current_plugin_context("ui_frame");
         let plugin_context_json = serde_json::to_string(&plugin_context).ok();
@@ -2809,12 +2813,13 @@ impl App {
             .filter(|entry| entry.layer.surface == herdr_ui_plugin_api::UiSurface::UsageStrip)
             .map(|entry| entry.layer.nodes.len())
             .sum();
-        tracing::info!(
+        tracing::debug!(
             changed,
             usage_nodes,
             layers = self.state.ui_surface_layers.len(),
             "frame events done"
         );
+        changed
     }
 
     /// Spec §7: builds the `HERDR_LAYOUT_JSON` blob delivered to v3 modules'

@@ -421,7 +421,7 @@ impl App {
             // capabilities, ui_input_file, collector argv) before the wasm
             // mtime watch, so a manifest change re-syncs the manager the same
             // tick its metadata is read for frame dispatch.
-            self.hot_reload_ui_plugin_manifests();
+            let manifests_changed = self.hot_reload_ui_plugin_manifests();
             let changed_ui_modules = self.ui_plugins.detect_changed_modules();
             let changed_reload = if changed_ui_modules.is_empty() {
                 false
@@ -445,7 +445,12 @@ impl App {
                 );
             }
             self.next_dash_tick = now + DASH_TICK_INTERVAL;
-            changed = true;
+            // Same rule as the headless tick: the tick firing is not itself a
+            // change, so it must not force a repaint on an idle screen.
+            changed |= manifests_changed
+                || !changed_ui_modules.is_empty()
+                || changed_ui_events
+                || has_pending;
         }
 
         changed

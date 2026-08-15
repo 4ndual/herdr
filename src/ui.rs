@@ -1300,7 +1300,10 @@ fn render_ui_plugin_layers(app: &AppState, frame: &mut Frame) {
         .ui_surface_layers
         .iter()
         .find(|entry| entry.layer.surface == UiSurface::UsageStrip);
-    tracing::info!(
+    // Per-frame, so it must not be `info!`: at the 16ms render floor this is up
+    // to 62 formatted log lines a second (plus the `usage_rect` recomputation)
+    // on the main thread, purely to say a frame happened.
+    tracing::debug!(
         layers = app.ui_surface_layers.len(),
         usage_nodes = usage.map(|entry| entry.layer.nodes.len()).unwrap_or(0),
         usage_rect = ?usage.map(|entry| ui_plugin_surface_rect(app, frame.area(), entry.layer.surface)),
