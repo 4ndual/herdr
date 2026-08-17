@@ -34,10 +34,17 @@
 //! `team` declaration and the last finished job keep the chip on the bar; the
 //! status dot, not the chip's presence, is what carries "this one is done".
 
+pub mod codename;
+
 use serde::{Deserialize, Serialize};
 
 /// Snapshot schema version. Bumped when the guest would misread an older file;
 /// the guest renders nothing rather than guess at a shape it does not know.
+///
+/// Deliberately NOT bumped for the codename fields: they are `#[serde(default)]`
+/// additions, so a new guest reads an old snapshot (blank codename → the chip
+/// falls back to its name) and an old guest reads a new one (unknown fields
+/// ignored). A bump here would blank the bar on every build skew instead.
 pub const SCHEMA: u32 = 1;
 
 /// Maximum ancestors walked upward before we declare the graph pathological.
@@ -209,6 +216,24 @@ pub struct Chip {
     /// else (Copy metadata, lineage lookups).
     #[serde(default)]
     pub display_name: String,
+    /// The instance codename — the unique id the fleet gave this pane, as
+    /// displayed (`"Bulbasur"`). This is what the bar DRAWS: the spec asks for
+    /// the bare id on the chip, with the real name revealed on hover.
+    ///
+    /// Empty for a pane the fleet has not named (titlesync not running, or a
+    /// pane it deliberately leaves alone), in which case the chip falls back
+    /// to [`Chip::label`]'s older behaviour and shows the instance name.
+    #[serde(default)]
+    pub codename: String,
+    /// The real name behind the codename — `display_name` with the codename
+    /// and lineage prefix taken off. This is the tooltip's text.
+    ///
+    /// Carried as its own field rather than re-parsed in the guest so the two
+    /// halves of a name are decided ONCE, by the process that can also consult
+    /// the fleet's ledger. A guest that re-derived it would be a second
+    /// implementation of the grammar with less information than the first.
+    #[serde(default)]
+    pub instance_title: String,
     /// This child's dispatch has FINISHED and the chip is being held on the bar
     /// through its retention grace (see `DISPATCH_GRACE` in the collector).
     ///
@@ -228,15 +253,53 @@ impl Chip {
         self.tab_id.is_some()
     }
 
-    /// What the bar draws for this chip: the resolved instance name, or the
-    /// harness identity when a producer left `display_name` unset (an older
-    /// collector build, or a hand-built snapshot in a test) — never a blank
-    /// chip.
+    /// What the bar DRAWS for this chip.
+    ///
+    /// The instance codename — the id — because the bar is a navigation row of
+    /// buttons packed shoulder to shoulder, and an id is short, stable and
+    /// unique, while an instance name is long, changes under the cursor every
+    /// time the agent retitles itself, and is frequently the same words as its
+    /// brother's. The real name is one hover away ([`Chip::detail`]).
+    ///
+    /// Falls back through the resolved instance name to the harness identity,
+    /// so a pane the fleet has not named — or a snapshot from a collector that
+    /// predates codenames — still draws something rather than a blank chip.
     pub fn label(&self) -> &str {
-        if self.display_name.is_empty() {
+        if !self.codename.is_empty() {
+            &self.codename
+        } else if !self.display_name.is_empty() {
+            &self.display_name
+        } else {
+            &self.name
+        }
+    }
+
+    /// What the hover tooltip says: the real name behind the id.
+    ///
+    /// Falls back the same way `label` does, and returns `""` only for a chip
+    /// with nothing at all to say — which the renderer treats as "no detail
+    /// available" rather than drawing an empty tooltip.
+    pub fn detail(&self) -> &str {
+        if !self.instance_title.is_empty() {
+            &self.instance_title
+        } else if !self.display_name.is_empty() && self.display_name != self.codename {
+            &self.display_name
+        } else if self.name != self.codename {
             &self.name
         } else {
-            &self.display_name
+            ""
+        }
+    }
+
+    /// The chip's full identity for a tooltip line: the id, its lineage, and
+    /// the real name. The lineage is deliberately absent from the CHIP (spec
+    /// 4: "do NOT show the `Hexagon >` prefix — just `Bulbasur`") but belongs
+    /// in the detail, which is where a question about parentage gets answered.
+    pub fn tooltip(&self) -> String {
+        let name = self.label();
+        match self.detail() {
+            "" => name.to_string(),
+            detail => format!("{name} — {detail}"),
         }
     }
 }
@@ -385,7 +448,38 @@ mod tests {
             runtime: None,
             folder: None,
             display_name: name.to_string(),
+            codename: String::new(),
+            instance_title: String::new(),
         }
+    }
+
+    /// The bar draws the ID and hovers the NAME — the whole point of the
+    /// codename layer, pinned at the model so neither the collector nor the
+    /// renderer can quietly invert it.
+    #[test]
+    fn a_named_chip_draws_its_id_and_hovers_its_real_name() {
+        let mut c = chip("worker", ChipRole::Child);
+        c.display_name = "Hexagon > Bulbasur (add tab to context menu)".into();
+        c.codename = "Bulbasur".into();
+        c.instance_title = "add tab to context menu".into();
+        assert_eq!(c.label(), "Bulbasur", "the chip carries the bare id");
+        assert_eq!(c.detail(), "add tab to context menu");
+        assert_eq!(c.tooltip(), "Bulbasur — add tab to context menu");
+    }
+
+    /// A collector that predates codenames, or a pane the fleet has not named:
+    /// the bar must still draw something useful rather than a blank chip.
+    #[test]
+    fn an_unnamed_chip_falls_back_to_the_instance_name_then_the_harness() {
+        let mut c = chip("worker", ChipRole::Child);
+        c.display_name = "Ship the daemon".into();
+        assert_eq!(c.label(), "Ship the daemon");
+        assert_eq!(c.detail(), "Ship the daemon");
+
+        c.display_name = String::new();
+        assert_eq!(c.label(), "worker");
+        // Nothing to add: a tooltip repeating the chip is noise, not detail.
+        assert_eq!(c.detail(), "worker");
     }
 
     #[test]

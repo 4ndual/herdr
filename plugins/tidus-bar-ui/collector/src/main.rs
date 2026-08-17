@@ -47,6 +47,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tidus_bar_model::codename;
 use tidus_bar_model::{
     job_tail, BarInput, Chip, ChipRole, ChipStatus, EdgeKind, EmptyReason, MAX_ANCESTRY, SCHEMA,
 };
@@ -847,6 +848,7 @@ fn resolve(focus: &Focus) -> BarInput {
         .as_ref()
         .map(ApiClient::pane_titles)
         .unwrap_or_default();
+    let codenames = load_codenames(&harness_root());
 
     let mut chips: Vec<Chip> = Vec::new();
     for node in ancestry {
@@ -858,6 +860,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &tab_by_workspace,
             &agent_status,
             &pane_titles,
+            &codenames,
         ));
     }
     if let Some(node) = by_name.get(focus_name.as_str()).copied() {
@@ -869,6 +872,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &tab_by_workspace,
             &agent_status,
             &pane_titles,
+            &codenames,
         ));
     }
     // Order is the render order and click handling addresses it by index:
@@ -886,6 +890,7 @@ fn resolve(focus: &Focus) -> BarInput {
                 &tab_by_workspace,
                 &agent_status,
                 &pane_titles,
+                &codenames,
             );
             if chip_is_worth_a_slot(&chip, edge) {
                 chips.push(chip);
@@ -975,6 +980,36 @@ fn edge_rank(edge: EdgeKind) -> u8 {
     }
 }
 
+/// The fleet's codename ledger: pane id → the word it was given.
+///
+/// `$HARNESS_ROOT/.codenames.json`, written by `harness titlesync`
+/// (harness-fleet, go/codename.go). Read rather than re-derived because it is
+/// keyed by pane id and therefore exact — the name grammar can only recognise
+/// an id that is wrapped around a title, and a pane whose runtime has not
+/// produced one yet is called just "Hexagon", which by shape alone is
+/// indistinguishable from a pane somebody labelled "Refactor".
+///
+/// An absent or unreadable ledger is not an error: the fleet may not be
+/// running the daemon, and the parse path still recovers every name that
+/// carries a title.
+fn load_codenames(root: &Path) -> HashMap<String, String> {
+    let Ok(raw) = std::fs::read(root.join(".codenames.json")) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return HashMap::new();
+    };
+    let Some(live) = value.get("live").and_then(|v| v.as_object()) else {
+        return HashMap::new();
+    };
+    live.iter()
+        .filter_map(|(pane, rec)| {
+            let word = rec.get("codename")?.as_str()?;
+            (!word.is_empty()).then(|| (pane.clone(), word.to_string()))
+        })
+        .collect()
+}
+
 fn chip_for(
     node: &Node,
     role: ChipRole,
@@ -983,6 +1018,7 @@ fn chip_for(
     tab_by_workspace: &HashMap<PathBuf, String>,
     agent_status: &HashMap<String, AgentPane>,
     pane_titles: &HashMap<String, PaneTitle>,
+    codenames: &HashMap<String, String>,
 ) -> Chip {
     // Resolve the tab the chip navigates to, freshest source first:
     //
@@ -1031,9 +1067,36 @@ fn chip_for(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| node.name.clone());
+    // Split the instance id off the front of the name. The LEDGER wins: it is
+    // keyed by pane id and therefore exact, while the parse is a shape rule
+    // that deliberately refuses anything ambiguous (a bare "Hexagon" with no
+    // title reads as an ordinary label, and would otherwise be lost).
+    let parsed = codename::parse(&display_name);
+    let codename = pane_id
+        .as_deref()
+        .and_then(|pane| codenames.get(pane))
+        .map(|word| codename::display(word))
+        .unwrap_or_else(|| parsed.codename.clone());
+    // ...but the TITLE always comes from the parse: the ledger knows the id,
+    // not the name it was wrapped around.
+    let instance_title = if parsed.codename.is_empty() && !codename.is_empty() {
+        // Ledger-confirmed id with an unparseable name — e.g. a pane still
+        // called just "Hexagon", before its runtime has produced a title.
+        // There is no real name yet, and inventing one from the id would make
+        // the tooltip echo the chip.
+        if display_name == codename {
+            String::new()
+        } else {
+            display_name.clone()
+        }
+    } else {
+        parsed.title.clone()
+    };
     Chip {
         name: node.name.clone(),
         display_name,
+        codename,
+        instance_title,
         role,
         status: status_for(node, agent.and_then(|a| a.status.as_deref())),
         edge,
@@ -1893,6 +1956,8 @@ mod tests {
             exec: None,
             runtime: Some("claude".into()),
             folder: None,
+            codename: String::new(),
+            instance_title: String::new(),
         }
     }
 
@@ -2140,6 +2205,7 @@ mod tests {
             &HashMap::new(),
             &agents,
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.status, ChipStatus::Attention);
         assert_eq!(chip.pane_id.as_deref(), Some("w1:p9"));
@@ -2196,6 +2262,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id, None);
         assert_eq!(
@@ -2209,6 +2276,7 @@ mod tests {
             ChipRole::Child,
             Some(EdgeKind::Team),
             &["w9:tZ".to_string()],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -2241,6 +2309,7 @@ mod tests {
             &by_cwd,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id.as_deref(), Some("w1:tLIVE"));
         assert!(chip.clickable(), "the chip must navigate again");
@@ -2267,5 +2336,115 @@ mod tests {
         std::env::remove_var("TIDUS_BAR_OUTPUT");
         assert_eq!(output_path(), PathBuf::from("/tmp/state").join(INPUT_FILE));
         std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+    }
+
+    // ── CODENAME: the id on the chip, the name in the tooltip ───────────────
+
+    /// Build a chip for a pane whose synced label is `label`, optionally with
+    /// a ledger entry for its pane id — the two sources the split resolves
+    /// against, and nothing else.
+    fn named_chip(label: &str, ledger: &[(&str, &str)]) -> Chip {
+        let mut n = node("kid");
+        n.tab_id = Some("w1:t9".into());
+        let mut agents = HashMap::new();
+        agents.insert(
+            "w1:t9".to_string(),
+            AgentPane {
+                pane_id: Some("w1:p9".into()),
+                status: Some("idle".into()),
+            },
+        );
+        let mut titles = HashMap::new();
+        titles.insert(
+            "w1:t9".to_string(),
+            PaneTitle {
+                label: Some(label.to_string()),
+                terminal_title_stripped: None,
+            },
+        );
+        let codenames: HashMap<String, String> = ledger
+            .iter()
+            .map(|(p, w)| (p.to_string(), w.to_string()))
+            .collect();
+        chip_for(
+            &n,
+            ChipRole::Child,
+            Some(EdgeKind::Team),
+            &["w1:t9".to_string()],
+            &HashMap::new(),
+            &agents,
+            &titles,
+            &codenames,
+        )
+    }
+
+    /// The spec's own example, end to end through the collector: the chip
+    /// carries the BARE codename (no "Hexagon >" lineage, no title) and the
+    /// real name is what hover will show.
+    #[test]
+    fn a_decorated_label_splits_into_the_id_and_the_real_name() {
+        let chip = named_chip("Hexagon > Bulbasur (add tab to context menu)", &[]);
+        assert_eq!(chip.codename, "Bulbasur");
+        assert_eq!(chip.instance_title, "add tab to context menu");
+        assert_eq!(chip.label(), "Bulbasur", "the chip draws the id alone");
+        assert_eq!(chip.detail(), "add tab to context menu");
+        // display_name is untouched: everything else on the bar (Copy
+        // metadata, the collector's own logs) still sees the full name.
+        assert_eq!(chip.display_name, "Hexagon > Bulbasur (add tab to context menu)");
+    }
+
+    /// The ledger is keyed by pane id and therefore exact; the parse is a
+    /// shape rule. When they disagree the ledger wins.
+    #[test]
+    fn the_ledger_wins_over_the_parse() {
+        let chip = named_chip("Hexagon (a task)", &[("w1:p9", "bulbasur")]);
+        assert_eq!(chip.codename, "Bulbasur");
+        assert_eq!(chip.instance_title, "a task");
+    }
+
+    /// A pane the fleet has named but whose runtime has not produced a title
+    /// yet is called just "Hexagon" — which the grammar refuses on purpose.
+    /// The ledger recovers the id, and the tooltip stays empty rather than
+    /// echoing the chip back at the operator.
+    #[test]
+    fn a_bare_codename_is_recovered_from_the_ledger_with_no_title() {
+        let chip = named_chip("Hexagon", &[("w1:p9", "hexagon")]);
+        assert_eq!(chip.codename, "Hexagon");
+        assert_eq!(chip.instance_title, "");
+        assert_eq!(chip.detail(), "kid", "falls back to the harness identity");
+    }
+
+    /// An ordinary label is never mistaken for an id. This is the failure that
+    /// would put a task description on the chip and the instance id in the
+    /// tooltip — exactly backwards — and it has no error message.
+    #[test]
+    fn an_ordinary_label_yields_no_codename() {
+        let chip = named_chip("Fix the parser (again)", &[]);
+        assert_eq!(chip.codename, "");
+        assert_eq!(chip.instance_title, "Fix the parser (again)");
+        assert_eq!(chip.label(), "Fix the parser (again)");
+    }
+
+    /// The ledger reader tolerates every shape a missing or half-written file
+    /// can have: the bar must degrade to the parse, never to a panic.
+    #[test]
+    fn a_missing_or_malformed_ledger_is_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("tidus-cn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        assert!(load_codenames(&dir).is_empty(), "absent file");
+        for body in ["{not json", "{}", r#"{"live":[]}"#, r#"{"live":{"w1:p1":{}}}"#] {
+            std::fs::write(dir.join(".codenames.json"), body).expect("write");
+            assert!(load_codenames(&dir).is_empty(), "body {body:?}");
+        }
+        std::fs::write(
+            dir.join(".codenames.json"),
+            r#"{"version":1,"live":{"w1:p1":{"codename":"hexagon","harness":"h"}}}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            load_codenames(&dir).get("w1:p1").map(String::as_str),
+            Some("hexagon")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
