@@ -850,6 +850,20 @@ fn resolve(focus: &Focus) -> BarInput {
         .unwrap_or_default();
     let codenames = load_codenames(&harness_root());
 
+    // Collect all nodes that will be rendered to build session_codenames mapping
+    let mut all_nodes_for_mapping: Vec<&Node> = Vec::new();
+    all_nodes_for_mapping.extend(&ancestry);
+    if let Some(node) = by_name.get(focus_name.as_str()).copied() {
+        all_nodes_for_mapping.push(node);
+    }
+    for (node, _) in &brothers {
+        all_nodes_for_mapping.push(node);
+    }
+    for (node, _) in &children {
+        all_nodes_for_mapping.push(node);
+    }
+    let session_codenames = build_session_codenames(&all_nodes_for_mapping, &codenames);
+
     let mut chips: Vec<Chip> = Vec::new();
     for node in ancestry {
         chips.push(chip_for(
@@ -861,6 +875,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &agent_status,
             &pane_titles,
             &codenames,
+            &session_codenames,
         ));
     }
     if let Some(node) = by_name.get(focus_name.as_str()).copied() {
@@ -873,6 +888,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &agent_status,
             &pane_titles,
             &codenames,
+            &session_codenames,
         ));
     }
     // Order is the render order and click handling addresses it by index:
@@ -891,6 +907,7 @@ fn resolve(focus: &Focus) -> BarInput {
                 &agent_status,
                 &pane_titles,
                 &codenames,
+                &session_codenames,
             );
             if chip_is_worth_a_slot(&chip, edge) {
                 chips.push(chip);
@@ -1010,6 +1027,33 @@ fn load_codenames(root: &Path) -> HashMap<String, String> {
         .collect()
 }
 
+/// Build a session_id -> codename mapping from pane_id -> codename.
+/// Searches through all accessible nodes to find which session_ids have codenames.
+fn build_session_codenames(
+    nodes: &[&Node],
+    pane_codenames: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut session_map: HashMap<String, String> = HashMap::new();
+
+    for node in nodes {
+        // Try to find a codename for this node by looking up all its known pane_ids
+        if let Some(session_id) = &node.session_id {
+            if !session_id.is_empty() && session_map.contains_key(session_id) {
+                // Already have a codename for this session
+                continue;
+            }
+
+            if let Some(pane_id) = &node.pane_id {
+                if let Some(codename) = pane_codenames.get(pane_id) {
+                    session_map.insert(session_id.clone(), codename.clone());
+                }
+            }
+        }
+    }
+
+    session_map
+}
+
 fn chip_for(
     node: &Node,
     role: ChipRole,
@@ -1019,6 +1063,7 @@ fn chip_for(
     agent_status: &HashMap<String, AgentPane>,
     pane_titles: &HashMap<String, PaneTitle>,
     codenames: &HashMap<String, String>,
+    session_codenames: &HashMap<String, String>,
 ) -> Chip {
     // Resolve the tab the chip navigates to, freshest source first:
     //
@@ -1068,14 +1113,23 @@ fn chip_for(
         })
         .unwrap_or_else(|| node.name.clone());
     // Split the instance id off the front of the name. The LEDGER wins: it is
-    // keyed by pane id and therefore exact, while the parse is a shape rule
-    // that deliberately refuses anything ambiguous (a bare "Hexagon" with no
-    // title reads as an ordinary label, and would otherwise be lost).
+    // keyed by session id (durable across relaunches) and therefore exact,
+    // while the parse is a shape rule that deliberately refuses anything
+    // ambiguous (a bare "Hexagon" with no title reads as an ordinary label,
+    // and would otherwise be lost).
     let parsed = codename::parse(&display_name);
-    let codename = pane_id
+    let codename = node
+        .session_id
         .as_deref()
-        .and_then(|pane| codenames.get(pane))
+        .and_then(|sid| session_codenames.get(sid))
         .map(|word| codename::display(word))
+        .or_else(|| {
+            // Fallback to pane_id lookup for panes that don't have session_id
+            pane_id
+                .as_deref()
+                .and_then(|pane| codenames.get(pane))
+                .map(|word| codename::display(word))
+        })
         .unwrap_or_else(|| parsed.codename.clone());
     // ...but the TITLE always comes from the parse: the ledger knows the id,
     // not the name it was wrapped around.
@@ -1102,6 +1156,7 @@ fn chip_for(
         edge,
         tab_id,
         pane_id,
+        session_id: node.session_id.clone(),
         // Nothing is hidden until the host's create-hidden work lands; the
         // field exists now so phase 2 is a collector change, not a protocol one.
         hidden: false,

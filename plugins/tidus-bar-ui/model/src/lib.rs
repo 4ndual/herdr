@@ -184,6 +184,10 @@ pub struct Chip {
     pub tab_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
+    /// The agent's session id — durable across pane relaunches. Used to keep
+    /// the same chip and codename when a pane is relaunched with a new pane_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// True when the tab is hidden and a click must `tab.show` rather than
     /// `tab.focus`. Always false until the host's create-hidden work lands;
     /// carried now so phase 2 is a collector change, not a protocol change.
@@ -440,6 +444,7 @@ mod tests {
             edge: None,
             tab_id: Some("w1:t2".into()),
             pane_id: None,
+            session_id: None,
             hidden: false,
             finished: false,
             task: None,
