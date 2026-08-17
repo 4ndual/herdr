@@ -28,8 +28,16 @@ and let the non-zero exit stop the work being called finished.
 | `VGATE_SESSION` | `tbvgate` | herdr session name |
 | `VGATE_FLEET` | `/tmp/vgate-fleet` | private `HARNESS_ROOT` |
 | `VGATE_OUT` | `/tmp/vgate` | video, claims, frames, report |
+| `VGATE_VIDEO` | `$VGATE_OUT/tidus-bar-vgate.mp4` | recording path |
 | `VGATE_HOLD` | `9000` | ms each phase is held on camera |
 | `VGATE_KEEP` | unset | leave the stage up after the run |
+| `VGATE_HERDR` | `~/.local/bin/herdrtest` | herdr binary to drive |
+| `VGATE_TERM` | `xfce4-terminal` | terminal emulator for the stage |
+| `VGATE_FORCE_X264` | unset | skip the VAAPI probe and encode with x264 |
+| `VGATE_REC_LEAD` | `2` | s between recorder start and scenario t=0 |
+| `VGATE_BAR_CROP` | `crop=1150:200:170:875` | the judged region handed to Mage-VL |
+| `VGATE_CELL_H` / `VGATE_CELL_W` | `17` / `8.14` | terminal cell metrics for chip targeting |
+| `VGATE_CHIP_GAP` | `26` | first-guess px gap between chips (then self-calibrated) |
 | `VL_ENDPOINT` / `VL_MODEL` | llama-swap / `mage-vl` | the reviewer's only vision |
 
 Requires: `bun`, `ffmpeg`, `xdotool`, `Xvfb`, `xfce4-terminal`, and Mage-VL
@@ -65,13 +73,18 @@ uses `tab focus` (not itself under test); the click criteria use **real xdotool
 presses** at the chip's own pixels — an interaction that is not visibly
 performed does not count.
 
-Chips are located by **ink-run matching** against the frame rather than by
-reimplementing `render::layout()`: that arithmetic is being actively rewritten,
-and a copy here would drift silently. A chip name is drawn as one contiguous
-glyph run of `len(name)` cells, so the run whose width matches, on the band
-whose run sequence matches that row's expected names, is the chip. This also
-means the gate clicks **what is actually drawn**, which is the point of a video
-gate.
+Chips are located by **anchoring on the bar's `⑂` row-0 prefix**, then clustering
+glyph runs within the requested row — not by reimplementing `render::layout()`,
+which is being actively rewritten and would drift silently here. Two earlier
+y-fraction bounds clicked the harness-indicator grid and then the pane title
+line, and the gate scored both as "the click did not navigate"; the icon is the
+one landmark that does not move.
+
+Where a row's chips cannot be separated (on a build whose entries are truncated
+pane-title paths, the largest gap on a row is ~14px and identical gaps occur
+both between chips and inside a label), the row span is divided evenly and the
+target is flagged `ambiguous`. A click resting on that weaker method is reported
+INSTRUMENT-LIMITED, never as a navigation defect — see C8 below.
 
 ## Checklist
 
