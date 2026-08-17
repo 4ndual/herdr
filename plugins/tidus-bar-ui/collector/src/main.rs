@@ -2004,6 +2004,7 @@ mod tests {
             edge: None,
             tab_id: tab.map(str::to_string),
             pane_id: None,
+            session_id: None,
             hidden: false,
             finished: false,
             task: None,
@@ -2261,6 +2262,7 @@ mod tests {
             &agents,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.status, ChipStatus::Attention);
         assert_eq!(chip.pane_id.as_deref(), Some("w1:p9"));
@@ -2318,6 +2320,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id, None);
         assert_eq!(
@@ -2331,6 +2334,7 @@ mod tests {
             ChipRole::Child,
             Some(EdgeKind::Team),
             &["w9:tZ".to_string()],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -2362,6 +2366,7 @@ mod tests {
             Some(EdgeKind::Team),
             &["w1:tLIVE".to_string()],
             &by_cwd,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -2430,6 +2435,7 @@ mod tests {
             &agents,
             &titles,
             &codenames,
+            &HashMap::new(),
         )
     }
 
