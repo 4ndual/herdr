@@ -595,6 +595,7 @@ mod tests {
     fn chip(name: &str, role: ChipRole) -> Chip {
         Chip {
             name: name.to_string(),
+            display_name: name.to_string(),
             role,
             status: ChipStatus::Idle,
             edge: (role == ChipRole::Child).then_some(EdgeKind::Dispatch),
@@ -783,7 +784,7 @@ mod tests {
         seed(input.clone());
         let (_, placed) = render::layout(&input).expect("rows");
         let kid = placed.iter().find(|p| p.index == 3).expect("the child");
-        assert_eq!(kid.row, 1, "precondition: the child is on the second row");
+        assert_eq!(kid.row, 2, "precondition: the child is on the child row");
 
         // Same column, both rows: two different agents must answer.
         let column = kid.x + kid.width / 2;
@@ -799,15 +800,17 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            tab_of(&press(1)),
+            tab_of(&press(2)),
             Some(serde_json::json!("w1:t-kid")),
             "the child row must open the child"
         );
-        assert_ne!(
-            tab_of(&press(0)),
-            Some(serde_json::json!("w1:t-kid")),
-            "the same column on row 0 is a different agent"
-        );
+        for above in [0u16, 1] {
+            assert_ne!(
+                tab_of(&press(above)),
+                Some(serde_json::json!("w1:t-kid")),
+                "the same column on row {above} is a different agent"
+            );
+        }
     }
 
     /// A press below the band belongs to the pane, not to the bar. With a
@@ -816,8 +819,7 @@ mod tests {
     #[test]
     fn a_press_past_the_bands_last_row_is_not_a_chip() {
         let _guard = test_guard();
-        seed(sample()); // one row: no children of the selected node
-        assert_eq!(render::content_height(&sample()), 2);
+        seed(sample());
         let update = handle_mouse(&MouseEvent {
             kind: MouseEventKind::LeftDown,
             column: 2,
@@ -826,12 +828,23 @@ mod tests {
         assert!(update.effects.is_empty(), "{:?}", update.effects);
     }
 
-    /// Spec (4): the band is one row at rest and two only while there are
-    /// children — the host sizes an `auto` band from the node count, so the
+    /// The band costs one row per LEVEL it actually has something to show on,
+    /// and no more — the host sizes an `auto` band from the node count, so the
     /// number of emitted `Line` nodes IS the number of pane rows taken.
     #[test]
-    fn the_band_grows_a_row_only_when_children_are_shown() {
+    fn the_band_costs_one_row_per_level_it_has_something_to_show() {
         let _guard = test_guard();
+
+        // A lone root: nothing to hang from, nothing hanging off it.
+        let lone = BarInput {
+            chips: vec![chip("main", ChipRole::Current)],
+            empty_reason: None,
+            ..Default::default()
+        };
+        let update = handle_event(&frame_event(&lone, Rect::new(0, 30, 120, 1)));
+        assert_eq!(line_nodes(&update), 1, "a lone orchestrator costs one row");
+
+        // Lineage + family, but the selection has no children.
         let childless = BarInput {
             chips: vec![
                 chip("main", ChipRole::Ancestor),
@@ -841,15 +854,16 @@ mod tests {
             empty_reason: None,
             ..Default::default()
         };
-        let update = handle_event(&frame_event(&childless, Rect::new(0, 30, 120, 1)));
+        let update = handle_event(&frame_event(&childless, Rect::new(0, 30, 120, 2)));
         assert_eq!(
             line_nodes(&update),
-            1,
-            "brothers alone must not cost a second row"
+            2,
+            "an empty child row must not be carved"
         );
 
-        let update = handle_event(&frame_event(&family(), Rect::new(0, 30, 120, 2)));
-        assert_eq!(line_nodes(&update), 2, "children earn the second row");
+        // ...and the child row appears only once there is a child on it.
+        let update = handle_event(&frame_event(&family(), Rect::new(0, 30, 120, 3)));
+        assert_eq!(line_nodes(&update), 3, "children earn the third row");
     }
 
     /// Closing a brother points focus back at the parent it shares with the

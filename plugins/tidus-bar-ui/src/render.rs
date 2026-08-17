@@ -5,22 +5,32 @@
 //! ratatui colors map to host theme roles via `guest::color_role`, so the bar
 //! follows the active theme instead of painting raw ANSI.
 //!
-//! Shape — ancestors pinned left, then the SELECTED node carrying the selected
-//! indicator, then its brothers; the selected node's own children go on a
-//! second row, indented to start underneath it:
+//! Shape — one row per LEVEL of the tree, each hanging off the chip above it.
+//! The lineage is row 0; the selected node and its brothers share the row under
+//! it; the selected node's own children get the row under that:
 //!
 //! ```text
-//! ⑂ main │ ▌squad▐ ● reviewer ○ writer
-//!         └ ◆ builder ○ scribe
+//! ⑂ ○ main
+//!   └ ▌squad▐ ● reviewer ○ writer
+//!       └ ◆ builder ○ scribe
 //! ```
 //!
-//! Two rules make the shape stable under navigation:
+//! The rows do not move when the selection does. Clicking `reviewer` marks
+//! `reviewer` and reorders that row — it does not promote the row, collapse the
+//! lineage above it, or push the family somewhere else:
 //!
-//!   * the brother set belongs to the PARENT, so clicking a brother re-roots
-//!     the bar on it without the row you clicked from disappearing;
-//!   * the second row exists only when the selected node actually has
-//!     children, so the band costs one line at rest and two only while there
-//!     is something to put on the second.
+//! ```text
+//! ⑂ ○ main
+//!   └ ▌reviewer▐ ● squad ○ writer
+//! ```
+//!
+//! That stability is the whole point. An earlier cut flattened the selection up
+//! onto the lineage row, and navigating down then looked like the tree turning
+//! inside out: the children you clicked jumped up a row and the row you clicked
+//! from vanished underneath the cursor.
+//!
+//! A root with no ancestors has no row to hang from, so it draws on row 0
+//! itself — which is why a lone orchestrator still costs exactly one line.
 //!
 //! Every chip is its own click target, so the bar is a grid of buttons rather
 //! than a line with a meaning. Left-click navigates (the terminal area swaps to
@@ -48,17 +58,27 @@ const CURRENT: Color = Color::Cyan;
 const ICON: &str = "\u{2442}"; // ⑂
 /// Between lineage chips: descent.
 const DESCEND: &str = " \u{25B8} "; // " ▸ "
-/// Between the lineage and the children.
-const DIVIDER: &str = " \u{2502} "; // " │ "
 /// Brackets around the SELECTED node. Half-block glyphs rather than `[ ]`: they
 /// read as a filled cartouche around the name at terminal resolution, which is
 /// what makes "this one is selected" answerable without comparing colours.
 const HERE_OPEN: &str = "\u{258C}"; // ▌
 const HERE_CLOSE: &str = "\u{2590}"; // ▐
-/// Elbow that opens the child row, drawn in the selected chip's own column so
-/// the row below is visibly hanging off the selected chip and not off the
-/// lineage or off a brother.
+/// Elbow that opens a hanging row, drawn in the column of the chip it hangs
+/// off, so each row is visibly attached to one specific chip above it rather
+/// than to the row in general.
 const BRANCH: &str = "\u{2514} "; // "└ "
+
+/// Furthest right a hanging row may be indented.
+///
+/// A row hangs off its parent chip's column, which reads correctly for the
+/// two or three levels a bar usually shows. But nesting five or six deep is
+/// normal fleet operation (see `MAX_ANCESTRY`), and a lineage that long is
+/// easily seventy columns wide — indenting the family row to match would push
+/// the selected node and every brother off the right edge of the bar. Past
+/// this point the rows stop stepping right and stack instead: the hierarchy
+/// gets slightly less literal, which is a much smaller loss than the chips
+/// becoming unreachable.
+const MAX_HANG: u16 = 24;
 
 // The bar publishes NO hit-rects any more: hover needs the raw mouse stream and
 // the host suppresses that over a module's own rects, so clicks are resolved
@@ -85,20 +105,27 @@ pub struct Placed {
 /// emits no layer and the host carves no band, rather than reserving a line to
 /// display emptiness.
 ///
-/// Row 0 is always present: `⑂ <ancestors> │ <selected> <brothers…>`. Row 1
-/// exists only when the selected node has children, and starts with the elbow
-/// in the selected chip's own column, so the band is one line tall at rest and
-/// two only while there is a child row to justify the second.
+/// One row per level, each hanging off the chip above it:
+///
+///   * row 0 — the WHOLE ancestor chain, root-most first. Every ancestor stays
+///     drawn and clickable however deep the selection goes; nothing here is
+///     ever elided, because the way back up must not depend on how far down you
+///     went (spec rule 10).
+///   * the family row — the selected node first, then its brothers. It hangs
+///     off the last ancestor. A root has no ancestor to hang from, so it draws
+///     on row 0 instead and a lone orchestrator still costs one line.
+///   * the child row — the selected node's own children, hanging off the
+///     selected chip. Built only when there is at least one.
 pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
     if input.is_empty() {
         return None;
     }
-    let mut spans: Vec<Span<'static>> = Vec::new();
     let mut placed: Vec<Placed> = Vec::new();
-    let mut x: u16 = 0;
-    // Column the selected chip starts at, which the child row indents to.
-    let mut selected_x: u16 = 0;
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // ── Row 0: the lineage, in full ────────────────────────────────────────
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x: u16 = 0;
     push(
         &mut spans,
         &mut x,
@@ -106,12 +133,14 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
         Style::default().fg(SUBTEXT),
     );
 
-    let mut first_ancestor = true;
+    // Column the family row hangs from: the PARENT, i.e. the last ancestor.
+    let mut parent_x: u16 = 0;
+    let mut any_ancestor = false;
     for (index, chip) in input.chips.iter().enumerate() {
         if chip.role != ChipRole::Ancestor {
             continue;
         }
-        if !first_ancestor {
+        if any_ancestor {
             push(
                 &mut spans,
                 &mut x,
@@ -119,7 +148,8 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
                 Style::default().fg(MUTED),
             );
         }
-        first_ancestor = false;
+        any_ancestor = true;
+        parent_x = x;
         let start = x;
         for (text, style) in ancestor_spans(chip) {
             push(&mut spans, &mut x, text, style);
@@ -132,32 +162,45 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
         });
     }
 
-    // The divider separates "how I got here" from "what is here". With no
-    // ancestors there is nothing on its left, and a leading bare divider would
-    // claim a lineage the bar does not have.
-    if !first_ancestor {
+    // The family: the selected node FIRST, then its brothers. It gets its own
+    // row under the parent — unless there is no parent, in which case the
+    // selected node IS the top of the chain and belongs on row 0 with it.
+    let family_row: u16 = if any_ancestor { 1 } else { 0 };
+    let (mut family, mut fx) = if any_ancestor {
+        lines.push(Line::from(std::mem::take(&mut spans)));
+        let mut family: Vec<Span<'static>> = Vec::new();
+        let mut fx: u16 = 0;
         push(
-            &mut spans,
-            &mut x,
-            DIVIDER.to_string(),
+            &mut family,
+            &mut fx,
+            " ".repeat(parent_x.min(MAX_HANG) as usize),
+            Style::default(),
+        );
+        push(
+            &mut family,
+            &mut fx,
+            BRANCH.to_string(),
             Style::default().fg(MUTED),
         );
-    }
+        (family, fx)
+    } else {
+        (std::mem::take(&mut spans), x)
+    };
 
-    // The selected node FIRST, then its brothers — spec order, and the reason
-    // the child row's indent is knowable before the brothers are laid out.
-    let mut any_peer = false;
+    // Column the child row hangs from: the selected chip itself.
+    let mut selected_x: u16 = 0;
+    let mut any_family = false;
     for (index, chip) in input.chips.iter().enumerate() {
         let selected = match chip.role {
             ChipRole::Current => true,
             ChipRole::Sibling => false,
             _ => continue,
         };
-        if any_peer {
-            push(&mut spans, &mut x, " ".to_string(), Style::default());
+        if any_family {
+            push(&mut family, &mut fx, " ".to_string(), Style::default());
         }
-        any_peer = true;
-        let start = x;
+        any_family = true;
+        let start = fx;
         if selected {
             selected_x = start;
         }
@@ -167,20 +210,19 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
             child_spans(chip)
         };
         for (text, style) in cells {
-            push(&mut spans, &mut x, text, style);
+            push(&mut family, &mut fx, text, style);
         }
         placed.push(Placed {
             index,
-            row: 0,
+            row: family_row,
             x: start,
-            width: x - start,
+            width: fx - start,
         });
     }
+    lines.push(Line::from(family));
 
-    let mut lines = vec![Line::from(spans)];
-
-    // Row 1: the selected node's children, hanging off its own column. Built
-    // only when there is at least one — an empty second row would cost the
+    // ── The child row ──────────────────────────────────────────────────────
+    // Built only when there is at least one child: an empty row would cost the
     // operator a line of pane height to display nothing.
     let mut kids: Vec<Span<'static>> = Vec::new();
     let mut kx: u16 = 0;
@@ -193,7 +235,7 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
             push(
                 &mut kids,
                 &mut kx,
-                " ".repeat(selected_x as usize),
+                " ".repeat(selected_x.min(MAX_HANG) as usize),
                 Style::default(),
             );
             push(
@@ -212,7 +254,7 @@ pub fn layout(input: &BarInput) -> Option<(Vec<Line<'static>>, Vec<Placed>)> {
         }
         placed.push(Placed {
             index,
-            row: 1,
+            row: family_row + 1,
             x: start,
             width: kx - start,
         });
@@ -231,7 +273,7 @@ fn ancestor_spans(chip: &Chip) -> Vec<(String, Style)> {
             format!("{} ", chip.status.dot()),
             Style::default().fg(status_color(chip.status)),
         ),
-        (chip.name.clone(), Style::default().fg(SUBTEXT)),
+        (chip.label().to_string(), Style::default().fg(SUBTEXT)),
     ]
 }
 
@@ -246,7 +288,7 @@ fn selected_spans(chip: &Chip) -> Vec<(String, Style)> {
     vec![
         (HERE_OPEN.to_string(), Style::default().fg(CURRENT)),
         (
-            chip.name.clone(),
+            chip.label().to_string(),
             Style::default()
                 .fg(CURRENT)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -286,12 +328,21 @@ fn child_spans(chip: &Chip) -> Vec<(String, Style)> {
     };
     let mut out = vec![
         (format!("{} ", chip.status.dot()), dot_style),
-        (chip.name.clone(), name_style),
+        (chip.label().to_string(), name_style),
     ];
-    // Only a job actually in flight earns the disambiguating tail; a finished
-    // chip showing one would read as still running.
+    // The disambiguating job tail is a FALLBACK, not decoration. It exists so
+    // two dispatches to the same harness can be told apart (brief §7) — and a
+    // chip that already carries a resolved instance name has told them apart
+    // by name, which is what the operator actually reads. Appending the tail
+    // then produces `Document the borrowLogin feature:797524`: an instance name
+    // with a job id stapled to it, which is neither.
+    //
+    // So: only when there is nothing but the bare harness name to go on, and
+    // only while the job is actually in flight — a finished chip showing a tail
+    // would read as still running.
     let in_flight = chip.edge == Some(EdgeKind::Dispatch);
-    if let Some(tail) = chip.job_tail.as_ref().filter(|_| in_flight) {
+    let named = !chip.display_name.is_empty() && chip.display_name != chip.name;
+    if let Some(tail) = chip.job_tail.as_ref().filter(|_| in_flight && !named) {
         out.push((format!(":{tail}"), Style::default().fg(MUTED)));
     }
     out
@@ -446,6 +497,7 @@ mod tests {
             runtime: Some("claude".into()),
             finished: false,
             folder: None,
+            display_name: name.to_string(),
         }
     }
 
@@ -505,21 +557,91 @@ mod tests {
         assert_eq!(content_height(&BarInput::default()), 0);
     }
 
-    /// Spec (3): the selected node comes FIRST after its parent, and the
+    /// Spec (3): the selected node comes FIRST on the family row and the
     /// brothers sit next to it — not before it, and not on another row.
+    ///
+    /// Spec: the ROWS do not move when the selection does. The lineage keeps
+    /// row 0 and the family keeps the row under it, so navigating down does not
+    /// promote the row you clicked from out of existence.
     #[test]
-    fn the_selected_node_leads_its_brothers_right_after_the_lineage() {
-        let top = row_text(&family(), 0);
-        let main = top.find("main").expect("ancestor");
-        let squad = top.find("squad").expect("selected");
-        let a = top.find("bro-a").expect("brother a");
-        let b = top.find("bro-b").expect("brother b");
-        assert!(main < squad && squad < a && a < b, "row order: {top}");
-        assert!(top.contains(DIVIDER), "lineage and family are separated");
+    fn the_selected_node_leads_its_brothers_on_the_row_under_the_lineage() {
+        let input = family();
+        let top = row_text(&input, 0);
+        assert!(top.contains("main"), "the lineage keeps row 0: {top}");
+        assert!(
+            !top.contains("squad") && !top.contains("bro-a"),
+            "the family does not climb onto the lineage row: {top}"
+        );
+
+        let fam = row_text(&input, 1);
+        let squad = fam.find("squad").expect("selected");
+        let a = fam.find("bro-a").expect("brother a");
+        let b = fam.find("bro-b").expect("brother b");
+        assert!(squad < a && a < b, "family row order: {fam}");
         // Spec (1): the brothers are on the bar at all. This is the whole
         // regression — selecting a child used to replace the row with that
         // child's own children and take its brothers with it.
-        assert!(!top.contains("kid-a"), "children belong on row 1: {top}");
+        assert!(!fam.contains("kid-a"), "children belong below: {fam}");
+    }
+
+    /// Spec rule 10: the FULL ancestor lineage is always rendered and every
+    /// ancestor is clickable, however deep the selection sits. The way back up
+    /// must not depend on how far down you went.
+    #[test]
+    fn the_whole_ancestor_chain_stays_drawn_and_clickable() {
+        // Names deliberately share no substring with each other: "grandparent"
+        // inside "great-grandparent" would make a position check pass or fail
+        // for reasons that have nothing to do with the lineage.
+        let input = bar(vec![
+            chip("alpha", ChipRole::Ancestor, ChipStatus::Idle),
+            chip("bravo", ChipRole::Ancestor, ChipStatus::Idle),
+            chip("charlie", ChipRole::Ancestor, ChipStatus::Idle),
+            chip("delta", ChipRole::Ancestor, ChipStatus::Idle),
+            chip("selected", ChipRole::Current, ChipStatus::Busy),
+            chip("bro", ChipRole::Sibling, ChipStatus::Idle),
+            chip("kid", ChipRole::Child, ChipStatus::Busy),
+        ]);
+
+        let top = row_text(&input, 0);
+        // A deep chain must not start eliding the far end to make room.
+        for ancestor in ["alpha", "bravo", "charlie", "delta"] {
+            assert!(top.contains(ancestor), "{ancestor} dropped out of: {top}");
+        }
+        // Reading order is root-most first, so the way back up is left to right.
+        let mut at = 0;
+        for ancestor in ["alpha", "bravo", "charlie", "delta"] {
+            let found = top.find(ancestor).expect(ancestor);
+            assert!(found >= at, "lineage out of order: {top}");
+            at = found;
+        }
+
+        // Every one of them is its own click target on row 0.
+        let (_, placed) = layout(&input).expect("rows");
+        for index in 0..4 {
+            let p = placed
+                .iter()
+                .find(|p| p.index == index)
+                .unwrap_or_else(|| panic!("ancestor {index} has no click target"));
+            assert_eq!(p.row, 0, "the lineage lives on row 0");
+            assert!(p.width > 0);
+        }
+    }
+
+    /// A deep lineage must not indent the family row off the right-hand edge.
+    #[test]
+    fn a_long_lineage_stops_stepping_right_rather_than_pushing_the_family_away() {
+        let mut chips: Vec<Chip> = (0..6)
+            .map(|i| chip(&format!("ancestor-number-{i}"), ChipRole::Ancestor, ChipStatus::Idle))
+            .collect();
+        chips.push(chip("selected", ChipRole::Current, ChipStatus::Busy));
+        let input = bar(chips);
+        let (_, placed) = layout(&input).expect("rows");
+        let selected = placed.iter().find(|p| p.index == 6).expect("selected");
+        assert!(
+            selected.x <= MAX_HANG + 2,
+            "the family row was indented to {} — off the edge of a narrow bar",
+            selected.x
+        );
     }
 
     /// Spec (2): the selected chip is distinguishable from a brother by its own
@@ -527,15 +649,15 @@ mod tests {
     #[test]
     fn the_selected_chip_carries_a_visible_selected_indicator() {
         let input = family();
-        let top = row_text(&input, 0);
+        let fam = row_text(&input, 1);
         assert!(
-            top.contains(&format!("{HERE_OPEN}squad{HERE_CLOSE}")),
-            "{top}"
+            fam.contains(&format!("{HERE_OPEN}squad{HERE_CLOSE}")),
+            "{fam}"
         );
         // ...and the style survives to the host, which only carries bold /
         // underline / italic.
         let (lines, _) = layout(&input).expect("a row");
-        let name = lines[0]
+        let name = lines[1]
             .spans
             .iter()
             .find(|s| s.content == "squad")
@@ -546,7 +668,7 @@ mod tests {
             "underlined"
         );
         // A brother must NOT wear it, or "selected" means nothing.
-        let bro = lines[0]
+        let bro = lines[1]
             .spans
             .iter()
             .find(|s| s.content == "bro-a")
@@ -554,25 +676,23 @@ mod tests {
         assert!(!bro.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
-    /// Spec (4): children go on a row UNDER the selected chip, and the band is
-    /// only two rows tall when there are children to put on the second.
+    /// Spec (4): children go on a row UNDER the selected chip, hanging off the
+    /// selected chip's own column — not off the lineage and not off a brother.
     #[test]
-    fn children_get_a_second_row_indented_under_the_selected_chip() {
+    fn children_hang_off_the_selected_chip_on_the_row_below_the_family() {
         let input = family();
-        assert_eq!(content_height(&input), 2, "a child row was earned");
-        let (lines, placed) = layout(&input).expect("rows");
-        assert_eq!(lines.len(), 2);
+        assert_eq!(content_height(&input), 3, "lineage, family, children");
+        let (_, placed) = layout(&input).expect("rows");
 
-        let bottom = row_text(&input, 1);
+        let bottom = row_text(&input, 2);
         assert!(bottom.contains("kid-a") && bottom.contains("kid-b"), "{bottom}");
-        assert!(!bottom.contains("bro-a"), "brothers stay on row 0: {bottom}");
+        assert!(!bottom.contains("bro-a"), "brothers stay on the family row");
 
-        // The elbow sits in the selected chip's own column.
         let selected = placed
             .iter()
             .find(|p| p.index == 1)
             .expect("the selected chip is placed");
-        assert_eq!(selected.row, 0);
+        assert_eq!(selected.row, 1, "the selection sits under the lineage");
         let elbow = bottom.find(BRANCH.trim()).expect("an elbow");
         assert_eq!(
             elbow as u16, selected.x,
@@ -580,13 +700,27 @@ mod tests {
         );
 
         for kid in placed.iter().filter(|p| p.index >= 4) {
-            assert_eq!(kid.row, 1, "children are on the second row");
+            assert_eq!(kid.row, 2, "children are on the row below the family");
             assert!(kid.x >= selected.x, "and start at or past the elbow");
         }
     }
 
+    /// The family row hangs off the PARENT, so it is visibly attached to the
+    /// specific ancestor it descends from.
     #[test]
-    fn a_selection_with_no_children_stays_one_row_tall() {
+    fn the_family_row_hangs_off_the_last_ancestor() {
+        let input = family();
+        let (_, placed) = layout(&input).expect("rows");
+        let parent = placed
+            .iter()
+            .find(|p| p.index == 0)
+            .expect("the ancestor is placed");
+        let elbow = row_text(&input, 1).find(BRANCH.trim()).expect("an elbow");
+        assert_eq!(elbow as u16, parent.x, "the family hangs off its parent");
+    }
+
+    #[test]
+    fn a_selection_with_no_children_costs_no_child_row() {
         let input = bar(vec![
             chip("main", ChipRole::Ancestor, ChipStatus::Idle),
             chip("squad", ChipRole::Current, ChipStatus::Busy),
@@ -594,21 +728,38 @@ mod tests {
         ]);
         assert_eq!(
             content_height(&input),
-            1,
-            "an empty second row would cost a line of pane height for nothing"
+            2,
+            "lineage and family only — an empty child row would cost a line of \
+             pane height to display nothing"
         );
     }
 
+    /// A root has no ancestor to hang from, so it draws on row 0 itself and a
+    /// lone orchestrator still costs exactly one line.
     #[test]
-    fn a_lone_orchestrator_renders_no_bare_divider() {
+    fn a_lone_orchestrator_draws_itself_on_the_only_row() {
         let input = bar(vec![chip("main", ChipRole::Current, ChipStatus::Idle)]);
-        let text = text_of(&input);
-        assert!(
-            !text.contains(DIVIDER),
-            "nothing sits left of the divider: {text}"
-        );
-        assert!(text.contains(&format!("{HERE_OPEN}main{HERE_CLOSE}")), "{text}");
         assert_eq!(content_height(&input), 1);
+        let text = row_text(&input, 0);
+        assert!(text.contains(&format!("{HERE_OPEN}main{HERE_CLOSE}")), "{text}");
+        assert!(!text.contains(BRANCH.trim()), "nothing to hang from: {text}");
+    }
+
+    /// A root WITH children keeps its children one row down, hanging off it.
+    #[test]
+    fn a_root_selection_puts_its_children_directly_under_itself() {
+        let input = bar(vec![
+            chip("main", ChipRole::Current, ChipStatus::Idle),
+            chip("kid-a", ChipRole::Child, ChipStatus::Busy),
+        ]);
+        assert_eq!(content_height(&input), 2);
+        let (_, placed) = layout(&input).expect("rows");
+        let root = placed.iter().find(|p| p.index == 0).expect("root");
+        let kid = placed.iter().find(|p| p.index == 1).expect("kid");
+        assert_eq!(root.row, 0);
+        assert_eq!(kid.row, 1);
+        let elbow = row_text(&input, 1).find(BRANCH.trim()).expect("an elbow");
+        assert_eq!(elbow as u16, root.x, "children hang off the root chip");
     }
 
     #[test]
@@ -624,8 +775,8 @@ mod tests {
         );
         // Overlap is only meaningful WITHIN a row: two rows may legitimately
         // draw different chips at the same column, which is the entire point of
-        // indenting the child row under the selected chip.
-        for row in [0u16, 1] {
+        // indenting each row under the chip it hangs from.
+        for row in [0u16, 1, 2] {
             let on_row: Vec<&Placed> = placed.iter().filter(|p| p.row == row).collect();
             for pair in on_row.windows(2) {
                 assert!(

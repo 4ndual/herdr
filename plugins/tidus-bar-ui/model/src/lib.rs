@@ -201,6 +201,14 @@ pub struct Chip {
     /// second round trip to the collector's own node table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
+    /// The instance's canonical synchronized name — session title = pane
+    /// label = tab name (titlesync, harness-fleet bcfd73f/51b3323) — resolved
+    /// pane label first, then the pane's stripped terminal title, falling
+    /// back to `name` (the harness identity) when neither is set. This is
+    /// what the bar DRAWS; `name` stays the harness identity for everything
+    /// else (Copy metadata, lineage lookups).
+    #[serde(default)]
+    pub display_name: String,
     /// This child's dispatch has FINISHED and the chip is being held on the bar
     /// through its retention grace (see `DISPATCH_GRACE` in the collector).
     ///
@@ -218,6 +226,18 @@ impl Chip {
     /// instance. Rendering a dead click target is worse than rendering none.
     pub fn clickable(&self) -> bool {
         self.tab_id.is_some()
+    }
+
+    /// What the bar draws for this chip: the resolved instance name, or the
+    /// harness identity when a producer left `display_name` unset (an older
+    /// collector build, or a hand-built snapshot in a test) — never a blank
+    /// chip.
+    pub fn label(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
     }
 }
 
@@ -364,6 +384,7 @@ mod tests {
             exec: None,
             runtime: None,
             folder: None,
+            display_name: name.to_string(),
         }
     }
 
