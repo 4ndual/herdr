@@ -33,6 +33,14 @@
       "description": "Relaunch THIS session in place with permissions bypassed — claude and codex; pi and jcode have no such flag"
     },
     {
+      "id": "codex-here",
+      "label": "Codex here",
+      "emoji": "🔄",
+      "shortcut": "⌃⌥C",
+      "color": "peach",
+      "description": "Reopen this pane's harness/workspace in the codex runtime, in place — resumes the harness's own codex session when it has one"
+    },
+    {
       "id": "relocate",
       "label": "Relocate",
       "emoji": "📦",

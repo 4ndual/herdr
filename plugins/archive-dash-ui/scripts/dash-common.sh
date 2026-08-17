@@ -207,6 +207,8 @@ desktop_notify() {
 #
 # Lookup is glob-only (no `find`): claude names one file per session id, and a
 # codex rollout filename ends in the uuid, so both are a single glob per root.
+# The root is resolved from each harness's declared configDir when present, so
+# a Tidus harness may own a project outside ~/harnesses/<name>/workspace.
 #
 # harness_owner <agent> <session-value>
 #   -> two lines, the owning harness NAME then its CONFIG DIR; nothing at all
@@ -225,29 +227,43 @@ harness_owner() {
   [ -d "$HOME/harnesses" ] || return 0
 
   for _h_dir in "$HOME"/harnesses/*/; do
-    [ -d "$_h_dir/config" ] || continue
+    [ -r "$_h_dir/harness.json" ] || continue
     # harness.json is the authoritative runtime declaration; a harness with a
     # different runtime cannot own this session, and one with none is skipped
     # rather than assumed (several exist: main, vanilla, mac-main, …).
     _h_rt=""
-    if [ -r "$_h_dir/harness.json" ] && command -v jq >/dev/null 2>&1; then
+    _h_profile="false"
+    _h_cfg=""
+    if command -v jq >/dev/null 2>&1; then
       _h_rt="$(jq -r '.runtime // empty' <"$_h_dir/harness.json" 2>/dev/null)"
+      _h_profile="$(jq -r '.profile // false' <"$_h_dir/harness.json" 2>/dev/null)"
+      _h_cfg="$(jq -r '.configDir // empty' <"$_h_dir/harness.json" 2>/dev/null)"
     fi
+    [ "$_h_profile" = "true" ] && continue
     [ "$_h_rt" = "$_h_agent" ] || continue
+    [ -n "$_h_cfg" ] || _h_cfg="${_h_dir%/}/config"
+    case "$_h_cfg" in
+      ~/*) _h_cfg="$HOME/${_h_cfg#~/}" ;;
+    esac
+    [ -d "$_h_cfg" ] || continue
+    case "$_h_agent" in
+      claude) [ -f "$_h_cfg/.credentials.json" ] || continue ;;
+      codex) [ -f "$_h_cfg/auth.json" ] || continue ;;
+    esac
 
     _h_root="${_h_dir%/}"
     case "$_h_agent" in
       claude)
-        for _h_f in "$_h_dir"config/projects/*/"$_h_value".jsonl; do
+        for _h_f in "$_h_cfg"/projects/*/"$_h_value".jsonl; do
           [ -f "$_h_f" ] || continue
-          printf '%s\n%s\n' "${_h_root##*/}" "$_h_root/config"
+          printf '%s\n%s\n' "${_h_root##*/}" "$_h_cfg"
           return 0
         done
         ;;
       codex)
-        for _h_f in "$_h_dir"config/sessions/*/*/*/rollout-*-"$_h_value".jsonl; do
+        for _h_f in "$_h_cfg"/sessions/*/*/*/rollout-*-"$_h_value".jsonl; do
           [ -f "$_h_f" ] || continue
-          printf '%s\n%s\n' "${_h_root##*/}" "$_h_root/config"
+          printf '%s\n%s\n' "${_h_root##*/}" "$_h_cfg"
           return 0
         done
         ;;
@@ -353,8 +369,8 @@ rc_flags() {
 
 # claude_roots -> every Claude Code config root on this machine, one per line.
 #
-# The default root FIRST, then each fleet harness root (~/harnesses/<name>/config
-# whose harness.json declares runtime "claude"). Callers that look up a
+# The default root FIRST, then each fleet harness root (the configDir declared
+# by ~/harnesses/<name>/harness.json when present). Callers that look up a
 # transcript must walk all of them: a harness pane's transcript has never lived
 # under ~/.claude, so a single-root lookup silently reports "no session" for
 # exactly the panes that most need recovering. Same defect the host carried in
@@ -368,14 +384,25 @@ claude_roots() {
 
   [ -d "$HOME/harnesses" ] || return 0
   for _cr_dir in "$HOME"/harnesses/*/; do
-    [ -d "$_cr_dir/config" ] || continue
-    [ "$_cr_dir/config" = "$_cr_default" ] && continue
+    [ -r "$_cr_dir/harness.json" ] || continue
     _cr_rt=""
-    if [ -r "$_cr_dir/harness.json" ] && command -v jq >/dev/null 2>&1; then
+    _cr_profile="false"
+    _cr_root=""
+    if command -v jq >/dev/null 2>&1; then
       _cr_rt="$(jq -r '.runtime // empty' <"$_cr_dir/harness.json" 2>/dev/null)"
+      _cr_profile="$(jq -r '.profile // false' <"$_cr_dir/harness.json" 2>/dev/null)"
+      _cr_root="$(jq -r '.configDir // empty' <"$_cr_dir/harness.json" 2>/dev/null)"
     fi
+    [ "$_cr_profile" = "true" ] && continue
     [ "$_cr_rt" = "claude" ] || continue
-    printf '%s\n' "${_cr_dir%/}/config"
+    [ -n "$_cr_root" ] || _cr_root="${_cr_dir%/}/config"
+    case "$_cr_root" in
+      ~/*) _cr_root="$HOME/${_cr_root#~/}" ;;
+    esac
+    [ -d "$_cr_root" ] || continue
+    [ -f "$_cr_root/.credentials.json" ] || continue
+    [ "$_cr_root" = "$_cr_default" ] && continue
+    printf '%s\n' "$_cr_root"
   done
   return 0
 }

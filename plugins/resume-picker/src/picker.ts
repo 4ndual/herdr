@@ -91,6 +91,19 @@ function statMtime(file: string): number | null {
   }
 }
 
+/**
+ * harness.json may point at a profile or another explicit config root. Keep
+ * the picker aligned with the fleet launcher instead of assuming every
+ * harness uses <harness-dir>/config.
+ */
+function declaredConfigRoot(harnessDir: string, metadata: any): string {
+  const declared = typeof metadata?.configDir === "string" ? metadata.configDir : "";
+  if (!declared) return join(harnessDir, "config");
+  if (declared === "~") return HOME;
+  if (declared.startsWith("~/")) return join(HOME, declared.slice(2));
+  return declared;
+}
+
 /** claude layout: <root>/projects/<slug>/<uuid>.jsonl */
 function scanClaudeRoot(root: string, harness: string, out: Session[]) {
   const projects = join(root, "projects");
@@ -182,13 +195,16 @@ function discover(): Session[] {
   // without one is skipped rather than assumed to be claude (several exist).
   const harnesses = join(HOME, "harnesses");
   for (const name of safeReaddir(harnesses)) {
-    const config = join(harnesses, name, "config");
-    let runtime = "";
+    const harnessDir = join(harnesses, name);
+    let metadata: any;
     try {
-      runtime = JSON.parse(readFileSync(join(harnesses, name, "harness.json"), "utf8")).runtime ?? "";
+      metadata = JSON.parse(readFileSync(join(harnessDir, "harness.json"), "utf8"));
     } catch {
       continue;
     }
+    if (metadata?.profile === true) continue;
+    const config = declaredConfigRoot(harnessDir, metadata);
+    const runtime = metadata?.runtime ?? "";
     if (runtime === "claude") scanClaudeRoot(config, name, out);
     else if (runtime === "codex") scanCodexRoot(config, name, out);
   }

@@ -243,3 +243,17 @@ align = "end"
 size = "42"
 min_peer = 24
 z = 60
+
+# codex-here: replace the CURRENT pane with the same work running under the
+# codex runtime. Same spawn-then-close ordering as relaunch-skip, so a failed
+# spawn never leaves the user paneless. All logic is in Go (`harness
+# codex-here`): it maps the pane cwd back to the owning harness, points
+# CODEX_HOME at that harness config dir, and resumes the harness OWN codex
+# session (state/session-id.codex) when one exists — a claude transcript can
+# never be resumed by codex, so the contract is same harness, same workspace,
+# codex own latest session. Detached so it outlives the action runner.
+[[actions]]
+id = "codex-here"
+title = "Codex here"
+contexts = ["tab", "pane"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/codex-here.sh\" >/dev/null 2>&1 &"]

@@ -123,6 +123,21 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
+        id: "codex-here",
+        label: "Codex here",
+        emoji: "\u{1F504}",            // 🔄
+        shortcut: "\u{2303}\u{2325}C", // ⌃⌥C
+        // Deliberate, allow-listed collision with `relaunch-skip` (see
+        // ALLOWED_COLOR_COLLISIONS). Both buttons do the same physical thing —
+        // replace THIS pane in place with a different launch of the same work —
+        // so sharing peach reads as a family; the glyphs carry the difference
+        // (⚡ same runtime, bypassed · 🔄 same work, other runtime).
+        color: "peach",
+        description: "Reopen this pane's harness/workspace in the codex runtime, in place — resumes the harness's own codex session when it has one",
+        action_id: "codex-here",
+        plugin: PLUGIN_ID,
+    },
+    ButtonDef {
         id: "relocate",
         label: "Relocate",
         emoji: "\u{1F4E6}",            // 📦
@@ -793,7 +808,13 @@ mod tests {
     /// accidental-collision case this test exists to catch. `handoff-hr` keeps
     /// `warning` and is now unpaired.
     const ALLOWED_COLOR_COLLISIONS: &[(&str, &str)] =
-        &[("green", "success"), ("magenta", "mauve")];
+        &[
+            ("green", "success"),
+            ("magenta", "mauve"),
+            // relaunch-skip ⚡ and codex-here 🔄: the two "replace this pane in
+            // place with another launch of the same work" buttons.
+            ("peach", "peach"),
+        ];
 
     #[test]
     fn button_colors_are_distinct() {

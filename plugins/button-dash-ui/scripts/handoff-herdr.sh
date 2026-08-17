@@ -285,6 +285,26 @@ if [[ ! -x "$IMPORT_EXE" ]]; then
 fi
 log "import exe: $IMPORT_EXE"
 
+# --- Gate 3.5: refuse a no-op handoff --------------------------------------
+# A handoff to the image already executing succeeds mechanically and toasts
+# success, but changes nothing — measured 2026-08-14: the button was pressed
+# before a new build was promoted to disk, the swap "worked", and the missing
+# fix read as "the handoff button is broken". The running image is
+# /proc/<pid>/exe (possibly an unlinked inode after a mv); compare inodes.
+RUNNING_INO=""
+if [[ -r "/proc/$SERVER_PID/exe" ]]; then
+  RUNNING_INO="$(stat -L -c %i "/proc/$SERVER_PID/exe" 2>/dev/null)"
+elif [[ "$UNAME_S" == "Darwin" ]]; then
+  RUNNING_INO="$(lsof -p "$SERVER_PID" -a -d txt 2>/dev/null | awk 'NR>1{print $(NF-1)}' | head -1)"
+fi
+IMPORT_INO="$(file_inode "$IMPORT_EXE")"
+log "no-op check: running_ino=$RUNNING_INO import_ino=$IMPORT_INO"
+if [[ -n "$RUNNING_INO" && -n "$IMPORT_INO" && "$RUNNING_INO" == "$IMPORT_INO" ]]; then
+  toast "Handoff skipped — already live on this binary" \
+        "$IMPORT_EXE is the image the server is already running. Promote a new build to disk first, then press again. Nothing was changed."
+  exit 16
+fi
+
 # --- Gate 4: pane count within the FD ceiling ----------------------------
 # MAX_FDS_PER_HANDOFF = 64 (src/server/handoff.rs). Refuse up front rather than
 # discovering it mid-transfer with live agents attached.
