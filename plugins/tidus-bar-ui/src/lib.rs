@@ -1,6 +1,12 @@
-//! Tidus subagent bar: a persistent bottom row showing the lineage of the
-//! focused orchestrator and its direct children, where each child is a chip you
-//! can click to swap the terminal area to that agent.
+//! Tidus subagent bar: a persistent bottom band showing the lineage of the
+//! selected agent, the selected agent itself, its brothers, and — on a second
+//! row underneath it — its own children. Every chip is clickable and swaps the
+//! terminal area to that agent.
+//!
+//! Selecting a brother re-roots the band on that brother WITHOUT removing the
+//! brothers: the brother set is a property of the parent, so navigating
+//! sideways keeps the row you navigated from. The band is one row tall at rest
+//! and two only while the selected agent has children to list.
 //!
 //! Why it exists: tidus can already spawn a tree of agents, but herdr's tab bar
 //! is a flat list in creation order — it cannot say who spawned whom, and once
@@ -20,8 +26,13 @@
 //!   * LEFT-click a chip with no pane in this instance (a `light` child that
 //!     runs inside `conductor`, or one reaped away) → report instead of
 //!     navigating, because there is no PTY to show.
-//!   * RIGHT-click → report. A bar you are looking at rather than driving
-//!     should not carry a destructive second gesture.
+//!   * RIGHT-click a chip → opens a small context menu in the bar's own row
+//!     (`Copy metadata`, `Close`, `Cancel`), styled and behaving like the
+//!     host's built-in tab/pane menus. `Copy metadata` reports the chip's
+//!     harness, runtime, pane id, tab id, workspace and launch folder.
+//!     `Close` closes that chip's tab; if the closed chip was the CURRENT
+//!     (focused) one, focus is pointed back at its parent in the lineage
+//!     rather than whatever the host would otherwise pick.
 //!
 //! The bar never steals focus on its own: it navigates only on a click, which
 //! is the brief's first-class UX rule (children spawn `focus:false`).
@@ -34,7 +45,7 @@ use herdr_ui_plugin_api::{
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::sync::Mutex;
-use tidus_bar_model::BarInput;
+use tidus_bar_model::{BarInput, Chip, ChipRole};
 
 /// Last snapshot rendered, so a click resolves against exactly what is on
 /// screen rather than whatever the collector wrote in the meantime.
@@ -42,12 +53,29 @@ static LAST_INPUT: Mutex<Option<BarInput>> = Mutex::new(None);
 
 static LAST_EVENT_RESPONSE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
-/// The carved row's absolute rect (x, y, width) from the last frame, and the
-/// chip the cursor is over. Both are resolved from the RAW mouse stream
-/// (capability `mouse_all`): the host suppresses raw `Move` over a module's own
-/// declared hit-rects, so a bar that wants hover must declare none and do its
-/// own arithmetic — the button-dash / archive-dash model.
-static ROW_RECT: Mutex<Option<(u16, u16, u16)>> = Mutex::new(None);
+/// A context menu opened by right-click, addressing the same `BarInput::chips`
+/// index a chip click would resolve against. Kept separate from `LAST_INPUT`
+/// so a menu survives an unrelated snapshot refresh (it re-resolves the chip
+/// by index on every repaint) but is dropped the moment that index no longer
+/// names a chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenMenu {
+    chip_index: usize,
+}
+
+static MENU: Mutex<Option<OpenMenu>> = Mutex::new(None);
+
+/// The carved band's absolute rect (x, y, width, height) from the last frame.
+/// Resolved from the RAW mouse stream (capability `mouse_all`): the host
+/// suppresses raw `Move` over a module's own declared hit-rects, so a bar that
+/// does its own hit testing must declare none and do its own arithmetic — the
+/// button-dash / archive-dash model.
+///
+/// The HEIGHT is carried because the band is two rows tall whenever the
+/// selected node has children, and a press then has to be attributed to the
+/// right row: the child row is indented to sit UNDER the selected chip, so the
+/// same column names a different agent on each row.
+static ROW_RECT: Mutex<Option<(u16, u16, u16, u16)>> = Mutex::new(None);
 // The bar is HOVER-INERT. There is deliberately no hover state here.
 //
 // It used to swap the whole row for a detail line about the chip under the
@@ -181,7 +209,7 @@ fn handle_event(event: &UiEvent) -> UiUpdate {
         if ctx.rect.width == 0 || ctx.rect.height == 0 {
             None
         } else {
-            Some((ctx.rect.x, ctx.rect.y, ctx.rect.width))
+            Some((ctx.rect.x, ctx.rect.y, ctx.rect.width, ctx.rect.height))
         };
 
     render_from(&input)
@@ -214,12 +242,25 @@ fn clear_bar() -> UiUpdate {
 
 /// Build the layer for `input`. One rendering, used by the frame path and by
 /// the click path, so what a click lands on is by construction what was drawn.
+///
+/// Checks the open menu first: while one is up, the row shows the menu
+/// instead of the chips, on every repaint (the next natural frame tick,
+/// not just the click that opened it) until it is dismissed or acted on.
 fn render_from(input: &BarInput) -> UiUpdate {
+    if let Some(menu) = *MENU.lock().expect("menu mutex poisoned") {
+        return render_menu(input, menu);
+    }
     let width = render::content_width(input);
-    if width == 0 {
+    let height = render::content_height(input);
+    if width == 0 || height == 0 {
         return clear_bar();
     }
-    let content = Rect::new(0, 0, width, 1);
+    // Content-sized in BOTH axes. The manifest sizes this band `auto`, and the
+    // host measures an auto band's height as the number of `Line` nodes the
+    // module emits (`ui.rs::panel_content_dims`), so the buffer's height is
+    // literally how many rows of pane the bar takes: one at rest, two while the
+    // selected node has children to show underneath it.
+    let content = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(content);
     render::render(input, content, &mut buf);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
@@ -244,12 +285,44 @@ fn render_from(input: &BarInput) -> UiUpdate {
     }
 }
 
-/// Which chip covers an absolute cell, from the SAME layout the row was drawn
+/// Render the open menu in place of the chip row. Falls back to a normal
+/// repaint (and drops the menu) if `menu.chip_index` no longer names a chip —
+/// the bar refreshed out from under an open menu, and describing a chip that
+/// vanished would be worse than closing the menu that was pointed at it.
+fn render_menu(input: &BarInput, menu: OpenMenu) -> UiUpdate {
+    let Some(chip) = input.chips.get(menu.chip_index) else {
+        *MENU.lock().expect("menu mutex poisoned") = None;
+        return render_from(input);
+    };
+    let width = render::menu_content_width(&chip.name);
+    let content = Rect::new(0, 0, width, 1);
+    let mut buf = Buffer::empty(content);
+    render::render_menu(&chip.name, content, &mut buf);
+    let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
+    UiUpdate {
+        layers: vec![UiLayer {
+            surface: UiSurface::Panel,
+            z_index: 0,
+            consumes_mouse: false,
+            nodes,
+            hits: Vec::new(),
+            data: None,
+        }],
+        ..Default::default()
+    }
+}
+
+/// Which chip covers an absolute cell, from the SAME layout the rows were drawn
 /// from — so the cell that answers a click is by construction the cell that was
 /// drawn there, with no second copy of the geometry to drift.
+///
+/// Both axes are matched: the child row is indented to sit under the selected
+/// chip, so column alone would resolve a press on a child to whichever brother
+/// happens to be above it.
 fn chip_at(input: &BarInput, column: u16, row: u16) -> Option<usize> {
-    let (ox, oy, width) = (*ROW_RECT.lock().expect("row rect mutex poisoned"))?;
-    if row != oy {
+    let (ox, oy, width, height) = (*ROW_RECT.lock().expect("row rect mutex poisoned"))?;
+    let rel_row = row.checked_sub(oy)?;
+    if rel_row >= height {
         return None;
     }
     let rel = column.checked_sub(ox)?;
@@ -259,8 +332,92 @@ fn chip_at(input: &BarInput, column: u16, row: u16) -> Option<usize> {
     let (_, placed) = render::layout(input)?;
     placed
         .iter()
+        .find(|p| p.row == rel_row && rel >= p.x && rel < p.x + p.width)
+        .map(|p| p.index)
+}
+
+/// Which menu item (by index into [`render::MENU_ITEMS`]) covers an absolute
+/// cell, from the SAME layout the menu row was drawn from.
+fn menu_item_at(chip_name: &str, column: u16, row: u16) -> Option<usize> {
+    let (ox, oy, _width, _height) = (*ROW_RECT.lock().expect("row rect mutex poisoned"))?;
+    // The menu is always exactly one row, on the band's first line, even when
+    // the chip grid it replaced was two rows tall.
+    if row != oy {
+        return None;
+    }
+    let rel = column.checked_sub(ox)?;
+    let (_, placed) = render::menu_layout(chip_name);
+    placed
+        .iter()
         .find(|p| rel >= p.x && rel < p.x + p.width)
         .map(|p| p.index)
+}
+
+/// The chip immediately upstream of `chip_index` in fleet lineage.
+///
+/// `BarInput::chips` is ordered root-most ancestor first, then Current, then
+/// the brothers, then the children (see the model's own doc comment), so:
+///
+///   * a CHILD hangs off the selected node itself (`Current`);
+///   * a BROTHER hangs off the same parent the selected node does — the LAST
+///     ancestor, not the slot before it in the vector, which for a brother is
+///     another brother rather than a parent;
+///   * an ancestor or the selected node hangs off the previous slot, because
+///     within the lineage prefix the vector order IS the descent.
+fn parent_tab_id(chips: &[Chip], chip_index: usize) -> Option<String> {
+    let chip = chips.get(chip_index)?;
+    match chip.role {
+        ChipRole::Child => chips
+            .iter()
+            .find(|c| c.role == ChipRole::Current)
+            .and_then(|c| c.tab_id.clone()),
+        ChipRole::Sibling => chips
+            .iter()
+            .filter(|c| c.role == ChipRole::Ancestor)
+            .next_back()
+            .and_then(|c| c.tab_id.clone()),
+        ChipRole::Ancestor | ChipRole::Current => chip_index
+            .checked_sub(1)
+            .and_then(|i| chips.get(i))
+            .and_then(|c| c.tab_id.clone()),
+    }
+}
+
+/// The workspace id a `tab_id` belongs to. Tab ids are `<workspace>:<tab>`
+/// (see the live pane roster and every other id on the chip), so the
+/// workspace is simply the id's own prefix — no extra round trip needed for
+/// the metadata report.
+fn workspace_of(tab_id: &str) -> Option<&str> {
+    tab_id.split_once(':').map(|(ws, _)| ws)
+}
+
+/// Build the "Copy metadata" report for `chip`, in the same key/shape family
+/// as the host's own pane "Copy metadata" (harness, runtime, pane id, tab id,
+/// workspace, folder) — an unknown fact is omitted rather than printed as
+/// "unknown", matching that action's own convention.
+fn metadata_text(chip: &Chip) -> String {
+    let mut out = String::from("herdr tab metadata\n");
+    let mut fields: Vec<(&str, String)> = vec![("harness", chip.name.clone())];
+    if let Some(runtime) = &chip.runtime {
+        fields.push(("runtime", runtime.clone()));
+    }
+    if let Some(pane_id) = &chip.pane_id {
+        fields.push(("pane", pane_id.clone()));
+    }
+    if let Some(tab_id) = &chip.tab_id {
+        fields.push(("tab", tab_id.clone()));
+        if let Some(ws) = workspace_of(tab_id) {
+            fields.push(("workspace", ws.to_string()));
+        }
+    }
+    if let Some(folder) = &chip.folder {
+        fields.push(("folder", folder.clone()));
+    }
+    let width = fields.iter().map(|(k, _)| k.len() + 1).max().unwrap_or(0);
+    for (key, value) in fields {
+        out.push_str(&format!("  {:<width$}  {value}\n", format!("{key}:"), width = width));
+    }
+    out
 }
 
 /// Hover reveals, left-click navigates, right-click does nothing.
@@ -273,12 +430,28 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
         return UiUpdate::default();
     };
+
+    if let Some(menu) = *MENU.lock().expect("menu mutex poisoned") {
+        return handle_menu_mouse(&input, menu, mouse);
+    }
+
     let hit = chip_at(&input, mouse.column, mouse.row);
 
+    if mouse.kind == MouseEventKind::RightDown {
+        let Some(index) = hit else {
+            return UiUpdate::default();
+        };
+        if input.chips.get(index).is_none() {
+            return UiUpdate::default();
+        }
+        *MENU.lock().expect("menu mutex poisoned") = Some(OpenMenu { chip_index: index });
+        return render_from(&input);
+    }
+
     if !matches!(mouse.kind, MouseEventKind::LeftDown) {
-        // Move, right-click, wheel: nothing. The bar is hover-inert, so the
-        // mouse crossing it must not repaint the row, must not change its
-        // width, and must not move the chips the user is aiming at.
+        // Move, wheel: nothing. The bar is hover-inert, so the mouse crossing
+        // it must not repaint the row, must not change its width, and must
+        // not move the chips the user is aiming at.
         return UiUpdate::default();
     }
 
@@ -329,6 +502,80 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     }
 }
 
+/// Mouse handling while the right-click menu is open: left-click on an item
+/// runs it, any other left-click dismisses (clicking away is how the host's
+/// own context menus close too), and right-click always dismisses rather than
+/// re-targeting — a second right-click while a menu is up reads as "never
+/// mind", not "open a different one out from under it".
+fn handle_menu_mouse(input: &BarInput, menu: OpenMenu, mouse: &MouseEvent) -> UiUpdate {
+    if mouse.kind == MouseEventKind::RightDown {
+        *MENU.lock().expect("menu mutex poisoned") = None;
+        return render_from(input);
+    }
+    if mouse.kind != MouseEventKind::LeftDown {
+        return UiUpdate::default();
+    }
+
+    // The chip may have vanished from under the menu (bar refreshed between
+    // the frame and the press); close rather than act on a stale target.
+    let Some(chip) = input.chips.get(menu.chip_index).cloned() else {
+        *MENU.lock().expect("menu mutex poisoned") = None;
+        return render_from(input);
+    };
+
+    let item = menu_item_at(&chip.name, mouse.column, mouse.row);
+    *MENU.lock().expect("menu mutex poisoned") = None;
+
+    match item.map(|i| render::MENU_ITEMS[i]) {
+        Some("Copy metadata") => UiUpdate {
+            effects: vec![HostEffect::CopyText {
+                text: metadata_text(&chip),
+            }],
+            ..render_from(input)
+        },
+        Some("Close") => close_chip(input, &chip, menu.chip_index),
+        // "Cancel", a miss outside every item, or a click past a chip the bar
+        // no longer draws — all the same outcome: close the menu and do
+        // nothing else, exactly like clicking away from a host context menu.
+        _ => render_from(input),
+    }
+}
+
+/// Close `chip`'s tab. If it was the CURRENT (focused) chip, also point focus
+/// at its parent in the lineage — overriding whatever tab the host would
+/// otherwise pick — falling back to the host's own next-tab choice when no
+/// parent is known (an ancestor-less root, or a lineage the collector could
+/// not resolve).
+fn close_chip(input: &BarInput, chip: &Chip, chip_index: usize) -> UiUpdate {
+    let Some(tab_id) = chip.tab_id.clone() else {
+        return UiUpdate {
+            effects: vec![HostEffect::ShowToast {
+                message: format!("{} has no tab to close", chip.name),
+            }],
+            ..render_from(input)
+        };
+    };
+
+    let mut effects = vec![HostEffect::Api {
+        request_id: format!("tidus-bar:close:{chip_index}"),
+        method: "tab.close".to_string(),
+        params: serde_json::json!({ "tab_id": tab_id }),
+    }];
+    if chip.role == ChipRole::Current {
+        if let Some(parent) = parent_tab_id(&input.chips, chip_index) {
+            effects.push(HostEffect::Api {
+                request_id: format!("tidus-bar:refocus:{chip_index}"),
+                method: "tab.focus".to_string(),
+                params: serde_json::json!({ "tab_id": parent }),
+            });
+        }
+    }
+    UiUpdate {
+        effects,
+        ..render_from(input)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,18 +606,24 @@ mod tests {
             exec: None,
             runtime: Some("claude".into()),
             finished: false,
+            folder: None,
         }
     }
 
     fn seed(input: BarInput) {
+        // The band as the host would carve it: origin (0, 0), 200 columns, and
+        // exactly as many rows as the bar asked for — an `auto` band is sized
+        // from the module's own node count, so the test must not hand the click
+        // path more rows than the renderer drew.
+        let height = render::content_height(&input).max(1);
         *LAST_INPUT.lock().expect("input mutex poisoned") = Some(input);
-        // The row as the host would carve it: origin (0, 0), 200 columns.
-        *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((0, 0, 200));
+        *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((0, 0, 200, height));
     }
 
-    /// Press a chip at the CENTRE of the cells the row actually drew for it.
-    /// The click path under test IS the geometry, so a test that called the
-    /// handler with a chip id would prove nothing about a real press.
+    /// Press a chip at the CENTRE of the cells the bar actually drew for it, on
+    /// the row it actually drew it on. The click path under test IS the
+    /// geometry, so a test that called the handler with a chip id would prove
+    /// nothing about a real press.
     fn click_chip(index: usize, kind: MouseEventKind) -> UiUpdate {
         let input = LAST_INPUT
             .lock()
@@ -382,7 +635,7 @@ mod tests {
             Some(p) => handle_mouse(&MouseEvent {
                 kind,
                 column: p.x + p.width / 2,
-                row: 0,
+                row: p.row,
             }),
             // No such chip drawn — press past the end of the row, which is what
             // clicking a chip that vanished actually looks like.
@@ -407,11 +660,12 @@ mod tests {
             .iter()
             .find(|p| p.index == index)
             .expect("chip is drawn");
+        let row = p.row;
         let press = |column| {
             handle_mouse(&MouseEvent {
                 kind: MouseEventKind::LeftDown,
                 column,
-                row: 0,
+                row,
             })
         };
         (press(p.x), press(p.x + p.width - 1))
@@ -424,6 +678,22 @@ mod tests {
             chips: vec![
                 chip("main", ChipRole::Ancestor),
                 chip("squad", ChipRole::Current),
+                chip("kid", ChipRole::Child),
+            ],
+            empty_reason: None,
+            ..Default::default()
+        }
+    }
+
+    /// The selected node with brothers beside it and children under it — the
+    /// shape the redesign is about.
+    fn family() -> BarInput {
+        BarInput {
+            focus_harness: Some("squad".into()),
+            chips: vec![
+                chip("main", ChipRole::Ancestor),
+                chip("squad", ChipRole::Current),
+                chip("bro", ChipRole::Sibling),
                 chip("kid", ChipRole::Child),
             ],
             empty_reason: None,
@@ -485,6 +755,122 @@ mod tests {
         }
     }
 
+    /// Spec (5): a brother is a click target that re-roots the bar on itself,
+    /// exactly like a child. Nothing about the click path may treat "the other
+    /// children of my parent" as decoration.
+    #[test]
+    fn a_left_click_on_a_brother_focuses_it_like_any_other_chip() {
+        let _guard = test_guard();
+        seed(family());
+        let update = click_chip(2, MouseEventKind::LeftDown);
+        match update.effects.as_slice() {
+            [HostEffect::Api { method, params, .. }] => {
+                assert_eq!(method, "tab.focus");
+                assert_eq!(params["tab_id"], "w1:t-bro");
+            }
+            other => panic!("a brother must be clickable, got {other:?}"),
+        }
+    }
+
+    /// The child row is indented to sit UNDER the selected chip, so a press
+    /// must be attributed by ROW as well as column — otherwise a click on a
+    /// child opens whichever brother happens to be drawn above it, which is the
+    /// worst kind of bug: it navigates somewhere plausible.
+    #[test]
+    fn a_press_on_the_child_row_never_resolves_to_the_row_above_it() {
+        let _guard = test_guard();
+        let input = family();
+        seed(input.clone());
+        let (_, placed) = render::layout(&input).expect("rows");
+        let kid = placed.iter().find(|p| p.index == 3).expect("the child");
+        assert_eq!(kid.row, 1, "precondition: the child is on the second row");
+
+        // Same column, both rows: two different agents must answer.
+        let column = kid.x + kid.width / 2;
+        let press = |row| {
+            handle_mouse(&MouseEvent {
+                kind: MouseEventKind::LeftDown,
+                column,
+                row,
+            })
+        };
+        let tab_of = |update: &UiUpdate| match update.effects.as_slice() {
+            [HostEffect::Api { params, .. }] => Some(params["tab_id"].clone()),
+            _ => None,
+        };
+        assert_eq!(
+            tab_of(&press(1)),
+            Some(serde_json::json!("w1:t-kid")),
+            "the child row must open the child"
+        );
+        assert_ne!(
+            tab_of(&press(0)),
+            Some(serde_json::json!("w1:t-kid")),
+            "the same column on row 0 is a different agent"
+        );
+    }
+
+    /// A press below the band belongs to the pane, not to the bar. With a
+    /// one-row bar this was implied by `row != oy`; with a growable band it has
+    /// to survive the height check.
+    #[test]
+    fn a_press_past_the_bands_last_row_is_not_a_chip() {
+        let _guard = test_guard();
+        seed(sample()); // one row: no children of the selected node
+        assert_eq!(render::content_height(&sample()), 2);
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: 2,
+            row: 9,
+        });
+        assert!(update.effects.is_empty(), "{:?}", update.effects);
+    }
+
+    /// Spec (4): the band is one row at rest and two only while there are
+    /// children — the host sizes an `auto` band from the node count, so the
+    /// number of emitted `Line` nodes IS the number of pane rows taken.
+    #[test]
+    fn the_band_grows_a_row_only_when_children_are_shown() {
+        let _guard = test_guard();
+        let childless = BarInput {
+            chips: vec![
+                chip("main", ChipRole::Ancestor),
+                chip("squad", ChipRole::Current),
+                chip("bro", ChipRole::Sibling),
+            ],
+            empty_reason: None,
+            ..Default::default()
+        };
+        let update = handle_event(&frame_event(&childless, Rect::new(0, 30, 120, 1)));
+        assert_eq!(
+            line_nodes(&update),
+            1,
+            "brothers alone must not cost a second row"
+        );
+
+        let update = handle_event(&frame_event(&family(), Rect::new(0, 30, 120, 2)));
+        assert_eq!(line_nodes(&update), 2, "children earn the second row");
+    }
+
+    /// Closing a brother points focus back at the parent it shares with the
+    /// selected node — not at the chip that happens to precede it in the
+    /// vector, which for a brother is another brother.
+    #[test]
+    fn a_brothers_parent_is_the_shared_parent_not_the_previous_chip() {
+        let _guard = test_guard();
+        let input = family();
+        assert_eq!(
+            parent_tab_id(&input.chips, 2).as_deref(),
+            Some("w1:t-main"),
+            "a brother hangs off the last ancestor"
+        );
+        assert_eq!(
+            parent_tab_id(&input.chips, 3).as_deref(),
+            Some("w1:t-squad"),
+            "a child hangs off the selected node"
+        );
+    }
+
     #[test]
     fn a_hidden_child_is_shown_rather_than_focused() {
         let _guard = test_guard();
@@ -521,19 +907,227 @@ mod tests {
         }
     }
 
-    /// Canon §1: right-click opens a contextual MENU or does nothing. This bar
-    /// has no secondary actions, so right-click is inert — it must not navigate
-    /// and must not describe (hover already does that).
+    /// Canon §1: right-click opens a contextual MENU rather than acting
+    /// immediately — no effect fires until an item is picked.
     #[test]
-    fn a_right_click_neither_navigates_nor_reports() {
+    fn a_right_click_opens_the_menu_without_acting_immediately() {
         let _guard = test_guard();
         seed(sample());
         let update = click_chip(2, MouseEventKind::RightDown);
         assert!(
             update.effects.is_empty(),
-            "right-click must be inert, got {:?}",
+            "opening the menu must not act by itself, got {:?}",
             update.effects
         );
+        assert!(
+            !update.layers.is_empty(),
+            "opening the menu must repaint the row to show it"
+        );
+        assert_eq!(
+            *MENU.lock().unwrap(),
+            Some(OpenMenu { chip_index: 2 }),
+            "the menu must remember which chip it was opened for"
+        );
+    }
+
+    /// Right-clicking empty band (no chip under the cursor) opens nothing.
+    #[test]
+    fn a_right_click_off_every_chip_opens_no_menu() {
+        let _guard = test_guard();
+        seed(sample());
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::RightDown,
+            column: 199,
+            row: 0,
+        });
+        assert!(update.effects.is_empty());
+        assert!(MENU.lock().unwrap().is_none());
+    }
+
+    /// "Copy metadata" reports harness, runtime, pane id, tab id, workspace and
+    /// folder — the same field family as the host's own pane "Copy metadata" —
+    /// and closes the menu afterward.
+    #[test]
+    fn copy_metadata_reports_the_chips_own_fields() {
+        let _guard = test_guard();
+        let mut input = sample();
+        input.chips[2].folder = Some("/home/andual/harnesses/kid/workspace".into());
+        seed(input);
+        let update = click_chip(2, MouseEventKind::RightDown);
+        assert!(update.layers.len() <= 1);
+        let item = menu_item_column(2, "Copy metadata");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: item,
+            row: 0,
+        });
+        match update.effects.as_slice() {
+            [HostEffect::CopyText { text }] => {
+                assert!(text.contains("harness:") && text.contains("kid"), "{text}");
+                assert!(text.contains("runtime:") && text.contains("claude"), "{text}");
+                assert!(text.contains("pane:") && text.contains("w1:p-kid"), "{text}");
+                assert!(text.contains("tab:") && text.contains("w1:t-kid"), "{text}");
+                assert!(text.contains("workspace:") && text.contains("w1"), "{text}");
+                assert!(text.contains("folder:") && text.contains("kid/workspace"), "{text}");
+            }
+            other => panic!("expected a CopyText effect, got {other:?}"),
+        }
+        assert!(MENU.lock().unwrap().is_none(), "the menu closes after acting");
+    }
+
+    /// Closing the CURRENT (focused) chip also refocuses its parent — the last
+    /// ancestor in the lineage — overriding whatever the host would otherwise
+    /// pick next.
+    #[test]
+    fn closing_the_current_chip_refocuses_its_parent() {
+        let _guard = test_guard();
+        seed(sample()); // main (ancestor) ▸ squad (current) ▸ kid (child)
+        click_chip(1, MouseEventKind::RightDown);
+        let item = menu_item_column(1, "Close");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: item,
+            row: 0,
+        });
+        match update.effects.as_slice() {
+            [HostEffect::Api { method: m1, params: p1, .. }, HostEffect::Api { method: m2, params: p2, .. }] =>
+            {
+                assert_eq!(m1, "tab.close");
+                assert_eq!(p1["tab_id"], "w1:t-squad");
+                assert_eq!(m2, "tab.focus");
+                assert_eq!(p2["tab_id"], "w1:t-main", "focus returns to the parent");
+            }
+            other => panic!("expected close then refocus, got {other:?}"),
+        }
+    }
+
+    /// Closing a CHILD (not the focused chip) closes it without touching focus
+    /// — nothing on the bar claims it was the tab on screen.
+    #[test]
+    fn closing_a_child_chip_does_not_refocus() {
+        let _guard = test_guard();
+        seed(sample());
+        click_chip(2, MouseEventKind::RightDown); // "kid", a Child
+        let item = menu_item_column(2, "Close");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: item,
+            row: 0,
+        });
+        match update.effects.as_slice() {
+            [HostEffect::Api { method, params, .. }] => {
+                assert_eq!(method, "tab.close");
+                assert_eq!(params["tab_id"], "w1:t-kid");
+            }
+            other => panic!("expected exactly one close effect, got {other:?}"),
+        }
+    }
+
+    /// A root chip with no ancestor at all (nothing upstream) closes with no
+    /// parent to refocus — the host's own next-tab choice applies.
+    #[test]
+    fn closing_a_rootless_current_chip_has_nothing_to_refocus() {
+        let _guard = test_guard();
+        seed(BarInput {
+            chips: vec![chip("main", ChipRole::Current)],
+            ..Default::default()
+        });
+        click_chip(0, MouseEventKind::RightDown);
+        let item = menu_item_column(0, "Close");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: item,
+            row: 0,
+        });
+        match update.effects.as_slice() {
+            [HostEffect::Api { method, .. }] => assert_eq!(method, "tab.close"),
+            other => panic!("expected exactly one close effect, got {other:?}"),
+        }
+    }
+
+    /// A chip with no tab (a `light` child, or one the reaper took) has nothing
+    /// to close, so "Close" refuses out loud instead of sending a doomed
+    /// `tab.close`.
+    #[test]
+    fn closing_a_chip_with_no_tab_reports_instead() {
+        let _guard = test_guard();
+        let mut input = sample();
+        input.chips[2].tab_id = None;
+        seed(input);
+        click_chip(2, MouseEventKind::RightDown);
+        let item = menu_item_column(2, "Close");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: item,
+            row: 0,
+        });
+        match update.effects.as_slice() {
+            [HostEffect::ShowToast { message }] => {
+                assert!(message.contains("no tab to close"), "{message}");
+            }
+            other => panic!("expected a report, got {other:?}"),
+        }
+    }
+
+    /// "Cancel", and a click outside every item, both just close the menu.
+    #[test]
+    fn cancel_and_a_miss_both_just_close_the_menu() {
+        let _guard = test_guard();
+        seed(sample());
+
+        click_chip(2, MouseEventKind::RightDown);
+        let cancel = menu_item_column(2, "Cancel");
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: cancel,
+            row: 0,
+        });
+        assert!(update.effects.is_empty());
+        assert!(MENU.lock().unwrap().is_none());
+
+        click_chip(2, MouseEventKind::RightDown);
+        let update = handle_mouse(&MouseEvent {
+            kind: MouseEventKind::LeftDown,
+            column: 199,
+            row: 0,
+        });
+        assert!(update.effects.is_empty());
+        assert!(MENU.lock().unwrap().is_none());
+    }
+
+    /// Right-clicking again while a menu is open dismisses it rather than
+    /// re-targeting a different chip.
+    #[test]
+    fn a_second_right_click_dismisses_the_open_menu() {
+        let _guard = test_guard();
+        seed(sample());
+        click_chip(2, MouseEventKind::RightDown);
+        assert!(MENU.lock().unwrap().is_some());
+        let update = click_chip(0, MouseEventKind::RightDown);
+        assert!(update.effects.is_empty());
+        assert!(MENU.lock().unwrap().is_none());
+    }
+
+    /// The column of a menu item, for `chip_index`'s menu — mirrors
+    /// `render::menu_layout` exactly, so a click at this column is what a real
+    /// press on that label looks like.
+    fn menu_item_column(chip_index: usize, label: &str) -> u16 {
+        let input = LAST_INPUT
+            .lock()
+            .expect("input mutex poisoned")
+            .clone()
+            .expect("seeded");
+        let chip = &input.chips[chip_index];
+        let (_, placed) = render::menu_layout(&chip.name);
+        let item_index = render::MENU_ITEMS
+            .iter()
+            .position(|l| *l == label)
+            .expect("label is a real menu item");
+        placed
+            .iter()
+            .find(|p| p.index == item_index)
+            .expect("item placed")
+            .x
     }
 
     /// Canon §2: hovering a chip reveals that chip's detail in place, and
@@ -579,6 +1173,18 @@ mod tests {
         }
     }
 
+    /// How many `Line` nodes the update carries — which is exactly how the host
+    /// measures an `auto` band's height (`ui.rs::panel_content_dims`), so this
+    /// is the bar's real cost in pane rows.
+    fn line_nodes(update: &UiUpdate) -> usize {
+        update
+            .layers
+            .iter()
+            .flat_map(|layer| layer.nodes.iter())
+            .filter(|node| matches!(node, herdr_ui_plugin_api::UiNode::Line { .. }))
+            .count()
+    }
+
     fn text_of(update: &UiUpdate) -> String {
         update
             .layers
@@ -618,13 +1224,14 @@ mod tests {
         assert!(layer.hits.is_empty(), "hit rects would kill hover");
         // and the row is still clickable, from its own geometry
         seed(input.clone());
-        *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((rect.x, rect.y, rect.width));
+        *ROW_RECT.lock().expect("row rect mutex poisoned") =
+            Some((rect.x, rect.y, rect.width, render::content_height(&input)));
         let (_, placed) = render::layout(&input).expect("row");
         let p = placed.iter().find(|p| p.index == 2).expect("chip");
         let update = handle_mouse(&MouseEvent {
             kind: MouseEventKind::LeftDown,
             column: rect.x + p.x + p.width / 2,
-            row: rect.y,
+            row: rect.y + p.row,
         });
         assert!(!update.effects.is_empty(), "the drawn cell must click");
     }

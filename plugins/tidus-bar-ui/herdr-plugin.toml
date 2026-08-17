@@ -2,7 +2,7 @@ id = "builtin.tidus-bar"
 name = "Tidus Subagent Bar"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Bottom bar of agent chips: the focused orchestrator's ancestor chain pinned left, then its direct spawned children, each clickable to swap the terminal area to that agent (wasm render)"
+description = "Bottom bar of agent chips: the selected agent's ancestor chain pinned left, then the selected agent and its brothers, with its own children on a second row underneath — each clickable to swap the terminal area to that agent (wasm render)"
 # Linux only, honestly: the collector attributes the focused pane by reading
 # /proc/<pid>/environ for HARNESS_NAME / CLAUDE_CONFIG_DIR. macOS has no /proc —
 # it needs KERN_PROCARGS2 sysctl work before this can claim to run there, and
@@ -57,7 +57,11 @@ collector = ["target/release/tidus-bar-collector"]
 # asks for a persistent bar under the typing box.
 region = "bottom"
 align = "start"
-size = "1"
+# Height follows the content (`panel_content_dims` counts the module's Line
+# nodes), which is how the bar costs ONE row at rest and two only while the
+# selected agent has children to list underneath it. Pinning this to "1" would
+# clip the child row off the bottom of the band instead of making room for it.
+size = "auto"
 # min_peer is counted in ROWS for a top/bottom band (src/ui.rs: max_slot =
 # height - min_peer). The schema default of 24 silently drops a one-row strip on
 # any pane area 24 rows or shorter — that is what kept version-dash invisible.
