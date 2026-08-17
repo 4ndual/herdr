@@ -657,27 +657,42 @@ fn resolve(focus: &Focus) -> BarInput {
 
     // Direct children ONLY — never uncles or cousins. This is the whole reason
     // the bar walks the spawn graph instead of reading herdr's tab order.
-    let mut children: Vec<(&Node, EdgeKind)> = nodes
-        .iter()
-        .filter(|n| n.name != focus_name)
-        // A profile is an external config dir registered as a fleet member; it
-        // has no managed process and nobody spawns it, so it can be an
-        // orchestrator but never a child.
-        .filter(|n| !n.profile)
-        // The focused pane's own session decides which JOBS are its own; team
-        // edges are profile-level and unaffected.
-        .filter_map(|n| {
-            n.edge_to(&focus_name, now, focus_session.as_deref())
-                .map(|edge| (n, edge))
-        })
-        .collect();
-    // Live work first, then declared members, then history; alphabetical inside
-    // each band so the bar does not reshuffle under the cursor every tick.
-    children.sort_by(|(a, ea), (b, eb)| {
-        edge_rank(*ea)
-            .cmp(&edge_rank(*eb))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    let children = children_of(&nodes, &focus_name, now, focus_session.as_deref());
+
+    // Brothers: the OTHER children of the selected node's parent. They are what
+    // makes the bar survive navigation — selecting one of them re-roots the bar
+    // on it without emptying the row it was selected from.
+    //
+    // The session key is the selected node's OWN dispatching session, not the
+    // focused pane's: `job_belongs_to_session` matches a job against the pane
+    // that SENT it, and the pane that sent the selected node's job is the same
+    // pane that sent its brothers'. Using the focused session here would filter
+    // out every brother the moment the selection moved down a level, which is
+    // the disappearing act this redesign exists to remove.
+    let brothers: Vec<(&Node, EdgeKind)> = match ancestry.last() {
+        Some(parent) => {
+            let parent_name = parent.name.clone();
+            let parent_session = by_name
+                .get(focus_name.as_str())
+                .and_then(|n| {
+                    n.dispatch_session
+                        .clone()
+                        .or_else(|| n.history_session.clone())
+                })
+                // A selection attached by TEAM carries no session of its own;
+                // fall back to the focused pane's, which is the only other
+                // claim available and is correct when the parent IS the focused
+                // profile's pane.
+                .or_else(|| focus_session.clone());
+            children_of(&nodes, &parent_name, now, parent_session.as_deref())
+                .into_iter()
+                .filter(|(n, _)| n.name != focus_name)
+                .collect()
+        }
+        // No parent means no brothers — the selected node is the root of the
+        // chain the bar can see.
+        None => Vec::new(),
+    };
 
     // Validate every tab against THIS instance before it becomes a click
     // target: `state/herdr-tab` is written by whichever herdr the harness was
@@ -709,23 +724,67 @@ fn resolve(focus: &Focus) -> BarInput {
             &agent_status,
         ));
     }
-    for (node, edge) in children {
-        let chip = chip_for(
-            node,
-            ChipRole::Child,
-            Some(edge),
-            &live_tabs,
-            &tab_by_workspace,
-            &agent_status,
-        );
-        if chip_is_worth_a_slot(&chip, edge) {
-            chips.push(chip);
+    // Order is the render order and click handling addresses it by index:
+    // lineage, the selected node, its brothers, then its children.
+    for (role, band) in [
+        (ChipRole::Sibling, brothers),
+        (ChipRole::Child, children),
+    ] {
+        for (node, edge) in band {
+            let chip = chip_for(
+                node,
+                role,
+                Some(edge),
+                &live_tabs,
+                &tab_by_workspace,
+                &agent_status,
+            );
+            if chip_is_worth_a_slot(&chip, edge) {
+                chips.push(chip);
+            }
         }
     }
 
     input.empty_reason = None;
     input.chips = chips;
     input
+}
+
+/// The direct children of `parent`, in render order.
+///
+/// Shared by the two bands the bar draws — the selected node's children and its
+/// brothers (which are its PARENT's children) — so the two can never disagree
+/// about what counts as a child. A brother that only appeared under one of the
+/// two rules would blink in and out as the selection moved between it and its
+/// sibling, which is exactly the class of disappearance this bar must not have.
+///
+/// `session` is the pane whose JOBS count: a dispatch is stamped with the
+/// session that sent it, and asking for `parent`'s children means asking about
+/// the session that dispatched from `parent`, not about whichever pane happens
+/// to be focused (see `Node::job_belongs_to_session`).
+fn children_of<'a>(
+    nodes: &'a [Node],
+    parent: &str,
+    now: SystemTime,
+    session: Option<&str>,
+) -> Vec<(&'a Node, EdgeKind)> {
+    let mut out: Vec<(&Node, EdgeKind)> = nodes
+        .iter()
+        .filter(|n| n.name != parent)
+        // A profile is an external config dir registered as a fleet member; it
+        // has no managed process and nobody spawns it, so it can be an
+        // orchestrator but never a child.
+        .filter(|n| !n.profile)
+        .filter_map(|n| n.edge_to(parent, now, session).map(|edge| (n, edge)))
+        .collect();
+    // Live work first, then declared members, then history; alphabetical inside
+    // each band so the bar does not reshuffle under the cursor every tick.
+    out.sort_by(|(a, ea), (b, eb)| {
+        edge_rank(*ea)
+            .cmp(&edge_rank(*eb))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
 }
 
 /// Whether a child has earned a slot on the bar.
@@ -827,6 +886,10 @@ fn chip_for(
         job_tail: node.job_tail.clone(),
         exec: node.exec.clone(),
         runtime: node.runtime.clone(),
+        folder: node
+            .workspace_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string()),
     }
 }
 
@@ -1257,6 +1320,70 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The brother band and the child band come from ONE rule, so a chip
+    /// cannot qualify as a child of its parent yet fail to qualify as a
+    /// brother of its sibling — which is what would make it blink in and out
+    /// as the selection moves between the two.
+    #[test]
+    fn brothers_are_just_the_parents_children_minus_the_selected_one() {
+        let now = SystemTime::now();
+        let mut kid_a = node("kid-a");
+        kid_a.dispatch_parent = Some("boss".into());
+        kid_a.dispatch_session = Some("sess-1".into());
+        let mut kid_b = node("kid-b");
+        kid_b.dispatch_parent = Some("boss".into());
+        kid_b.dispatch_session = Some("sess-1".into());
+        let mut grandkid = node("grandkid");
+        grandkid.dispatch_parent = Some("kid-a".into());
+        grandkid.dispatch_session = Some("sess-2".into());
+        let nodes = vec![node("boss"), kid_a, kid_b, grandkid];
+
+        // Looking at the parent: both children, no brothers of its own.
+        let names = |v: Vec<(&Node, EdgeKind)>| {
+            v.into_iter().map(|(n, _)| n.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(children_of(&nodes, "boss", now, Some("sess-1"))),
+            vec!["kid-a", "kid-b"]
+        );
+
+        // Now select kid-a. Its brothers are its parent's children minus
+        // itself — keyed by the session that DISPATCHED kid-a, not by whatever
+        // session kid-a's own pane runs. kid-b must survive the move.
+        let brothers: Vec<String> = names(children_of(&nodes, "boss", now, Some("sess-1")))
+            .into_iter()
+            .filter(|n| n != "kid-a")
+            .collect();
+        assert_eq!(brothers, vec!["kid-b"], "the brother must not disappear");
+
+        // ...and kid-a's own children are a separate, deeper band.
+        assert_eq!(
+            names(children_of(&nodes, "kid-a", now, Some("sess-2"))),
+            vec!["grandkid"]
+        );
+    }
+
+    /// Keying the brother query on the FOCUSED pane's session instead of the
+    /// dispatching one is the exact mistake that empties the row: a child's own
+    /// session never matches the job its parent sent to its brother.
+    #[test]
+    fn the_brother_query_is_keyed_on_the_dispatching_session() {
+        let now = SystemTime::now();
+        let mut kid_b = node("kid-b");
+        kid_b.dispatch_parent = Some("boss".into());
+        kid_b.dispatch_session = Some("boss-sess".into());
+        let nodes = vec![node("boss"), kid_b];
+
+        assert!(
+            children_of(&nodes, "boss", now, Some("boss-sess")).len() == 1,
+            "the dispatching session sees the job"
+        );
+        assert!(
+            children_of(&nodes, "boss", now, Some("some-childs-own-session")).is_empty(),
+            "an unrelated session must not claim another pane's dispatch"
+        );
+    }
+
     fn node(name: &str) -> Node {
         Node {
             name: name.to_string(),
@@ -1548,6 +1675,7 @@ mod tests {
             job_tail: None,
             exec: None,
             runtime: Some("claude".into()),
+            folder: None,
         }
     }
 

@@ -7,8 +7,18 @@
 //!
 //! ## What a chip means
 //!
-//! The bar shows the **ancestor chain of the focused orchestrator, pinned left,
-//! then that orchestrator's DIRECT children** — never uncles or cousins.
+//! The bar shows the **ancestor chain of the selected node pinned left, then
+//! the selected node itself, then its BROTHERS** (the other children of the
+//! same parent), with the selected node's own DIRECT children on a second row
+//! underneath it — never uncles or cousins.
+//!
+//! Selecting a brother re-roots the same shape on it: the brother set is a
+//! property of the PARENT, not of the selection, so navigating sideways never
+//! makes the row you navigated from disappear. That was the old behaviour and
+//! it cost the operator their place: clicking a child replaced the row with
+//! that child's own children, so the siblings you were comparing vanished at
+//! the moment you compared them.
+//!
 //! Parentage is a fleet fact, not herdr tab order, and it has three sources
 //! (`docs/tidus-ui-plugin-brief.md` §3):
 //!
@@ -44,11 +54,17 @@ pub const JOB_TAIL: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChipRole {
-    /// An ancestor of the focused node, root-most first. Pinned left.
+    /// An ancestor of the selected node, root-most first. Pinned left.
     Ancestor,
-    /// The focused orchestrator itself. Pinned, rendered as "you are here".
+    /// The selected node itself. Drawn FIRST after the lineage, carrying the
+    /// selected indicator.
     Current,
-    /// A direct child of the focused orchestrator.
+    /// Another child of the selected node's parent — a brother. Drawn on the
+    /// same row, immediately after [`ChipRole::Current`], and deliberately
+    /// still there after the selection moves to one of them.
+    Sibling,
+    /// A direct child of the selected node. Drawn on the second row, indented
+    /// to start under the selected chip.
     Child,
 }
 
@@ -180,6 +196,11 @@ pub struct Chip {
     /// Runtime declared by `harness.json` (claude/codex/pi/jcode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// `<harness>/workspace`, canonicalised. Carried onto the chip so the
+    /// context-menu "Copy metadata" action can report a folder without a
+    /// second round trip to the collector's own node table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
     /// This child's dispatch has FINISHED and the chip is being held on the bar
     /// through its retention grace (see `DISPATCH_GRACE` in the collector).
     ///
@@ -228,7 +249,9 @@ pub struct BarInput {
     /// Harness or profile the focused pane runs inside, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus_harness: Option<String>,
-    /// Ancestors (root-most first), then the focused node, then its children.
+    /// Ancestors (root-most first), then the selected node, then its brothers,
+    /// then its children. The order IS the render order, and click handling
+    /// addresses this vector by index, so a producer must not reshuffle it.
     #[serde(default)]
     pub chips: Vec<Chip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,13 +293,27 @@ impl BarInput {
         self.chips.iter().filter(|c| c.role == ChipRole::Child)
     }
 
+    /// The brothers of the selected node. Named separately from `lineage` so a
+    /// caller cannot accidentally treat them as ancestors: they share the top
+    /// row, but a brother is a click target that re-roots the bar, while an
+    /// ancestor is a step back up it.
+    pub fn siblings(&self) -> impl Iterator<Item = &Chip> {
+        self.chips.iter().filter(|c| c.role == ChipRole::Sibling)
+    }
+
     pub fn lineage(&self) -> impl Iterator<Item = &Chip> {
-        self.chips.iter().filter(|c| c.role != ChipRole::Child)
+        self.chips
+            .iter()
+            .filter(|c| matches!(c.role, ChipRole::Ancestor | ChipRole::Current))
     }
 
     /// The loudest thing on the bar, for the summary in the detail toast.
+    /// Brothers count: they are on the bar and clickable, so a blocked one is
+    /// news whether or not it is the selected node's own child.
     pub fn needs_attention(&self) -> bool {
-        self.children().any(|c| c.status == ChipStatus::Attention)
+        self.children()
+            .chain(self.siblings())
+            .any(|c| c.status == ChipStatus::Attention)
     }
 }
 
@@ -326,21 +363,30 @@ mod tests {
             job_tail: None,
             exec: None,
             runtime: None,
+            folder: None,
         }
     }
 
     #[test]
-    fn lineage_and_children_partition_the_chips() {
+    fn lineage_siblings_and_children_partition_the_chips() {
         let input = BarInput {
             chips: vec![
                 chip("main", ChipRole::Ancestor),
                 chip("mid", ChipRole::Current),
+                chip("bro", ChipRole::Sibling),
                 chip("kid", ChipRole::Child),
             ],
             ..Default::default()
         };
         assert_eq!(input.lineage().count(), 2);
+        assert_eq!(input.siblings().count(), 1);
         assert_eq!(input.children().count(), 1);
+        // Every chip lands in exactly one bucket — a brother counted as lineage
+        // would be drawn as an ancestor and click like one.
+        assert_eq!(
+            input.lineage().count() + input.siblings().count() + input.children().count(),
+            input.chips.len()
+        );
         assert!(!input.is_empty());
     }
 
@@ -370,6 +416,15 @@ mod tests {
         kid.status = ChipStatus::Attention;
         let input = BarInput {
             chips: vec![chip("main", ChipRole::Current), kid],
+            ..Default::default()
+        };
+        assert!(input.needs_attention());
+
+        // A blocked BROTHER is equally on the bar and equally stuck.
+        let mut bro = chip("bro", ChipRole::Sibling);
+        bro.status = ChipStatus::Attention;
+        let input = BarInput {
+            chips: vec![chip("main", ChipRole::Current), bro],
             ..Default::default()
         };
         assert!(input.needs_attention());
