@@ -74,6 +74,22 @@ const CLI_PARENT: &str = "(cli)";
 const SPAWN_LOCK_FRESH: Duration = Duration::from_secs(30);
 
 fn main() {
+    // `--dump-tree` resolves the snapshot exactly as a dash tick would and
+    // prints the parent → children mapping it produced, instead of writing the
+    // bar's input file.
+    //
+    // It exists so the binding between "what the fleet recorded" and "what the
+    // bar renders" is auditable without reading pixels. A bar that draws two
+    // children when the orchestrator dispatched five is indistinguishable, on
+    // screen, from an orchestrator that only dispatched two — this prints which
+    // of the two it is, and for every instance the collector could NOT attach,
+    // says why. It is generated from `resolve()`, so it cannot drift from what
+    // the bar draws: if this list is wrong, the bar is wrong in the same way.
+    if std::env::args().any(|arg| arg == "--dump-tree") {
+        dump_tree();
+        return;
+    }
+
     let started = Instant::now();
     let out_path = output_path();
     if let Some(parent) = out_path.parent() {
@@ -103,6 +119,106 @@ fn main() {
             eprintln!("tidus-bar-collector: encode failed: {err}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Print the resolved lineage the bar would draw for the focused pane, plus
+/// every fleet instance the collector could NOT attach to it and the reason.
+///
+/// The attached half comes straight out of [`resolve`] — the same call the dash
+/// tick makes — so the mapping printed here IS the mapping rendered. The
+/// unattached half is the part worth reading: an instance with no
+/// `dispatch.json`, no `team`, and no `last-result.json` has NO recorded edge
+/// to anything, and no amount of rendering work will put it under its parent.
+/// That is a fleet-side gap, and printing it is how the two get told apart.
+fn dump_tree() {
+    let focus = read_focus();
+    let input = resolve(&focus);
+
+    println!("tidus-bar resolved lineage");
+    println!(
+        "  focused pane   {}",
+        focus.pane_id.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  focus session  {}",
+        focus.session_ref.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "  orchestrator   {}",
+        input.focus_harness.as_deref().unwrap_or("(unattributed)")
+    );
+    if let Some(evidence) = input.evidence.as_deref() {
+        println!("  attributed by  {evidence}");
+    }
+
+    let row = |chip: &Chip| {
+        println!(
+            "    {:<9} {:<22} pane={:<12} tab={:<12} edge={:<8} status={}",
+            format!("{:?}", chip.role).to_lowercase(),
+            chip.name,
+            chip.pane_id.as_deref().unwrap_or("-"),
+            chip.tab_id.as_deref().unwrap_or("-"),
+            chip.edge
+                .map(|e| format!("{e:?}").to_lowercase())
+                .unwrap_or_else(|| "-".into()),
+            chip.status.label(),
+        );
+    };
+
+    println!("\n  lineage (root-most first, all clickable):");
+    for chip in input.lineage() {
+        row(chip);
+    }
+    println!("\n  brothers of the selected node:");
+    for chip in input.siblings() {
+        row(chip);
+    }
+    println!("\n  children of the selected node:");
+    for chip in input.children() {
+        row(chip);
+    }
+
+    // Everything the fleet knows about that did NOT make it onto the bar, with
+    // the reason. This is the half that answers "why is my child missing".
+    let nodes = load_fleet(&harness_root());
+    let now = SystemTime::now();
+    let on_bar: Vec<&str> = input.chips.iter().map(|c| c.name.as_str()).collect();
+    println!("\n  NOT attached to the focused orchestrator:");
+    for node in &nodes {
+        if on_bar.contains(&node.name.as_str()) {
+            continue;
+        }
+        let why = if node.profile {
+            "profile — never a child"
+        } else if node.dispatch_parent.is_none()
+            && node.team.is_none()
+            && node.history_parent.is_none()
+        {
+            "NO recorded edge: no dispatch.json, no team, no last-result.json"
+        } else if let Some(parent) = node.primary_parent(now) {
+            if input.focus_harness.as_deref() != Some(parent) {
+                "child of another orchestrator"
+            } else if node.team.as_deref() == Some(parent) && node.tab_id.is_none() {
+                // A team edge is never session-filtered and never expires, so
+                // the only thing that can drop one is having no pane open here.
+                "team member of this orchestrator, but no open tab in this herdr"
+            } else {
+                "edge to this orchestrator, but its job belongs to another session"
+            }
+        } else {
+            "edge expired past the retention window"
+        };
+        let parent = node
+            .dispatch_parent
+            .as_deref()
+            .or(node.team.as_deref())
+            .or(node.history_parent.as_deref())
+            .unwrap_or("-");
+        println!(
+            "    {:<22} parent={:<16} {}",
+            node.name, parent, why
+        );
     }
 }
 
@@ -144,11 +260,26 @@ fn string_at(value: &serde_json::Value, key: &str) -> Option<String> {
 
 /// How long a FINISHED dispatch keeps its chip on the bar, greyed.
 ///
-/// Ten minutes. The number is a human span, not a technical one: it answers
-/// "did anything run here while I was reading something else?", and the
-/// operator scenario that motivated it — a `codex-gp` dispatch that completes
-/// in about seven seconds with no team edge to fall back on — is invisible at
-/// any window shorter than the gap between two glances at the bar.
+/// Twelve hours — a working day, deliberately.
+///
+/// This was ten minutes, chosen as the gap between two glances at the bar so a
+/// seven-second `codex-gp` dispatch could not appear and vanish unseen. That
+/// answered "did anything run just now?", but it made the bar answer the WRONG
+/// question: a child dispatched this morning and finished at lunch silently
+/// left the structure, so "show me what this orchestrator is running" quietly
+/// became "show me what it ran in the last ten minutes". Measured live: `main`
+/// had dispatched docs-writer, test-w1 and others, and the bar showed two of
+/// them — test-w1 dropped off the moment its result aged past the window.
+///
+/// It also broke the lineage rule outright. A child's parent edge expires with
+/// the same clock (`primary_parent`), so an expired history edge truncated the
+/// ancestor chain — and the way back UP the tree must not depend on how long
+/// ago the work finished.
+///
+/// A day-scale window keeps every instance the orchestrator dispatched today on
+/// the bar. The status dot, not the chip's presence, is what says "this one is
+/// done"; dropping the chip says "this never happened", which is a different
+/// and false claim.
 ///
 /// Measured from `last-result.json`'s own `t`, so this needs no state carried
 /// between ticks: the collector is a fresh process on every dash tick, and a
@@ -158,7 +289,7 @@ fn string_at(value: &serde_json::Value, key: &str) -> Option<String> {
 /// A TEAM edge is not subject to this. Team is a declared, persistent
 /// affiliation — those children stay on the bar whether or not they have run
 /// recently, which is the whole difference between the two edges.
-const DISPATCH_GRACE: Duration = Duration::from_secs(10 * 60);
+const DISPATCH_GRACE: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// One harness as the collector sees it on disk.
 #[derive(Debug, Clone)]
@@ -220,6 +351,16 @@ struct Node {
 struct AgentPane {
     pane_id: Option<String>,
     status: Option<String>,
+}
+
+/// The raw inputs for a chip's "instance name" (titlesync,
+/// harness-fleet@bcfd73f/51b3323: session title = pane label = tab name):
+/// the pane's manual label, and its terminal title with the host's own ANSI
+/// stripping already applied. Keyed by tab id, same as [`AgentPane`].
+#[derive(Debug, Clone, Default)]
+struct PaneTitle {
+    label: Option<String>,
+    terminal_title_stripped: Option<String>,
 }
 
 impl Node {
@@ -702,6 +843,10 @@ fn resolve(focus: &Focus) -> BarInput {
         .as_ref()
         .map(|api| api.tabs_by_cwd(&live_tabs))
         .unwrap_or_default();
+    let pane_titles = api
+        .as_ref()
+        .map(ApiClient::pane_titles)
+        .unwrap_or_default();
 
     let mut chips: Vec<Chip> = Vec::new();
     for node in ancestry {
@@ -712,6 +857,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &live_tabs,
             &tab_by_workspace,
             &agent_status,
+            &pane_titles,
         ));
     }
     if let Some(node) = by_name.get(focus_name.as_str()).copied() {
@@ -722,6 +868,7 @@ fn resolve(focus: &Focus) -> BarInput {
             &live_tabs,
             &tab_by_workspace,
             &agent_status,
+            &pane_titles,
         ));
     }
     // Order is the render order and click handling addresses it by index:
@@ -738,6 +885,7 @@ fn resolve(focus: &Focus) -> BarInput {
                 &live_tabs,
                 &tab_by_workspace,
                 &agent_status,
+                &pane_titles,
             );
             if chip_is_worth_a_slot(&chip, edge) {
                 chips.push(chip);
@@ -834,6 +982,7 @@ fn chip_for(
     live_tabs: &[String],
     tab_by_workspace: &HashMap<PathBuf, String>,
     agent_status: &HashMap<String, AgentPane>,
+    pane_titles: &HashMap<String, PaneTitle>,
 ) -> Chip {
     // Resolve the tab the chip navigates to, freshest source first:
     //
@@ -867,8 +1016,24 @@ fn chip_for(
     let pane_id = agent
         .and_then(|a| a.pane_id.clone())
         .or_else(|| tab_id.as_ref().and(node.pane_id.clone()));
+    // Instance name (titlesync): pane label first — it is the one a human set
+    // on purpose — then the pane's own (stripped-of-spinner) terminal title,
+    // falling back to the harness identity when the tab has neither, which is
+    // also correct for a chip with no live pane at all.
+    let title = tab_id.as_ref().and_then(|tab| pane_titles.get(tab));
+    let display_name = title
+        .and_then(|t| t.label.clone())
+        .or_else(|| {
+            title
+                .and_then(|t| t.terminal_title_stripped.as_deref())
+                .map(strip_spinner)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| node.name.clone());
     Chip {
         name: node.name.clone(),
+        display_name,
         role,
         status: status_for(node, agent.and_then(|a| a.status.as_deref())),
         edge,
@@ -890,6 +1055,29 @@ fn chip_for(
             .workspace_dir
             .as_ref()
             .map(|dir| dir.display().to_string()),
+    }
+}
+
+/// Strip a leading agent status glyph — a spinner frame or state dot Claude
+/// Code and friends prepend to their own pane title (e.g. "◑ Doing work") —
+/// so the bar shows the operator-meaningful part of the title, not a symbol
+/// that already has its own status dot drawn on the chip.
+///
+/// A spinner glyph is a single non-alphanumeric, non-ASCII character standing
+/// alone before the first space; herdr's own `terminal_title_stripped` only
+/// removes ANSI/OSC wrapping, so this symbol survives into it untouched.
+fn strip_spinner(title: &str) -> &str {
+    let trimmed = title.trim_start();
+    let mut chars = trimmed.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return trimmed;
+    };
+    if first.is_ascii() || first.is_alphanumeric() {
+        return trimmed;
+    }
+    match chars.next() {
+        Some((idx, c)) if c.is_whitespace() => trimmed[idx..].trim_start(),
+        _ => trimmed,
     }
 }
 
@@ -1212,6 +1400,34 @@ impl ApiClient {
                 AgentPane {
                     pane_id: string_at(agent, "pane_id"),
                     status: string_at(agent, "agent_status"),
+                },
+            );
+        }
+        out
+    }
+
+    /// `tab_id → label/title` for every live pane — the titlesync inputs
+    /// (harness-fleet@bcfd73f/51b3323 keeps pane label = tab name = session
+    /// title in sync), so the bar can show the instance's own name instead of
+    /// `<harness>:<jobid>`.
+    fn pane_titles(&self) -> HashMap<String, PaneTitle> {
+        let mut out = HashMap::new();
+        let Some(result) = self.request("pane.list", serde_json::json!({})) else {
+            return out;
+        };
+        let Some(panes) = result.get("panes").and_then(serde_json::Value::as_array) else {
+            return out;
+        };
+        for pane in panes {
+            let Some(tab) = string_at(pane, "tab_id") else {
+                continue;
+            };
+            out.insert(
+                tab,
+                PaneTitle {
+                    label: string_at(pane, "label").filter(|s| !s.trim().is_empty()),
+                    terminal_title_stripped: string_at(pane, "terminal_title_stripped")
+                        .filter(|s| !s.trim().is_empty()),
                 },
             );
         }
@@ -1664,6 +1880,7 @@ mod tests {
     fn slot_chip(tab: Option<&str>) -> Chip {
         Chip {
             name: "member".into(),
+            display_name: "member".into(),
             role: ChipRole::Child,
             status: ChipStatus::Idle,
             edge: None,
@@ -1922,6 +2139,7 @@ mod tests {
             &["w1:t9".to_string()],
             &HashMap::new(),
             &agents,
+            &HashMap::new(),
         );
         assert_eq!(chip.status, ChipStatus::Attention);
         assert_eq!(chip.pane_id.as_deref(), Some("w1:p9"));
@@ -1977,6 +2195,7 @@ mod tests {
             &["w1:t2".to_string()],
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(chip.tab_id, None);
         assert_eq!(
@@ -1990,6 +2209,7 @@ mod tests {
             ChipRole::Child,
             Some(EdgeKind::Team),
             &["w9:tZ".to_string()],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -2019,6 +2239,7 @@ mod tests {
             Some(EdgeKind::Team),
             &["w1:tLIVE".to_string()],
             &by_cwd,
+            &HashMap::new(),
             &HashMap::new(),
         );
         assert_eq!(chip.tab_id.as_deref(), Some("w1:tLIVE"));
