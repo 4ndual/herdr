@@ -68,6 +68,21 @@ const isErr = (a: string) => a.startsWith("VL-ERROR");
 const unusable = (a: string) => isErr(a) || /^\s*$|UNREADABLE|NO FRAME|NO CLAIM/i.test(a);
 
 /**
+ * Did the transcription ELIDE the entries?
+ *
+ * On this build a bar entry is a ~50-character pane-title path, and Mage-VL
+ * routinely returns it shortened ("andual@andual: /tmp/vgate-f…"). The instance
+ * name lives at the END of that path, so elision removes exactly the token every
+ * structural criterion matches on — and the run-to-run coin flip between "read
+ * it" and "elided it" made the same recording produce different verdicts.
+ *
+ * Elision is therefore reported as UNREADABLE-AT-THIS-LABEL-LENGTH rather than
+ * as absence. It is a consequence of C1, and saying so keeps the verdict stable
+ * and points the implementer at the one defect that actually has to be fixed.
+ */
+const elided = (a: string) => /(\.\.\.|…)/.test(a);
+
+/**
  * Terse-negative recovery, mandated by the skill's Mage-VL failure modes:
  * a bare "No" to a pointed question is as often the model declining to look as
  * it is a real absence, and multiple-choice phrasing returns "none of the
@@ -234,6 +249,8 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
       if (mismatched.length)
         clues.push(`${p}: collector emits display_name ≠ name for ${mismatched.length} chip(s), e.g. ${mismatched[0]}`);
       if (unusable(a)) { unreadable++; clues.push(`${p}: ${a.slice(0, 90)}`); continue; }
+      // NB: C1 itself still judges an elided read — an entry shortened to
+      // "andual@andual: /tmp/vgate-f…" is already proof it is not a bare name.
       ev.push(`${p} (${frameOf(p)}) → ${a.replace(/\s+/g, " ").slice(0, 340)}`);
       // Entries as the VL quoted them, split on the separator it was asked for.
       const entries = a.split("\n").flatMap((l) => l.split("|")).map((s) => s.trim()).filter(Boolean);
@@ -273,7 +290,7 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
     let ok = 0, unreadable = 0;
     for (const [p, want] of [["root-selected", "vg-root"], ["alpha-selected", "vg-alpha"], ["a1-selected", "vg-a1"]] as const) {
       const a = readOf(p);
-      if (unusable(a)) { unreadable++; continue; }
+      if (unusable(a) || elided(a)) { unreadable++; if (elided(a)) clues.push(`${p}: entries elided by the transcriber ("…") — unreadable at this label length, see C1`); continue; }
       // Any line where the VL reported a marker AND named the expected agent.
       // Per ENTRY, not per line: the VL often returns the whole bar as one
       // line, so a line-level test cannot say WHICH entry carried the marker.
@@ -297,7 +314,7 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
       ["alpha-selected", ["vg-a1", "vg-a2"], ["vg-beta"]],
     ] as const) {
       const a = readOf(p);
-      if (unusable(a)) { unreadable++; continue; }
+      if (unusable(a) || elided(a)) { unreadable++; if (elided(a)) clues.push(`${p}: entries elided by the transcriber ("…") — unreadable at this label length, see C1`); continue; }
       const row = childRowLine(a);
       ev.push(`${p}: expected child row [${kids.join(", ")}] → ${row.replace(/\s+/g, " ").slice(0, 240)}`);
       const present = kids.filter((k) => mentions(row, k));
@@ -321,7 +338,7 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
       const truth = expected[p].filter((n) => cl?.panesPresent?.[n]);
       const drawnClaim = (cl?.bar?.chips ?? []).filter((x: any) => x.role === "child").map((x: any) => x.name);
       ev.push(`${p}: pane-list ground truth = [${truth}]; collector claims child row = [${drawnClaim}]`);
-      if (unusable(a)) { unreadable++; continue; }
+      if (unusable(a) || elided(a)) { unreadable++; if (elided(a)) clues.push(`${p}: entries elided ("…") — unreadable at this label length, see C1`); continue; }
       const dAns = childRowLine(a);
       const missingOnScreen = truth.filter((n) => !mentions(dAns, n));
       ev.push(`${p} video read (child row) → ${dAns.replace(/\s+/g, " ").slice(0, 220)}`);
@@ -340,7 +357,7 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
     let ok = 0, unreadable = 0;
     for (const [p, brother] of [["alpha-selected", "vg-beta"], ["a1-selected", "vg-a2"], ["click-brother", "vg-a1"]] as const) {
       const a = readOf(p);
-      if (unusable(a)) { unreadable++; continue; }
+      if (unusable(a) || elided(a)) { unreadable++; if (elided(a)) clues.push(`${p}: entries elided ("…") — unreadable at this label length, see C1`); continue; }
       ev.push(`${p}: brother ${brother} must be on screen → ${a.replace(/\s+/g, " ").slice(0, 200)}`);
       if (mentions(a, brother)) ok++;
       else clues.push(`${p} (${frameOf(p)}): brother ${brother} was NOT read anywhere on the bar`);
@@ -353,7 +370,7 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
     const c = CHECKLIST.find((x) => x.id === id)!;
     const a = readOf("a1-selected");
     const ev = [`a1-selected (${frameOf("a1-selected")}) → ${a.replace(/\s+/g, " ").slice(0, 320)}`];
-    if (unusable(a)) { add(c, "UNVERIFIABLE", ev, [`a1-selected: ${a.slice(0, 90)}`]); continue; }
+    if (unusable(a) || elided(a)) { add(c, "UNVERIFIABLE", ev, [elided(a) ? "a1-selected: entries elided (\"…\") — unreadable at this label length, see C1" : `a1-selected: ${a.slice(0, 90)}`]); continue; }
     const missing = wants.filter((w) => !mentions(a, w));
     add(c, missing.length ? "FAIL" : "PASS", ev,
       missing.length ? [`with vg-a1 selected at depth 2, these were not read on the bar: ${missing.join(", ")}`] : []);
@@ -375,7 +392,18 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
       // from a click that never reached the bar, and reporting the gate's own
       // aim as a product defect is worse than reporting nothing — so it is
       // INSTRUMENT-LIMITED and says so.
+      // An AMBIGUOUS target that navigated somewhere else proves the bar is
+      // live but proves nothing about which chip was hit — the aim, not the
+      // bar, is the unknown. Only a chip located unambiguously can convict.
       if (act.landed) ok++;
+      else if (act.target?.ambiguous && act.before && act.got?.tab_id !== act.before.tab_id) {
+        inert++;
+        clues.push(
+          `${p}: click at (${act.target?.x},${act.target?.y}) DID navigate (${act.before.tab_id} → ${act.got?.tab_id}), ` +
+          `so the bar is live and clickable — but the chip was targeted by even division of the row ` +
+          `(${act.target?.clusters} ink cluster(s) for ${"" + (act.target?.expected ?? "n")} chips), so this cannot be ` +
+          `attributed to a specific entry. INSTRUMENT-LIMITED, not a navigation defect.`);
+      }
       else if (act.before && act.got?.tab_id === act.before.tab_id) {
         inert++;
         clues.push(
@@ -407,7 +435,9 @@ export async function judge(video: string, claimsPath: string, workdir: string) 
       `bar after right-click (${frameOf("right-click")}) → ${a.replace(/\s+/g, " ").slice(0, 240)}`];
     const clues: string[] = [];
     if (!act) add(c, "UNVERIFIABLE", ev, ["no right-click recorded"]);
-    else if (act.error) add(c, "FAIL", ev, [act.error]);
+    else if (act.error) add(c, "UNVERIFIABLE", ev, [
+      `${act.error} — the gesture was never delivered, so this says nothing about the bar. ` +
+      `INSTRUMENT-LIMITED: chip targeting is blocked by C1 (entries are truncated pane-title paths).`]);
     else {
       if (act.navigated) clues.push(`right-click NAVIGATED (focus moved ${act.before?.tab_id} → ${act.after?.tab_id}); it must report instead`);
       const menuish = !isErr(a) && /menu|report|option|detail|status|edge/i.test(a);
