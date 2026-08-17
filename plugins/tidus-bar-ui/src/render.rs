@@ -41,7 +41,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use tidus_bar_model::{BarInput, Chip, ChipRole, ChipStatus, EdgeKind};
+use tidus_bar_model::{codename, BarInput, Chip, ChipRole, ChipStatus, EdgeKind};
 
 const MUTED: Color = Color::DarkGray;
 const SUBTEXT: Color = Color::Gray;
@@ -67,6 +67,16 @@ const HERE_CLOSE: &str = "\u{2590}"; // ▐
 /// off, so each row is visibly attached to one specific chip above it rather
 /// than to the row in general.
 const BRANCH: &str = "\u{2514} "; // "└ "
+/// Opens the tooltip row. A distinct glyph from the lineage icon (⑂) and the
+/// menu prefix (≡), so the three rows the band can show are tellable apart at a
+/// glance without reading them.
+const TIP: &str = "\u{25B8} "; // "▸ "
+/// Between the id and the name it stands for, in the tooltip.
+const TIP_DASH: &str = " \u{2014} "; // " — "
+/// Longest tooltip drawn. Titles are already capped at 72 by titlesync; this is
+/// a backstop so a pathological name cannot make the guest's off-screen buffer
+/// enormous, and the host clips to the real band width anyway.
+const TIP_MAX: usize = 110;
 
 /// Furthest right a hanging row may be indented.
 ///
@@ -79,6 +89,24 @@ const BRANCH: &str = "\u{2514} "; // "└ "
 /// gets slightly less literal, which is a much smaller loss than the chips
 /// becoming unreachable.
 const MAX_HANG: u16 = 24;
+
+/// Character budget for the text drawn on ONE chip.
+///
+/// A codename is 3–12 characters by construction, so this never fires for a
+/// named instance — it is the guard for the fallback, where a chip has no
+/// codename and draws an instance name or a harness identity instead, and one
+/// unnamed pane with a sentence for a title could otherwise push every other
+/// chip off the row.
+///
+/// USER RULING (2026-08-17): shortening is a RENDER concern. The stored synced
+/// name stays full-length; `codename::fit` is applied here, on the way to the
+/// screen, and nowhere on the way into herdr's state.
+const CHIP_MAX: usize = 28;
+
+/// The text a chip paints: the instance id, cut to the chip budget.
+fn chip_text(chip: &Chip) -> String {
+    codename::fit(chip.label(), CHIP_MAX)
+}
 
 // The bar publishes NO hit-rects any more: hover needs the raw mouse stream and
 // the host suppresses that over a module's own rects, so clicks are resolved
@@ -273,7 +301,7 @@ fn ancestor_spans(chip: &Chip) -> Vec<(String, Style)> {
             format!("{} ", chip.status.dot()),
             Style::default().fg(status_color(chip.status)),
         ),
-        (chip.label().to_string(), Style::default().fg(SUBTEXT)),
+        (chip_text(chip), Style::default().fg(SUBTEXT)),
     ]
 }
 
@@ -288,7 +316,7 @@ fn selected_spans(chip: &Chip) -> Vec<(String, Style)> {
     vec![
         (HERE_OPEN.to_string(), Style::default().fg(CURRENT)),
         (
-            chip.label().to_string(),
+            chip_text(chip),
             Style::default()
                 .fg(CURRENT)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -328,7 +356,7 @@ fn child_spans(chip: &Chip) -> Vec<(String, Style)> {
     };
     let mut out = vec![
         (format!("{} ", chip.status.dot()), dot_style),
-        (chip.label().to_string(), name_style),
+        (chip_text(chip), name_style),
     ];
     // The disambiguating job tail is a FALLBACK, not decoration. It exists so
     // two dispatches to the same harness can be told apart (brief §7) — and a
@@ -341,7 +369,11 @@ fn child_spans(chip: &Chip) -> Vec<(String, Style)> {
     // only while the job is actually in flight — a finished chip showing a tail
     // would read as still running.
     let in_flight = chip.edge == Some(EdgeKind::Dispatch);
-    let named = !chip.display_name.is_empty() && chip.display_name != chip.name;
+    // A codename is by construction unique among live instances, so a chip
+    // carrying one has already told two dispatches apart — appending a job
+    // tail to an id would be a second id stapled to the first.
+    let named = !chip.codename.is_empty()
+        || (!chip.display_name.is_empty() && chip.display_name != chip.name);
     if let Some(tail) = chip.job_tail.as_ref().filter(|_| in_flight && !named) {
         out.push((format!(":{tail}"), Style::default().fg(MUTED)));
     }
@@ -371,11 +403,120 @@ fn width_of(text: &str) -> u16 {
     text.chars().count() as u16
 }
 
+/// The chip a tooltip should describe: the one under the cursor, or — with the
+/// cursor elsewhere — the SELECTED node.
+///
+/// Falling back to the selection rather than to nothing is what makes the row
+/// worth its permanent line: at rest it answers "what is this agent actually
+/// called", which is the question the bare-id chips otherwise leave open.
+fn tip_subject(input: &BarInput, hovered: Option<usize>) -> Option<&Chip> {
+    hovered
+        .and_then(|i| input.chips.get(i))
+        .or_else(|| input.chips.iter().find(|c| c.role == ChipRole::Current))
+        .or_else(|| input.chips.first())
+}
+
+/// The tooltip row: the real name behind a chip's codename.
+///
+/// This row is the whole reason the bar can show bare ids. The spec asks for a
+/// hover tooltip that "must not glitch the UI and must NOT block/obscure the
+/// view of the other tabs", and a reserved row in the band's own carve is the
+/// only shape that satisfies both:
+///
+///   * it OCCLUDES NOTHING — it is carved pane, not a layer floating over the
+///     chips or the terminal, so every chip stays visible and clickable while
+///     it is up (the images-plugin lesson: a surface that draws correctly while
+///     covering the terminal underneath has not passed);
+///   * it CANNOT GLITCH — the row is drawn whether or not anything is hovered,
+///     so the band's height never changes on hover, the host never re-carves,
+///     and the chips do not move under the cursor that is aiming at them. That
+///     is the failure that got the previous hover pattern deleted (pitfall 39):
+///     the swap changed the row's WIDTH, the host re-carved, and the chips
+///     moved while being aimed at.
+///
+/// The third failure of that pattern — a parked cursor keeping a stale line on
+/// screen — is answered at the call site rather than here: the subject is
+/// re-resolved from the cursor cell against the CURRENT snapshot on every
+/// frame, so this row can never describe a chip that is no longer there.
+pub fn tooltip_line(input: &BarInput, hovered: Option<usize>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x: u16 = 0;
+    push(&mut spans, &mut x, TIP.to_string(), Style::default().fg(MUTED));
+    let Some(chip) = tip_subject(input, hovered) else {
+        return Line::from(spans);
+    };
+    push(
+        &mut spans,
+        &mut x,
+        chip_text(chip),
+        Style::default().fg(CURRENT).add_modifier(Modifier::BOLD),
+    );
+    let detail = chip.detail();
+    if !detail.is_empty() {
+        push(
+            &mut spans,
+            &mut x,
+            TIP_DASH.to_string(),
+            Style::default().fg(MUTED),
+        );
+        let room = TIP_MAX.saturating_sub(x as usize);
+        push(
+            &mut spans,
+            &mut x,
+            clip(detail, room),
+            Style::default().fg(SUBTEXT),
+        );
+    }
+    Line::from(spans)
+}
+
+/// Cut `text` to `max` cells, ellipsised. Rune-wise, so a multibyte name is
+/// clipped at a character rather than split down the middle of one.
+fn clip(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if max == 0 {
+        return String::new();
+    }
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut out: String = chars[..max - 1].iter().collect();
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Whether the reserved tooltip row is drawn.
+///
+/// OFF for this release, by instruction: the codename layer ships on its own
+/// first — bare ids on the chips and in every pane/tab name — and the hover
+/// tooltip follows once it has been exercised on screen. The row costs a
+/// permanent line of pane height, so shipping it unexercised alongside a change
+/// this visible would put two things on trial at once.
+///
+/// Everything the row needs is already here and tested ([`tooltip_line`]);
+/// turning it on is this one flag.
+pub const TOOLTIP_ROW: bool = false;
+
+/// Every row the band draws: the chip grid, then (when enabled) the tooltip.
+fn rows(input: &BarInput, hovered: Option<usize>) -> Option<Vec<Line<'static>>> {
+    let (mut lines, _) = layout(input)?;
+    if TOOLTIP_ROW {
+        lines.push(tooltip_line(input, hovered));
+    }
+    Some(lines)
+}
+
 /// Natural width of the widest row, so the host can carve the slot on the first
 /// content frame (before which `ctx.rect` is still zero).
-pub fn content_width(input: &BarInput) -> u16 {
-    layout(input)
-        .map(|(lines, _)| {
+pub fn content_width(input: &BarInput, hovered: Option<usize>) -> u16 {
+    rows(input, hovered)
+        .map(|lines| {
             lines
                 .iter()
                 .map(|line| line.spans.iter().map(|s| width_of(&s.content)).sum())
@@ -385,18 +526,19 @@ pub fn content_width(input: &BarInput) -> u16 {
         .unwrap_or(0)
 }
 
-/// Natural height in rows: 1, or 2 while the selected node has children. The
-/// manifest sizes this band `auto`, so this number is literally how many rows
-/// of pane height the bar takes — which is why the child row is built only when
-/// it has something on it.
-pub fn content_height(input: &BarInput) -> u16 {
-    layout(input)
-        .map(|(lines, _)| lines.len() as u16)
-        .unwrap_or(0)
+/// Natural height in rows: the chip levels that have something on them, plus
+/// the tooltip row. The manifest sizes this band `auto`, so this number is
+/// literally how many rows of pane height the bar takes — which is why the
+/// child row is still built only when it has something on it, and why the
+/// tooltip row is drawn even when nothing is hovered. A tooltip row that came
+/// and went with the cursor would resize the band on hover, and resizing the
+/// band moves the chips being aimed at.
+pub fn content_height(input: &BarInput, hovered: Option<usize>) -> u16 {
+    rows(input, hovered).map(|l| l.len() as u16).unwrap_or(0)
 }
 
-pub fn render(input: &BarInput, area: Rect, buf: &mut Buffer) {
-    let Some((lines, _)) = layout(input) else {
+pub fn render(input: &BarInput, hovered: Option<usize>, area: Rect, buf: &mut Buffer) {
+    let Some(lines) = rows(input, hovered) else {
         return;
     };
     Paragraph::new(lines).render(area, buf);
@@ -498,7 +640,19 @@ mod tests {
             finished: false,
             folder: None,
             display_name: name.to_string(),
+            codename: String::new(),
+            instance_title: String::new(),
         }
+    }
+
+    /// A chip as the fleet actually names one: a codename id and the real name
+    /// behind it.
+    fn named(name: &str, role: ChipRole, codename: &str, title: &str) -> Chip {
+        let mut c = chip(name, role, ChipStatus::Idle);
+        c.codename = codename.to_string();
+        c.instance_title = title.to_string();
+        c.display_name = format!("{codename} ({title})");
+        c
     }
 
     fn bar(chips: Vec<Chip>) -> BarInput {
@@ -553,8 +707,8 @@ mod tests {
     #[test]
     fn an_empty_bar_draws_no_row_at_all() {
         assert!(layout(&BarInput::default()).is_none());
-        assert_eq!(content_width(&BarInput::default()), 0);
-        assert_eq!(content_height(&BarInput::default()), 0);
+        assert_eq!(content_width(&BarInput::default(), None), 0);
+        assert_eq!(content_height(&BarInput::default(), None), 0);
     }
 
     /// Spec (3): the selected node comes FIRST on the family row and the
@@ -681,7 +835,7 @@ mod tests {
     #[test]
     fn children_hang_off_the_selected_chip_on_the_row_below_the_family() {
         let input = family();
-        assert_eq!(content_height(&input), 3, "lineage, family, children");
+        assert_eq!(content_height(&input, None), 3, "lineage, family, children");
         let (_, placed) = layout(&input).expect("rows");
 
         let bottom = row_text(&input, 2);
@@ -727,7 +881,7 @@ mod tests {
             chip("bro-a", ChipRole::Sibling, ChipStatus::Busy),
         ]);
         assert_eq!(
-            content_height(&input),
+            content_height(&input, None),
             2,
             "lineage and family only — an empty child row would cost a line of \
              pane height to display nothing"
@@ -739,7 +893,7 @@ mod tests {
     #[test]
     fn a_lone_orchestrator_draws_itself_on_the_only_row() {
         let input = bar(vec![chip("main", ChipRole::Current, ChipStatus::Idle)]);
-        assert_eq!(content_height(&input), 1);
+        assert_eq!(content_height(&input, None), 1);
         let text = row_text(&input, 0);
         assert!(text.contains(&format!("{HERE_OPEN}main{HERE_CLOSE}")), "{text}");
         assert!(!text.contains(BRANCH.trim()), "nothing to hang from: {text}");
@@ -752,7 +906,7 @@ mod tests {
             chip("main", ChipRole::Current, ChipStatus::Idle),
             chip("kid-a", ChipRole::Child, ChipStatus::Busy),
         ]);
-        assert_eq!(content_height(&input), 2);
+        assert_eq!(content_height(&input, None), 2);
         let (_, placed) = layout(&input).expect("rows");
         let root = placed.iter().find(|p| p.index == 0).expect("root");
         let kid = placed.iter().find(|p| p.index == 1).expect("kid");
@@ -820,7 +974,7 @@ mod tests {
             .map(|l| l.chars().count() as u16)
             .max()
             .expect("rows");
-        assert_eq!(content_width(&input), widest);
+        assert_eq!(content_width(&input, None), widest);
     }
 
     #[test]
@@ -865,7 +1019,7 @@ mod tests {
         ]);
         let area = Rect::new(0, 0, 4, 1); // narrower than the content
         let mut buf = Buffer::empty(area);
-        render(&input, area, &mut buf);
+        render(&input, None, area, &mut buf);
     }
 
     #[test]

@@ -126,6 +126,42 @@ pub fn parse(name: &str) -> Parsed {
     }
 }
 
+/// Fit `s` into `max` display cells, ellipsised. Mirrors the fleet's `cnFit`.
+///
+/// USER RULING (2026-08-17): shortening happens at RENDER level only. The
+/// stored synced name — session title, pane label, tab name — stays
+/// full-length; this is what the painter calls on the way to the screen. A
+/// name cut on the way into herdr's state is cut for every consumer that had
+/// more room than the one surface the budget was chosen for.
+///
+/// Edge cases, all pinned by tests:
+///
+/// * `max == 0` — no budget: unchanged. Zero is how a caller opts out, and a
+///   surface with genuinely zero cells is not drawing a name at all.
+/// * `max >= len` — unchanged, and no ellipsis for an exact fit.
+/// * `max == 1` — just `…`: one cell cannot hold a character AND a marker.
+/// * multibyte — cut on CHARACTER boundaries, so `"café ✳ résumé"` is never
+///   split down the middle of a byte sequence.
+/// * a trailing space is trimmed before the ellipsis, so a cut at a word gap
+///   reads `"Check the…"` rather than `"Check the …"`.
+/// * trimming can empty the head; `…` alone is still returned, because a blank
+///   says nothing while an ellipsis says "there is more".
+pub fn fit(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if max == 0 || chars.len() <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut out: String = chars[..max - 1].iter().collect();
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Render a stored (lowercase) codename the way a name carries it:
 /// `"hexagon"` → `"Hexagon"`. Mirrors the fleet's `cnDisplay`.
 pub fn display(word: &str) -> String {
@@ -221,5 +257,34 @@ mod tests {
         let p = parse("Hexagon (café ✳ résumé)");
         assert_eq!(p.codename, "Hexagon");
         assert_eq!(p.title, "café ✳ résumé");
+    }
+
+    /// The cut is display-only, so its edge cases are the ones that show up on
+    /// screen: an exact fit must not gain an ellipsis, a one-cell budget has
+    /// no room for content, and a multibyte name must never be split down the
+    /// middle of a character.
+    #[test]
+    fn fit_handles_every_edge() {
+        assert_eq!(fit("Check the parser", 0), "Check the parser", "no budget");
+        assert_eq!(fit("short", 5), "short", "exact fit gains no ellipsis");
+        assert_eq!(fit("short", 99), "short");
+        assert_eq!(fit("", 4), "");
+        assert_eq!(fit("abcdef", 1), "\u{2026}");
+        assert_eq!(fit("abcdef", 2), "a\u{2026}");
+        assert_eq!(fit("abcdef", 4), "abc\u{2026}");
+        // a cut landing on a word gap must not leave the space in
+        assert_eq!(fit("Check the parser", 11), "Check the\u{2026}");
+        // multibyte: cut on characters, and the result stays valid UTF-8
+        // "café " trims its trailing space before the ellipsis, so the result
+        // is allowed to come in UNDER budget — a cut is a ceiling, not a
+        // target, and padding it back out to the budget would put the space
+        // straight back.
+        let got = fit("café ✳ résumé", 6);
+        assert_eq!(got, "café\u{2026}");
+        assert!(got.chars().count() <= 6);
+        // ...and the budget is honoured in CELLS, not bytes
+        for max in 1..20 {
+            assert!(fit("café ✳ résumé", max).chars().count() <= max.max(1));
+        }
     }
 }

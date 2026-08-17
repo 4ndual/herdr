@@ -76,24 +76,27 @@ static MENU: Mutex<Option<OpenMenu>> = Mutex::new(None);
 /// right row: the child row is indented to sit UNDER the selected chip, so the
 /// same column names a different agent on each row.
 static ROW_RECT: Mutex<Option<(u16, u16, u16, u16)>> = Mutex::new(None);
-// The bar is HOVER-INERT. There is deliberately no hover state here.
-//
-// It used to swap the whole row for a detail line about the chip under the
-// cursor. Three things were wrong with that, and they compound:
-//
-//   * the row is navigation-dense — chips sit shoulder to shoulder, so moving
-//     the mouse ACROSS the bar to reach one rewrote the row under the cursor
-//     several times on the way;
-//   * the swap changed the row's WIDTH, so the host re-carved the slot and the
-//     chips moved while being aimed at;
-//   * a parked cursor kept a stale detail line on screen after the bar changed
-//     beneath it — no Move event is coming to correct a cursor that has not
-//     moved, which cost an independent video gate two failures.
-//
-// The summary row now renders statically and hover changes nothing. Detail is
-// not lost: a chip's own text carries its status dot, and left-click still
-// navigates to the agent itself, which is the answer the detail line was
-// standing in for.
+
+/// The last cursor CELL the guest was told about, in absolute screen
+/// coordinates — not a chip index.
+///
+/// Storing the cell rather than the resolved chip is the whole design. Hover
+/// used to be deleted from this bar (pitfall 39) for three compounding
+/// reasons, and remembering a cell instead of an index is what disarms the
+/// third of them:
+///
+///   * the row is navigation-dense, so crossing the bar rewrote it several
+///     times on the way — now nothing on the CHIP rows changes on hover at
+///     all, only the text inside the reserved tooltip row;
+///   * the swap changed the row's WIDTH and the host re-carved the slot, so
+///     the chips moved while being aimed at — now the band's height is fixed
+///     (the tooltip row is drawn hovered or not) and the width of a BOTTOM
+///     band is the pane's, not the content's, so there is nothing to re-carve;
+///   * a parked cursor kept a STALE line on screen, because no Move event is
+///     coming to correct a cursor that has not moved — now the subject is
+///     re-resolved from this cell against the current snapshot on every frame,
+///     so the row cannot describe a chip that is no longer there.
+static HOVER_CELL: Mutex<Option<(u16, u16)>> = Mutex::new(None);
 
 // ── ABI version ────────────────────────────────────────────────────────────
 
@@ -246,12 +249,24 @@ fn clear_bar() -> UiUpdate {
 /// Checks the open menu first: while one is up, the row shows the menu
 /// instead of the chips, on every repaint (the next natural frame tick,
 /// not just the click that opened it) until it is dismissed or acted on.
+/// The chip the tooltip row should describe right now, resolved from the
+/// remembered cursor cell against `input`.
+///
+/// Re-resolved rather than remembered: a cell that named a child a second ago
+/// may name a different one now, or none at all, and the tooltip must follow
+/// the bar rather than the other way round.
+fn hovered_chip(input: &BarInput) -> Option<usize> {
+    let (column, row) = (*HOVER_CELL.lock().expect("hover mutex poisoned"))?;
+    chip_at(input, column, row)
+}
+
 fn render_from(input: &BarInput) -> UiUpdate {
     if let Some(menu) = *MENU.lock().expect("menu mutex poisoned") {
         return render_menu(input, menu);
     }
-    let width = render::content_width(input);
-    let height = render::content_height(input);
+    let hovered = hovered_chip(input);
+    let width = render::content_width(input, hovered);
+    let height = render::content_height(input, hovered);
     if width == 0 || height == 0 {
         return clear_bar();
     }
@@ -262,7 +277,7 @@ fn render_from(input: &BarInput) -> UiUpdate {
     // selected node has children to show underneath it.
     let content = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(content);
-    render::render(input, content, &mut buf);
+    render::render(input, hovered, content, &mut buf);
     let nodes = herdr_ui_plugin_api::guest::flatten_buffer(&buf);
 
     // NO declarative hit-rects. Clicks are resolved from the same layout the
@@ -420,12 +435,8 @@ fn metadata_text(chip: &Chip) -> String {
     out
 }
 
-/// Hover reveals, left-click navigates, right-click does nothing.
-///
-/// Right-click used to report the chip's detail as a toast. The canon reserves
-/// right-click for a contextual MENU and puts detail on hover; this bar has no
-/// secondary actions, so right-click is inert rather than being given a second,
-/// undiscoverable meaning.
+/// Hover reveals the real name in the tooltip row, left-click navigates,
+/// right-click opens the chip menu — the canon's three verbs.
 fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     let Some(input) = LAST_INPUT.lock().expect("input mutex poisoned").clone() else {
         return UiUpdate::default();
@@ -436,6 +447,34 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     }
 
     let hit = chip_at(&input, mouse.column, mouse.row);
+
+    if mouse.kind == MouseEventKind::Move {
+        // The bar is hover-inert while `render::TOOLTIP_ROW` is off: with no
+        // row to update, a Move must change nothing at all — not the layer,
+        // not the width, and not the chips being aimed at.
+        if !render::TOOLTIP_ROW {
+            return UiUpdate::default();
+        }
+        // The tooltip's subject is the chip under the cursor. Repaint ONLY
+        // when that subject changes: a mouse crossing one chip fires a Move
+        // per cell, and repainting each of them would rewrite the band dozens
+        // of times to say the same thing.
+        let before = hovered_chip(&input);
+        *HOVER_CELL.lock().expect("hover mutex poisoned") = match hit {
+            // Off every chip — including a press on the tooltip row itself, or
+            // anywhere else in the pane the broadcast reaches us from. Forget
+            // the cell rather than keep pointing at the chip the cursor has
+            // left.
+            None => None,
+            Some(_) => Some((mouse.column, mouse.row)),
+        };
+        if before == hit {
+            // A no-op must stay Partial: an empty Full update would CLEAR the
+            // row, so a cursor crossing the bar would erase it.
+            return UiUpdate::default();
+        }
+        return render_from(&input);
+    }
 
     if mouse.kind == MouseEventKind::RightDown {
         let Some(index) = hit else {
@@ -449,9 +488,8 @@ fn handle_mouse(mouse: &MouseEvent) -> UiUpdate {
     }
 
     if !matches!(mouse.kind, MouseEventKind::LeftDown) {
-        // Move, wheel: nothing. The bar is hover-inert, so the mouse crossing
-        // it must not repaint the row, must not change its width, and must
-        // not move the chips the user is aiming at.
+        // Wheel, releases, drags: nothing. Only Move (handled above) and the
+        // two presses mean anything on this band.
         return UiUpdate::default();
     }
 
@@ -608,6 +646,8 @@ mod tests {
             runtime: Some("claude".into()),
             finished: false,
             folder: None,
+            codename: String::new(),
+            instance_title: String::new(),
         }
     }
 
@@ -616,7 +656,7 @@ mod tests {
         // exactly as many rows as the bar asked for — an `auto` band is sized
         // from the module's own node count, so the test must not hand the click
         // path more rows than the renderer drew.
-        let height = render::content_height(&input).max(1);
+        let height = render::content_height(&input, None).max(1);
         *LAST_INPUT.lock().expect("input mutex poisoned") = Some(input);
         *ROW_RECT.lock().expect("row rect mutex poisoned") = Some((0, 0, 200, height));
     }
@@ -1239,7 +1279,7 @@ mod tests {
         // and the row is still clickable, from its own geometry
         seed(input.clone());
         *ROW_RECT.lock().expect("row rect mutex poisoned") =
-            Some((rect.x, rect.y, rect.width, render::content_height(&input)));
+            Some((rect.x, rect.y, rect.width, render::content_height(&input, None)));
         let (_, placed) = render::layout(&input).expect("row");
         let p = placed.iter().find(|p| p.index == 2).expect("chip");
         let update = handle_mouse(&MouseEvent {
