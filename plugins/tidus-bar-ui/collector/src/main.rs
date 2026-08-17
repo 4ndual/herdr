@@ -2447,4 +2447,67 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── LUNA-VISIBILITY: recursion at any depth ─────────────────────────────
+
+    /// A pool worker under an orchestrator under the profile — the shape the
+    /// operator asked for, three deep: `Orbiter > Darknet > Hexagon`.
+    ///
+    /// The bar re-roots on whatever is FOCUSED, so "the selected chip's
+    /// children row lists its own subchildren, at any depth" is really two
+    /// claims about the same node set, and both are pinned here: asking for a
+    /// MIDDLE node's children returns its own children (not the root's), and
+    /// walking up from the LEAF yields the whole chain in root-most order.
+    ///
+    /// This is a regression test, not a new feature: the recursion was always
+    /// right. What was missing was the panes — pool workers ran headless, so
+    /// there were no chips to recurse INTO (harness-fleet, isWorkerSlot).
+    #[test]
+    fn a_three_deep_chain_recurses_from_either_end() {
+        let now = SystemTime::now();
+        let mut root = node("main");
+        root.profile = true; // the profile is an orchestrator, never a child
+        let mut mid = node("task-handler");
+        mid.team = Some("main".into());
+        let mut leaf = node("luna-probe-w1");
+        leaf.dispatch_parent = Some("task-handler".into());
+        leaf.dispatch_session = Some("sid-mid".into());
+        let nodes = vec![root, mid, leaf];
+
+        // The MIDDLE node's children are its own — the root's are not mixed in,
+        // and the leaf is not skipped over as a grandchild of the root.
+        let kids = children_of(&nodes, "task-handler", now, Some("sid-mid"));
+        assert_eq!(
+            kids.iter().map(|(n, _)| n.name.as_str()).collect::<Vec<_>>(),
+            vec!["luna-probe-w1"],
+            "the selected node lists ITS OWN children"
+        );
+        assert_eq!(kids[0].1, EdgeKind::Dispatch);
+        // ...and the root's children are the middle node, not the leaf: a bar
+        // rooted on main must not show its grandchild as if it were its child.
+        let top = children_of(&nodes, "main", now, Some("sid-mid"));
+        assert_eq!(
+            top.iter().map(|(n, _)| n.name.as_str()).collect::<Vec<_>>(),
+            vec!["task-handler"],
+            "never uncles or cousins — and never grandchildren either"
+        );
+
+        // Walking UP from the leaf yields the whole chain, root-most first,
+        // which is what makes every ancestor drawn and clickable however deep
+        // the selection sits.
+        let by_name: HashMap<&str, &Node> =
+            nodes.iter().map(|n| (n.name.as_str(), n)).collect();
+        let mut chain: Vec<&str> = Vec::new();
+        let mut cursor = by_name.get("luna-probe-w1").copied();
+        while let Some(n) = cursor {
+            let Some(parent) = n.primary_parent(now) else { break };
+            if chain.contains(&parent) || chain.len() >= MAX_ANCESTRY {
+                break;
+            }
+            chain.push(parent);
+            cursor = by_name.get(parent).copied();
+        }
+        chain.reverse();
+        assert_eq!(chain, vec!["main", "task-handler"], "root-most first");
+    }
 }
