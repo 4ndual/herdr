@@ -201,6 +201,14 @@ struct Node {
     /// Tab/pane as tidus recorded them; validated against this instance later.
     tab_id: Option<String>,
     pane_id: Option<String>,
+    /// `state/session-id` — the managed harness's own primary session, written
+    /// by its session-start hook. The fallback focus-session when the host's
+    /// focus event carries no `session_ref` (herdr does not always detect an
+    /// `agent_session` for a pane; measured live 2026-08-16: a supervised
+    /// harness pane with a dispatch in flight had none, so every
+    /// session-stamped child edge was filtered out and the bar said
+    /// "no children" while a job was visibly running).
+    session_id: Option<String>,
 }
 
 /// What herdr knows about the pane behind a harness's tab, keyed by tab id.
@@ -362,6 +370,7 @@ fn load_fleet(root: &Path) -> Vec<Node> {
             fleet_status: fleet_status(&name, &state, profile),
             tab_id: read_trim(&state.join("herdr-tab")),
             pane_id: read_trim(&state.join("herdr-pane")),
+            session_id: read_trim(&state.join("session-id")),
         });
     }
     nodes
@@ -608,6 +617,23 @@ fn resolve(focus: &Focus) -> BarInput {
     let now = SystemTime::now();
     let by_name: HashMap<&str, &Node> = nodes.iter().map(|n| (n.name.as_str(), n)).collect();
 
+    // The session that decides which JOBS belong to this pane. The host's
+    // focus event is the strongest claim, but herdr does not always detect an
+    // agent session for a pane (measured: a supervised harness pane mid-
+    // dispatch with none) — and with no session every session-stamped edge
+    // fails `job_belongs_to_session` and the bar lies "no children" while a
+    // job runs. A MANAGED harness has exactly one primary session and its own
+    // hook records it in `state/session-id`, so that file is the fallback.
+    // Profiles stay strict (session_ref only): they host many concurrent
+    // sessions and last-writer-wins on that file is exactly the nephews bug
+    // the per-pane attribution fixed.
+    let focus_session: Option<String> = focus.session_ref.clone().or_else(|| {
+        by_name
+            .get(focus_name.as_str())
+            .filter(|n| !n.profile)
+            .and_then(|n| n.session_id.clone())
+    });
+
     // Ancestors: walk up the spawn edges, root-most first. Cycle-guarded — a
     // malformed pair of records must not hang the dash tick.
     let mut ancestry: Vec<&Node> = Vec::new();
@@ -641,7 +667,7 @@ fn resolve(focus: &Focus) -> BarInput {
         // The focused pane's own session decides which JOBS are its own; team
         // edges are profile-level and unaffected.
         .filter_map(|n| {
-            n.edge_to(&focus_name, now, focus.session_ref.as_deref())
+            n.edge_to(&focus_name, now, focus_session.as_deref())
                 .map(|edge| (n, edge))
         })
         .collect();
@@ -1254,6 +1280,7 @@ mod tests {
             fleet_status: ChipStatus::Stopped,
             tab_id: None,
             pane_id: None,
+            session_id: None,
         }
     }
 
