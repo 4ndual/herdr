@@ -7823,8 +7823,16 @@ next_tab = ""
         server.app.next_dash_tick = now + Duration::from_secs(3600);
         let without_tick = server.handle_scheduled_tasks_headless(now, false);
 
-        // Same state, dash tick due. No UI modules are loaded, so the tick
-        // genuinely produces nothing to draw.
+        // Settle the built-in UI modules first. Since the 0.8.2 merge the default
+        // fixture LOADS builtin modules (goal-dash, harness-manager, ...), so the
+        // very first frame dispatch legitimately produces their initial layers —
+        // that tick really did change something. The property under test is about
+        // a tick that produces NOTHING, so let the first one land before measuring.
+        server.app.next_dash_tick = now - Duration::from_millis(1);
+        let _settling_tick = server.handle_scheduled_tasks_headless(now, false);
+
+        // Same state, dash tick due again. The modules' layers are unchanged from
+        // the settling tick, so this tick genuinely produces nothing to draw.
         server.app.next_dash_tick = now - Duration::from_millis(1);
         let with_tick = server.handle_scheduled_tasks_headless(now, false);
 
@@ -7838,7 +7846,7 @@ next_tab = ""
         );
         assert!(
             !with_tick,
-            "an idle server with no loaded UI modules must not request a repaint"
+            "an idle server whose UI modules produced no new layers must not request a repaint"
         );
     }
 

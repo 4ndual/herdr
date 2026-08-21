@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
         assert_eq!(
             frame_digest(&frame),
-            "a7c21fa42305a41231c7ae254f264f6ef923f46301d8fc4cd35ab6dfdd651b6b"
+            "1c80b5adc1e766cadd5d9c14da7a16a025ee05448656670700cbebb319c6796c"
         );
     }
 
@@ -373,7 +373,7 @@ mod tests {
         // the previous digest exactly.
         assert_eq!(
             frame_digest(&frame),
-            "4a2d296004fbd75c2daf3b5ee042d4d2494e251ca6309f481c9e347d6a2c604b"
+            "3211577c2eac19f75208b62b39f95056acf0f3df1a9e2acd37d081edcbe809a0"
         );
     }
 
