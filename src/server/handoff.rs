@@ -44,6 +44,11 @@ pub(crate) struct HandoffManifest {
     /// an older exporter simply sends none, and an older importer ignores it.
     #[serde(default)]
     pub ui_plugin_state: Vec<crate::ui_plugins::UiPluginGuestState>,
+    /// An outer window title set over the API outlives the server that took the
+    /// call, so a handoff carries it rather than falling back to the config.
+    /// Absent from manifests written before this field existed.
+    #[serde(default)]
+    pub api_window_title: Option<String>,
 }
 
 #[cfg(unix)]
@@ -310,6 +315,7 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     ui_plugin_state: Vec<crate::ui_plugins::UiPluginGuestState>,
+    api_window_title: Option<String>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -320,6 +326,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         ui_plugin_state,
+        api_window_title,
     }
 }
 
@@ -470,4 +477,57 @@ fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
 #[cfg(unix)]
 pub(crate) fn log_import_result(panes: usize) {
     info!(panes, "handoff import ready");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn empty_snapshot() -> crate::persist::SessionSnapshot {
+        crate::persist::SessionSnapshot {
+            version: 0,
+            workspaces: Vec::new(),
+            active: None,
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_handoff_carries_an_api_set_window_title() {
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            Some("deploying".to_string()),
+        );
+
+        assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
+    }
+
+    #[test]
+    fn a_manifest_written_before_the_title_field_still_loads() {
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            Some("deploying".to_string()),
+        );
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("api_window_title");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        assert!(older.api_window_title.is_none());
+    }
 }
