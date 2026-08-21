@@ -6,6 +6,7 @@ use crate::api::schema::{
     PANE_GRAPHICS_PRIMARY_LAYER_ID, PANE_GRAPHICS_SET_MAX_BYTES, PANE_GRAPHICS_STREAM_MAX_BYTES,
 };
 use crate::app::pane_graphics::{Key as PaneGraphicsKey, Layer, Slot};
+use crate::app::state::PaneGraphicsLayer;
 use crate::app::App;
 use crate::layout::PaneId;
 
@@ -933,6 +934,7 @@ mod tests {
             image_height: 1,
             data: Some(vec![value; 4]),
             data_base64: String::new(),
+            source_path: String::new(),
             placement: Default::default(),
         }
     }
@@ -1344,7 +1346,17 @@ mod tests {
                 PaneGraphicsClearParams {
                     pane_id,
                     layer_id: Some("clear".into()),
-                    owner: String::new(),
+                    // fork(+127): ported verbatim from upstream, which has no
+                    // owner concept — every clear there is scoped to exactly
+                    // `layer_id`. In the fork, an EMPTY owner is the
+                    // privileged socket caller, which ignores `layer_id` and
+                    // wipes the whole pane by design (see the doc on
+                    // `PaneGraphicsClearParams::layer_id`), which would also
+                    // take out the "set" layer this test means to keep. A
+                    // non-empty owner (the same one that opened and abandoned
+                    // the "clear" stream) is what asks for a single-layer
+                    // clear, matching this test's original upstream intent.
+                    owner: "owner-clear".into(),
                 },
             ))
             .is_ok()
@@ -1396,8 +1408,8 @@ mod tests {
         let (mut app, pane_id) = app();
         let (_, pane) = app.parse_pane_id(&pane_id).unwrap();
         let mut params = frame(pane_id.clone(), None, "", 9);
-        params.placement.grid_cols = 10;
-        params.placement.grid_rows = 4;
+        params.placement.grid_cols = Some(10);
+        params.placement.grid_rows = Some(4);
         assert!(serde_json::from_str::<SuccessResponse>(
             &app.handle_pane_graphics_set("set".into(), params)
         )
@@ -1409,7 +1421,10 @@ mod tests {
             .and_then(|slot| slot.layer.as_ref())
             .unwrap();
         assert_eq!(layer.inline_data(), Some([9; 4].as_slice()));
-        assert_eq!((layer.render.grid_cols, layer.render.grid_rows), (10, 4));
+        assert_eq!(
+            (layer.render.grid_cols, layer.render.grid_rows),
+            (Some(10), Some(4))
+        );
         assert!(!app.state.session_dirty);
 
         assert!(

@@ -324,6 +324,7 @@ fn serve_frames(
                     image_height: header.image_height,
                     data: Some(data),
                     data_base64: String::new(),
+                    source_path: String::new(),
                     placement: header.placement,
                 }),
             },
@@ -685,7 +686,7 @@ mod tests {
         assert_eq!((header.image_width, header.image_height), (2, 3));
         assert_eq!(
             (header.placement.grid_cols, header.placement.grid_rows),
-            (2, 3)
+            (Some(2), Some(3))
         );
     }
 
@@ -753,8 +754,8 @@ mod tests {
                 assert_eq!(params.image_height, 1);
                 assert_eq!(params.data.as_deref(), Some(&[1_u8, 2, 3, 4][..]));
                 assert!(params.data_base64.is_empty());
-                assert_eq!(params.placement.grid_cols, 10);
-                assert_eq!(params.placement.grid_rows, 5);
+                assert_eq!(params.placement.grid_cols, Some(10));
+                assert_eq!(params.placement.grid_rows, Some(5));
             }
             other => panic!("unexpected request: {other:?}"),
         }

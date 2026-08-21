@@ -1453,7 +1453,6 @@ mod pane_graphics_request_tests {
         let request = Request {
             id: "graphics-max".into(),
             method: Method::PaneGraphicsSet(crate::api::schema::PaneGraphicsSetParams {
-                layer_id: String::new(),
                 pane_id: "pane_1".into(),
                 layer_id: None,
                 z_index: 0,

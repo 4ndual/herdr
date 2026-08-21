@@ -239,7 +239,7 @@ impl App {
                     }
                 }
             }
-            return;
+            return Vec::new();
         }
 
         if let AppEvent::WorktreeAddFinished(result) = ev {
@@ -257,7 +257,7 @@ impl App {
         // paths (which would fail to find it) run.
         if let AppEvent::PaneDied { pane_id } = &ev {
             if self.handle_resume_picker_pane_died(*pane_id) {
-                return;
+                return Vec::new();
             }
         }
 

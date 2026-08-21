@@ -407,7 +407,7 @@ impl App {
         )
         .and_then(|hit| hit.declared_hit_owner)
         .is_some_and(|(_, _, negotiated_version)| negotiated_version == 3);
-        if !v3_owned_cell && crate::usage_host::route_mouse(self, mouse) {
+        if !v3_owned_cell && crate::usage_host::route_mouse(self, source_id, mouse) {
             self.request_render();
             return;
         }

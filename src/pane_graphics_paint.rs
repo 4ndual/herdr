@@ -214,6 +214,24 @@ fn layer_rgba(layer: &PaneGraphicsLayer) -> Option<RgbaImage> {
                 data,
             })
         }
+        // Same shape as `Rgba` above, just with the red and blue channels
+        // swapped back into RGBA order so the half-block fallback doesn't
+        // silently drop (or mis-color) BGRA frames.
+        PaneGraphicsFormat::Bgra => {
+            let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+            if layer.data.len() < expected {
+                return None;
+            }
+            let mut data = Vec::with_capacity(expected);
+            for px in layer.data[..expected].chunks_exact(4) {
+                data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+            Some(RgbaImage {
+                width: w,
+                height: h,
+                data,
+            })
+        }
     }
 }
 

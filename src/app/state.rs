@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use herdr_ui_plugin_api::UiActionRef;
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
+use std::hash::{Hash, Hasher};
 
 use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};

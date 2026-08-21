@@ -298,6 +298,17 @@ pub enum PaneGraphicsFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneGraphicsSetParams {
     pub pane_id: String,
+    /// fork(+127): identifies this layer WITHIN its owner, so one caller can hold
+    /// several coexisting layers on one pane.
+    ///
+    /// Before +127 a layer's identity was its owner alone: one layer per plugin
+    /// per pane, and a second `set` replaced the first. That is fine for a single
+    /// panel image and impossible for the Claude `[Image #N]` case, where one
+    /// plugin must paint every placeholder visible in a pane at once.
+    ///
+    /// Identity is the pair `(owner, layer_id)`. `None`/absent resolves to the
+    /// primary layer id, which is the one every pre-+127 caller uses, which is
+    /// why their single-layer behaviour is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer_id: Option<String>,
     #[serde(default)]
@@ -329,19 +340,6 @@ pub struct PaneGraphicsSetParams {
     /// has no such constraint and is capped at the streaming limit instead.
     #[serde(default)]
     pub source_path: String,
-    /// fork(+127): identifies this layer WITHIN its owner, so one caller can hold
-    /// several coexisting layers on one pane.
-    ///
-    /// Before +127 a layer's identity was its owner alone: one layer per plugin
-    /// per pane, and a second `set` replaced the first. That is fine for a single
-    /// panel image and impossible for the Claude `[Image #N]` case, where one
-    /// plugin must paint every placeholder visible in a pane at once.
-    ///
-    /// Identity is the pair `(owner, layer_id)`. Empty (the default) is a real
-    /// id, not "unset" — it is the one every pre-+127 caller uses, which is why
-    /// their single-layer behaviour is unchanged.
-    #[serde(default)]
-    pub layer_id: String,
     #[serde(default)]
     pub placement: PaneGraphicsPlacementParams,
 }

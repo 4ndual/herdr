@@ -83,7 +83,7 @@ impl Agent {
         matches!(self, Self::Claude | Self::Codex | Self::Pi | Self::Jcode)
     }
 
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,
@@ -109,7 +109,7 @@ impl Agent {
         Self::Jcode,
     ];
 
-    pub const SCREEN_MANIFEST_AGENTS: [Self; 20] = [
+    pub const SCREEN_MANIFEST_AGENTS: [Self; 21] = [
         Self::Pi,
         Self::Claude,
         Self::Codex,

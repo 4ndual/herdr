@@ -2107,16 +2107,20 @@ mod tests {
         let mut app = crate::app::AppState::test_new();
         app.workspaces = vec![crate::workspace::Workspace::test_new("img")];
         app.active = Some(0);
-        app.pane_graphics_layers.insert(
-            pane_id,
-            vec![crate::app::state::PaneGraphicsLayer::new(
-                crate::api::schema::PaneGraphicsFormat::Rgba,
-                8,
-                8,
-                vec![255; 8 * 8 * 4],
-                crate::api::schema::PaneGraphicsPlacementParams::default(),
-                None,
-            )],
+        let mut graphics = crate::app::pane_graphics::Runtime::default();
+        graphics.slots.insert(
+            (pane_id, crate::api::schema::PANE_GRAPHICS_PRIMARY_LAYER_ID.into()),
+            crate::app::pane_graphics::Slot::test(
+                PANE_GRAPHICS_IMAGE_ID_BIT | 1,
+                Some(crate::app::pane_graphics::Layer::inline(
+                    crate::api::schema::PaneGraphicsFormat::Rgba,
+                    8,
+                    8,
+                    vec![255; 8 * 8 * 4],
+                    crate::api::schema::PaneGraphicsPlacementParams::default(),
+                    0,
+                )),
+            ),
         );
         let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let pane_infos = [info];
@@ -2130,8 +2134,14 @@ mod tests {
         };
 
         app.mode = crate::app::Mode::Terminal;
-        let visible =
-            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        let visible = collect_visible_placements(
+            &app,
+            &graphics,
+            &runtimes,
+            surface,
+            cell_size,
+            &HashMap::new(),
+        );
         assert_eq!(
             visible.len(),
             1,
@@ -2139,8 +2149,14 @@ mod tests {
         );
 
         app.mode = crate::app::Mode::GlobalMenu;
-        let suppressed =
-            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        let suppressed = collect_visible_placements(
+            &app,
+            &graphics,
+            &runtimes,
+            surface,
+            cell_size,
+            &HashMap::new(),
+        );
         assert!(
             suppressed.is_empty(),
             "layer must not be collected while an overlay is open"
@@ -2168,16 +2184,26 @@ mod tests {
         let mut app = crate::app::AppState::test_new();
         app.workspaces = vec![crate::workspace::Workspace::test_new("img")];
         app.active = Some(0);
-        for (owner, fill) in [(None, 255_u8), (Some("plugin:a".to_string()), 128_u8)] {
-            app.upsert_pane_graphics_layer(
-                pane_id,
-                crate::app::state::PaneGraphicsLayer::new(
-                    crate::api::schema::PaneGraphicsFormat::Rgba,
-                    8,
-                    8,
-                    vec![fill; 8 * 8 * 4],
-                    crate::api::schema::PaneGraphicsPlacementParams::default(),
-                    owner,
+        let mut graphics = crate::app::pane_graphics::Runtime::default();
+        for (owner_index, (layer_id, fill)) in [
+            (crate::api::schema::PANE_GRAPHICS_PRIMARY_LAYER_ID, 255_u8),
+            ("plugin:a", 128_u8),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            graphics.slots.insert(
+                (pane_id, layer_id.to_string()),
+                crate::app::pane_graphics::Slot::test(
+                    PANE_GRAPHICS_IMAGE_ID_BIT | owner_index as u32,
+                    Some(crate::app::pane_graphics::Layer::inline(
+                        crate::api::schema::PaneGraphicsFormat::Rgba,
+                        8,
+                        8,
+                        vec![fill; 8 * 8 * 4],
+                        crate::api::schema::PaneGraphicsPlacementParams::default(),
+                        0,
+                    )),
                 ),
             );
         }
@@ -2193,13 +2219,19 @@ mod tests {
         };
         app.mode = crate::app::Mode::Terminal;
 
-        let visible =
-            collect_visible_placements(&app, &runtimes, surface, cell_size, &HashMap::new());
+        let visible = collect_visible_placements(
+            &app,
+            &graphics,
+            &runtimes,
+            surface,
+            cell_size,
+            &HashMap::new(),
+        );
         assert_eq!(visible.len(), 2, "both layers must be collected");
 
         let ids: Vec<u32> = visible
             .iter()
-            .map(|placement| host_placement_id(placement.source_key, &placement.placement))
+            .map(|placement| host_placement_id(&placement.source_key, &placement.placement))
             .collect();
         assert_ne!(
             ids[0], ids[1],

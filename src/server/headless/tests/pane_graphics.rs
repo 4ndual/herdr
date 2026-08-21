@@ -140,7 +140,6 @@ fn stream_set_message(
                 id: id.into(),
                 method: api::schema::Method::PaneGraphicsStreamSet(
                     api::schema::PaneGraphicsSetParams {
-                        layer_id: String::new(),
                         pane_id: pane_id.into(),
                         layer_id: None,
                         z_index: 0,
@@ -631,7 +630,6 @@ fn stream_set_has_graphics_only_render_impact() {
         request: api::schema::Request {
             id: "direct-frame".into(),
             method: api::schema::Method::PaneGraphicsSet(api::schema::PaneGraphicsSetParams {
-                layer_id: String::new(),
                 pane_id: public_pane_id,
                 layer_id: None,
                 z_index: 0,

@@ -180,10 +180,31 @@ fn in_rect(r: Rect, col: u16, row: u16) -> bool {
 
 /// Route a mouse event onto the native usage strip when it lands there. Returns
 /// true if consumed. Events outside the strip are left for the host.
-pub fn route_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+pub fn route_mouse(app: &mut App, source_id: crate::app::InputSourceId, mouse: MouseEvent) -> bool {
     let (col, row) = (mouse.column, mouse.row);
 
     if in_rect(app.state.view.usage_strip_rect, col, row) {
+        // A Drag/Up report that lands over the strip but belongs to a gesture
+        // anchored elsewhere (a tab/workspace press, or any other chrome/pane
+        // drag such as a split-border or scrollbar drag) must still reach its
+        // owner. The strip only owns FRESH input over its own rows, not the
+        // tail end of someone else's gesture; the strip sits at the bottom of
+        // the screen, which is exactly where a drag or a stray coordinate is
+        // likely to end up. Swallowing it here would silently drop the Up
+        // that completes, say, a tab click whenever the pointer's path (real
+        // or misreported) crosses the strip's rows.
+        let gesture_in_flight = app.state.tab_presses.contains_key(&source_id)
+            || app.state.workspace_presses.contains_key(&source_id)
+            || app.state.drag.is_some();
+        if gesture_in_flight
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return false;
+        }
+
         use usage_dash_core::Action as U;
         let action = match mouse.kind {
             MouseEventKind::Moved => U::Hover(col, row),
