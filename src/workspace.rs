@@ -204,6 +204,11 @@ pub struct Workspace {
     pub(crate) next_public_tab_number: usize,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// fork(ADR-014): hidden workspaces keep every tab, pane, PTY, layout and
+    /// agent registration. Only the sidebar row list and the workspace
+    /// navigation order derived from it skip them. Written solely by
+    /// `AppState::set_workspace_hidden`, which owns the last-visible refusal.
+    pub hidden: bool,
     #[cfg(test)]
     pub(crate) test_runtimes: HashMap<PaneId, TerminalRuntime>,
 }
@@ -269,6 +274,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            hidden: false,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         }
@@ -468,6 +474,7 @@ impl Workspace {
                 next_public_tab_number: 2,
                 tabs: vec![tab],
                 active_tab: 0,
+                hidden: false,
                 #[cfg(test)]
                 test_runtimes: HashMap::new(),
             },
@@ -1351,6 +1358,7 @@ impl Workspace {
             next_public_tab_number: 2,
             tabs: vec![tab],
             active_tab: 0,
+            hidden: false,
             test_runtimes: HashMap::new(),
         }
     }

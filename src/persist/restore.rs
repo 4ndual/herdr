@@ -300,6 +300,15 @@ fn restore_with_imports_and_failures(
         }
     }
     crate::workspace::reserve_workspace_ids(&workspaces);
+    // fork(ADR-014): re-establish the last-visible-workspace invariant across
+    // the whole restored list. `AppState::set_workspace_hidden` cannot produce
+    // an all-hidden session, but a hand-edited or partially-restored snapshot
+    // can — and an empty sidebar is unrecoverable from the TUI, so reveal the
+    // first workspace rather than start with no rows.
+    if !workspaces.is_empty() && workspaces.iter().all(|ws| ws.hidden) {
+        tracing::warn!("every restored workspace was hidden; revealing the first");
+        workspaces[0].hidden = false;
+    }
     ((workspaces, terminals, terminal_runtimes), failed_imports)
 }
 
@@ -440,6 +449,11 @@ fn restore_workspace(
             next_public_tab_number,
             active_tab: restored_active_tab(&tabs, snap.active_tab),
             tabs,
+            // fork(ADR-014): restored as captured. The last-visible-workspace
+            // invariant is re-established by the caller once every workspace
+            // is restored, not per workspace here, because it is a property of
+            // the whole list.
+            hidden: snap.hidden,
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         })
@@ -1276,6 +1290,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     hidden: false,
                     custom_name: None,
@@ -1367,6 +1382,7 @@ mod tests {
                     next_public_pane_number: 0,
                     public_tab_numbers: Vec::new(),
                     next_public_tab_number: 0,
+                    hidden: false,
                     tabs: vec![TabSnapshot {
                         hidden: false,
                         custom_name: None,
@@ -1459,6 +1475,7 @@ mod tests {
                 next_public_pane_number: 2,
                 public_tab_numbers: vec![1],
                 next_public_tab_number: 2,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     hidden: false,
                     custom_name: None,
@@ -1573,6 +1590,7 @@ mod tests {
                 next_public_pane_number: 4,
                 public_tab_numbers: vec![5],
                 next_public_tab_number: 6,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     hidden: false,
                     custom_name: None,
@@ -1696,6 +1714,7 @@ mod tests {
                 next_public_pane_number: 5,
                 public_tab_numbers: vec![1, 3, 4, 5],
                 next_public_tab_number: 6,
+                hidden: false,
                 tabs: vec![
                     TabSnapshot {
                         hidden: false,
@@ -1784,6 +1803,7 @@ mod tests {
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
             next_public_tab_number: 0,
+            hidden: false,
             tabs: vec![TabSnapshot {
                 hidden: false,
                 custom_name: None,
@@ -1825,6 +1845,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     hidden: false,
                     custom_name: None,
@@ -2042,6 +2063,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     hidden: false,
                     custom_name: None,

@@ -66,6 +66,11 @@ pub struct WorkspaceSnapshot {
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
+    /// fork(ADR-014): workspace visibility survives restart, exactly as
+    /// `TabSnapshot.hidden` does for tabs. Serde-default so snapshots written
+    /// before this field restore as visible.
+    #[serde(default)]
+    pub hidden: bool,
     /// #34 phase 2, workspace half: the colour a user gave the workspace. The
     /// pane colour has been persisted since the same change; the workspace one
     /// was not, so setting it was a session-scoped novelty rather than a
@@ -203,6 +208,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             next_public_tab_number: 0,
             tabs: vec![tab],
             active_tab: 0,
+            hidden: false,
             color: None,
         }
     }
@@ -345,6 +351,7 @@ fn capture_workspace(
             .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
             .collect(),
         active_tab: ws.active_tab,
+        hidden: ws.hidden,
         color: ws
             .metadata_tokens
             .values()
@@ -739,6 +746,7 @@ mod tests {
                 next_public_pane_number: 3,
                 public_tab_numbers: vec![1],
                 next_public_tab_number: 2,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
                     hidden: false,
@@ -1309,6 +1317,7 @@ mod tests {
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
+                hidden: false,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     hidden: false,

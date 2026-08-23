@@ -201,7 +201,12 @@ fn api_command() -> Command {
 fn workspace_command() -> Command {
     Command::new("workspace")
         .about("Manage workspaces over the socket API")
-        .subcommand(Command::new("list").about("List workspaces"))
+        .subcommand(
+            Command::new("list")
+                .about("List workspaces")
+                .arg(flag("hidden"))
+                .arg(flag("visible")),
+        )
         .subcommand(
             Command::new("create")
                 .about("Create a workspace")
@@ -230,6 +235,10 @@ fn workspace_command() -> Command {
                 .arg(option("ttl-ms", "N")),
         )
         .subcommand(id_command("close", "workspace_id", "Close a workspace"))
+        .subcommand(id_command("hide", "workspace_id", "Hide a workspace"))
+        .subcommand(
+            id_command("show", "workspace_id", "Reveal a hidden workspace").arg(flag("focus")),
+        )
 }
 
 fn worktree_command() -> Command {

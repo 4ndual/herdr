@@ -507,6 +507,10 @@ impl App {
                 crate::workspace::public_tab_id_for_number(&ws.id, ws.active_tab + 1)
             }),
             agent_status: pane_agent_status(agg_state, seen),
+            // fork(ADR-014): reported, never filtered here. A hidden workspace
+            // keeps full runtime ownership, so it still gets a `WorkspaceInfo`;
+            // filtering belongs to `workspace.list {hidden}`.
+            hidden: ws.hidden,
             tokens: ws.metadata_tokens.values(),
             worktree: ws
                 .worktree_space()

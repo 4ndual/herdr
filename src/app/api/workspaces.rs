@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCreateParams,
-    WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
-    WorkspaceReportMetadataParams, WorkspaceTarget,
+    WorkspaceListParams, WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
+    WorkspaceReportMetadataParams, WorkspaceTarget, WorkspaceVisibilityParams,
 };
 use crate::app::App;
 
@@ -11,11 +11,15 @@ use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_tt
 use super::responses::{encode_error, encode_success};
 
 impl App {
-    pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
+    pub(super) fn handle_workspace_list(
+        &mut self,
+        id: String,
+        params: WorkspaceListParams,
+    ) -> String {
         encode_success(
             id,
             ResponseResult::WorkspaceList {
-                workspaces: self.workspace_list_info(),
+                workspaces: self.workspace_list_info_filtered(params.hidden),
             },
         )
     }
@@ -330,12 +334,90 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// fork(ADR-014): hide a workspace without closing anything it owns.
+    ///
+    /// Routed through the same `AppState::set_workspace_hidden` setter as
+    /// `handle_workspace_show`, so the last-visible refusal and the focus move
+    /// off a hidden workspace are enforced in exactly one place.
+    pub(super) fn handle_workspace_hide(
+        &mut self,
+        id: String,
+        params: WorkspaceVisibilityParams,
+    ) -> String {
+        let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
+            return workspace_not_found(id, &params.workspace_id);
+        };
+        if self.state.workspaces.get(index).is_none() {
+            return workspace_not_found(id, &params.workspace_id);
+        }
+        if params.focus {
+            return encode_error(
+                id,
+                "invalid_request",
+                "cannot focus a workspace while hiding it",
+            );
+        }
+        if !self.state.set_workspace_hidden(index, true) {
+            // The setter refuses to hide the last visible workspace: a sidebar
+            // with no rows is unrecoverable from the TUI.
+            return encode_error(
+                id,
+                "invalid_request",
+                "cannot hide the last visible workspace",
+            );
+        }
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        encode_success(
+            id,
+            ResponseResult::WorkspaceInfo {
+                workspace: self.workspace_info(index),
+            },
+        )
+    }
+
+    /// fork(ADR-014): put a hidden workspace back in the sidebar.
+    pub(super) fn handle_workspace_show(
+        &mut self,
+        id: String,
+        params: WorkspaceVisibilityParams,
+    ) -> String {
+        let Some(index) = self.parse_workspace_id(&params.workspace_id) else {
+            return workspace_not_found(id, &params.workspace_id);
+        };
+        if self.state.workspaces.get(index).is_none() {
+            return workspace_not_found(id, &params.workspace_id);
+        }
+        if !self.state.set_workspace_hidden(index, false) {
+            return workspace_not_found(id, &params.workspace_id);
+        }
+        if params.focus {
+            self.state.switch_workspace(index);
+        }
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        encode_success(
+            id,
+            ResponseResult::WorkspaceInfo {
+                workspace: self.workspace_info(index),
+            },
+        )
+    }
+
     fn workspace_list_info(&self) -> Vec<crate::api::schema::WorkspaceInfo> {
+        self.workspace_list_info_filtered(None)
+    }
+
+    fn workspace_list_info_filtered(
+        &self,
+        hidden: Option<bool>,
+    ) -> Vec<crate::api::schema::WorkspaceInfo> {
         self.state
             .workspaces
             .iter()
             .enumerate()
             .map(|(idx, _)| self.workspace_info(idx))
+            .filter(|workspace| hidden.is_none_or(|hidden| workspace.hidden == hidden))
             .collect()
     }
 }
@@ -352,6 +434,169 @@ fn workspace_not_found(id: String, workspace_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
+
+    fn app_with_two_workspaces() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app
+    }
+
+    fn error_code(response: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(response)
+            .expect("a json response")
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(|code| code.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// fork(ADR-014): `workspace.hide` is the API counterpart of the "Hide" menu
+    /// row and routes through the same setter, so the two cannot diverge.
+    #[test]
+    fn api_workspace_hide_hides_it_and_workspace_show_brings_it_back() {
+        let mut app = app_with_two_workspaces();
+        let workspace_id = app.public_workspace_id(1);
+
+        let response = app.handle_workspace_hide(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id: workspace_id.clone(),
+                focus: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert!(app.state.workspaces[1].hidden);
+
+        let response = app.handle_workspace_show(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id,
+                focus: false,
+            },
+        );
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceInfo { .. }
+        ));
+        assert!(!app.state.workspaces[1].hidden);
+    }
+
+    /// Refused LOUDLY, not by returning a workspace that quietly stayed visible.
+    #[test]
+    fn api_workspace_hide_refuses_the_last_visible_workspace() {
+        let mut app = app_with_two_workspaces();
+        let first = app.public_workspace_id(0);
+        let second = app.public_workspace_id(1);
+
+        app.handle_workspace_hide(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id: second,
+                focus: false,
+            },
+        );
+        let response = app.handle_workspace_hide(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id: first,
+                focus: false,
+            },
+        );
+
+        assert_eq!(error_code(&response), "invalid_request");
+        assert!(
+            app.state.workspaces.iter().any(|ws| !ws.hidden),
+            "a session always keeps one visible workspace"
+        );
+    }
+
+    /// Hidden and focused at once is contradictory; the handler says so rather
+    /// than picking one and leaving the caller to discover which.
+    #[test]
+    fn api_workspace_hide_rejects_hidden_together_with_focus() {
+        let mut app = app_with_two_workspaces();
+        let workspace_id = app.public_workspace_id(1);
+
+        let response = app.handle_workspace_hide(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id,
+                focus: true,
+            },
+        );
+
+        assert_eq!(error_code(&response), "invalid_request");
+        assert!(!app.state.workspaces[1].hidden);
+    }
+
+    /// Showing an already-visible workspace is a no-op that SUCCEEDS — an
+    /// idempotent call must not look like a missing workspace.
+    #[test]
+    fn api_workspace_show_on_an_already_visible_workspace_succeeds() {
+        let mut app = app_with_two_workspaces();
+        let workspace_id = app.public_workspace_id(1);
+
+        let response = app.handle_workspace_show(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id,
+                focus: false,
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(
+            matches!(success.result, ResponseResult::WorkspaceInfo { .. }),
+            "an already-visible workspace is not a missing workspace"
+        );
+    }
+
+    /// `workspace.list` defaults to no visibility filter, and `{hidden}` is the
+    /// only way back to a hidden workspace from outside the TUI.
+    #[test]
+    fn api_workspace_list_defaults_to_no_filter_and_can_select_hidden_only() {
+        let mut app = app_with_two_workspaces();
+        let workspace_id = app.public_workspace_id(1);
+        app.handle_workspace_hide(
+            "req".into(),
+            WorkspaceVisibilityParams {
+                workspace_id: workspace_id.clone(),
+                focus: false,
+            },
+        );
+
+        let unfiltered = app.handle_workspace_list("req".into(), WorkspaceListParams::default());
+        let success: SuccessResponse = serde_json::from_str(&unfiltered).unwrap();
+        let ResponseResult::WorkspaceList { workspaces } = success.result else {
+            panic!("expected a workspace list");
+        };
+        assert_eq!(workspaces.len(), 2, "no filter lists hidden workspaces too");
+
+        let hidden_only =
+            app.handle_workspace_list("req".into(), WorkspaceListParams { hidden: Some(true) });
+        let success: SuccessResponse = serde_json::from_str(&hidden_only).unwrap();
+        let ResponseResult::WorkspaceList { workspaces } = success.result else {
+            panic!("expected a workspace list");
+        };
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_id, workspace_id);
+        assert!(workspaces[0].hidden);
+    }
 
     // `new_cwd = follow` must anchor on the focused pane for every creation
     // surface. Splits and tabs already do; a new workspace must follow the

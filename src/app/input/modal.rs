@@ -808,6 +808,18 @@ pub(super) fn apply_context_menu_action(
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
+        // fork(ADR-014): host-owned, exactly like the Tab arm's "Make
+        // invisible" below — it mutates core workspace state, so it cannot be a
+        // plugin action.
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Hide"),
+        ) => {
+            if state.set_workspace_hidden(ws_idx, true) {
+                state.mark_session_dirty();
+            }
+            leave_modal(state);
+        }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
@@ -1350,6 +1362,19 @@ impl App {
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
+            // fork(ADR-014): the API-routed twin of the "Hide" arm in
+            // `apply_context_menu_action`. Real sidebar clicks land HERE, not
+            // there, so both tables need the row or the menu entry is a no-op.
+            (
+                ContextMenuKind::Workspace { ws_idx }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Hide"),
+            ) => {
+                if self.state.set_workspace_hidden(ws_idx, true) {
+                    self.state.mark_session_dirty();
+                }
+                leave_modal(&mut self.state);
+            }
             (
                 ContextMenuKind::Workspace { ws_idx }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
