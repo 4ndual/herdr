@@ -1317,6 +1317,53 @@ impl AppState {
         }
     }
 
+    /// fork(ADR-014): the sole writer of `Workspace.hidden`.
+    ///
+    /// Hiding keeps every tab, pane, PTY, layout and agent registration; only
+    /// `ui::sidebar::workspace_list_entries_inner` — and therefore the sidebar
+    /// rows, their hit testing, and the `visible_workspace_order` above —
+    /// skip the workspace. Returns false when the request is refused: an
+    /// unknown index, or the last visible workspace, because a sidebar with no
+    /// rows is unrecoverable from the TUI.
+    ///
+    /// This lives on `AppState` rather than `Workspace` (where the tab
+    /// equivalent `Workspace::set_tab_hidden` lives) because both the
+    /// last-visible refusal and the neighbour move are facts about the
+    /// workspace *list*, which a `Workspace` cannot see.
+    pub fn set_workspace_hidden(&mut self, idx: usize, hidden: bool) -> bool {
+        let Some(ws) = self.workspaces.get(idx) else {
+            return false;
+        };
+        if ws.hidden == hidden {
+            return true;
+        }
+        if hidden && self.workspaces.iter().filter(|ws| !ws.hidden).count() <= 1 {
+            return false;
+        }
+        self.workspaces[idx].hidden = hidden;
+        if hidden {
+            // Nearest visible neighbour — the same replacement rule
+            // `Workspace::set_tab_hidden` uses when it hides the active tab.
+            let replacement = self
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter(|(_, ws)| !ws.hidden)
+                .min_by_key(|(candidate, _)| candidate.abs_diff(idx))
+                .map(|(candidate, _)| candidate)
+                .expect("hiding a workspace leaves one visible workspace");
+            if self.active == Some(idx) {
+                self.switch_workspace(replacement);
+            }
+            // `switch_workspace` already moves `selected`; this covers the
+            // case where the hidden workspace was selected but not active.
+            if self.selected == idx {
+                self.selected = replacement;
+            }
+        }
+        true
+    }
+
     pub(crate) fn workspace_at_visible_position(&self, position: usize) -> Option<usize> {
         self.visible_workspace_order().get(position).copied()
     }
@@ -3438,6 +3485,88 @@ mod tests {
             state.mode = Mode::Terminal;
         }
         state
+    }
+
+    /// fork(ADR-014): hiding keeps the workspace and everything it owns; only
+    /// the row list and the navigation order derived from it drop it.
+    #[test]
+    fn hiding_a_workspace_keeps_it_owned_but_removes_it_from_navigation() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let panes_before = state.workspaces[1].public_pane_numbers.len();
+
+        assert!(state.set_workspace_hidden(1, true));
+
+        assert!(state.workspaces[1].hidden);
+        assert_eq!(
+            state.workspaces.len(),
+            2,
+            "a hidden workspace is still owned, not closed"
+        );
+        assert_eq!(
+            state.workspaces[1].public_pane_numbers.len(),
+            panes_before,
+            "hiding must not touch pane ownership"
+        );
+        assert!(
+            !state.visible_workspace_order().contains(&1),
+            "a hidden workspace leaves the navigation order"
+        );
+    }
+
+    /// A sidebar with no rows is unrecoverable from the TUI, so the setter
+    /// refuses rather than allowing an empty workspace list.
+    #[test]
+    fn hiding_the_last_visible_workspace_is_refused() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+
+        assert!(state.set_workspace_hidden(1, true));
+        assert!(!state.set_workspace_hidden(0, true));
+
+        assert!(
+            state.workspaces.iter().any(|ws| !ws.hidden),
+            "one workspace always stays visible"
+        );
+    }
+
+    /// Hiding the workspace the user is in must not strand focus on a row that
+    /// no longer exists.
+    #[test]
+    fn hiding_the_active_workspace_moves_focus_to_a_visible_neighbour() {
+        let mut state = app_with_workspaces(&["one", "two", "three"]);
+        state.active = Some(1);
+        state.selected = 1;
+
+        assert!(state.set_workspace_hidden(1, true));
+
+        assert_ne!(state.active, Some(1), "focus left the hidden workspace");
+        assert_ne!(state.selected, 1, "selection left the hidden workspace");
+        assert!(
+            state
+                .active
+                .is_some_and(|idx| !state.workspaces[idx].hidden),
+            "focus landed on a visible workspace"
+        );
+    }
+
+    /// Showing is the exact inverse, and both directions are idempotent — a
+    /// repeat call is a no-op that still reports success.
+    #[test]
+    fn showing_a_hidden_workspace_puts_it_back_and_both_directions_are_idempotent() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+
+        assert!(state.set_workspace_hidden(1, true));
+        assert!(state.set_workspace_hidden(1, true), "hide is idempotent");
+        assert!(state.set_workspace_hidden(1, false));
+        assert!(state.set_workspace_hidden(1, false), "show is idempotent");
+
+        assert!(!state.workspaces[1].hidden);
+        assert!(state.visible_workspace_order().contains(&1));
+    }
+
+    #[test]
+    fn set_workspace_hidden_reports_false_for_an_unknown_index() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        assert!(!state.set_workspace_hidden(9, true));
     }
 
     fn insert_test_pane_graphics_layer(state: &mut AppState, pane_id: PaneId) {

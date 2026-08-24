@@ -6970,7 +6970,7 @@ mod tests {
         let read_only = crate::api::schema::Request {
             id: "req_1".into(),
             method: crate::api::schema::Method::WorkspaceList(
-                crate::api::schema::EmptyParams::default(),
+                crate::api::schema::WorkspaceListParams::default(),
             ),
         };
         let mutating = crate::api::schema::Request {
@@ -9148,13 +9148,22 @@ last_pane = "prefix+tab"
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.confirm_close = false;
-        app.state.context_menu = Some(state::ContextMenuState {
+        // fork(ADR-013): row resolved from the live menu, not hard coded —
+        // ADR-014 added "Hide" between "Rename" and "Close".
+        let mut menu = state::ContextMenuState {
             plugin_items: Vec::new(),
             kind: state::ContextMenuKind::Workspace { ws_idx: 1 },
             x: 2,
             y: 2,
-            list: state::MenuListState::new(1),
-        });
+            list: state::MenuListState::new(0),
+        };
+        let close_row = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("the workspace context menu has a Close row");
+        menu.list = state::MenuListState::new(close_row);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
 
         app.route_client_input(b"\r".to_vec());

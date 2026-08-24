@@ -75,6 +75,12 @@ const WRITE_METHODS: &[&str] = &[
     "workspace.create",
     "workspace.focus",
     "workspace.rename",
+    // fork(ADR-014): same argument as `tab.show` above — revealing a workspace
+    // the user hid can only make an already-owned workspace visible again,
+    // strictly less destructive than `workspace.close`. `workspace.hide` sits
+    // with it so a dash can offer both halves of the toggle.
+    "workspace.show",
+    "workspace.hide",
     "layout.apply",
     "plugin.action.invoke",
 ];

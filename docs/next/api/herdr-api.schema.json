@@ -1083,6 +1083,10 @@
             "focused": {
               "type": "boolean"
             },
+            "hidden": {
+              "description": "fork(ADR-014): a hidden workspace retains full runtime ownership, so it\nstill gets a `WorkspaceInfo`. Visibility is reported here; filtering is\nleft to `workspace.list {hidden}`.",
+              "type": "boolean"
+            },
             "label": {
               "type": "string"
             },
@@ -1133,7 +1137,8 @@
             "pane_count",
             "tab_count",
             "active_tab_id",
-            "agent_status"
+            "agent_status",
+            "hidden"
           ],
           "type": "object"
         },
@@ -4464,6 +4469,19 @@
           },
           "type": "object"
         },
+        "WorkspaceListParams": {
+          "description": "fork(ADR-014): `workspace.list` params. Every field is optional and\nserde-defaulted, so a bare `{}` — what every caller sent before workspace\nvisibility existed — still deserializes and still means \"no filter\".",
+          "properties": {
+            "hidden": {
+              "description": "When set, restrict the result to workspaces with this visibility state.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "WorkspaceMoveBlockParams": {
           "properties": {
             "before_workspace_id": {
@@ -4564,6 +4582,23 @@
         },
         "WorkspaceTarget": {
           "properties": {
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "workspace_id"
+          ],
+          "type": "object"
+        },
+        "WorkspaceVisibilityParams": {
+          "description": "fork(ADR-014): shared by `workspace.hide` and `workspace.show`, mirroring\n`TabVisibilityParams`.",
+          "properties": {
+            "focus": {
+              "default": false,
+              "description": "Reveal the workspace and focus it when true. Defaults to false.",
+              "type": "boolean"
+            },
             "workspace_id": {
               "type": "string"
             }
@@ -4902,7 +4937,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/EmptyParams"
+              "$ref": "#/schemas/request/$defs/WorkspaceListParams"
             }
           },
           "required": [
@@ -4919,6 +4954,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/WorkspaceTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.show",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceVisibilityParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "workspace.hide",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/WorkspaceVisibilityParams"
             }
           },
           "required": [
@@ -10946,6 +11013,10 @@
             "focused": {
               "type": "boolean"
             },
+            "hidden": {
+              "description": "fork(ADR-014): a hidden workspace retains full runtime ownership, so it\nstill gets a `WorkspaceInfo`. Visibility is reported here; filtering is\nleft to `workspace.list {hidden}`.",
+              "type": "boolean"
+            },
             "label": {
               "type": "string"
             },
@@ -10996,7 +11067,8 @@
             "pane_count",
             "tab_count",
             "active_tab_id",
-            "agent_status"
+            "agent_status",
+            "hidden"
           ],
           "type": "object"
         },

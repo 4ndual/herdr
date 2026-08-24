@@ -369,6 +369,12 @@ pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceLi
 fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
     let mut members_by_key = std::collections::HashMap::<String, Vec<usize>>::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+        // fork(ADR-014): a hidden workspace is not a group member either, so a
+        // worktree group whose only remaining sibling is hidden stops being a
+        // group instead of drawing a parent chevron over nothing.
+        if ws.hidden {
+            continue;
+        }
         if let Some(space) = ws.worktree_space() {
             members_by_key
                 .entry(space.key.clone())
@@ -405,6 +411,14 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     let mut emitted_groups = std::collections::HashSet::<String>::new();
     let mut entries = Vec::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+        // fork(ADR-014): the one visibility filter for workspaces. Sidebar
+        // geometry (`compute_workspace_list_areas`), its hit testing, and
+        // `AppState::visible_workspace_order` — and so `next_workspace` /
+        // `previous_workspace` — all read this list, so hidden workspaces
+        // leave every one of them from here.
+        if ws.hidden {
+            continue;
+        }
         let Some(space) = ws
             .worktree_space()
             .filter(|space| grouped_keys.contains(&space.key))
@@ -1678,6 +1692,44 @@ mod tests {
                     row_text(buffer, row, width)
                 )
             })
+    }
+
+    /// fork(ADR-014): `workspace_list_entries_inner` is the ONE place workspace
+    /// visibility is applied. This pins that the row list, the card areas that
+    /// drive hit testing, and `visible_workspace_order` all drop a hidden
+    /// workspace together — a second filter anywhere else would be a bug.
+    #[test]
+    fn a_hidden_workspace_leaves_the_row_list_the_card_areas_and_navigation() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            crate::workspace::Workspace::test_new("one"),
+            crate::workspace::Workspace::test_new("two"),
+        ];
+        app.active = Some(0);
+        app.selected = 0;
+        let area = Rect::new(0, 0, 30, 20);
+
+        let rows_before = workspace_list_entries(&app).len();
+        let cards_before = compute_workspace_card_areas(&app, area).len();
+        assert_eq!(rows_before, 2, "the fixture must draw both workspaces");
+        assert!(app.visible_workspace_order().contains(&1));
+
+        app.workspaces[1].hidden = true;
+
+        assert_eq!(
+            workspace_list_entries(&app).len(),
+            rows_before - 1,
+            "a hidden workspace leaves the row list"
+        );
+        assert_eq!(
+            compute_workspace_card_areas(&app, area).len(),
+            cards_before - 1,
+            "and therefore leaves hit testing"
+        );
+        assert!(
+            !app.visible_workspace_order().contains(&1),
+            "and therefore leaves workspace navigation"
+        );
     }
 
     #[test]

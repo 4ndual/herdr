@@ -4250,13 +4250,23 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        app.state.context_menu = Some(ContextMenuState {
+        // fork(ADR-013): resolve the row from the live menu instead of hard
+        // coding it, so this survives either side adding a row — ADR-014 added
+        // "Hide" between "Rename" and "Close".
+        let mut menu = ContextMenuState {
             kind: ContextMenuKind::Workspace { ws_idx: 1 },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
+            list: MenuListState::new(0),
             plugin_items: Vec::new(),
-        });
+        };
+        let close_row = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("the workspace context menu has a Close row");
+        menu.list = MenuListState::new(close_row);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
             &mut app.state,
@@ -4284,6 +4294,57 @@ mod tests {
         assert_eq!(app.state.workspaces[0].display_name(), "a");
     }
 
+    /// fork(ADR-014): the menu row is dispatched by TWO tables —
+    /// `apply_context_menu_action` and `apply_context_menu_action_via_api` —
+    /// and a real sidebar click goes through the second one. Shipping the row
+    /// in only the first made "Hide" a silent no-op, so this test clicks it the
+    /// way the sidebar does rather than calling the handler directly.
+    #[test]
+    fn clicking_workspace_context_menu_hide_routes_through_api_path() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("a"), Workspace::test_new("b")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let mut context_menu = ContextMenuState {
+            plugin_items: Vec::new(),
+            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            x: 2,
+            y: 2,
+            list: MenuListState::new(0),
+        };
+        let hide_row = context_menu
+            .items()
+            .iter()
+            .position(|item| *item == "Hide")
+            .expect("the workspace context menu has a Hide row");
+        context_menu.list = MenuListState::new(hide_row);
+        app.state.context_menu = Some(context_menu);
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = app.state.context_menu_rect().unwrap();
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            menu.x + 2,
+            menu.y + 1 + hide_row as u16,
+        ));
+
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "Hide must not close the workspace"
+        );
+        assert!(app.state.workspaces[1].hidden, "the workspace is hidden");
+        assert!(
+            !crate::ui::workspace_list_entries(&app.state)
+                .iter()
+                .any(|entry| matches!(
+                    entry,
+                    crate::ui::WorkspaceListEntry::Workspace { ws_idx: 1, .. }
+                )),
+            "and it left the sidebar row list"
+        );
+    }
+
     #[test]
     fn clicking_context_menu_close_routes_through_api_path() {
         let mut app = app_for_mouse_test();
@@ -4291,20 +4352,30 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.confirm_close = false;
-        app.state.context_menu = Some(ContextMenuState {
+        // fork(ADR-013): both the selected index and the clicked row come from
+        // the live menu, so adding a row (ADR-014's "Hide") cannot silently
+        // repoint this click at a different action.
+        let mut context_menu = ContextMenuState {
             plugin_items: Vec::new(),
             kind: ContextMenuKind::Workspace { ws_idx: 1 },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        let close_row = context_menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("the workspace context menu has a Close row");
+        context_menu.list = MenuListState::new(close_row);
+        app.state.context_menu = Some(context_menu);
         app.state.mode = Mode::ContextMenu;
 
         let menu = app.state.context_menu_rect().unwrap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 2,
+            menu.y + 1 + close_row as u16,
         ));
 
         assert_eq!(app.state.workspaces.len(), 1);

@@ -1602,16 +1602,29 @@ impl ContextMenuState {
     // from `right_click_passthrough` and friends.
     pub fn builtin_items(&self) -> Vec<&str> {
         match self.kind {
-            ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
+            // fork(ADR-014): "Hide" sits before "Close" here for the same
+            // reason "Make invisible" does in the Tab arms below — the
+            // non-destructive option comes before the destructive one.
+            ContextMenuKind::Workspace { .. } => vec!["Rename", "Hide", "Close"],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 ..
-            } => vec!["Rename", "Close", "New worktree", "Open worktree..."],
+            } => vec![
+                "Rename",
+                "Hide",
+                "Close",
+                "New worktree",
+                "Open worktree...",
+            ],
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: true,
                 ..
-            } => vec!["Rename", "Close", "Delete worktree checkout..."],
+            } => vec!["Rename", "Hide", "Close", "Delete worktree checkout..."],
+            // fork(ADR-014): deliberately no "Hide" row on a worktree group
+            // parent. "Collapse" is already the visibility affordance for a
+            // group, and hiding the parent alone would strand its children as
+            // ungrouped top-level rows. Hide the members individually instead.
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: true,
@@ -3805,7 +3818,7 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            vec!["Rename", "Close", "Delete worktree checkout..."]
+            vec!["Rename", "Hide", "Close", "Delete worktree checkout..."]
         );
     }
 
@@ -3826,7 +3839,13 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            vec!["Rename", "Close", "New worktree", "Open worktree..."]
+            vec![
+                "Rename",
+                "Hide",
+                "Close",
+                "New worktree",
+                "Open worktree..."
+            ]
         );
     }
 

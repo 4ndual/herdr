@@ -66,9 +66,14 @@ pub enum Method {
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
-    WorkspaceList(EmptyParams),
+    WorkspaceList(WorkspaceListParams),
     #[serde(rename = "workspace.get")]
     WorkspaceGet(WorkspaceTarget),
+    // fork(ADR-014): workspace visibility, mirroring `tab.show` / `tab.hide`.
+    #[serde(rename = "workspace.show")]
+    WorkspaceShow(WorkspaceVisibilityParams),
+    #[serde(rename = "workspace.hide")]
+    WorkspaceHide(WorkspaceVisibilityParams),
     #[serde(rename = "workspace.focus")]
     WorkspaceFocus(WorkspaceTarget),
     #[serde(rename = "workspace.rename")]

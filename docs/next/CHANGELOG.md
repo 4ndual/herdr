@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Workspaces can now be hidden from the sidebar without closing them: a `Hide` entry in the workspace right-click menu, `workspace.hide`/`workspace.show` and a `hidden` filter on `workspace.list` over the socket API, and `herdr workspace hide|show` plus `herdr workspace list --hidden` in the CLI. A hidden workspace keeps every tab, pane, agent, and layout, and it survives restart. Herdr refuses to hide the last visible workspace.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added

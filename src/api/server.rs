@@ -394,6 +394,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceGet(_) => "workspace.get",
+        Method::WorkspaceShow(_) => "workspace.show",
+        Method::WorkspaceHide(_) => "workspace.hide",
         Method::WorkspaceFocus(_) => "workspace.focus",
         Method::WorkspaceRename(_) => "workspace.rename",
         Method::WorkspaceMove(_) => "workspace.move",
@@ -1124,7 +1126,7 @@ mod tests {
         let rejected = handle_request(
             Request {
                 id: "after_stop".into(),
-                method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+                method: Method::WorkspaceList(crate::api::schema::WorkspaceListParams::default()),
             },
             &tx,
             None,
@@ -1141,7 +1143,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let request = Request {
             id: "req_2".into(),
-            method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+            method: Method::WorkspaceList(crate::api::schema::WorkspaceListParams::default()),
         };
 
         let request_for_thread = request.clone();

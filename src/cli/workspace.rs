@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::api::schema::{
-    Method, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceReportMetadataParams,
+    Method, WorkspaceCreateParams, WorkspaceListParams, WorkspaceRenameParams,
+    WorkspaceReportMetadataParams,
 };
 
 pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
@@ -18,6 +19,8 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
         "rename" => workspace_rename(&args[1..]),
         "report-metadata" => workspace_report_metadata(&args[1..]),
         "close" => workspace_close(&args[1..]),
+        "hide" => workspace_hide(&args[1..]),
+        "show" => workspace_show(&args[1..]),
         "help" | "--help" | "-h" => {
             print_workspace_help();
             Ok(0)
@@ -30,12 +33,57 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn workspace_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: herdr workspace list");
-        return Ok(2);
+    // ADR-014: the CLI is the only reveal path for a hidden workspace, so the
+    // filter has to be reachable here.
+    let mut hidden: Option<bool> = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--hidden" => {
+                hidden = Some(true);
+                index += 1;
+            }
+            "--visible" => {
+                hidden = Some(false);
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
     }
 
-    super::runtime::workspace_list()
+    // `None` is "no visibility filter", the same default `workspace.list` uses.
+    // The CLI stays a thin wrapper rather than inventing a second contract.
+    super::runtime::workspace_list(WorkspaceListParams { hidden })
+}
+
+fn workspace_hide(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_workspace_id) = args.first().filter(|_| args.len() == 1) else {
+        eprintln!("usage: herdr workspace hide <workspace_id>");
+        return Ok(2);
+    };
+
+    super::runtime::workspace_hide(super::normalize_workspace_id(raw_workspace_id))
+}
+
+fn workspace_show(args: &[String]) -> std::io::Result<i32> {
+    let Some(raw_workspace_id) = args.first() else {
+        eprintln!("usage: herdr workspace show <workspace_id> [--focus]");
+        return Ok(2);
+    };
+    let focus = match args.len() {
+        1 => false,
+        2 if args[1] == "--focus" => true,
+        _ => {
+            eprintln!("usage: herdr workspace show <workspace_id> [--focus]");
+            return Ok(2);
+        }
+    };
+
+    super::runtime::workspace_show(super::normalize_workspace_id(raw_workspace_id), focus)
 }
 
 fn workspace_create(args: &[String]) -> std::io::Result<i32> {
@@ -239,11 +287,13 @@ fn workspace_close(args: &[String]) -> std::io::Result<i32> {
 
 fn print_workspace_help() {
     eprintln!("herdr workspace commands:");
-    eprintln!("  herdr workspace list");
+    eprintln!("  herdr workspace list [--hidden | --visible]");
     eprintln!("  herdr workspace create [--cwd PATH] [--label TEXT] [--env KEY=VALUE] [--focus] [--no-focus]");
     eprintln!("  herdr workspace get <workspace_id>");
     eprintln!("  herdr workspace focus <workspace_id>");
     eprintln!("  herdr workspace rename <workspace_id> <label>");
     eprintln!("  herdr workspace report-metadata <workspace_id> --source ID [--token NAME=VALUE] [--clear-token NAME] [--seq N] [--ttl-ms N]");
     eprintln!("  herdr workspace close <workspace_id>");
+    eprintln!("  herdr workspace hide <workspace_id>");
+    eprintln!("  herdr workspace show <workspace_id> [--focus]");
 }

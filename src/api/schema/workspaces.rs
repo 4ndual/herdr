@@ -16,6 +16,26 @@ pub struct WorkspaceCreateParams {
     pub env: HashMap<String, String>,
 }
 
+/// fork(ADR-014): `workspace.list` params. Every field is optional and
+/// serde-defaulted, so a bare `{}` — what every caller sent before workspace
+/// visibility existed — still deserializes and still means "no filter".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceListParams {
+    /// When set, restrict the result to workspaces with this visibility state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+}
+
+/// fork(ADR-014): shared by `workspace.hide` and `workspace.show`, mirroring
+/// `TabVisibilityParams`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceVisibilityParams {
+    pub workspace_id: String,
+    /// Reveal the workspace and focus it when true. Defaults to false.
+    #[serde(default)]
+    pub focus: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceRenameParams {
     pub workspace_id: String,
@@ -58,6 +78,10 @@ pub struct WorkspaceInfo {
     pub tab_count: usize,
     pub active_tab_id: String,
     pub agent_status: AgentStatus,
+    /// fork(ADR-014): a hidden workspace retains full runtime ownership, so it
+    /// still gets a `WorkspaceInfo`. Visibility is reported here; filtering is
+    /// left to `workspace.list {hidden}`.
+    pub hidden: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[schemars(schema_with = "super::common::metadata_token_values_schema")]
     pub tokens: HashMap<String, String>,

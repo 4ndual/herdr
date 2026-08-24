@@ -1,9 +1,9 @@
 use crate::api::schema::{
-    EmptyParams, Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams,
-    PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
-    WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams,
-    WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams, PaneRenameParams,
+    PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, Request,
+    TabCreateParams, TabListParams, TabRenameParams, TabTarget, WorkspaceCreateParams,
+    WorkspaceListParams, WorkspaceRenameParams, WorkspaceTarget, WorkspaceVisibilityParams,
+    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -13,10 +13,29 @@ fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i3
     })?)
 }
 
-pub(super) fn workspace_list() -> std::io::Result<i32> {
+pub(super) fn workspace_list(params: WorkspaceListParams) -> std::io::Result<i32> {
+    print_method_response("cli:workspace:list", Method::WorkspaceList(params))
+}
+
+pub(super) fn workspace_show(workspace_id: String, focus: bool) -> std::io::Result<i32> {
     print_method_response(
-        "cli:workspace:list",
-        Method::WorkspaceList(EmptyParams::default()),
+        "cli:workspace:show",
+        Method::WorkspaceShow(WorkspaceVisibilityParams {
+            workspace_id,
+            focus,
+        }),
+    )
+}
+
+pub(super) fn workspace_hide(workspace_id: String) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:workspace:hide",
+        Method::WorkspaceHide(WorkspaceVisibilityParams {
+            workspace_id,
+            // Hiding a workspace and focusing it in the same call is
+            // contradictory and the handler rejects it; the CLI never asks.
+            focus: false,
+        }),
     )
 }
 
