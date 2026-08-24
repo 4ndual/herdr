@@ -1,0 +1,20 @@
+[package]
+name = "swap-here-tui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "swap-here-tui"
+path = "src/main.rs"
+
+[workspace]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde_json = "1"
+
+[profile.release]
+lto = true
+opt-level = "z"
