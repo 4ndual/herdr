@@ -691,6 +691,22 @@ impl App {
         self.focus_pane_internal_via_api(ws_idx, target.pane_id);
     }
 
+    /// fork(rail-action): invoke a plugin action from a right-rail button click.
+    /// Same path as `plugin.action.invoke` / the guest `InvokePluginAction`
+    /// host effect, so capabilities, platform gating and logging are identical.
+    pub(crate) fn invoke_rail_plugin_action(&mut self, plugin_id: &str, action_id: &str) {
+        let _ = self.handle_api_request(crate::api::schema::Request {
+            id: "rail-action".into(),
+            method: crate::api::schema::Method::PluginActionInvoke(
+                crate::api::schema::PluginActionInvokeParams {
+                    action_id: action_id.to_string(),
+                    plugin_id: Some(plugin_id.to_string()),
+                    context: None,
+                },
+            ),
+        });
+    }
+
     pub(crate) fn focus_toast_target_via_api(&mut self) {
         let Some(target) = self
             .state

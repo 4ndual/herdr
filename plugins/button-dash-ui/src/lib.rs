@@ -123,18 +123,21 @@ static BUTTONS: &[ButtonDef] = &[
         plugin: PLUGIN_ID,
     },
     ButtonDef {
-        id: "codex-here",
-        label: "Codex here",
+        id: "swap-here",
+        label: "Swap here",
         emoji: "\u{1F504}",            // 🔄
         shortcut: "\u{2303}\u{2325}C", // ⌃⌥C
-        // Deliberate, allow-listed collision with `relaunch-skip` (see
-        // ALLOWED_COLOR_COLLISIONS). Both buttons do the same physical thing —
-        // replace THIS pane in place with a different launch of the same work —
-        // so sharing peach reads as a family; the glyphs carry the difference
-        // (⚡ same runtime, bypassed · 🔄 same work, other runtime).
+        // Replaces the old one-runtime `codex-here` button, which was this same
+        // swap with both ends hard-coded. Codex is now one row in the picker,
+        // so the shortcut, the glyph and the colour are inherited deliberately:
+        // the muscle memory points at the same physical act, with more of it
+        // reachable. Deliberate, allow-listed collision with `relaunch-skip`
+        // (see ALLOWED_COLOR_COLLISIONS): both replace THIS pane in place with
+        // another launch of the same work, and the glyphs carry the difference
+        // (⚡ same runtime, bypassed · 🔄 another runtime or harness).
         color: "peach",
-        description: "Reopen this pane's harness/workspace in the codex runtime, in place — resumes the harness's own codex session when it has one",
-        action_id: "codex-here",
+        description: "Reopen OR FORK this pane's session in ANY runtime and ANY harness — one overlay picker; 'open as' chooses replace-in-place vs fork-to-new-tab",
+        action_id: "swap-here",
         plugin: PLUGIN_ID,
     },
     ButtonDef {
@@ -811,7 +814,7 @@ mod tests {
         &[
             ("green", "success"),
             ("magenta", "mauve"),
-            // relaunch-skip ⚡ and codex-here 🔄: the two "replace this pane in
+            // relaunch-skip ⚡ and swap-here 🔄: the two "replace this pane in
             // place with another launch of the same work" buttons.
             ("peach", "peach"),
         ];

@@ -93,6 +93,11 @@ pub(super) enum MouseAction {
         pane_id: crate::layout::PaneId,
     },
     FocusToastTarget,
+    /// fork(rail-action): invoke `plugin_id:action_id` (a right-rail button).
+    InvokePluginAction {
+        plugin_id: String,
+        action_id: String,
+    },
     MoveWorkspace {
         source_ws_idx: usize,
         insert_idx: usize,
@@ -194,6 +199,14 @@ impl AppState {
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             if let Some(plugin_id) = self.right_panel_rail_icon_at(mouse.column, mouse.row) {
+                // fork(rail-action): a rail slot declaring `rail_action` is a plain
+                // button — it invokes that plugin action and opens no panel.
+                if let Some((target_plugin, action_id)) = self.rail_action_for_plugin(&plugin_id) {
+                    return Some(MouseAction::InvokePluginAction {
+                        plugin_id: target_plugin,
+                        action_id,
+                    });
+                }
                 self.toggle_right_panel(&plugin_id);
                 return None;
             }
@@ -2233,6 +2246,96 @@ fn ui_action_kind_for_crossterm(kind: MouseEventKind) -> Option<herdr_ui_plugin_
 
 #[cfg(test)]
 mod tests {
+
+    /// fork(rail-action): the 📚 rail slot is a plain button. Clicking it routes
+    /// to `plugin.action.invoke` (`MouseAction::InvokePluginAction` ->
+    /// `App::invoke_rail_plugin_action`) and must leave the right panel exactly
+    /// as it was: no panel opens, nothing becomes active. An ordinary
+    /// right-panel plugin's icon still toggles its panel.
+    #[test]
+    fn rail_click_on_a_rail_action_plugin_invokes_the_action_and_opens_no_panel() {
+        use crate::app::state::RightPanelRailIcon;
+
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::Terminal;
+        app.state.view.right_panel_rail_icons = vec![
+            RightPanelRailIcon {
+                plugin_id: "local.sidebar-rail".into(),
+                rect: Rect::new(100, 5, 3, 1),
+                active: false,
+            },
+            RightPanelRailIcon {
+                plugin_id: "builtin.goal-dash".into(),
+                rect: Rect::new(100, 6, 3, 1),
+                active: false,
+            },
+        ];
+        let mut plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: "local.sidebar-rail".into(),
+            name: "Sidebar Rail".into(),
+            version: "0.2.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "/tmp/rail/herdr-plugin.toml".into(),
+            plugin_root: "/tmp/rail".into(),
+            enabled: true,
+            platforms: None,
+            build: Vec::new(),
+            startup: Vec::new(),
+            actions: Vec::new(),
+            events: Vec::new(),
+            panes: Vec::new(),
+            ui_modules: Vec::new(),
+            link_handlers: Vec::new(),
+            source: Default::default(),
+            warnings: Vec::new(),
+        };
+        plugin.ui_modules = vec![crate::api::schema::PluginManifestUiModule {
+            rail_icon: Some("\u{1F4DA}".into()),
+            rail_action: Some("herdr-sidebar:open-sidebar".into()),
+            id: "sidebar-rail".into(),
+            title: "Sidebar".into(),
+            description: None,
+            platforms: None,
+            kind: Default::default(),
+            api_version: 3,
+            module: "dist/main.wasm".into(),
+            hot_reload: Default::default(),
+            surfaces: vec![crate::api::schema::PluginUiSurface::RightPanel],
+            placement: None,
+            capabilities: Vec::new(),
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            max_layers_per_pane: None,
+            collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
+        }];
+        app.state
+            .installed_plugins
+            .insert("local.sidebar-rail".into(), plugin);
+
+        // The routing decision itself: which action a rail icon invokes.
+        assert_eq!(
+            app.state.rail_action_for_plugin("local.sidebar-rail"),
+            Some(("herdr-sidebar".to_string(), "open-sidebar".to_string()))
+        );
+        assert_eq!(app.state.rail_action_for_plugin("builtin.goal-dash"), None);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 101, 5));
+        assert_eq!(
+            app.state.active_right_panel, None,
+            "a rail button must open no panel"
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 101, 6));
+        assert_eq!(
+            app.state.active_right_panel.as_deref(),
+            Some("builtin.goal-dash"),
+            "existing right-panel plugins keep their expand/collapse behaviour"
+        );
+    }
 
     /// `harness:copy:` must route to the host like open/disable do. It cannot be
     /// guest-owned: the row model carries no path, so only the host can turn a

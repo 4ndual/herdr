@@ -430,6 +430,12 @@ pub struct PluginManifestUiModule {
     /// One or two display cells of non-control text; omitted keeps the fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rail_icon: Option<String>,
+    /// fork: `"<plugin_id>:<action_id>"`. When set, this module contributes a
+    /// right-panel RAIL SLOT ONLY: the host emits its rail icon even with an
+    /// empty right-panel layer, and a click on that icon invokes the named
+    /// plugin action instead of expanding/collapsing a panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rail_action: Option<String>,
     /// fork: optional single path segment naming an image file under this
     /// module's plugin directory. When declared, the HOST loads it and paints
     /// it over the module's surface `Rect` (kitty transmit path, or half-block

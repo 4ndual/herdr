@@ -5015,6 +5015,7 @@ mod tests {
         };
         plugin.ui_modules.push(PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "handoff-ui".into(),
             title: "Handoff UI".into(),
@@ -5157,6 +5158,7 @@ mod tests {
         };
         plugin.ui_modules.push(PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "state-ui".into(),
             title: "State UI".into(),
@@ -5874,6 +5876,7 @@ mod tests {
                 panes: vec![],
                 ui_modules: vec![crate::api::schema::PluginManifestUiModule {
                     rail_icon: None,
+                    rail_action: None,
                     id: "m".into(),
                     title: "m".into(),
                     description: None,
@@ -9472,6 +9475,7 @@ last_pane = "prefix+tab"
             panes: vec![],
             ui_modules: vec![crate::api::schema::PluginManifestUiModule {
                 rail_icon: None,
+                rail_action: None,
                 id: "probe".into(),
                 title: "Key Probe".into(),
                 description: None,

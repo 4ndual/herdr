@@ -126,6 +126,9 @@ struct RawPluginManifestUiModule {
     // Right-panel rail glyph (see PluginManifestUiModule::rail_icon).
     #[serde(default)]
     rail_icon: Option<String>,
+    // fork: rail-only action target (see PluginManifestUiModule::rail_action).
+    #[serde(default)]
+    rail_action: Option<String>,
     // fork: optional host-consumed image filename (see PluginManifestUiModule::image_file).
     #[serde(default)]
     image_file: Option<String>,
@@ -600,6 +603,12 @@ fn normalize_manifest_ui_module(
         Some(icon) => Some(normalize_rail_icon(&icon)?),
         None => None,
     };
+    // fork(rail-action): a rail slot that invokes an action instead of opening a
+    // panel. Validated at load so a typo names the plugin that made it.
+    let rail_action = match module.rail_action {
+        Some(spec) => Some(normalize_rail_action(&spec)?),
+        None => None,
+    };
     // fork: graphics_roots are absolute directories OUTSIDE the plugin dir, so
     // the single-segment guard above does not apply. They are validated for
     // shape here and canonicalised at use time (a root may legitimately not
@@ -631,6 +640,7 @@ fn normalize_manifest_ui_module(
         capabilities: module.capabilities,
         ui_input_file,
         rail_icon,
+        rail_action,
         image_file,
         graphics_roots,
         max_layers_per_pane: module.max_layers_per_pane,
@@ -638,6 +648,30 @@ fn normalize_manifest_ui_module(
         host_actions,
         host_action_mode: module.host_action_mode,
     })
+}
+
+/// Validate a module's `rail_action`: `"<plugin_id>:<action_id>"`, both halves
+/// non-empty, printable, no extra separator. Returns the trimmed spec.
+fn normalize_rail_action(spec: &str) -> Result<String, (&'static str, String)> {
+    let spec = spec.trim();
+    let invalid = |reason: &str| {
+        (
+            "invalid_plugin_ui_rail_action",
+            format!("ui module rail_action {reason}"),
+        )
+    };
+    if spec.chars().any(char::is_control) {
+        return Err(invalid("must not contain control characters"));
+    }
+    let mut parts = spec.split(':');
+    let (Some(plugin_id), Some(action_id), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(invalid("must be \"<plugin_id>:<action_id>\""));
+    };
+    if plugin_id.trim().is_empty() || action_id.trim().is_empty() {
+        return Err(invalid("must name a non-empty plugin id and action id"));
+    }
+    Ok(format!("{}:{}", plugin_id.trim(), action_id.trim()))
 }
 
 /// Validate a module's `rail_icon`: short, printable, single-line.
@@ -954,6 +988,7 @@ mod tests {
     fn ui_module_requires_surface_and_api_version() {
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
@@ -978,6 +1013,7 @@ mod tests {
 
         let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),
@@ -1005,6 +1041,7 @@ mod tests {
     fn ui_module_normalizes_wasm_panel_manifest() {
         let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: " Goal UI ".into(),
@@ -1047,6 +1084,7 @@ mod tests {
     fn ui_module_with_input_file(name: &str) -> RawPluginManifestUiModule {
         RawPluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "usage".into(),
             title: "Usage".into(),
@@ -1068,9 +1106,35 @@ mod tests {
         }
     }
 
+    /// fork(rail-action): `"<plugin_id>:<action_id>"` is validated at load, so a
+    /// typo names the plugin instead of producing a rail button that fires at
+    /// nothing.
+    #[test]
+    fn rail_action_is_accepted_trimmed_and_shape_checked() {
+        let module = normalize_manifest_ui_module(RawPluginManifestUiModule {
+            rail_action: Some(" herdr-sidebar : open-sidebar ".into()),
+            ..ui_module_with_input_file("usage_input.json")
+        })
+        .expect("a well-formed rail_action is accepted");
+        assert_eq!(
+            module.rail_action.as_deref(),
+            Some("herdr-sidebar:open-sidebar")
+        );
+
+        for bad in ["open-sidebar", "a:b:c", ":open", "herdr-sidebar:", "\n:x"] {
+            let err = normalize_manifest_ui_module(RawPluginManifestUiModule {
+                rail_action: Some(bad.into()),
+                ..ui_module_with_input_file("usage_input.json")
+            })
+            .expect_err("rail_action must be rejected");
+            assert_eq!(err.0, "invalid_plugin_ui_rail_action", "for {bad:?}");
+        }
+    }
+
     fn ui_module_with_rail_icon(icon: &str) -> RawPluginManifestUiModule {
         RawPluginManifestUiModule {
             rail_icon: Some(icon.into()),
+            rail_action: None,
             ..ui_module_with_input_file("usage_input.json")
         }
     }

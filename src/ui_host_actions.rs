@@ -276,6 +276,7 @@ mod claim_table_tests {
     ) -> PluginManifestUiModule {
         PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             id: id.into(),
             title: id.into(),
             description: None,

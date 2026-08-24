@@ -293,6 +293,7 @@ mod tests {
         let mut plugin = sample_plugin(id);
         plugin.ui_modules = vec![PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: format!("{id}.dash"),
             title: "Dash".to_string(),

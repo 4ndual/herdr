@@ -937,6 +937,7 @@ fn plugin_link_list_unlink_round_trip() {
         }],
         ui_modules: vec![PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "goal-ui".into(),
             title: "Goal UI".into(),

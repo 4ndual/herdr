@@ -13,6 +13,11 @@ platforms = ["linux", "macos"]
 [[build]]
 command = ["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]
 
+# The swap picker's ratatui binary (see the `swap-here` action below). Separate
+# crate, separate target dir: a wasm32 build and a host build cannot share one.
+[[build]]
+command = ["sh", "-lc", "cd tui-swap && cargo build --release"]
+
 # restart-hr: fully kill & relaunch this herdr instance, restoring the session.
 # The host runs actions with cwd = plugin_root and the server's full env inherited
 # (HERDR_PLUGIN_ROOT + the server's own HERDR_SESSION / XDG_CONFIG_HOME, verified
@@ -244,16 +249,36 @@ size = "42"
 min_peer = 24
 z = 60
 
-# codex-here: replace the CURRENT pane with the same work running under the
-# codex runtime. Same spawn-then-close ordering as relaunch-skip, so a failed
-# spawn never leaves the user paneless. All logic is in Go (`harness
-# codex-here`): it maps the pane cwd back to the owning harness, points
-# CODEX_HOME at that harness config dir, and resumes the harness OWN codex
-# session (state/session-id.codex) when one exists — a claude transcript can
-# never be resumed by codex, so the contract is same harness, same workspace,
-# codex own latest session. Detached so it outlives the action runner.
+# swap-here: the "resume this session anywhere" PICKER.
+#
+# It replaces the old `codex-here` button, which was this same swap with both
+# ends nailed down (codex, and whichever harness owned the pane). Codex is now
+# one row in the picker.
+#
+# Two halves, the split the agent launcher established: an OVERLAY pane running
+# a native ratatui form (tui-swap/), and one command that does the work. The
+# overlay owns the keyboard, and it resolves the SOURCE pane from
+# HERDR_PLUGIN_CONTEXT_JSON — the host captures that before the overlay takes
+# focus, so it sees the pane the user was looking at, not itself.
+#
+# The picker holds NO swap logic: both its `plan:` preview (`--dry-run`, which
+# writes nothing) and its Enter come from `harness swap-here`
+# (harness-fleet/go/swaphere.go). One algorithm, so a preview can never
+# describe a different swap than the one that runs.
 [[actions]]
-id = "codex-here"
-title = "Codex here"
+id = "swap-here"
+title = "Swap here"
 contexts = ["tab", "pane"]
-command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/codex-here.sh\" >/dev/null 2>&1 &"]
+command = ["sh", "-lc", "nohup \"$HERDR_PLUGIN_ROOT/scripts/swap-here.sh\" >/dev/null 2>&1 &"]
+
+# The picker's surface. Overlay, not popup: a list whose length is the size of
+# the fleet is a secondary surface, and it gets Esc-to-close for free. The host
+# sizes an overlay, so no width/height here (manifest.rs rejects a size on
+# anything but a "popup").
+[[panes]]
+id = "swap"
+title = "resume this session anywhere"
+description = "Pick a runtime, mode and harness; reopens this pane's session there, in place"
+placement = "overlay"
+command = ["sh", "-lc", "exec \"$HERDR_PLUGIN_ROOT/tui-swap/target/release/swap-here-tui\""]
+

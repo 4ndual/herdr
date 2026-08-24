@@ -2175,6 +2175,20 @@ impl AppState {
             && self.active_right_panel.as_deref() == Some(plugin_id)
     }
 
+    /// fork(rail-action): the `(plugin_id, action_id)` this plugin's rail icon
+    /// invokes, from the first ui module declaring `rail_action`. `None` for an
+    /// ordinary right-panel plugin, whose rail icon toggles its panel instead.
+    pub(crate) fn rail_action_for_plugin(&self, plugin_id: &str) -> Option<(String, String)> {
+        let spec = self
+            .installed_plugins
+            .get(plugin_id)?
+            .ui_modules
+            .iter()
+            .find_map(|module| module.rail_action.as_deref())?;
+        let (plugin, action) = spec.split_once(':')?;
+        Some((plugin.to_string(), action.to_string()))
+    }
+
     /// The plugin id of the right-panel rail icon at `(col, row)`, if any. Used by
     /// the mouse handler to route a rail click to `toggle_right_panel`.
     pub(crate) fn right_panel_rail_icon_at(&self, col: u16, row: u16) -> Option<String> {

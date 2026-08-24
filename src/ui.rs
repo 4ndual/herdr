@@ -333,6 +333,27 @@ fn compute_view_internal(
             right_panel_plugins.push(entry.plugin_id.clone());
         }
     }
+    // fork(rail-action): a plugin whose ui module declares `rail_action` gets a
+    // rail SLOT ONLY — it never renders right-panel nodes, so the loop above
+    // cannot see it. Its icon invokes an action (routed in `handle_mouse`) and
+    // never becomes `active_right_panel`, so it carves no content column.
+    // Sorted: `installed_plugins` is a HashMap, and the rail order must not
+    // reshuffle between frames.
+    let mut rail_action_plugins: Vec<&String> = app
+        .installed_plugins
+        .iter()
+        .filter(|(plugin_id, plugin)| {
+            plugin.enabled
+                && plugin
+                    .ui_modules
+                    .iter()
+                    .any(|module| module.rail_action.is_some())
+                && !right_panel_plugins.contains(plugin_id)
+        })
+        .map(|(plugin_id, _)| plugin_id)
+        .collect();
+    rail_action_plugins.sort();
+    right_panel_plugins.extend(rail_action_plugins.into_iter().cloned());
     // Clear a stale selection whose plugin no longer renders content. The panel
     // starts as an icon-only rail (nothing expanded) and the user clicks an icon
     // to expand a plugin — so we never auto-expand here (pure, unit-tested).
@@ -2059,6 +2080,113 @@ mod tests {
         layer
     }
 
+    /// An installed plugin whose single ui module declares 📚 + a `rail_action`.
+    fn test_plugin_with_rail_action(
+        plugin_id: &str,
+        rail_action: Option<&str>,
+    ) -> crate::api::schema::InstalledPluginInfo {
+        let mut plugin = crate::api::schema::InstalledPluginInfo {
+            plugin_id: plugin_id.into(),
+            name: "Sidebar Rail".into(),
+            version: "0.2.0".into(),
+            min_herdr_version: crate::build_info::BASE_VERSION.into(),
+            description: None,
+            manifest_path: "/tmp/rail/herdr-plugin.toml".into(),
+            plugin_root: "/tmp/rail".into(),
+            enabled: true,
+            platforms: None,
+            build: Vec::new(),
+            startup: Vec::new(),
+            actions: Vec::new(),
+            events: Vec::new(),
+            panes: Vec::new(),
+            ui_modules: Vec::new(),
+            link_handlers: Vec::new(),
+            source: Default::default(),
+            warnings: Vec::new(),
+        };
+        plugin.ui_modules = vec![crate::api::schema::PluginManifestUiModule {
+            rail_icon: Some("\u{1F4DA}".into()),
+            rail_action: rail_action.map(str::to_string),
+            id: "sidebar-rail".into(),
+            title: "Sidebar".into(),
+            description: None,
+            platforms: None,
+            kind: Default::default(),
+            api_version: 3,
+            module: "dist/main.wasm".into(),
+            hot_reload: Default::default(),
+            surfaces: vec![crate::api::schema::PluginUiSurface::RightPanel],
+            placement: None,
+            capabilities: Vec::new(),
+            ui_input_file: None,
+            image_file: None,
+            graphics_roots: Vec::new(),
+            max_layers_per_pane: None,
+            collector: None,
+            host_actions: Vec::new(),
+            host_action_mode: None,
+        }];
+        plugin
+    }
+
+    /// fork(rail-action): a module declaring `rail_action` contributes a rail
+    /// SLOT ONLY — it renders no right-panel nodes, so without this it got no
+    /// icon at all and the 📚 button could not exist.
+    #[test]
+    fn rail_action_module_gets_a_rail_icon_without_rendering_a_panel() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.installed_plugins.insert(
+            "local.sidebar-rail".into(),
+            test_plugin_with_rail_action("local.sidebar-rail", Some("herdr-sidebar:open-sidebar")),
+        );
+
+        // No layers at all: the rail slot comes from the manifest, not content.
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rail_icons.len(), 1);
+        assert_eq!(
+            app.view.right_panel_rail_icons[0].plugin_id,
+            "local.sidebar-rail"
+        );
+        assert_eq!(
+            right_panel_rail_glyph(&app, "local.sidebar-rail"),
+            "\u{1F4DA}"
+        );
+        // A rail button never expands a content column.
+        assert_eq!(app.view.right_panel_rect.width, 0);
+        assert_eq!(app.active_right_panel, None);
+
+        // An ordinary right-panel plugin is unaffected: it still gets its icon
+        // from rendered content and still expands a panel when clicked.
+        app.ui_surface_layers = vec![right_panel_layer(vec![goal_line_node()])];
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert_eq!(app.view.right_panel_rail_icons.len(), 2);
+        app.toggle_right_panel("builtin.goal-dash");
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rect.width >= GOAL_PANEL_MIN_WIDTH);
+    }
+
+    /// A disabled plugin contributes no rail slot (it cannot run its action).
+    #[test]
+    fn disabled_rail_action_plugin_gets_no_rail_icon() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let mut plugin =
+            test_plugin_with_rail_action("local.sidebar-rail", Some("herdr-sidebar:open-sidebar"));
+        plugin.enabled = false;
+        app.installed_plugins
+            .insert("local.sidebar-rail".into(), plugin);
+
+        compute_view(&mut app, Rect::new(0, 0, 160, 40));
+        assert!(app.view.right_panel_rail_icons.is_empty());
+    }
     /// The rail glyph comes from the plugin's manifest, with the bundled ids as
     /// a fallback. Without this, a third-party right-panel plugin drew the same
     /// generic marker as every other one.
@@ -2098,6 +2226,7 @@ mod tests {
         };
         plugin.ui_modules = vec![crate::api::schema::PluginManifestUiModule {
             rail_icon: Some("\u{1F680}".into()),
+            rail_action: None,
             id: "main".into(),
             title: "Main".into(),
             description: None,

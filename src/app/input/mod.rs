@@ -476,6 +476,10 @@ impl App {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
                     }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
+                    MouseAction::InvokePluginAction {
+                        plugin_id,
+                        action_id,
+                    } => self.invoke_rail_plugin_action(&plugin_id, &action_id),
                     MouseAction::MoveWorkspace {
                         source_ws_idx,
                         insert_idx,

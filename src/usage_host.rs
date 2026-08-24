@@ -247,6 +247,7 @@ mod tests {
     ) -> PluginManifestUiModule {
         PluginManifestUiModule {
             rail_icon: None,
+            rail_action: None,
             max_layers_per_pane: None,
             id: "usage".into(),
             title: "Usage".into(),
