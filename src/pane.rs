@@ -2079,6 +2079,12 @@ impl PaneRuntime {
                 child_pid.store(pid, Ordering::Release);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
+            crate::pty::memory_cap::spawn_idle_reclaim(
+                pane_id.raw(),
+                child_pid.clone(),
+                child_wait_completed.clone(),
+                content_seq.clone(),
+            );
             tokio::task::spawn_blocking(move || {
                 match child.wait() {
                     Ok(status) => {

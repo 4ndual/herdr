@@ -12,8 +12,9 @@ pub(crate) struct SpawnedPty {
 pub(crate) fn spawn_with_portable_pty(
     rows: u16,
     cols: u16,
-    cmd: CommandBuilder,
+    mut cmd: CommandBuilder,
 ) -> std::io::Result<SpawnedPty> {
+    crate::pty::memory_cap::apply(&mut cmd);
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Linux panes now run in their own transient systemd scope with a soft `terminal.memory.pane_high` ceiling, get `BUN_JSC_forceRAMSize` / `NODE_OPTIONS=--max-old-space-size` heap hints, and have their resident memory pushed to swap via cgroup `memory.reclaim` after `terminal.memory.idle_reclaim_minutes` of inactivity.
+
 ## [0.8.2] - 2026-08-19
 
 ### Added

@@ -91,6 +91,18 @@ new_cwd = "follow"
 
 `new_cwd = "follow"` keeps the default behavior and inherits the source pane or workspace. When there is no source workspace, Herdr starts in `$HOME`. Use `"home"` to always start in `$HOME`, `"current"` to use Herdr's process directory, or a fixed path such as `"~/Projects"`. Explicit `--cwd` values from the CLI or socket API still take precedence.
 
+Cap how much RAM each pane keeps resident (Linux with a systemd user session):
+
+```toml
+[terminal.memory]
+pane_high = "768M"
+bun_force_ram_size = "512M"
+node_max_old_space_size = "1G"
+idle_reclaim_minutes = 10
+```
+
+Every pane command is started in its own transient systemd scope (`systemd-run --user --scope`) with `MemoryHigh = pane_high`, a soft ceiling: a pane that grows past it is throttled and has its cold pages reclaimed to swap, but is never OOM-killed. `bun_force_ram_size` sets `BUN_JSC_forceRAMSize` and `node_max_old_space_size` appends `--max-old-space-size` to `NODE_OPTIONS`, so JavaScript agents (`claude`, `omp`, `codex`'s node helpers) garbage-collect as if the machine were smaller. A pane with no output and negligible CPU for `idle_reclaim_minutes` has its resident memory pushed to swap through cgroup `memory.reclaim`; it pages back in on the next keystroke. Sizes take a K/M/G suffix; an empty string turns that knob off. When `systemd-run` is missing or the memory controller is not delegated to the user session, Herdr logs once and starts panes exactly as before.
+
 ## Worktrees
 
 Set the root directory Herdr uses for Git worktree checkouts created from the sidebar:

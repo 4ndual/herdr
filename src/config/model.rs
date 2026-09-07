@@ -267,6 +267,77 @@ pub struct TerminalConfig {
     pub shell_mode: ShellModeConfig,
     /// CWD policy for new interactive panes, tabs, and workspaces.
     pub new_cwd: NewTerminalCwdConfig,
+    /// Per-pane memory pressure policy (Linux/systemd only).
+    pub memory: PaneMemoryConfig,
+}
+
+/// Per-pane memory pressure policy. Each pane command is wrapped in its own
+/// transient systemd scope with a soft `MemoryHigh` ceiling, so the kernel
+/// reclaims that pane's cold pages (to swap/zram) before touching anything
+/// else, and JS runtimes are told to size their heaps for a smaller machine.
+/// Sizes accept an optional K/M/G suffix; an empty string disables the knob.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PaneMemoryConfig {
+    /// systemd `MemoryHigh=` for each pane's scope. Soft ceiling: the pane is
+    /// throttled and reclaimed above it, never OOM-killed. Default: "768M".
+    pub pane_high: String,
+    /// `BUN_JSC_forceRAMSize` for bun and bun-compiled binaries. JSC treats the
+    /// heap as critical past a fraction of this and collects harder. Default: "512M".
+    pub bun_force_ram_size: String,
+    /// `--max-old-space-size` appended to `NODE_OPTIONS`. Hard V8 heap limit,
+    /// so keep it generous. Default: "1G".
+    pub node_max_old_space_size: String,
+    /// Minutes without pty output or CPU use after which a pane's resident
+    /// memory is pushed to swap via `memory.reclaim`. 0 disables. Default: 10.
+    pub idle_reclaim_minutes: u64,
+}
+
+impl Default for PaneMemoryConfig {
+    fn default() -> Self {
+        Self {
+            pane_high: "768M".into(),
+            bun_force_ram_size: "512M".into(),
+            node_max_old_space_size: "1G".into(),
+            idle_reclaim_minutes: 10,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PaneMemoryConfig {
+    pub fn disabled() -> Self {
+        Self {
+            pane_high: String::new(),
+            bun_force_ram_size: String::new(),
+            node_max_old_space_size: String::new(),
+            idle_reclaim_minutes: 0,
+        }
+    }
+}
+
+/// Parse a size with an optional K/M/G/T suffix (base 1024) into bytes.
+/// Empty input is `Ok(None)`.
+pub fn parse_memory_size(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let (digits, shift) = match text.as_bytes()[text.len() - 1].to_ascii_uppercase() {
+        b'K' => (&text[..text.len() - 1], 10),
+        b'M' => (&text[..text.len() - 1], 20),
+        b'G' => (&text[..text.len() - 1], 30),
+        b'T' => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_shl(shift))
+        .filter(|n| *n > 0)
+        .map(Some)
+        .ok_or_else(|| format!("invalid memory size {text:?}; expected e.g. \"768M\""))
 }
 
 #[derive(Debug, Deserialize)]

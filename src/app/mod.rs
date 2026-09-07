@@ -765,6 +765,9 @@ impl App {
     ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        for diagnostic in crate::pty::memory_cap::configure(&config.terminal.memory) {
+            tracing::warn!(subsystem = "config", "{diagnostic}");
+        }
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
@@ -2217,6 +2220,7 @@ impl App {
             self.state.default_shell = config.terminal.default_shell.clone();
             self.state.shell_mode = config.terminal.shell_mode;
             self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
+            diagnostics.extend(crate::pty::memory_cap::configure(&config.terminal.memory));
         }
 
         if !invalid_section("worktrees") {

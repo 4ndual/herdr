@@ -180,6 +180,18 @@ pub(crate) fn pane_spawn_started(
     );
 }
 
+pub(crate) fn pane_memory_reclaimed(pane_id: u32, before_bytes: u64, after_bytes: u64) {
+    tracing::info!(
+        event = "pane.memory_reclaimed",
+        subsystem = "pane",
+        outcome = "ok",
+        pane_id,
+        before_bytes,
+        after_bytes,
+        "idle pane memory pushed to swap"
+    );
+}
+
 pub(crate) fn pane_spawned(pane_id: u32, pid: u32) {
     tracing::info!(
         event = "pane.spawned",

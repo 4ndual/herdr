@@ -206,6 +206,30 @@
             "current",
             "path"
           ]
+        },
+        {
+          "key": "terminal.memory.pane_high",
+          "type": "string",
+          "default": "\"768M\"",
+          "description": "Linux/systemd only. Soft memory ceiling (systemd MemoryHigh) for each pane's own transient scope. Above it the pane is reclaimed to swap, never OOM-killed. Empty disables the scope wrapper."
+        },
+        {
+          "key": "terminal.memory.bun_force_ram_size",
+          "type": "string",
+          "default": "\"512M\"",
+          "description": "BUN_JSC_forceRAMSize for bun and bun-compiled binaries in panes; JavaScriptCore sizes its heap as if the machine had this much RAM. Empty disables."
+        },
+        {
+          "key": "terminal.memory.node_max_old_space_size",
+          "type": "string",
+          "default": "\"1G\"",
+          "description": "--max-old-space-size appended to NODE_OPTIONS for panes. Hard V8 heap limit; keep it generous. Empty disables."
+        },
+        {
+          "key": "terminal.memory.idle_reclaim_minutes",
+          "type": "integer",
+          "default": "10",
+          "description": "Linux only. Minutes without pty output or CPU use after which a pane scope's resident memory is pushed to swap via cgroup memory.reclaim. 0 disables."
         }
       ]
     },
