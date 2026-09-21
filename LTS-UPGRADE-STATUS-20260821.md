@@ -84,7 +84,15 @@ below if it is real. Regenerate only after the image e2e passes.
 1. **`layer_id` resolved to upstream's `Option<String>`** (the fork had `String`).
    Matches every call site's `.as_deref()`/`Some(..)`/`None` usage, but it is a
    real API-shape decision made during conflict cleanup.
-2. **BGRA channel order is inconsistent.** The half-block fallback now swaps
+2. **BGRA channel order — RESOLVED, not a bug.** Verified on the merged binary:
+   a red/green/blue/white quadrant image renders pixel-correct via BOTH the
+   `source_path` path AND the `data_base64` path, each against a
+   verified-blank baseline (the previous layer was cleared first, so nothing
+   could show through). Red stays top-left, blue stays bottom-left. The concern
+   below was raised from code reading; it does not reproduce in either transport.
+
+   Original concern, kept for the record:
+   **BGRA channel order is inconsistent.** The half-block fallback now swaps
    B/R correctly. `src/kitty_graphics.rs` `pane_graphics_kitty_format` maps
    `Bgra -> KittyImageFormat::Rgba` and passes raw bytes through WITHOUT a swap
    (pre-existing upstream code, untouched). If that is wrong, BGRA frames render
@@ -170,3 +178,47 @@ dispatch tests, `183c4a2c` hidden tabs + per-item colors + agents-panel roster
 scope, `3e7b10ce` workspace colour persistence). Verified live: the Make
 invisible round-trip was driven through the real UI and the tab restored with
 all 4 panes intact.
+
+## Per-branch e2e on the merged binary (the decisive test)
+
+Static comparison said no branch was needed; this verified it by exercising each
+branch's FEATURE AREA against the merged binary, without that branch applied:
+
+| branch | feature area | result on merged binary |
+|---|---|---|
+| `origin/plugin-v1` | plugin API | **221 passed, 0 failed** |
+| `origin/task/linux-compat` | plugin geometry | **17 passed, 0 failed** |
+| `origin/task/historial-persist-fix` | historial | **6 passed, 0 failed** |
+| `origin/task/wave1-no-images` | image handling | **48 passed, 0 failed** |
+| `integration/linux-e2e` | foreground-group / pgid | **15 passed, 0 failed** |
+| `origin/task/doctor-dash` | dash | **6 passed, 0 failed** |
+
+313 tests, zero failures. Note the pgid branch's OWN named reproduction
+(`live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session`) does not exist
+in the merged tree — it was a branch-local test — and its symptom was reported
+"confirmed via local reproduction on macOS"; this box is Linux.
+
+**FINAL MERGE DECISION: merge nothing beyond v0.8.2.** Every candidate branch's
+functionality is present and passing on the merged tree. Merging any of them
+would replay 250-900-commit-old code over a subsystem upstream has since
+reworked — strictly more risk than value.
+
+## Gap the LTS upgrade does NOT close: invisible WORKSPACES
+
+Asked directly during this session. Confirmed absent three ways:
+- no `hidden` field on `Workspace` anywhere in `src/workspace/` (the concept
+  exists only on `Tab`)
+- the workspace context menu is hardcoded:
+  `ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"]`
+- the API has `tab.hide` / `tab.show` but NO `workspace.hide` / `workspace.show`
+  (`workspace.*` = create/close/focus/get/list/move/rename)
+
+Upstream v0.8.2 does not add it either, so the upgrade will not bring it.
+
+Of the three prioritised features:
+- invisible TABS — exists, verified live (hidden via UI click, restored via
+  `tab.show`, 4 panes intact)
+- workspace COLORS — exists (`3e7b10ce`, already merged)
+- invisible WORKSPACES — **does not exist; would be new work**, closely modelled
+  on hidden tabs: a `hidden` flag on Workspace, `workspace.hide`/`workspace.show`
+  mirroring the tab pair, a context-menu entry, sidebar filtering, persistence.
